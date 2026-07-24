@@ -1,3 +1,0 @@
-ddgs
-dnspython
-requests

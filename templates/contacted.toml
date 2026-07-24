@@ -1,0 +1,9 @@
+# Domains you've ALREADY contacted (before or outside coldtrail), so the pipeline
+# never re-surfaces or re-contacts them. This file is yours — coldtrail never
+# overwrites it, and it stays LOCAL. Run `coldtrail seed` after editing.
+#
+#   status = "sent"  -> already contacted
+#   status = "skip"  -> do-not-contact
+
+"example-agency.com" = { name = "Example Agency", status = "sent" }
+"another-co.io" = { name = "Another Co", status = "skip" }

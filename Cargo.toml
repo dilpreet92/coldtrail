@@ -1,0 +1,30 @@
+[package]
+name = "coldtrail"
+version = "0.1.0"
+edition = "2021"
+description = "Discovery-first, deduped outreach — drafts you send by hand."
+license = "MIT"
+
+[[bin]]
+name = "coldtrail"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+scraper = "0.19"
+hickory-resolver = "0.24"
+regex = "1"
+anyhow = "1"
+dirs = "5"
+urlencoding = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[profile.release]
+strip = true
+opt-level = "z"
+lto = true

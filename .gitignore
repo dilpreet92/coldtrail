@@ -1,12 +1,5 @@
-.venv/
-__pycache__/
-*.pyc
-*.log
+/target
+**/*.rs.bk
+.DS_Store
 
-# Live state — never commit (this is your real outreach data)
-outreach.db
-pending_drafts.json
-
-# Your private config — keep local
-message.py
-seed_contacted.py
+# Runtime state lives in ~/.coldtrail/, never in the repo.
