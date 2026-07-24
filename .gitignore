@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+*.log
+
+# Live state — never commit (this is your real outreach data)
+outreach.db
+pending_drafts.json
+
+# Your private config — keep local
+message.py
+seed_contacted.py
