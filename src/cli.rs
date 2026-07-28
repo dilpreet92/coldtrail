@@ -16,8 +16,17 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Launch the agent (Claude Code) in the coldtrail workspace
-    Run,
+    /// (default) Open the coldtrail app in your browser
+    Serve {
+        /// Port to bind (default 8787; falls back to a free port if taken)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Don't auto-open a browser
+        #[arg(long)]
+        no_open: bool,
+    },
+    /// Launch the raw terminal agent in the workspace (advanced)
+    Agent,
     /// Detect agents, pick a default provider, and wire Canonical + Gmail MCP
     Setup {
         /// Force a provider (claude|codex) instead of detecting/asking

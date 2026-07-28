@@ -8,8 +8,9 @@ starts from the opposite end: **discovery**. Canonical turns a plain-English ICP
 verified, long-tail companies standard databases miss; everything downstream is
 state-tracking and drafts you review by hand. It never sends anything on its own.
 
-`coldtrail` is a single binary that is both the **launcher** (it spins up Claude Code in a
-pre-wired workspace) and the **commands the agent runs** to drive the loop.
+`coldtrail` is a single binary. Run it and it opens a **local app in your browser** — a
+chat that drives an embedded agent (headless Claude Code / Codex) to source, enrich, and
+draft, plus a pipeline dashboard and a drafts view where you review and send by hand.
 
 ## Install
 
@@ -22,16 +23,28 @@ The only runtime dependency is an agent CLI — [Claude Code](https://claude.com
 one and tells you how to get it if it's missing. Then:
 
 ```bash
-coldtrail setup     # the wizard (see below)
-# edit ~/.coldtrail/message.toml   (your name, pitch, link)
-# edit ~/.coldtrail/contacted.toml (domains you've already contacted)
-coldtrail seed      # load the dedupe guard
-coldtrail           # launch your chosen agent in the workspace
+coldtrail           # opens the app at http://127.0.0.1:8787
 ```
 
+On first run it opens your browser to the **Setup** screen: pick your agent, wire the
+Canonical + Gmail connectors, and paste your pitch. Then use **Chat** to run the loop,
+**Pipeline** to watch companies flow through statuses, and **Drafts** to review and hit
+**Send** (the only thing that ever sends — a human click).
+
 Everything lives in `~/.coldtrail/` — the SQLite state, your private message template, the
-agent brief (`CLAUDE.md`), and the MCP config. Nothing leaves your machine except the drafts
-you choose to send.
+agent brief (`CLAUDE.md`), and the MCP config. The app binds `127.0.0.1` only, guarded by a
+one-time token in the URL. Nothing leaves your machine except the drafts you choose to send.
+
+### Command-line surface
+
+Bare `coldtrail` serves the app. The workflow also runs headless for power users / CI:
+
+```bash
+coldtrail serve --port 9000 --no-open   # serve without opening a browser
+coldtrail setup                         # the terminal setup wizard (see below)
+coldtrail agent                         # launch the raw terminal agent in the workspace
+coldtrail import / add-contact / find-emails / draft-prep / mark / seed
+```
 
 ### `coldtrail setup` — the wizard
 

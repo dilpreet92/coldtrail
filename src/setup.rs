@@ -229,7 +229,44 @@ fn print_gmail_prereqs(port: u16) {
     println!("     (if Claude reports a different callback URL on first use, add that one too)");
 }
 
-fn write_agent(kind: AgentKind) -> Result<()> {
+/// Wire the chosen provider's MCP servers (canonical + optional gmail) into coldtrail
+/// scope. Returns the wired server names. Shared by the CLI wizard and web onboarding.
+pub fn wire_mcp(
+    provider: AgentKind,
+    gmail: Option<(String, String)>,
+    callback_port: u16,
+    force: bool,
+    ws: &Path,
+) -> Result<Vec<String>> {
+    let canonical = McpServer {
+        name: "canonical".into(),
+        url: CANONICAL_URL.into(),
+        oauth: None,
+    };
+    let mut wired = Vec::new();
+    match provider {
+        AgentKind::Claude => {
+            claude_wire(&canonical, None, force, ws)?;
+            wired.push("canonical".into());
+            if let Some((id, secret)) = gmail {
+                let g = gmail_server(id, callback_port);
+                claude_wire(&g, Some(&secret), force, ws)?;
+                wired.push("gmail".into());
+            }
+        }
+        AgentKind::Codex => {
+            let mut servers = vec![canonical];
+            if let Some((id, _)) = &gmail {
+                servers.push(gmail_server(id.clone(), callback_port));
+            }
+            codex_wire(&servers)?;
+            wired = servers.into_iter().map(|s| s.name).collect();
+        }
+    }
+    Ok(wired)
+}
+
+pub fn write_agent(kind: AgentKind) -> Result<()> {
     let p = crate::home::path("config.toml")?;
     std::fs::write(&p, format!("agent = \"{}\"\n", kind.config_value()))?;
     Ok(())

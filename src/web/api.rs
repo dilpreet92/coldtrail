@@ -1,0 +1,95 @@
+//! Request/response types shared between the Rust server and the browser UI.
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize)]
+pub struct AgentDto {
+    pub kind: String,
+    pub label: String,
+    pub present: bool,
+    pub authed: bool,
+}
+
+#[derive(Serialize)]
+pub struct StatusDto {
+    pub provider: String,
+    pub agents: Vec<AgentDto>,
+    pub canonical_wired: bool,
+    pub gmail_wired: bool,
+    pub message_customized: bool,
+    pub contacted_customized: bool,
+    pub onboarded: bool,
+}
+
+#[derive(Serialize)]
+pub struct CompanyDto {
+    pub domain: String,
+    pub name: Option<String>,
+    pub status: String,
+    pub first_seen: String,
+}
+
+#[derive(Serialize)]
+pub struct ContactDto {
+    pub domain: String,
+    pub founder_name: Option<String>,
+    pub email: Option<String>,
+    pub mx_ok: bool,
+    pub confidence: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct DraftDto {
+    pub domain: String,
+    pub to: Option<String>,
+    pub subject: Option<String>,
+    pub body: Option<String>,
+    pub status: String,
+    pub gmail_draft_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ChatReq {
+    pub message: String,
+}
+
+#[derive(Serialize)]
+pub struct ChatResp {
+    pub run: String,
+}
+
+#[derive(Deserialize)]
+pub struct ProviderReq {
+    pub provider: String,
+}
+
+#[derive(Deserialize)]
+pub struct McpReq {
+    pub gmail_client_id: Option<String>,
+    pub gmail_secret: Option<String>,
+    pub callback_port: Option<u16>,
+    pub skip_gmail: Option<bool>,
+}
+
+#[derive(Deserialize)]
+pub struct TomlReq {
+    pub toml: String,
+}
+
+#[derive(Serialize)]
+pub struct MsgResp {
+    pub ok: bool,
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wired: Option<Vec<String>>,
+}
+
+impl MsgResp {
+    pub fn ok() -> Self {
+        MsgResp {
+            ok: true,
+            message: None,
+            wired: None,
+        }
+    }
+}

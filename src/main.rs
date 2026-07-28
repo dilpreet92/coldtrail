@@ -11,9 +11,12 @@ mod mark;
 mod mcp;
 mod message;
 mod prompt;
+mod provider;
 mod run;
 mod seed;
+mod serve;
 mod setup;
+mod web;
 
 use clap::Parser;
 use cli::{Cli, Commands};
@@ -22,7 +25,9 @@ use cli::{Cli, Commands};
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        None | Some(Commands::Run) => run::run().await,
+        None => serve::serve(None, false).await,
+        Some(Commands::Serve { port, no_open }) => serve::serve(port, no_open).await,
+        Some(Commands::Agent) => run::run().await,
         Some(Commands::Setup {
             provider,
             gmail_callback_port,
@@ -57,6 +62,11 @@ pub(crate) mod testutil {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Serialize any test that mutates the process-global `COLDTRAIL_HOME`.
+    pub fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     pub fn with_home<T>(sub: &str, f: impl FnOnce(&PathBuf) -> T) -> T {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

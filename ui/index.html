@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en" data-view="onboarding">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" />
+<title>coldtrail</title>
+<link rel="stylesheet" href="/assets/app.css" />
+</head>
+<body>
+<div class="grain" aria-hidden="true"></div>
+
+<aside class="rail">
+  <div class="brand">
+    <svg class="mark" viewBox="0 0 40 40" aria-hidden="true">
+      <path d="M4 30 L14 18 L22 24 L36 8" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="36" cy="8" r="3.2" fill="currentColor"/>
+      <circle cx="4" cy="30" r="2.4" fill="none" stroke="currentColor" stroke-width="2"/>
+    </svg>
+    <span class="wordmark">coldtrail</span>
+  </div>
+
+  <nav class="nav">
+    <button class="nav-item" data-nav="onboarding"><span class="dot"></span>Setup</button>
+    <button class="nav-item" data-nav="chat"><span class="dot"></span>Chat</button>
+    <button class="nav-item" data-nav="pipeline"><span class="dot"></span>Pipeline</button>
+    <button class="nav-item" data-nav="drafts"><span class="dot"></span>Drafts</button>
+  </nav>
+
+  <div class="rail-foot">
+    <div class="conn"><span class="led" id="led-provider"></span><span id="provider-label">—</span></div>
+    <div class="conn"><span class="led" id="led-canonical"></span>canonical</div>
+    <div class="conn"><span class="led" id="led-gmail"></span>gmail</div>
+  </div>
+</aside>
+
+<main class="stage">
+  <!-- ONBOARDING -->
+  <section class="view" id="view-onboarding">
+    <header class="view-head">
+      <h1>Get set up</h1>
+      <p class="sub">Discovery-first outreach. Sourcing is fixed to Canonical; drafts are never auto-sent — you send by hand.</p>
+    </header>
+
+    <ol class="checklist" id="checklist"></ol>
+
+    <div class="panels">
+      <div class="panel" id="panel-provider">
+        <h2>1 · Agent</h2>
+        <p class="hint">coldtrail drives a headless agent. Pick the one it should use.</p>
+        <div class="agent-row" id="agent-row"></div>
+      </div>
+
+      <div class="panel" id="panel-mcp">
+        <h2>2 · Connectors</h2>
+        <p class="hint">Canonical (sourcing) wires automatically. Gmail (drafts) needs a Google Cloud OAuth client — <a href="https://developers.google.com/workspace/gmail/api/guides/configure-mcp-server" target="_blank" rel="noreferrer">setup guide</a>. Scopes: <code>gmail.readonly</code>, <code>gmail.compose</code>; redirect <code>http://localhost:8765/callback</code>.</p>
+        <form id="mcp-form" class="stack">
+          <label>Gmail OAuth client id <input name="gmail_client_id" placeholder="…apps.googleusercontent.com" autocomplete="off" /></label>
+          <label>Gmail OAuth client secret <input name="gmail_secret" type="password" autocomplete="off" /></label>
+          <label class="check"><input type="checkbox" name="skip_gmail" /> skip Gmail for now (Canonical only)</label>
+          <button class="btn primary" type="submit">Wire connectors</button>
+          <span class="form-msg" id="mcp-msg"></span>
+        </form>
+      </div>
+
+      <div class="panel" id="panel-message">
+        <h2>3 · Your pitch</h2>
+        <p class="hint">Your message template (<code>message.toml</code>). Placeholders <code>{company}</code> / <code>{fn}</code> fill per contact. Stays local.</p>
+        <textarea id="message-toml" spellcheck="false" rows="12"></textarea>
+        <div class="row"><button class="btn" id="save-message">Save pitch</button><span class="form-msg" id="message-msg"></span></div>
+      </div>
+
+      <div class="panel" id="panel-contacted">
+        <h2>4 · Already contacted</h2>
+        <p class="hint">Domains you've reached before (<code>contacted.toml</code>) so coldtrail never double-contacts.</p>
+        <textarea id="contacted-toml" spellcheck="false" rows="8"></textarea>
+        <div class="row"><button class="btn" id="save-contacted">Save list</button><span class="form-msg" id="contacted-msg"></span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CHAT -->
+  <section class="view" id="view-chat">
+    <header class="view-head"><h1>Run the loop</h1><p class="sub">Tell the agent what you want. It sources via Canonical, enriches, and drafts — you review and send.</p></header>
+    <div class="chat" id="chat-log"></div>
+    <form class="composer" id="chat-form">
+      <textarea id="chat-input" rows="1" placeholder="e.g. Find 20 companies like Linear and draft intros to the founders"></textarea>
+      <button class="btn primary" type="submit" id="chat-send">Send ↵</button>
+    </form>
+  </section>
+
+  <!-- PIPELINE -->
+  <section class="view" id="view-pipeline">
+    <header class="view-head"><h1>Pipeline</h1><p class="sub">Every company, deduped by domain, with its status.</p>
+      <div class="filters" id="pipe-filters"></div>
+    </header>
+    <div class="table-wrap"><table class="grid" id="companies-table"><thead><tr><th>Company</th><th>Domain</th><th>Status</th><th>First seen</th></tr></thead><tbody></tbody></table></div>
+  </section>
+
+  <!-- DRAFTS -->
+  <section class="view" id="view-drafts">
+    <header class="view-head"><h1>Drafts</h1><p class="sub">Review, then send by hand. <span id="warmup" class="warmup"></span></p></header>
+    <div class="drafts" id="drafts-list"></div>
+  </section>
+</main>
+
+<script src="/assets/app.js"></script>
+</body>
+</html>
