@@ -5,7 +5,7 @@
 #
 # Env overrides:
 #   COLDTRAIL_BIN   path to a prebuilt binary to install (skips download; used in tests/dev)
-#   COLDTRAIL_REF   git ref for the from-source fallback (default: main)
+#   COLDTRAIL_REF   branch, tag (v*), or commit SHA for the from-source fallback (default: main)
 set -euo pipefail
 
 REPO="dilpreet92/coldtrail"
@@ -29,7 +29,7 @@ arch="$(uname -m)"
 case "${os}-${arch}" in
   Darwin-arm64)   target="aarch64-apple-darwin" ;;
   Darwin-x86_64)  target="x86_64-apple-darwin" ;;
-  Linux-x86_64)   target="x86_64-unknown-linux-gnu" ;;
+  Linux-x86_64)   target="x86_64-unknown-linux-musl" ;;
   *) err "unsupported platform: ${os} ${arch}"; exit 1 ;;
 esac
 
@@ -50,7 +50,17 @@ else
     install -m 0755 "${tmp}/coldtrail" "${BIN}"
   elif command -v cargo >/dev/null 2>&1; then
     info "no release asset yet — building from source with cargo"
-    cargo install --git "https://github.com/${REPO}" --branch "${COLDTRAIL_REF:-main}" --root "${HOME}/.local"
+    # cargo's --branch/--tag/--rev are distinct; pick by the ref shape so a tag or
+    # SHA override works, not just branch names.
+    ref="${COLDTRAIL_REF:-main}"
+    if [[ "${ref}" =~ ^v[0-9] ]]; then
+      ref_flag=(--tag "${ref}")
+    elif [[ "${ref}" =~ ^[0-9a-f]{7,40}$ ]]; then
+      ref_flag=(--rev "${ref}")
+    else
+      ref_flag=(--branch "${ref}")
+    fi
+    cargo install --git "https://github.com/${REPO}" "${ref_flag[@]}" --root "${HOME}/.local"
   else
     err "could not download a release and cargo is not installed."
     info "install Rust (https://rustup.rs) and re-run, or grab a release manually:"

@@ -8,7 +8,7 @@ use hickory_resolver::TokioAsyncResolver;
 use regex::Regex;
 use rusqlite::{params, OptionalExtension};
 use scraper::{Html, Selector};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -170,7 +170,18 @@ async fn hunt(domain: &str, company: &str, founder: Option<&str>) -> Option<Foun
     queries.push(format!("{company} founder email {domain}"));
     queries.push(format!("site:{domain} founder contact"));
 
-    let mut candidates: HashMap<String, (&'static str, &'static str)> = HashMap::new();
+    // Insertion-ordered accumulation (first occurrence of an email wins), so tie-breaking
+    // is deterministic across runs — matching the original Python's insertion-ordered dict.
+    // A std HashMap would randomize iteration order and make the final pick nondeterministic.
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut record =
+        |email: String, conf: &'static str, src: &'static str, seen: &mut HashSet<String>| {
+            if seen.insert(email.clone()) {
+                candidates.push((email, (conf, src)));
+            }
+        };
+
     let mut domain_urls: HashSet<String> = HashSet::new();
 
     for q in &queries {
@@ -178,7 +189,7 @@ async fn hunt(domain: &str, company: &str, founder: Option<&str>) -> Option<Foun
             let blob = format!("{} {}", hit.title, hit.body);
             for e in domain_emails(&blob, domain) {
                 if let Some(conf) = score(&e, founder) {
-                    candidates.entry(e).or_insert((conf, "ddg-snippet"));
+                    record(e, conf, "ddg-snippet", &mut seen);
                 }
             }
             if hit.href.contains(domain) {
@@ -196,27 +207,35 @@ async fn hunt(domain: &str, company: &str, founder: Option<&str>) -> Option<Foun
         let text = fetch(url).await;
         for e in domain_emails(&text, domain) {
             if let Some(conf) = score(&e, founder) {
-                candidates.entry(e).or_insert((conf, "site-page"));
+                record(e, conf, "site-page", &mut seen);
             }
         }
     }
 
-    // Accept direct (founder-name) match from anywhere; accept inferred ONLY from a
-    // real on-domain page (snippet-only inferred = where placeholder junk comes from).
-    let mut usable: Vec<(String, (&'static str, &'static str))> = candidates
+    pick(candidates).map(|(email, confidence, source)| Found {
+        email,
+        confidence,
+        source,
+    })
+}
+
+type Candidate = (String, (&'static str, &'static str));
+
+/// Choose the best usable candidate, preserving discovery order on ties.
+/// Accept a `direct` (founder-name) match from anywhere; accept `inferred` ONLY from a
+/// real on-domain page (snippet-only inferred is where placeholder junk comes from).
+fn pick(candidates: Vec<Candidate>) -> Option<(String, &'static str, &'static str)> {
+    let mut usable: Vec<Candidate> = candidates
         .into_iter()
         .filter(|(_, (conf, src))| *conf == "direct" || *src == "site-page")
         .collect();
     if usable.is_empty() {
         return None;
     }
+    // Stable sort: among equal keys, insertion order (first-discovered) is preserved.
     usable.sort_by_key(|(_, (conf, _))| if *conf == "direct" { 0 } else { 1 });
     let (email, (confidence, source)) = usable.into_iter().next().unwrap();
-    Some(Found {
-        email,
-        confidence,
-        source,
-    })
+    Some((email, confidence, source))
 }
 
 pub async fn run(max: usize) -> Result<()> {
@@ -308,5 +327,33 @@ mod tests {
             decode_ddg_href("https://acme.com/about"),
             "https://acme.com/about"
         );
+    }
+
+    #[test]
+    fn pick_is_deterministic_and_prefers_direct() {
+        // first-discovered direct wins on a tie (mirrors Python insertion order)
+        let c = vec![
+            ("a@x.com".to_string(), ("direct", "ddg-snippet")),
+            ("b@x.com".to_string(), ("direct", "site-page")),
+        ];
+        assert_eq!(pick(c).unwrap().0, "a@x.com");
+
+        // inferred is usable only from an on-domain page
+        let c2 = vec![
+            ("g@x.com".to_string(), ("inferred", "ddg-snippet")), // filtered out
+            ("h@x.com".to_string(), ("inferred", "site-page")),   // kept
+        ];
+        assert_eq!(pick(c2).unwrap().0, "h@x.com");
+
+        // a direct match outranks an inferred site-page match regardless of order
+        let c3 = vec![
+            ("i@x.com".to_string(), ("inferred", "site-page")),
+            ("j@x.com".to_string(), ("direct", "ddg-snippet")),
+        ];
+        assert_eq!(pick(c3).unwrap().0, "j@x.com");
+
+        // nothing usable -> None
+        let c4 = vec![("k@x.com".to_string(), ("inferred", "ddg-snippet"))];
+        assert!(pick(c4).is_none());
     }
 }
