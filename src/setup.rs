@@ -71,10 +71,19 @@ pub fn run(opts: SetupOpts) -> Result<()> {
     };
 
     if let Some(flag) = &opts.provider {
-        if AgentKind::from_str(flag).is_none() {
-            return Err(anyhow!(
-                "unknown --provider '{flag}' (expected claude or codex)"
-            ));
+        match AgentKind::from_str(flag) {
+            None => {
+                return Err(anyhow!(
+                    "unknown --provider '{flag}' (expected claude or codex)"
+                ));
+            }
+            Some(k) if !statuses.iter().any(|s| s.kind == k && s.present) => {
+                return Err(anyhow!(
+                    "--provider '{flag}' is not installed; install it ({}) or choose an available agent",
+                    k.install_hint()
+                ));
+            }
+            Some(_) => {}
         }
     }
 
