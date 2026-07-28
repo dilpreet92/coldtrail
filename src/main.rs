@@ -1,3 +1,4 @@
+mod agents;
 mod cli;
 mod contact;
 mod db;
@@ -7,7 +8,9 @@ mod find;
 mod home;
 mod import;
 mod mark;
+mod mcp;
 mod message;
+mod prompt;
 mod run;
 mod seed;
 mod setup;
@@ -20,7 +23,17 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         None | Some(Commands::Run) => run::run().await,
-        Some(Commands::Setup) => setup::run(),
+        Some(Commands::Setup {
+            provider,
+            gmail_callback_port,
+            skip_gmail,
+            force,
+        }) => setup::run(setup::SetupOpts {
+            provider,
+            gmail_callback_port,
+            skip_gmail,
+            force,
+        }),
         Some(Commands::Import { json, label }) => import::run(&json, &label),
         Some(Commands::AddContact {
             domain,

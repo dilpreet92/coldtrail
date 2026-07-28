@@ -18,8 +18,21 @@ pub struct Cli {
 pub enum Commands {
     /// Launch the agent (Claude Code) in the coldtrail workspace
     Run,
-    /// Write config + templates, then initialize the database
-    Setup,
+    /// Detect agents, pick a default provider, and wire Canonical + Gmail MCP
+    Setup {
+        /// Force a provider (claude|codex) instead of detecting/asking
+        #[arg(long)]
+        provider: Option<String>,
+        /// Fixed OAuth callback port for the Gmail MCP redirect URI
+        #[arg(long, default_value_t = 8765)]
+        gmail_callback_port: u16,
+        /// Don't wire the Gmail MCP server
+        #[arg(long)]
+        skip_gmail: bool,
+        /// Re-wire MCP servers even if already configured
+        #[arg(long)]
+        force: bool,
+    },
     /// Import Canonical search results (JSON), deduped by domain
     Import {
         /// Path to the saved Canonical results JSON

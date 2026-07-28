@@ -17,21 +17,49 @@ pre-wired workspace) and the **commands the agent runs** to drive the loop.
 curl -fsSL https://raw.githubusercontent.com/dilpreet92/coldtrail/main/install.sh | bash
 ```
 
-The only runtime dependency is the [Claude Code CLI](https://claude.com/claude-code)
-(`claude`) — the installer checks for it and tells you how to get it if it's missing.
-Then:
+The only runtime dependency is an agent CLI — [Claude Code](https://claude.com/claude-code)
+(`claude`) or [Codex](https://github.com/openai/codex) (`codex`). The installer checks for
+one and tells you how to get it if it's missing. Then:
 
 ```bash
-coldtrail setup     # writes ~/.coldtrail/, initializes the database
+coldtrail setup     # the wizard (see below)
 # edit ~/.coldtrail/message.toml   (your name, pitch, link)
 # edit ~/.coldtrail/contacted.toml (domains you've already contacted)
 coldtrail seed      # load the dedupe guard
-coldtrail           # launch the agent in the workspace
+coldtrail           # launch your chosen agent in the workspace
 ```
 
-Everything lives in `~/.coldtrail/` — the SQLite state, your private message template, and
-the agent brief (`CLAUDE.md`). Nothing leaves your machine except the drafts you choose to
-send.
+Everything lives in `~/.coldtrail/` — the SQLite state, your private message template, the
+agent brief (`CLAUDE.md`), and the MCP config. Nothing leaves your machine except the drafts
+you choose to send.
+
+### `coldtrail setup` — the wizard
+
+`setup` is idempotent and re-runnable. It:
+
+1. **Detects** which agent CLIs you have (`claude`, `codex`) and whether they're signed in.
+2. **Picks a default provider** — if both are present it asks; otherwise it uses the one it
+   finds. Saved to `~/.coldtrail/config.toml` (`agent = "claude"` | `"codex"`). `coldtrail`
+   launches whichever you chose.
+3. **Wires Canonical** (sourcing) into coldtrail's own scope — for Claude that's
+   `~/.coldtrail/.mcp.json`; for Codex, `~/.codex/config.toml`. OAuth completes in-browser on
+   first use.
+4. **Wires Gmail** (drafts) — Google's Gmail MCP (`https://gmailmcp.googleapis.com/mcp/v1`).
+   This needs a one-time Google Cloud OAuth client: enable the Gmail API + Gmail MCP API,
+   create an OAuth 2.0 Web client, add scopes `gmail.readonly` + `gmail.compose`, and register
+   the redirect URI `http://localhost:8765/callback`. setup prints these steps and takes your
+   client id/secret (the secret is never written to the repo).
+
+Flags / env for non-interactive use:
+
+```bash
+coldtrail setup --provider claude              # skip the provider prompt
+coldtrail setup --skip-gmail                   # Canonical only
+coldtrail setup --gmail-callback-port 9000     # change the OAuth redirect port
+coldtrail setup --force                        # re-wire servers already configured
+# Gmail creds without a prompt:
+COLDTRAIL_GMAIL_CLIENT_ID=…  COLDTRAIL_GMAIL_CLIENT_SECRET=…  coldtrail setup
+```
 
 ## How it's wired
 
