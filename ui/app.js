@@ -35,6 +35,12 @@ async function postJSON(path, body) {
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const esc = (s) => (s || "").replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+// Safe inline markdown: escape first, then add controlled tags for `code`, **bold**, *italic*.
+const mdInline = (s) =>
+  esc(s)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
 
 // --- navigation -------------------------------------------------------------
 const loaders = {};
@@ -275,34 +281,36 @@ async function sendChat() {
   catch (e) { bubble("agent", "⚠ " + e.message); busy = false; $("#chat-send").disabled = false; return; }
 
   let agentBubble = null;
+  let agentRaw = "";
   let pendingTool = null;
+  // Only ever one live (blinking) bubble: clear it on every transition.
+  const finishLive = () => { if (agentBubble) { agentBubble.classList.remove("live"); agentBubble = null; agentRaw = ""; } };
+  const done = () => { finishLive(); es.close(); busy = false; $("#chat-send").disabled = false; };
+
   const es = new EventSource(`/api/chat/stream?run=${encodeURIComponent(run)}&t=${encodeURIComponent(token())}`);
   es.onmessage = (ev) => {
     let e;
     try { e = JSON.parse(ev.data); } catch (_) { return; }
     if (e.type === "text") {
-      if (!agentBubble) { agentBubble = bubble("agent live", ""); }
-      agentBubble.textContent += e.text;
+      if (!agentBubble) { agentBubble = bubble("agent live", ""); agentRaw = ""; }
+      agentRaw += e.text;
+      agentBubble.innerHTML = mdInline(agentRaw);
       log.scrollTop = log.scrollHeight;
     } else if (e.type === "tool_start") {
+      finishLive();
       pendingTool = toolChip(e.name);
-      agentBubble = null;
     } else if (e.type === "tool_end") {
       if (pendingTool) { pendingTool.classList.add("done"); if (!e.ok) pendingTool.classList.add("fail"); pendingTool = null; }
     } else if (e.type === "error") {
+      finishLive();
       bubble("agent", "⚠ " + e.message);
     } else if (e.type === "done") {
-      if (agentBubble) agentBubble.classList.remove("live");
-      es.close();
-      busy = false; $("#chat-send").disabled = false;
-      loaders.pipeline && document.getElementById("view-pipeline") && loaders.pipeline();
+      done();
+      loaders.pipeline();
       loaders.drafts();
     }
   };
-  es.onerror = () => {
-    if (agentBubble) agentBubble.classList.remove("live");
-    es.close(); busy = false; $("#chat-send").disabled = false;
-  };
+  es.onerror = () => done();
 }
 
 // --- boot -------------------------------------------------------------------

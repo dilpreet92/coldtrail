@@ -44,6 +44,9 @@ subcommands — never re-implement their logic, never touch `outreach.db` direct
   don't know something, don't invent it.
 - **Pace warmup.** On a new mailbox, ~5 sends/day. Don't bulk-draft beyond what the human
   will actually review and send.
+- **Don't pause mid-run to ask.** If the ICP is ambiguous, pick the most reasonable
+  interpretation, state it in one line, and keep going — the human refines and re-runs.
+  Never phrase it as if you're waiting for an answer.
 
 ## Commands
 
