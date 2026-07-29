@@ -267,6 +267,42 @@ loaders.drafts = async () => {
     body: card.querySelector(".draft-body-edit")?.value,
   });
 
+  // Bulk: create a Gmail draft for every pending draft, one at a time (each is an agent turn).
+  const pending = rows.filter((r) => r.status === "draft_pending");
+  const bulk = $("#drafts-bulk");
+  if (bulk) {
+    bulk.innerHTML = pending.length >= 2
+      ? `<button class="btn primary" id="bulk-draft">Create all Gmail drafts (${pending.length})</button><span class="form-msg" id="bulk-msg"></span>`
+      : "";
+  }
+  const bulkBtn = $("#bulk-draft");
+  if (bulkBtn)
+    bulkBtn.addEventListener("click", async () => {
+      if (!confirm(`Create Gmail drafts for all ${pending.length} pending? Each is created as a draft — nothing is sent.`)) return;
+      const msg = $("#bulk-msg");
+      $$("#drafts-list .push, #drafts-list .save").forEach((b) => (b.disabled = true));
+      bulkBtn.disabled = true;
+      const cardByDom = {};
+      $$("#drafts-list .draft").forEach((c) => { cardByDom[c.dataset.domain] = c; });
+      const doms = pending.map((r) => r.domain);
+      let ok = 0;
+      const fails = [];
+      for (let i = 0; i < doms.length; i++) {
+        const dom = doms[i];
+        if (msg) msg.textContent = `creating ${i + 1}/${doms.length}…`;
+        try {
+          const card = cardByDom[dom];
+          if (card) await postJSON(`/api/drafts/${encodeURIComponent(dom)}`, edits(card)); // persist edits first
+          const r = await postJSON(`/api/drafts/${encodeURIComponent(dom)}/send`, {}); // creates a Gmail draft
+          if (r.ok) ok++; else fails.push(`${dom}: ${r.message || "failed"}`);
+        } catch (e) { fails.push(`${dom}: ${e.message}`); }
+      }
+      let summary = `Created ${ok} Gmail draft${ok === 1 ? "" : "s"}.`;
+      if (fails.length) summary += `\n\nNot created (${fails.length}):\n${fails.join("\n")}`;
+      alert(summary);
+      await loaders.drafts();
+    });
+
   $$("#drafts-list .save").forEach((b) =>
     b.addEventListener("click", async () => {
       const card = b.closest(".draft");
