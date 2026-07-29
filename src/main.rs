@@ -6,7 +6,6 @@ mod db;
 mod draft;
 mod enrich;
 mod find;
-mod gmail;
 mod home;
 mod import;
 mod mark;

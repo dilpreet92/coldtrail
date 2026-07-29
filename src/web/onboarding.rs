@@ -43,8 +43,11 @@ pub async fn status() -> Result<Json<StatusDto>, ApiErr> {
         Some(_) => canonical_wired,
         None => crate::secrets::has_token("canonical"),
     };
-    // Sending uses coldtrail's own Gmail OAuth token on every backend.
-    let destination_connected = crate::secrets::has_token("gmail");
+    let destination_connected = match kind {
+        // CLI backends get Gmail from the provider's account connector — treat as ready.
+        Some(_) => true,
+        None => crate::secrets::has_token("gmail"),
+    };
     let _ = gmail_wired;
     let onboarded = message_customized && provider_ready && discovery_connected;
 
@@ -74,14 +77,27 @@ pub async fn connect_discovery() -> Result<Json<MsgResp>, ApiErr> {
     Ok(Json(MsgResp::ok()))
 }
 
-/// Connect Destination (Gmail): coldtrail's own OAuth (gmail.compose, send-capable) via its
-/// built-in Google client — same on every backend, since coldtrail sends via the Gmail API.
+/// Connect Destination (Gmail). CLI providers use their account's Gmail connector
+/// (nothing to wire here); BYOK/Ollama run keyless OAuth with coldtrail's built-in client.
 pub async fn connect_destination(
     Json(req): Json<super::api::GmailConnectReq>,
 ) -> Result<Json<MsgResp>, ApiErr> {
     let port = req.callback_port.unwrap_or(8765);
-    crate::oauth::connect_gmail(port).await?;
-    Ok(Json(MsgResp::ok()))
+    match crate::provider::resolve() {
+        crate::provider::Backend::Cli(_) => Ok(Json(MsgResp {
+            ok: true,
+            message: Some(
+                "Gmail comes from your Claude/Codex account connector — enable it at \
+                 claude.ai → Connectors. Nothing to configure here."
+                    .into(),
+            ),
+            wired: None,
+        })),
+        crate::provider::Backend::OpenAi { .. } => {
+            crate::oauth::connect_gmail(port).await?;
+            Ok(Json(MsgResp::ok()))
+        }
+    }
 }
 
 pub async fn set_provider(Json(req): Json<ProviderReq>) -> Result<Json<MsgResp>, ApiErr> {

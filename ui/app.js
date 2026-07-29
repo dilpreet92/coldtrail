@@ -69,6 +69,11 @@ async function loadStatus() {
   if (st) st.textContent = s.discovery_connected ? "· connected" : "";
   const dt = $("#dest-state");
   if (dt) dt.textContent = s.destination_connected ? "· connected" : "";
+  // Destination is provider-aware: CLI uses the account connector (no keys); BYOK/Ollama connects keyless via coldtrail's Google client.
+  const cliProvider = s.provider === "claude" || s.provider === "codex";
+  const ga = $("#gmail-account"), gb = $("#gmail-byo");
+  if (ga) ga.hidden = !cliProvider;
+  if (gb) gb.hidden = cliProvider;
 
   // checklist
   const items = [
@@ -237,17 +242,22 @@ loaders.drafts = async () => {
   if (!rows.length) { list.innerHTML = `<div class="empty">No drafts yet — ask the agent to draft outreach in Chat.</div>`; return; }
   list.innerHTML = rows
     .map((r) => {
-      const draftable = r.status === "draft_pending" || r.status === "drafted"; // reviewable
+      const draftable = r.status === "draft_pending"; // still editable, not yet in Gmail
+      const inGmail = r.status === "drafted"; // pushed to Gmail, awaiting your send
       const head = `<div class="draft-head">
           <span class="to">${esc(r.to) || esc(r.domain)}</span>
           <span class="spacer"></span>
           <span class="status s-${esc(r.status)}">${esc(r.status)}</span>
-          ${draftable ? `<button class="btn save">Save</button><button class="btn primary send">Send</button>` : ""}
+          ${draftable ? `<button class="btn save">Save</button><button class="btn primary push">Create Gmail draft</button>` : ""}
+          ${inGmail ? `<a class="btn" href="https://mail.google.com/mail/u/0/#drafts" target="_blank" rel="noreferrer">Open Gmail</a><button class="btn marksent">Mark sent</button>` : ""}
         </div>`;
+      const gmailNote = inGmail
+        ? `<div class="gmail-note">↳ In your Gmail Drafts — review &amp; send it there, then Mark sent.</div>`
+        : "";
       const bodyBlock = draftable
         ? `<input class="draft-subj" value="${escAttr(r.subject || "")}" placeholder="subject" />
            <textarea class="draft-body-edit" rows="9" spellcheck="false">${esc(r.body || "")}</textarea>`
-        : `<div class="draft-subj-ro">${esc(r.subject || "")}</div><div class="draft-body">${esc(r.body || "")}</div>`;
+        : `<div class="draft-subj-ro">${esc(r.subject || "")}</div>${gmailNote}<div class="draft-body">${esc(r.body || "")}</div>`;
       return `<div class="draft" data-domain="${escAttr(r.domain)}">${head}${bodyBlock}</div>`;
     })
     .join("");
@@ -268,18 +278,24 @@ loaders.drafts = async () => {
       } catch (e) { b.textContent = "Save"; b.disabled = false; alert(e.message); }
     })
   );
-  $$("#drafts-list .send").forEach((b) =>
+  $$("#drafts-list .push").forEach((b) =>
     b.addEventListener("click", async () => {
       const card = b.closest(".draft");
       const dom = card.dataset.domain;
-      if (!confirm(`Send this email to ${dom}? coldtrail will send it via Gmail now.`)) return;
-      b.disabled = true; b.textContent = "sending…";
+      b.disabled = true; b.textContent = "creating…";
       try {
         await postJSON(`/api/drafts/${encodeURIComponent(dom)}`, edits(card)); // persist edits first
-        const r = await postJSON(`/api/drafts/${encodeURIComponent(dom)}/send`, {});
-        if (r.ok) { await loaders.drafts(); }
-        else { b.disabled = false; b.textContent = "Send"; alert(r.message || "send did not complete"); }
-      } catch (e) { b.disabled = false; b.textContent = "Send"; alert(e.message); }
+        const r = await postJSON(`/api/drafts/${encodeURIComponent(dom)}/send`, {}); // creates a Gmail draft
+        if (r.ok) { alert(r.message || "created in Gmail"); await loaders.drafts(); }
+        else { b.disabled = false; b.textContent = "Create Gmail draft"; alert(r.message || "could not create the Gmail draft"); }
+      } catch (e) { b.disabled = false; b.textContent = "Create Gmail draft"; alert(e.message); }
+    })
+  );
+  $$("#drafts-list .marksent").forEach((b) =>
+    b.addEventListener("click", async () => {
+      const dom = b.closest(".draft").dataset.domain;
+      try { await postJSON(`/api/followups/${encodeURIComponent(dom)}/mark`, { value: "sent" }); await loaders.drafts(); }
+      catch (e) { alert(e.message); }
     })
   );
 };
