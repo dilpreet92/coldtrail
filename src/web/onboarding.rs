@@ -64,7 +64,32 @@ pub async fn status() -> Result<Json<StatusDto>, ApiErr> {
         key_set,
         discovery_connected,
         destination_connected,
+        osint: crate::osint::status(),
     }))
+}
+
+/// Auto-install theHarvester (via pipx) on demand from the browser Setup panel.
+/// Runs off the async runtime; degrades gracefully when pipx is unavailable.
+pub async fn install_osint() -> Result<Json<MsgResp>, ApiErr> {
+    let res = tokio::task::spawn_blocking(crate::osint::install_the_harvester).await;
+    let resp = match res {
+        Ok(Ok(message)) => MsgResp {
+            ok: true,
+            message: Some(message),
+            wired: None,
+        },
+        Ok(Err(e)) => MsgResp {
+            ok: false,
+            message: Some(e.to_string()),
+            wired: None,
+        },
+        Err(e) => MsgResp {
+            ok: false,
+            message: Some(format!("install task failed: {e}")),
+            wired: None,
+        },
+    };
+    Ok(Json(resp))
 }
 
 /// Connect Discovery (Canonical): wire the MCP for CLI providers, or OAuth for BYOK/Ollama.

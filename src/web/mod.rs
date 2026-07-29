@@ -81,6 +81,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/onboarding/message", post(onboarding::set_message))
         .route("/api/onboarding/contacted", post(onboarding::set_contacted))
         .route(
+            "/api/onboarding/osint/install",
+            post(onboarding::install_osint),
+        )
+        .route(
             "/api/discovery/canonical/connect",
             post(onboarding::connect_discovery),
         )

@@ -88,6 +88,9 @@ async function loadStatus() {
   if (ga) ga.hidden = !cliProvider;
   if (gb) gb.hidden = cliProvider;
 
+  // enrichment (OSINT)
+  renderOsint(s.osint || {});
+
   // checklist
   const items = [
     ["Provider", !!s.provider],
@@ -145,6 +148,35 @@ function msg(el, text, ok) {
   const m = $(el);
   m.textContent = text;
   m.className = "form-msg " + (ok ? "ok" : "err");
+}
+
+// Enrichment (OSINT) setup panel: detected / one-click install / can't-install.
+function renderOsint(o) {
+  const state = $("#osint-state");
+  if (state) state.textContent = o.the_harvester ? "· ready" : "";
+  const body = $("#osint-body");
+  if (!body) return;
+  const extra = o.spiderfoot ? `<p class="hint">✓ SpiderFoot also detected.</p>` : "";
+  if (o.the_harvester) {
+    body.innerHTML = `<p class="hint">✓ <strong>theHarvester</strong> is installed — enrichment runs will use it.</p>${extra}`;
+    return;
+  }
+  if (o.can_install) {
+    body.innerHTML = `<div class="row"><button class="btn primary" id="install-osint">Install theHarvester</button><span class="form-msg" id="osint-msg"></span></div>
+      <p class="hint" style="margin-top:8px">One-time, via pipx (~a minute). coldtrail runs the install for you.</p>${extra}`;
+    $("#install-osint").addEventListener("click", async () => {
+      const b = $("#install-osint");
+      b.disabled = true; b.textContent = "installing…";
+      msg("#osint-msg", "installing via pipx… about a minute", true);
+      try {
+        const r = await postJSON("/api/onboarding/osint/install", {});
+        toast(r.message || (r.ok ? "installed" : "install failed"), r.ok ? "ok" : "err");
+        await loadStatus();
+      } catch (e) { b.disabled = false; b.textContent = "Install theHarvester"; msg("#osint-msg", e.message, false); }
+    });
+    return;
+  }
+  body.innerHTML = `<p class="hint">theHarvester isn't installed and <code>pipx</code> wasn't found, so coldtrail can't auto-install it. Install pipx (<code>python3 -m pip install --user pipx &amp;&amp; python3 -m pipx ensurepath</code>) and reload — or just rely on the built-in web finder.</p>${extra}`;
 }
 
 $("#connect-canonical").addEventListener("click", async () => {

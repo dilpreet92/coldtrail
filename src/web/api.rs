@@ -26,6 +26,8 @@ pub struct StatusDto {
     /// Unified connected state for the chosen provider (MCP-wired for CLI, token for BYOK).
     pub discovery_connected: bool,
     pub destination_connected: bool,
+    /// OSINT enrichment tooling (theHarvester) detection + install-ability.
+    pub osint: crate::osint::OsintStatus,
 }
 
 #[derive(Deserialize, Default)]

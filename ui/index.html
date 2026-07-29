@@ -81,6 +81,12 @@
         <p class="hint" style="margin-top:12px;opacity:.55">also a destination: <span class="status s-sourced">LinkedIn — coming</span></p>
       </div>
 
+      <div class="panel" id="panel-osint">
+        <h2>Enrichment · OSINT <span class="conn-state" id="osint-state"></span></h2>
+        <p class="hint">Deeper founder-email discovery. The agent uses <strong>theHarvester</strong> when it's installed, and always falls back to its built-in web finder — nothing breaks if it's missing.</p>
+        <div id="osint-body"></div>
+      </div>
+
       <div class="panel" id="panel-message">
         <h2>4 · Your brief</h2>
         <p class="hint">Your outreach brief (<code>message.toml</code>) — your voice, offer, and link. The agent writes a <em>personalized</em> pitch per company from it; it never sends this verbatim. Stays local.</p>

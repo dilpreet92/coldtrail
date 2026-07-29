@@ -161,6 +161,28 @@ pub fn run(opts: SetupOpts) -> Result<()> {
         }
     }
 
+    // --- enrichment (OSINT) --------------------------------------------------
+    // Auto-install theHarvester so the agent can do deeper founder-email discovery.
+    // Best-effort: never fail setup over it — the built-in web finder is the fallback.
+    println!("\nenrichment (OSINT):");
+    let osint = crate::osint::status();
+    if osint.the_harvester {
+        println!("  ✓ theHarvester already installed");
+    } else if osint.pipx {
+        print!("  installing theHarvester via pipx… ");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        match crate::osint::install_the_harvester() {
+            Ok(_) => println!("done"),
+            Err(e) => println!("skipped ({e})"),
+        }
+    } else {
+        println!(
+            "  – pipx not found; skipping theHarvester. Install pipx to enable it \
+             (the agent falls back to its built-in web finder either way)."
+        );
+    }
+
     println!("\ndone. run `coldtrail` — OAuth for Canonical/Gmail completes in your browser on first use.");
     Ok(())
 }
