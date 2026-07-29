@@ -266,6 +266,35 @@ pub fn wire_mcp(
     Ok(wired)
 }
 
+/// Wire just the Canonical (discovery) MCP into the CLI provider's coldtrail scope.
+pub fn wire_canonical(provider: AgentKind, force: bool, ws: &Path) -> Result<()> {
+    let c = McpServer {
+        name: "canonical".into(),
+        url: CANONICAL_URL.into(),
+        oauth: None,
+    };
+    match provider {
+        AgentKind::Claude => claude_wire(&c, None, force, ws),
+        AgentKind::Codex => codex_wire(&[c]),
+    }
+}
+
+/// Wire just the Gmail (destination) MCP into the CLI provider's coldtrail scope.
+pub fn wire_gmail(
+    provider: AgentKind,
+    client_id: &str,
+    secret: &str,
+    port: u16,
+    force: bool,
+    ws: &Path,
+) -> Result<()> {
+    let g = gmail_server(client_id.to_string(), port);
+    match provider {
+        AgentKind::Claude => claude_wire(&g, Some(secret), force, ws),
+        AgentKind::Codex => codex_wire(&[g]),
+    }
+}
+
 pub fn write_agent(kind: AgentKind) -> Result<()> {
     let p = crate::home::path("config.toml")?;
     std::fs::write(&p, format!("agent = \"{}\"\n", kind.config_value()))?;

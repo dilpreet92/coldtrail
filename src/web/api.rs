@@ -23,6 +23,16 @@ pub struct StatusDto {
     pub base_url: Option<String>,
     pub model: Option<String>,
     pub key_set: bool,
+    /// Unified connected state for the chosen provider (MCP-wired for CLI, token for BYOK).
+    pub discovery_connected: bool,
+    pub destination_connected: bool,
+}
+
+#[derive(Deserialize)]
+pub struct GmailConnectReq {
+    pub client_id: String,
+    pub client_secret: String,
+    pub callback_port: Option<u16>,
 }
 
 #[derive(Serialize)]

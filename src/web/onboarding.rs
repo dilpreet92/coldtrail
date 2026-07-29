@@ -38,7 +38,16 @@ pub async fn status() -> Result<Json<StatusDto>, ApiErr> {
         Some(k) => detected.iter().any(|s| s.kind == k && s.present),
         None => base_url.is_some(), // openai backend
     };
-    let onboarded = message_customized && provider_ready;
+    // Unified connected state: MCP-wired for CLI backends, OAuth token for BYOK/Ollama.
+    let discovery_connected = match kind {
+        Some(_) => canonical_wired,
+        None => crate::secrets::has_token("canonical"),
+    };
+    let destination_connected = match kind {
+        Some(_) => gmail_wired,
+        None => crate::secrets::has_token("gmail"),
+    };
+    let onboarded = message_customized && provider_ready && discovery_connected;
 
     Ok(Json(StatusDto {
         provider,
@@ -51,7 +60,36 @@ pub async fn status() -> Result<Json<StatusDto>, ApiErr> {
         base_url,
         model,
         key_set,
+        discovery_connected,
+        destination_connected,
     }))
+}
+
+/// Connect Discovery (Canonical): wire the MCP for CLI providers, or OAuth for BYOK/Ollama.
+pub async fn connect_discovery() -> Result<Json<MsgResp>, ApiErr> {
+    let ws = crate::home::workspace()?;
+    match crate::provider::resolve() {
+        crate::provider::Backend::Cli(kind) => setup::wire_canonical(kind, true, &ws)?,
+        crate::provider::Backend::OpenAi { .. } => crate::oauth::connect_canonical().await?,
+    }
+    Ok(Json(MsgResp::ok()))
+}
+
+/// Connect Destination (Gmail): wire the MCP for CLI providers, or OAuth for BYOK/Ollama.
+pub async fn connect_destination(
+    Json(req): Json<super::api::GmailConnectReq>,
+) -> Result<Json<MsgResp>, ApiErr> {
+    let ws = crate::home::workspace()?;
+    let port = req.callback_port.unwrap_or(8765);
+    match crate::provider::resolve() {
+        crate::provider::Backend::Cli(kind) => {
+            setup::wire_gmail(kind, &req.client_id, &req.client_secret, port, true, &ws)?
+        }
+        crate::provider::Backend::OpenAi { .. } => {
+            crate::oauth::connect_gmail(&req.client_id, &req.client_secret, port).await?
+        }
+    }
+    Ok(Json(MsgResp::ok()))
 }
 
 pub async fn set_provider(Json(req): Json<ProviderReq>) -> Result<Json<MsgResp>, ApiErr> {

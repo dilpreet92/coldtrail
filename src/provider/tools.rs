@@ -11,44 +11,55 @@ fn s(args: &Value, k: &str) -> String {
         .to_string()
 }
 
-/// OpenAI-style function-tool definitions.
-pub fn defs() -> Value {
-    json!([
-        {"type":"function","function":{
+/// OpenAI-style function-tool definitions. When Canonical (discovery) is connected, a
+/// native `discover_companies` tool is offered; otherwise sourcing is via `import_json`.
+pub fn defs(canonical_connected: bool) -> Value {
+    let mut v = vec![
+        json!({"type":"function","function":{
             "name":"import_json",
             "description":"Import Canonical search results (a JSON string) into the pipeline, deduped by domain.",
             "parameters":{"type":"object","properties":{
                 "results_json":{"type":"string","description":"Canonical results as a JSON string"},
                 "label":{"type":"string","description":"short ICP label"}},
-                "required":["results_json","label"]}}},
-        {"type":"function","function":{
+                "required":["results_json","label"]}}}),
+        json!({"type":"function","function":{
             "name":"add_contact",
             "description":"Add an MX-verified founder contact. Generic/placeholder addresses are rejected.",
             "parameters":{"type":"object","properties":{
                 "domain":{"type":"string"},"name":{"type":"string"},"email":{"type":"string"},
-                "source":{"type":"string"}},"required":["domain","name","email"]}}},
-        {"type":"function","function":{
+                "source":{"type":"string"}},"required":["domain","name","email"]}}}),
+        json!({"type":"function","function":{
             "name":"find_emails",
             "description":"Best-effort OSINT founder-email finder for known companies lacking a verified email.",
-            "parameters":{"type":"object","properties":{"max":{"type":"integer"}}}}},
-        {"type":"function","function":{
+            "parameters":{"type":"object","properties":{"max":{"type":"integer"}}}}}),
+        json!({"type":"function","function":{
             "name":"draft",
             "description":"Store a PERSONALIZED outreach draft (subject + body you composed) for a company. Never sends.",
             "parameters":{"type":"object","properties":{
                 "domain":{"type":"string"},"subject":{"type":"string"},"body":{"type":"string"}},
-                "required":["domain","subject","body"]}}},
-        {"type":"function","function":{
+                "required":["domain","subject","body"]}}}),
+        json!({"type":"function","function":{
             "name":"mark",
             "description":"Advance a company's status: a gmail draft id, or 'sent' / 'bounced'.",
             "parameters":{"type":"object","properties":{
-                "domain":{"type":"string"},"value":{"type":"string"}},"required":["domain","value"]}}},
-        {"type":"function","function":{
+                "domain":{"type":"string"},"value":{"type":"string"}},"required":["domain","value"]}}}),
+        json!({"type":"function","function":{
             "name":"list_companies","description":"List companies with their status.",
-            "parameters":{"type":"object","properties":{}}}},
-        {"type":"function","function":{
+            "parameters":{"type":"object","properties":{}}}}),
+        json!({"type":"function","function":{
             "name":"list_drafts","description":"List prepared drafts (domain, subject, status).",
-            "parameters":{"type":"object","properties":{}}}}
-    ])
+            "parameters":{"type":"object","properties":{}}}}),
+    ];
+    if canonical_connected {
+        v.push(json!({"type":"function","function":{
+            "name":"discover_companies",
+            "description":"Discover verified companies from Canonical for a plain-English ICP, imported (deduped) into the pipeline.",
+            "parameters":{"type":"object","properties":{
+                "query":{"type":"string","description":"plain-English ICP"},
+                "label":{"type":"string","description":"short label"}},
+                "required":["query"]}}}));
+    }
+    Value::Array(v)
 }
 
 /// Execute a tool call; returns a short result string (errors are returned, never panic).
@@ -94,7 +105,46 @@ pub async fn exec(name: &str, args: &Value) -> String {
         "list_drafts" => query(
             "SELECT domain, COALESCE(subject,''), status FROM outreach ORDER BY created_at DESC",
         ),
+        "discover_companies" => discover(args).await,
         other => format!("error: unknown tool '{other}'"),
+    }
+}
+
+/// Source companies from Canonical via the in-Rust MCP client, then import (dedupe).
+async fn discover(args: &Value) -> String {
+    let query = s(args, "query");
+    let label = {
+        let l = s(args, "label");
+        if l.is_empty() {
+            "discovery".to_string()
+        } else {
+            l
+        }
+    };
+    let token = match crate::oauth::valid_access("canonical").await {
+        Some(t) => t,
+        None => return "error: Canonical isn't connected — connect it in Setup".to_string(),
+    };
+    let client =
+        match crate::mcp_client::McpClient::connect("https://trycanonical.ai/mcp", Some(&token))
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => return format!("error: connecting Canonical: {e}"),
+        };
+    match client
+        .call_tool("search_companies", json!({"query": query}))
+        .await
+    {
+        Ok(res) => {
+            // MCP tool results carry text content; import_json handles the wrapper shapes.
+            let text = res["content"][0]["text"].as_str().unwrap_or("[]");
+            match crate::import::import_str(text, &label) {
+                Ok((a, sk, t)) => format!("discovered + imported {a} new, {sk} deduped, from {t}"),
+                Err(e) => format!("error: importing discovery results: {e}"),
+            }
+        }
+        Err(e) => format!("error: Canonical search failed: {e}"),
     }
 }
 

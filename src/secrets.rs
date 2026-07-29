@@ -1,13 +1,45 @@
-//! API keys for BYOK backends. Stored in `~/.coldtrail/secrets.toml` (0600), never in
-//! `config.toml` or the repo, and never returned by any HTTP endpoint. `COLDTRAIL_API_KEY`
-//! overrides.
+//! Secrets: the BYOK API key and per-connector OAuth tokens. Stored in
+//! `~/.coldtrail/secrets.toml` (0600), never in `config.toml`/repo, never returned by HTTP.
+//! `COLDTRAIL_API_KEY` overrides the API key.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenRec {
+    pub access: String,
+    pub refresh: Option<String>,
+    pub expires_at: Option<i64>,
+    pub token_endpoint: String,
+    pub client_id: String,
+    pub client_secret: Option<String>,
+}
 
 #[derive(Default, Serialize, Deserialize)]
 struct Secrets {
     api_key: Option<String>,
+    #[serde(default)]
+    tokens: BTreeMap<String, TokenRec>,
+}
+
+fn load() -> Secrets {
+    crate::home::path("secrets.toml")
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| toml::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save(s: &Secrets) -> Result<()> {
+    let p = crate::home::path("secrets.toml")?;
+    std::fs::write(&p, toml::to_string(s)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 /// The BYOK API key, from env or `secrets.toml`. `None` if unset (e.g. local Ollama).
@@ -17,29 +49,56 @@ pub fn api_key() -> Option<String> {
             return Some(k);
         }
     }
-    crate::home::path("secrets.toml")
-        .ok()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| toml::from_str::<Secrets>(&s).ok())
-        .and_then(|s| s.api_key)
-        .filter(|k| !k.trim().is_empty())
+    load().api_key.filter(|k| !k.trim().is_empty())
 }
 
 pub fn set_api_key(key: &str) -> Result<()> {
-    let p = crate::home::path("secrets.toml")?;
-    let body = toml::to_string(&Secrets {
-        api_key: Some(key.to_string()),
-    })?;
-    std::fs::write(&p, body)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    let mut s = load();
+    s.api_key = Some(key.to_string());
+    save(&s)
 }
 
-/// Whether a key is configured (for status display — never returns the value).
 pub fn has_key() -> bool {
     api_key().is_some()
+}
+
+pub fn save_token(connector: &str, rec: TokenRec) -> Result<()> {
+    let mut s = load();
+    s.tokens.insert(connector.to_string(), rec);
+    save(&s)
+}
+
+pub fn token(connector: &str) -> Option<TokenRec> {
+    load().tokens.get(connector).cloned()
+}
+
+pub fn has_token(connector: &str) -> bool {
+    load().tokens.contains_key(connector)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_roundtrip() {
+        crate::testutil::with_home("ct-secrets-test", |_| {
+            crate::home::workspace().unwrap();
+            save_token(
+                "canonical",
+                TokenRec {
+                    access: "a1".into(),
+                    refresh: Some("r1".into()),
+                    expires_at: Some(123),
+                    token_endpoint: "https://t".into(),
+                    client_id: "cid".into(),
+                    client_secret: None,
+                },
+            )
+            .unwrap();
+            assert!(has_token("canonical"));
+            assert_eq!(token("canonical").unwrap().access, "a1");
+            assert!(!has_token("gmail"));
+        });
+    }
 }

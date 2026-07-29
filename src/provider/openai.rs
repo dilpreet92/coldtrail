@@ -20,7 +20,7 @@ pub async fn run_turn(
 ) -> bool {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let client = reqwest::Client::new();
-    let tool_defs = tools::defs();
+    let tool_defs = tools::defs(crate::secrets::has_token("canonical"));
 
     let mut messages = vec![
         json!({"role": "system", "content": system_prompt(home)}),

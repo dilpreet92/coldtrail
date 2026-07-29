@@ -47,15 +47,61 @@ pub async fn send(
 
     let backend = resolve();
     if !backend.is_cli() {
-        return Ok(Json(MsgResp {
-            ok: false,
-            message: Some(
-                "Sending isn't available on the BYOK/Ollama backend yet — switch to Claude Code \
-                 in Setup (the Gmail connector for this backend lands with the MCP client)."
-                    .into(),
-            ),
-            wired: None,
-        }));
+        // BYOK/Ollama: send via the Gmail MCP directly, using the stored OAuth token.
+        let token = match crate::oauth::valid_access("gmail").await {
+            Some(t) => t,
+            None => {
+                return Ok(Json(MsgResp {
+                    ok: false,
+                    message: Some(
+                        "Gmail isn't connected for this backend — connect it in Setup.".into(),
+                    ),
+                    wired: None,
+                }))
+            }
+        };
+        let client = crate::mcp_client::McpClient::connect(
+            "https://gmailmcp.googleapis.com/mcp/v1",
+            Some(&token),
+        )
+        .await?;
+        let send_name = client
+            .list_tools()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(|s| s.to_string()))
+            .find(|n| n.to_lowercase().contains("send"));
+        let name = match send_name {
+            Some(n) => n,
+            None => {
+                return Ok(Json(MsgResp {
+                    ok: false,
+                    message: Some("the Gmail MCP exposes no send tool".into()),
+                    wired: None,
+                }))
+            }
+        };
+        let args = serde_json::json!({
+            "to": to.clone(),
+            "subject": subject.clone().unwrap_or_default(),
+            "body": body.clone().unwrap_or_default(),
+        });
+        return match client.call_tool(&name, args).await {
+            Ok(_) => {
+                crate::mark::run(&domain, "sent")?;
+                Ok(Json(MsgResp {
+                    ok: true,
+                    message: Some("sent via Gmail".into()),
+                    wired: None,
+                }))
+            }
+            Err(e) => Ok(Json(MsgResp {
+                ok: false,
+                message: Some(e.to_string()),
+                wired: None,
+            })),
+        };
     }
     let home = crate::home::workspace()?;
     let sid = uuid::Uuid::new_v4().to_string();

@@ -59,27 +59,30 @@
         </div>
       </div>
 
-      <div class="panel" id="panel-mcp">
-        <h2>2 · Connectors</h2>
-        <p class="hint">Canonical (sourcing) wires automatically. Gmail (drafts) needs a Google Cloud OAuth client — <a href="https://developers.google.com/workspace/gmail/api/guides/configure-mcp-server" target="_blank" rel="noreferrer">setup guide</a>. Scopes: <code>gmail.readonly</code>, <code>gmail.compose</code>; redirect <code>http://localhost:8765/callback</code>.</p>
-        <form id="mcp-form" class="stack">
-          <label>Gmail OAuth client id <input name="gmail_client_id" placeholder="…apps.googleusercontent.com" autocomplete="off" /></label>
-          <label>Gmail OAuth client secret <input name="gmail_secret" type="password" autocomplete="off" /></label>
-          <label class="check"><input type="checkbox" name="skip_gmail" /> skip Gmail for now (Canonical only)</label>
-          <button class="btn primary" type="submit">Wire connectors</button>
-          <span class="form-msg" id="mcp-msg"></span>
-        </form>
+      <div class="panel" id="panel-discovery">
+        <h2>2 · Discovery <span class="conn-state" id="disc-state"></span></h2>
+        <p class="hint">Where companies come from. <strong>Canonical</strong> — verified, long-tail company search. Connecting authorizes it for your chosen provider (in-browser for BYOK/Ollama).</p>
+        <div class="row"><button class="btn primary" id="connect-canonical">Connect Canonical</button><span class="form-msg" id="disc-msg"></span></div>
+      </div>
+
+      <div class="panel" id="panel-destination">
+        <h2>3 · Destination <span class="conn-state" id="dest-state"></span></h2>
+        <p class="hint">Where outreach goes. <strong>Gmail</strong> needs a Google Cloud OAuth client — <a href="https://developers.google.com/workspace/gmail/api/guides/configure-mcp-server" target="_blank" rel="noreferrer">setup guide</a>. Scopes <code>gmail.compose</code>, <code>gmail.readonly</code>; redirect <code>http://localhost:8765/callback</code>.</p>
+        <label>Gmail OAuth client id <input id="gm-id" placeholder="…apps.googleusercontent.com" autocomplete="off" /></label>
+        <label>Gmail OAuth client secret <input id="gm-secret" type="password" autocomplete="off" /></label>
+        <div class="row"><button class="btn primary" id="connect-gmail">Connect Gmail</button><span class="form-msg" id="dest-msg"></span></div>
+        <p class="hint" style="margin-top:12px;opacity:.55">also a destination: <span class="status s-sourced">LinkedIn — coming</span></p>
       </div>
 
       <div class="panel" id="panel-message">
-        <h2>3 · Your brief</h2>
+        <h2>4 · Your brief</h2>
         <p class="hint">Your outreach brief (<code>message.toml</code>) — your voice, offer, and link. The agent writes a <em>personalized</em> pitch per company from it; it never sends this verbatim. Stays local.</p>
         <textarea id="message-toml" spellcheck="false" rows="12"></textarea>
         <div class="row"><button class="btn" id="save-message">Save pitch</button><span class="form-msg" id="message-msg"></span></div>
       </div>
 
       <div class="panel" id="panel-contacted">
-        <h2>4 · Already contacted</h2>
+        <h2>5 · Already contacted</h2>
         <p class="hint">Domains you've reached before (<code>contacted.toml</code>) so coldtrail never double-contacts.</p>
         <textarea id="contacted-toml" spellcheck="false" rows="8"></textarea>
         <div class="row"><button class="btn" id="save-contacted">Save list</button><span class="form-msg" id="contacted-msg"></span></div>

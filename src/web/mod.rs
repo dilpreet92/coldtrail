@@ -79,6 +79,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/onboarding/mcp", post(onboarding::set_mcp))
         .route("/api/onboarding/message", post(onboarding::set_message))
         .route("/api/onboarding/contacted", post(onboarding::set_contacted))
+        .route(
+            "/api/discovery/canonical/connect",
+            post(onboarding::connect_discovery),
+        )
+        .route(
+            "/api/destination/gmail/connect",
+            post(onboarding::connect_destination),
+        )
         .route("/api/companies", get(pipeline::companies))
         .route("/api/contacts", get(pipeline::contacts))
         .route("/api/drafts", get(pipeline::drafts))

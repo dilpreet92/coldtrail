@@ -57,14 +57,18 @@ async function loadStatus() {
   };
   $("#provider-label").textContent = s.provider || "—";
   led("led-provider", !!s.provider);
-  led("led-canonical", s.canonical_wired);
-  led("led-gmail", s.gmail_wired ? true : "warn");
+  led("led-canonical", s.discovery_connected);
+  led("led-gmail", s.destination_connected ? true : "warn");
+  const st = $("#disc-state");
+  if (st) st.textContent = s.discovery_connected ? "· connected" : "";
+  const dt = $("#dest-state");
+  if (dt) dt.textContent = s.destination_connected ? "· connected" : "";
 
   // checklist
   const items = [
-    ["Agent", !!s.provider],
-    ["Canonical", s.canonical_wired],
-    ["Gmail", s.gmail_wired],
+    ["Provider", !!s.provider],
+    ["Discovery", s.discovery_connected],
+    ["Destination", s.destination_connected],
     ["Pitch", s.message_customized],
   ];
   $("#checklist").innerHTML = items
@@ -119,21 +123,28 @@ function msg(el, text, ok) {
   m.className = "form-msg " + (ok ? "ok" : "err");
 }
 
-$("#mcp-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const fd = new FormData(e.target);
+$("#connect-canonical").addEventListener("click", async () => {
+  msg("#disc-msg", "connecting… authorize in the browser tab if one opens", true);
+  try {
+    await postJSON("/api/discovery/canonical/connect", {});
+    msg("#disc-msg", "connected", true);
+    await loadStatus();
+  } catch (e) { msg("#disc-msg", e.message, false); }
+});
+$("#connect-gmail").addEventListener("click", async () => {
   const body = {
-    gmail_client_id: fd.get("gmail_client_id") || null,
-    gmail_secret: fd.get("gmail_secret") || null,
-    skip_gmail: fd.get("skip_gmail") === "on",
+    client_id: $("#gm-id").value.trim(),
+    client_secret: $("#gm-secret").value.trim(),
     callback_port: 8765,
   };
-  msg("#mcp-msg", "wiring…", true);
+  if (!body.client_id || !body.client_secret) { msg("#dest-msg", "enter client id + secret", false); return; }
+  msg("#dest-msg", "connecting… authorize in the browser tab if one opens", true);
   try {
-    const r = await postJSON("/api/onboarding/mcp", body);
-    msg("#mcp-msg", "wired: " + (r.wired || []).join(", "), true);
+    await postJSON("/api/destination/gmail/connect", body);
+    $("#gm-secret").value = "";
+    msg("#dest-msg", "connected", true);
     await loadStatus();
-  } catch (err) { msg("#mcp-msg", err.message, false); }
+  } catch (e) { msg("#dest-msg", e.message, false); }
 });
 $("#save-message").addEventListener("click", async () => {
   try { await postJSON("/api/onboarding/message", { toml: $("#message-toml").value }); msg("#message-msg", "saved", true); await loadStatus(); }

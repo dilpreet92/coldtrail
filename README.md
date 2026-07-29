@@ -31,11 +31,18 @@ Canonical + Gmail connectors, and paste your pitch. Then use **Chat** to run the
 **Pipeline** to watch companies flow through statuses, and **Drafts** to review and hit
 **Send** (the only thing that ever sends — a human click).
 
-**Backends.** The agent runs on headless **Claude Code** / **Codex** (reuses your
-subscription + MCP), or on **your own model** — any OpenAI-compatible endpoint or a local
-**Ollama** — via a built-in tool-calling loop. (For BYOK/Ollama today, source by importing a
-Canonical results JSON and send from the Claude backend; native Canonical/Gmail for those
-models arrives with the MCP-client milestone.)
+Setup has three pluggable slots:
+
+- **Provider** (the brain) — headless **Claude Code** / **Codex** (reuses your subscription
+  + MCP), or **your own model**: any OpenAI-compatible endpoint or local **Ollama**, via a
+  built-in tool-calling loop.
+- **Discovery** (where companies come from) — **Canonical**. Extensible.
+- **Destination** (where outreach goes) — **Gmail**; **LinkedIn** and others later.
+
+**Connect** wires each slot for your chosen provider: for Claude/Codex it writes the MCP
+into their config (OAuth in-browser on first use); for BYOK/Ollama coldtrail's own MCP
+client does the OAuth (Canonical's discovery-based flow; Gmail via your Google OAuth client)
+and stores the token — so those models get native sourcing and sending too.
 
 Everything lives in `~/.coldtrail/` — the SQLite state, your private message template, the
 agent brief (`CLAUDE.md`), and the MCP config. The app binds `127.0.0.1` only, guarded by a

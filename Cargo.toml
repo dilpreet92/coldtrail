@@ -31,6 +31,8 @@ open = "5"
 uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
 tokio-stream = "0.1"
+base64 = "0.22"
+sha2 = "0.10"
 
 [profile.release]
 strip = true
