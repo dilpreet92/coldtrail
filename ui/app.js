@@ -262,6 +262,15 @@ function toolChip(name) {
   log.scrollTop = log.scrollHeight;
   return d;
 }
+// Animated "working" indicator — kept at the bottom while the agent is busy between
+// visible text, so a long tool call never looks frozen.
+let workingEl = null;
+function showWorking() {
+  if (!workingEl) { workingEl = document.createElement("div"); workingEl.className = "working"; workingEl.innerHTML = "<i></i><i></i><i></i>"; }
+  log.appendChild(workingEl); // moves it to the end
+  log.scrollTop = log.scrollHeight;
+}
+function hideWorking() { if (workingEl) workingEl.remove(); }
 
 const input = $("#chat-input");
 input.addEventListener("input", () => { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, 200) + "px"; });
@@ -275,23 +284,25 @@ async function sendChat() {
   busy = true; $("#chat-send").disabled = true;
   bubble("user", text);
   input.value = ""; input.style.height = "auto";
+  showWorking();
 
   let run;
   try { run = (await postJSON("/api/chat", { message: text })).run; }
-  catch (e) { bubble("agent", "⚠ " + e.message); busy = false; $("#chat-send").disabled = false; return; }
+  catch (e) { hideWorking(); bubble("agent", "⚠ " + e.message); busy = false; $("#chat-send").disabled = false; return; }
 
   let agentBubble = null;
   let agentRaw = "";
   let pendingTool = null;
   // Only ever one live (blinking) bubble: clear it on every transition.
   const finishLive = () => { if (agentBubble) { agentBubble.classList.remove("live"); agentBubble = null; agentRaw = ""; } };
-  const done = () => { finishLive(); es.close(); busy = false; $("#chat-send").disabled = false; };
+  const done = () => { finishLive(); hideWorking(); es.close(); busy = false; $("#chat-send").disabled = false; };
 
   const es = new EventSource(`/api/chat/stream?run=${encodeURIComponent(run)}&t=${encodeURIComponent(token())}`);
   es.onmessage = (ev) => {
     let e;
     try { e = JSON.parse(ev.data); } catch (_) { return; }
     if (e.type === "text") {
+      hideWorking(); // the streaming cursor is the activity now
       if (!agentBubble) { agentBubble = bubble("agent live", ""); agentRaw = ""; }
       agentRaw += e.text;
       agentBubble.innerHTML = mdInline(agentRaw);
@@ -299,8 +310,10 @@ async function sendChat() {
     } else if (e.type === "tool_start") {
       finishLive();
       pendingTool = toolChip(e.name);
+      showWorking(); // keep motion below the running tool
     } else if (e.type === "tool_end") {
       if (pendingTool) { pendingTool.classList.add("done"); if (!e.ok) pendingTool.classList.add("fail"); pendingTool = null; }
+      showWorking(); // still thinking about the next step
     } else if (e.type === "error") {
       finishLive();
       bubble("agent", "⚠ " + e.message);
