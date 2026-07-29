@@ -28,9 +28,9 @@ subcommands — never re-implement their logic, never touch `outreach.db` direct
    actually does and why it's a fit — in the user's voice, honest, short. Then store it:
    `coldtrail draft <domain> --subject "<subject>" --body "<body>"`
    This writes a DB row only. It does not create a Gmail draft and does not send.
-4. **Hand off.** Tell the user the drafts are ready to review in the **Drafts** tab. They
-   review each and click **Send** — that is the only thing that sends, and it is a human
-   action outside this chat.
+4. **Hand off.** Tell the user the drafts are ready in the **Drafts** tab. They review/edit
+   each, click **Create Gmail draft** (coldtrail pushes it to their Gmail Drafts via
+   `create_draft` — it never sends), then send it from Gmail by hand. You never send.
 
 ## Guardrails — non-negotiable
 

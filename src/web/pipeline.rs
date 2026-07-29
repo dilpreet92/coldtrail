@@ -55,8 +55,8 @@ pub async fn mark_touch(
     axum::extract::Path(domain): axum::extract::Path<String>,
     Json(req): Json<MarkReq>,
 ) -> Result<Json<MsgResp>, ApiErr> {
-    if req.value != "replied" && req.value != "bounced" {
-        return Err(anyhow::anyhow!("mark value must be 'replied' or 'bounced'").into());
+    if !["sent", "replied", "bounced"].contains(&req.value.as_str()) {
+        return Err(anyhow::anyhow!("mark value must be 'sent', 'replied' or 'bounced'").into());
     }
     crate::mark::run(&domain.to_lowercase(), &req.value)?;
     Ok(Json(MsgResp::ok()))
