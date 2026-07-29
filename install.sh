@@ -85,8 +85,7 @@ esac
 
 # --- 5. next steps ------------------------------------------------------------
 printf '\n'
-info "done. next:"
-info "    coldtrail setup     # write config + init the database"
-info "    # edit ~/.coldtrail/message.toml and contacted.toml"
-info "    coldtrail seed      # load your already-contacted dedupe guard"
-info "    coldtrail           # launch the agent"
+info "done. now run:"
+info "    coldtrail"
+info "  it opens the app in your browser — pick a provider, connect Discovery"
+info "  (Canonical) + Destination (Gmail), write your pitch, then run the loop in Chat."
