@@ -99,6 +99,15 @@ textarea{resize:vertical; line-height:1.5}
 .form-msg{font-family:var(--mono); font-size:12px; color:var(--mut)}
 .form-msg.ok{color:var(--ok)} .form-msg.err{color:var(--bad)}
 
+/* toasts */
+#toasts{position:fixed; right:20px; bottom:20px; display:flex; flex-direction:column; gap:8px; z-index:200; pointer-events:none}
+.toast{background:var(--panel2); border:1px solid var(--line2); border-left:3px solid var(--ember); color:var(--ink);
+  padding:10px 14px; border-radius:8px; font-size:13px; line-height:1.4; max-width:380px; white-space:pre-line;
+  box-shadow:0 10px 30px rgba(0,0,0,.45); opacity:0; transform:translateY(10px); transition:opacity .25s ease, transform .25s ease}
+.toast.show{opacity:1; transform:translateY(0)}
+.toast.ok{border-left-color:var(--ok)}
+.toast.err{border-left-color:var(--bad)}
+
 .agent-row{display:flex; gap:10px; flex-wrap:wrap}
 .agent{cursor:pointer; border:1px solid var(--line2); border-radius:10px; padding:12px 15px; background:#0f141b; min-width:150px; transition:.15s; color:var(--ink); appearance:none; -webkit-appearance:none; text-align:left; font:inherit}
 .agent:hover{border-color:var(--faint)}

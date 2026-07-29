@@ -34,6 +34,19 @@ async function postJSON(path, body) {
 }
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+
+// Non-blocking toast — replaces alert() so actions confirm without stealing focus.
+function toast(text, kind) {
+  let host = $("#toasts");
+  if (!host) { host = document.createElement("div"); host.id = "toasts"; document.body.appendChild(host); }
+  const t = document.createElement("div");
+  t.className = "toast " + (kind || "");
+  t.textContent = text;
+  host.appendChild(t);
+  requestAnimationFrame(() => t.classList.add("show"));
+  const ttl = Math.min(8000, 3000 + text.length * 30); // longer messages linger longer
+  setTimeout(() => { t.classList.remove("show"); setTimeout(() => t.remove(), 300); }, ttl);
+}
 const esc = (s) => (s || "").replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 // Safe inline markdown: escape first, then add controlled tags for `code`, **bold**, *italic*.
 const mdInline = (s) =>
@@ -113,7 +126,7 @@ async function loadStatus() {
         return;
       }
       try { await postJSON("/api/onboarding/provider", { provider: b.dataset.kind }); await loadStatus(); }
-      catch (e) { alert(e.message); }
+      catch (e) { toast(e.message, "err"); }
     })
   );
 
@@ -233,13 +246,22 @@ loaders.overview = async () => {
 
 // --- drafts -----------------------------------------------------------------
 const escAttr = (s) => esc(s).replace(/"/g, "&quot;");
+const DRAFT_LABEL = { draft_pending: "draft", drafted: "in Gmail" };
 loaders.drafts = async () => {
-  let rows;
-  try { rows = await getJSON("/api/drafts"); } catch (e) { return; }
-  const sent = rows.filter((r) => r.status === "sent").length;
-  $("#warmup").textContent = `${sent} sent · pace new mailboxes to ~5/day`;
+  let rows, ov;
+  try { [rows, ov] = await Promise.all([getJSON("/api/drafts"), getJSON("/api/overview").catch(() => ({ sent: 0 }))]); }
+  catch (e) { return; }
+  const sent = ov.sent || 0;
+  $("#warmup").textContent = sent ? `${sent} sent · pace new mailboxes to ~5/day` : "pace new mailboxes to ~5/day";
   const list = $("#drafts-list");
-  if (!rows.length) { list.innerHTML = `<div class="empty">No drafts yet — ask the agent to draft outreach in Chat.</div>`; return; }
+  const bulkHost = $("#drafts-bulk");
+  if (!rows.length) {
+    if (bulkHost) bulkHost.innerHTML = "";
+    list.innerHTML = sent
+      ? `<div class="empty">All caught up — nothing waiting to draft. ${sent} sent; track replies in <strong>Follow-ups</strong>.</div>`
+      : `<div class="empty">No drafts yet — ask the agent to draft outreach in Chat.</div>`;
+    return;
+  }
   list.innerHTML = rows
     .map((r) => {
       const draftable = r.status === "draft_pending"; // still editable, not yet in Gmail
@@ -247,7 +269,7 @@ loaders.drafts = async () => {
       const head = `<div class="draft-head">
           <span class="to">${esc(r.to) || esc(r.domain)}</span>
           <span class="spacer"></span>
-          <span class="status s-${esc(r.status)}">${esc(r.status)}</span>
+          <span class="status s-${esc(r.status)}">${esc(DRAFT_LABEL[r.status] || r.status)}</span>
           ${draftable ? `<button class="btn save">Save</button><button class="btn primary push">Create Gmail draft</button>` : ""}
           ${inGmail ? `<a class="btn" href="https://mail.google.com/mail/u/0/#drafts" target="_blank" rel="noreferrer">Open Gmail</a><button class="btn marksent">Mark sent</button>` : ""}
         </div>`;
@@ -298,8 +320,9 @@ loaders.drafts = async () => {
         } catch (e) { fails.push(`${dom}: ${e.message}`); }
       }
       let summary = `Created ${ok} Gmail draft${ok === 1 ? "" : "s"}.`;
-      if (fails.length) summary += `\n\nNot created (${fails.length}):\n${fails.join("\n")}`;
-      alert(summary);
+      if (fails.length) summary += ` ${fails.length} failed — see below.`;
+      toast(summary, fails.length ? "err" : "ok");
+      if (fails.length) toast(`Not created:\n${fails.join("\n")}`, "err");
       await loaders.drafts();
     });
 
@@ -311,7 +334,7 @@ loaders.drafts = async () => {
         await postJSON(`/api/drafts/${encodeURIComponent(card.dataset.domain)}`, edits(card));
         b.textContent = "saved";
         setTimeout(() => { b.textContent = "Save"; b.disabled = false; }, 1200);
-      } catch (e) { b.textContent = "Save"; b.disabled = false; alert(e.message); }
+      } catch (e) { b.textContent = "Save"; b.disabled = false; toast(e.message, "err"); }
     })
   );
   $$("#drafts-list .push").forEach((b) =>
@@ -322,16 +345,16 @@ loaders.drafts = async () => {
       try {
         await postJSON(`/api/drafts/${encodeURIComponent(dom)}`, edits(card)); // persist edits first
         const r = await postJSON(`/api/drafts/${encodeURIComponent(dom)}/send`, {}); // creates a Gmail draft
-        if (r.ok) { alert(r.message || "created in Gmail"); await loaders.drafts(); }
-        else { b.disabled = false; b.textContent = "Create Gmail draft"; alert(r.message || "could not create the Gmail draft"); }
-      } catch (e) { b.disabled = false; b.textContent = "Create Gmail draft"; alert(e.message); }
+        if (r.ok) { toast(r.message || "Created in your Gmail Drafts.", "ok"); await loaders.drafts(); }
+        else { b.disabled = false; b.textContent = "Create Gmail draft"; toast(r.message || "could not create the Gmail draft", "err"); }
+      } catch (e) { b.disabled = false; b.textContent = "Create Gmail draft"; toast(e.message, "err"); }
     })
   );
   $$("#drafts-list .marksent").forEach((b) =>
     b.addEventListener("click", async () => {
       const dom = b.closest(".draft").dataset.domain;
-      try { await postJSON(`/api/followups/${encodeURIComponent(dom)}/mark`, { value: "sent" }); await loaders.drafts(); }
-      catch (e) { alert(e.message); }
+      try { await postJSON(`/api/followups/${encodeURIComponent(dom)}/mark`, { value: "sent" }); toast(`Marked ${dom} as sent.`, "ok"); await loaders.drafts(); }
+      catch (e) { toast(e.message, "err"); }
     })
   );
 };
@@ -363,16 +386,17 @@ loaders.followups = async () => {
       b.disabled = true; b.textContent = "drafting…";
       try {
         const r = await postJSON(`/api/followups/${encodeURIComponent(dom)}/draft`, {});
-        alert(r.message || "follow-up drafted");
+        toast(r.message || "Follow-up drafted — see the Drafts tab.", "ok");
         await loaders.followups();
-      } catch (e) { b.disabled = false; b.textContent = "Draft follow-up"; alert(e.message); }
+      } catch (e) { b.disabled = false; b.textContent = "Draft follow-up"; toast(e.message, "err"); }
     })
   );
   $$("#followups-list .fu-mark").forEach((b) =>
     b.addEventListener("click", async () => {
       const dom = b.closest(".fu-row").dataset.domain;
-      try { await postJSON(`/api/followups/${encodeURIComponent(dom)}/mark`, { value: b.dataset.v }); await loaders.followups(); }
-      catch (e) { alert(e.message); }
+      const v = b.dataset.v;
+      try { await postJSON(`/api/followups/${encodeURIComponent(dom)}/mark`, { value: v }); toast(`Marked ${dom} as ${v}.`, "ok"); await loaders.followups(); }
+      catch (e) { toast(e.message, "err"); }
     })
   );
 };

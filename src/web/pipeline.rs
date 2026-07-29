@@ -154,8 +154,11 @@ pub async fn contacts() -> Result<Json<Vec<ContactDto>>, ApiErr> {
 pub async fn drafts() -> Result<Json<Vec<DraftDto>>, ApiErr> {
     let c = crate::db::open()?;
     let mut stmt = c.prepare(
+        // Drafts is a work queue — only rows still awaiting action. Once a draft is
+        // sent/replied/bounced it leaves this list (it lives on in Overview / Follow-ups).
         "SELECT o.domain, k.email, o.subject, o.body, o.status, o.gmail_draft_id \
          FROM outreach o LEFT JOIN contacts k ON k.id = o.contact_id \
+         WHERE o.status IN ('draft_pending','drafted') \
          ORDER BY o.created_at DESC",
     )?;
     let rows = stmt
