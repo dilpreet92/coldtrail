@@ -39,10 +39,17 @@ Setup has three pluggable slots:
 - **Discovery** (where companies come from) — **Canonical**. Extensible.
 - **Destination** (where outreach goes) — **Gmail**; **LinkedIn** and others later.
 
-**Connect** wires each slot for your chosen provider: for Claude/Codex it writes the MCP
-into their config (OAuth in-browser on first use); for BYOK/Ollama coldtrail's own MCP
-client does the OAuth (Canonical's discovery-based flow; Gmail via your Google OAuth client)
-and stores the token — so those models get native sourcing and sending too.
+**Connect** is provider-aware and keyless. For **Claude/Codex** the connectors come from the
+provider — Canonical is wired into its config and Gmail from your account's Gmail connector;
+OAuth happens in-browser on first use, no keys to enter. For **BYOK/Ollama** coldtrail's own
+MCP client does the OAuth (Canonical auto-registers; Gmail uses coldtrail's built-in Google
+client) — you just consent in the browser.
+
+> **Maintainer note:** the keyless Gmail path for BYOK/Ollama needs coldtrail's own Google
+> OAuth client. Create a Google **Desktop** OAuth client with the Gmail API + Gmail MCP API
+> enabled, then build/run with `COLDTRAIL_GOOGLE_CLIENT_ID` and `COLDTRAIL_GOOGLE_CLIENT_SECRET`
+> set. Until Google verifies the app for the `gmail.compose` scope, users pass an
+> "unverified app" consent screen (Advanced → continue).
 
 Everything lives in `~/.coldtrail/` — the SQLite state, your private message template, the
 agent brief (`CLAUDE.md`), and the MCP config. The app binds `127.0.0.1` only, guarded by a

@@ -271,15 +271,43 @@ fn parse_callback(target: &str) -> (Option<String>, Option<String>) {
 
 const CB_PORT: u16 = 8765;
 
-/// Connect Gmail (destination) for the in-Rust backends via the user's Google OAuth client.
-pub async fn connect_gmail(client_id: &str, client_secret: &str, port: u16) -> Result<()> {
+const GOOGLE_AUTH: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+const GOOGLE_TOKEN: &str = "https://oauth2.googleapis.com/token";
+const GMAIL_SCOPE: &str =
+    "https://www.googleapis.com/auth/gmail.compose https://www.googleapis.com/auth/gmail.readonly";
+
+/// coldtrail's built-in Google OAuth client (a Desktop client, so users don't create
+/// their own). Baked in at build time via `COLDTRAIL_GOOGLE_CLIENT_ID`/`_SECRET`, with a
+/// runtime env override. `None` if this build has no client configured.
+pub fn google_client() -> Option<(String, Option<String>)> {
+    let id = std::env::var("COLDTRAIL_GOOGLE_CLIENT_ID")
+        .ok()
+        .or_else(|| option_env!("COLDTRAIL_GOOGLE_CLIENT_ID").map(str::to_string))
+        .filter(|s| !s.trim().is_empty())?;
+    let secret = std::env::var("COLDTRAIL_GOOGLE_CLIENT_SECRET")
+        .ok()
+        .or_else(|| option_env!("COLDTRAIL_GOOGLE_CLIENT_SECRET").map(str::to_string))
+        .filter(|s| !s.trim().is_empty());
+    Some((id, secret))
+}
+
+/// Connect Gmail (destination) for the in-Rust backends — keyless, using coldtrail's
+/// built-in Google client. Users just consent in the browser.
+pub async fn connect_gmail(port: u16) -> Result<()> {
+    let (client_id, secret) = google_client().ok_or_else(|| {
+        anyhow!(
+            "this build has no Google client configured. The maintainer must create a Google \
+             Desktop OAuth client (with the Gmail API + Gmail MCP API enabled) and build/run with \
+             COLDTRAIL_GOOGLE_CLIENT_ID and COLDTRAIL_GOOGLE_CLIENT_SECRET set."
+        )
+    })?;
     run_flow(
         "gmail",
-        "https://accounts.google.com/o/oauth2/v2/auth",
-        "https://oauth2.googleapis.com/token",
-        client_id,
-        Some(client_secret),
-        "https://www.googleapis.com/auth/gmail.compose https://www.googleapis.com/auth/gmail.readonly",
+        GOOGLE_AUTH,
+        GOOGLE_TOKEN,
+        &client_id,
+        secret.as_deref(),
+        GMAIL_SCOPE,
         port,
     )
     .await

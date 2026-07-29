@@ -67,10 +67,14 @@
 
       <div class="panel" id="panel-destination">
         <h2>3 · Destination <span class="conn-state" id="dest-state"></span></h2>
-        <p class="hint">Where outreach goes. <strong>Gmail</strong> needs a Google Cloud OAuth client — <a href="https://developers.google.com/workspace/gmail/api/guides/configure-mcp-server" target="_blank" rel="noreferrer">setup guide</a>. Scopes <code>gmail.compose</code>, <code>gmail.readonly</code>; redirect <code>http://localhost:8765/callback</code>.</p>
-        <label>Gmail OAuth client id <input id="gm-id" placeholder="…apps.googleusercontent.com" autocomplete="off" /></label>
-        <label>Gmail OAuth client secret <input id="gm-secret" type="password" autocomplete="off" /></label>
-        <div class="row"><button class="btn primary" id="connect-gmail">Connect Gmail</button><span class="form-msg" id="dest-msg"></span></div>
+        <p class="hint">Where outreach goes. <strong>Gmail</strong> — you review every draft and hit Send; coldtrail never auto-sends.</p>
+        <div id="gmail-account" hidden>
+          <p class="hint">On Claude Code / Codex, Gmail comes from your <strong>account's Gmail connector</strong> — exactly as in Claude Code, no keys to enter. Enable it at <a href="https://claude.ai/settings/connectors" target="_blank" rel="noreferrer">claude.ai → Connectors</a>.</p>
+        </div>
+        <div id="gmail-byo" hidden>
+          <p class="hint">One browser consent, no keys — coldtrail brings its own Google client. You'll pass Google's "unverified app" screen (Advanced → continue).</p>
+          <div class="row"><button class="btn primary" id="connect-gmail">Connect Gmail</button><span class="form-msg" id="dest-msg"></span></div>
+        </div>
         <p class="hint" style="margin-top:12px;opacity:.55">also a destination: <span class="status s-sourced">LinkedIn — coming</span></p>
       </div>
 

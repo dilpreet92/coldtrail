@@ -63,6 +63,11 @@ async function loadStatus() {
   if (st) st.textContent = s.discovery_connected ? "· connected" : "";
   const dt = $("#dest-state");
   if (dt) dt.textContent = s.destination_connected ? "· connected" : "";
+  // Destination is provider-aware: CLI uses the account connector (no keys); BYOK/Ollama connects keyless via coldtrail's Google client.
+  const cliProvider = s.provider === "claude" || s.provider === "codex";
+  const ga = $("#gmail-account"), gb = $("#gmail-byo");
+  if (ga) ga.hidden = !cliProvider;
+  if (gb) gb.hidden = cliProvider;
 
   // checklist
   const items = [
@@ -132,16 +137,9 @@ $("#connect-canonical").addEventListener("click", async () => {
   } catch (e) { msg("#disc-msg", e.message, false); }
 });
 $("#connect-gmail").addEventListener("click", async () => {
-  const body = {
-    client_id: $("#gm-id").value.trim(),
-    client_secret: $("#gm-secret").value.trim(),
-    callback_port: 8765,
-  };
-  if (!body.client_id || !body.client_secret) { msg("#dest-msg", "enter client id + secret", false); return; }
-  msg("#dest-msg", "connecting… authorize in the browser tab if one opens", true);
+  msg("#dest-msg", "connecting… authorize in the browser tab that opens", true);
   try {
-    await postJSON("/api/destination/gmail/connect", body);
-    $("#gm-secret").value = "";
+    await postJSON("/api/destination/gmail/connect", { callback_port: 8765 });
     msg("#dest-msg", "connected", true);
     await loadStatus();
   } catch (e) { msg("#dest-msg", e.message, false); }

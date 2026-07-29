@@ -75,21 +75,27 @@ pub async fn connect_discovery() -> Result<Json<MsgResp>, ApiErr> {
     Ok(Json(MsgResp::ok()))
 }
 
-/// Connect Destination (Gmail): wire the MCP for CLI providers, or OAuth for BYOK/Ollama.
+/// Connect Destination (Gmail). CLI providers use their account's Gmail connector
+/// (nothing to wire here); BYOK/Ollama run keyless OAuth with coldtrail's built-in client.
 pub async fn connect_destination(
     Json(req): Json<super::api::GmailConnectReq>,
 ) -> Result<Json<MsgResp>, ApiErr> {
-    let ws = crate::home::workspace()?;
     let port = req.callback_port.unwrap_or(8765);
     match crate::provider::resolve() {
-        crate::provider::Backend::Cli(kind) => {
-            setup::wire_gmail(kind, &req.client_id, &req.client_secret, port, true, &ws)?
-        }
+        crate::provider::Backend::Cli(_) => Ok(Json(MsgResp {
+            ok: true,
+            message: Some(
+                "Gmail comes from your Claude/Codex account connector — enable it at \
+                 claude.ai → Connectors. Nothing to configure here."
+                    .into(),
+            ),
+            wired: None,
+        })),
         crate::provider::Backend::OpenAi { .. } => {
-            crate::oauth::connect_gmail(&req.client_id, &req.client_secret, port).await?
+            crate::oauth::connect_gmail(port).await?;
+            Ok(Json(MsgResp::ok()))
         }
     }
-    Ok(Json(MsgResp::ok()))
 }
 
 pub async fn set_provider(Json(req): Json<ProviderReq>) -> Result<Json<MsgResp>, ApiErr> {

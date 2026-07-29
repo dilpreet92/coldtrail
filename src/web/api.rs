@@ -28,10 +28,8 @@ pub struct StatusDto {
     pub destination_connected: bool,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub struct GmailConnectReq {
-    pub client_id: String,
-    pub client_secret: String,
     pub callback_port: Option<u16>,
 }
 
