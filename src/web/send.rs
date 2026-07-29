@@ -10,8 +10,8 @@ use tokio::sync::mpsc;
 
 use super::api::MsgResp;
 use super::{ApiErr, AppState};
-use crate::provider::cli::{run_turn, Tools};
-use crate::provider::{AgentEvent, GMAIL_TOOL};
+use crate::provider::cli::Tools;
+use crate::provider::{resolve, run_turn, AgentEvent, GMAIL_TOOL};
 
 pub async fn send(
     State(_state): State<Arc<AppState>>,
@@ -45,7 +45,18 @@ pub async fn send(
     };
     let to = to.ok_or_else(|| anyhow::anyhow!("no recipient email on file for {domain}"))?;
 
-    let kind = crate::setup::read_agent()?;
+    let backend = resolve();
+    if !backend.is_cli() {
+        return Ok(Json(MsgResp {
+            ok: false,
+            message: Some(
+                "Sending isn't available on the BYOK/Ollama backend yet — switch to Claude Code \
+                 in Setup (the Gmail connector for this backend lands with the MCP client)."
+                    .into(),
+            ),
+            wired: None,
+        }));
+    }
     let home = crate::home::workspace()?;
     let sid = uuid::Uuid::new_v4().to_string();
     let msg = format!(
@@ -61,7 +72,7 @@ pub async fn send(
     let (tx, mut rx) = mpsc::channel(64);
     let h = home.clone();
     tokio::spawn(async move {
-        let _ = run_turn(kind, &sid, true, &msg, &h, &tools, tx).await;
+        let _ = run_turn(&backend, &sid, true, &msg, &h, &tools, tx).await;
     });
 
     // Require positive evidence: the Gmail tool actually ran and the turn finished ok.

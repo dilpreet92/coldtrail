@@ -61,10 +61,10 @@ fn parse_value(v: Value) -> Result<Vec<Company>> {
         .collect())
 }
 
-pub fn run(json_path: &str, label: &str) -> Result<()> {
-    let raw = std::fs::read_to_string(json_path).with_context(|| format!("read {json_path}"))?;
-    let results = parse_results(&raw)?;
-
+/// Import from a raw JSON string. Returns (added, skipped, total). Shared by the CLI
+/// and the agent `import_json` tool.
+pub fn import_str(raw: &str, label: &str) -> Result<(u32, u32, usize)> {
+    let results = parse_results(raw)?;
     crate::db::init()?;
     let conn = crate::db::open()?;
     let (mut added, mut skipped) = (0u32, 0u32);
@@ -88,10 +88,13 @@ pub fn run(json_path: &str, label: &str) -> Result<()> {
             skipped += 1;
         }
     }
-    println!(
-        "imported: {added} new, {skipped} already-known (deduped) from {} results",
-        results.len()
-    );
+    Ok((added, skipped, results.len()))
+}
+
+pub fn run(json_path: &str, label: &str) -> Result<()> {
+    let raw = std::fs::read_to_string(json_path).with_context(|| format!("read {json_path}"))?;
+    let (added, skipped, total) = import_str(&raw, label)?;
+    println!("imported: {added} new, {skipped} already-known (deduped) from {total} results");
     Ok(())
 }
 

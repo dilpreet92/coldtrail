@@ -1,5 +1,6 @@
 mod agents;
 mod cli;
+mod config;
 mod contact;
 mod db;
 mod draft;
@@ -13,6 +14,7 @@ mod message;
 mod prompt;
 mod provider;
 mod run;
+mod secrets;
 mod seed;
 mod serve;
 mod setup;

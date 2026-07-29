@@ -47,8 +47,16 @@
     <div class="panels">
       <div class="panel" id="panel-provider">
         <h2>1 · Agent</h2>
-        <p class="hint">coldtrail drives a headless agent. Pick the one it should use.</p>
+        <p class="hint">coldtrail drives an agent. Use a headless CLI (Claude Code / Codex) or bring your own model.</p>
         <div class="agent-row" id="agent-row"></div>
+        <div id="byok" class="byok" hidden>
+          <p class="hint">Any OpenAI-compatible endpoint — local <strong>Ollama</strong> or a BYOK gateway. <em>Note: sourcing (Canonical) &amp; sending (Gmail) need the Claude/Codex backend for now.</em></p>
+          <div class="row"><button class="btn" type="button" id="ollama-preset">Ollama (localhost)</button></div>
+          <label>Base URL <input id="byok-base" placeholder="http://localhost:11434/v1" autocomplete="off" /></label>
+          <label>Model <input id="byok-model" placeholder="llama3.1" autocomplete="off" /></label>
+          <label>API key <span style="text-transform:none">(blank for local Ollama)</span> <input id="byok-key" type="password" autocomplete="off" /></label>
+          <div class="row"><button class="btn primary" id="save-byok">Save backend</button><span class="form-msg" id="byok-msg"></span></div>
+        </div>
       </div>
 
       <div class="panel" id="panel-mcp">

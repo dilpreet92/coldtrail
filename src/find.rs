@@ -240,28 +240,35 @@ fn pick(candidates: Vec<Candidate>) -> Option<(String, &'static str, &'static st
 
 pub async fn run(max: usize) -> Result<()> {
     crate::db::init()?;
-    let conn = crate::db::open()?;
-    let mut stmt = conn.prepare(
-        "SELECT c.domain, c.name FROM companies c \
-         WHERE c.status IN ('sourced','named') \
-           AND NOT EXISTS (SELECT 1 FROM contacts k WHERE k.domain=c.domain AND k.email IS NOT NULL AND k.mx_ok=1) \
-         ORDER BY c.first_seen LIMIT ?1",
-    )?;
-    let rows: Vec<(String, Option<String>)> = stmt
-        .query_map([max as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
+    // Read the worklist into memory, then drop the connection — we must not hold a
+    // rusqlite handle across an .await (it's !Send, and this runs inside a spawned task).
+    let rows: Vec<(String, Option<String>)> = {
+        let conn = crate::db::open()?;
+        let mut stmt = conn.prepare(
+            "SELECT c.domain, c.name FROM companies c \
+             WHERE c.status IN ('sourced','named') \
+               AND NOT EXISTS (SELECT 1 FROM contacts k WHERE k.domain=c.domain AND k.email IS NOT NULL AND k.mx_ok=1) \
+             ORDER BY c.first_seen LIMIT ?1",
+        )?;
+        let out = stmt
+            .query_map([max as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<(String, Option<String>)>>>()?;
+        out
+    };
     println!("hunting emails for {} companies\n", rows.len());
 
     for (domain, name) in rows {
         let company = name.clone().unwrap_or_default();
-        // seeded founder name if present
-        let seeded: Option<String> = conn
-            .query_row(
+        // seeded founder name if present (short-lived connection, no await while open)
+        let seeded: Option<String> = {
+            let conn = crate::db::open()?;
+            conn.query_row(
                 "SELECT founder_name FROM contacts WHERE domain=?1 AND founder_name IS NOT NULL LIMIT 1",
                 [&domain],
                 |r| r.get(0),
             )
-            .optional()?;
+            .optional()?
+        };
         let founder = match seeded {
             Some(f) => Some(f),
             None => resolve_founder(&company, &domain).await,
@@ -275,6 +282,7 @@ pub async fn run(max: usize) -> Result<()> {
         match hunt(&domain, &company, founder.as_deref()).await {
             None => {
                 println!("    no founder email found");
+                let conn = crate::db::open()?;
                 crate::db::set_status(
                     &conn,
                     &domain,
@@ -287,6 +295,7 @@ pub async fn run(max: usize) -> Result<()> {
             }
             Some(res) => {
                 let ok = mx_ok(&domain).await;
+                let conn = crate::db::open()?;
                 conn.execute(
                     "INSERT OR IGNORE INTO contacts \
                      (domain, founder_name, email, email_source, email_confidence, mx_ok) \

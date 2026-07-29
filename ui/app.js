@@ -71,8 +71,8 @@ async function loadStatus() {
     .map(([n, done]) => `<li class="${done ? "done" : ""}"><span class="tick">${done ? "✓" : ""}</span>${n}</li>`)
     .join("");
 
-  // agents
-  $("#agent-row").innerHTML = s.agents
+  // agents (claude/codex cards + a BYOK/Local card)
+  let cards = s.agents
     .map((a) => {
       const cur = a.kind === s.provider;
       const state = !a.present ? "not installed" : a.authed ? "ready" : "sign in needed";
@@ -80,8 +80,23 @@ async function loadStatus() {
         <div class="an">${esc(a.label)}</div><div class="as">${state}</div></button>`;
     })
     .join("");
+  cards += `<button class="agent" data-kind="openai" aria-pressed="${s.provider === "openai"}">
+      <div class="an">BYOK / Local</div><div class="as">OpenAI-compatible · Ollama</div></button>`;
+  $("#agent-row").innerHTML = cards;
+
+  // prefill + reveal the BYOK form
+  $("#byok-base").value = s.base_url || "";
+  $("#byok-model").value = s.model || "";
+  $("#byok-key").placeholder = s.key_set ? "•••••• (saved — leave blank to keep)" : "blank for local Ollama";
+  $("#byok").hidden = s.provider !== "openai";
+
   $$("#agent-row .agent").forEach((b) =>
     b.addEventListener("click", async () => {
+      if (b.dataset.kind === "openai") {
+        $("#byok").hidden = false;
+        $$("#agent-row .agent").forEach((x) => x.setAttribute("aria-pressed", x.dataset.kind === "openai"));
+        return;
+      }
       try { await postJSON("/api/onboarding/provider", { provider: b.dataset.kind }); await loadStatus(); }
       catch (e) { alert(e.message); }
     })
@@ -127,6 +142,25 @@ $("#save-message").addEventListener("click", async () => {
 $("#save-contacted").addEventListener("click", async () => {
   try { await postJSON("/api/onboarding/contacted", { toml: $("#contacted-toml").value }); msg("#contacted-msg", "saved", true); }
   catch (e) { msg("#contacted-msg", e.message, false); }
+});
+$("#ollama-preset").addEventListener("click", () => {
+  $("#byok-base").value = "http://localhost:11434/v1";
+  if (!$("#byok-model").value) $("#byok-model").value = "llama3.1";
+});
+$("#save-byok").addEventListener("click", async () => {
+  const body = {
+    provider: "openai",
+    base_url: $("#byok-base").value.trim(),
+    model: $("#byok-model").value.trim(),
+    api_key: $("#byok-key").value.trim() || null,
+  };
+  msg("#byok-msg", "saving…", true);
+  try {
+    await postJSON("/api/onboarding/provider", body);
+    $("#byok-key").value = "";
+    msg("#byok-msg", "saved", true);
+    await loadStatus();
+  } catch (e) { msg("#byok-msg", e.message, false); }
 });
 
 // --- pipeline ---------------------------------------------------------------

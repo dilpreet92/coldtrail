@@ -1,24 +1,20 @@
-//! Add a founder email discovered by hand (or via the agent's WebSearch) into the
-//! pipeline, MX-verified, so manual finds flow through the same dedupe/draft path.
-//! Rejects generic/placeholder locals.
+//! Add a founder email (from the agent, WebSearch, or by hand) into the pipeline,
+//! MX-verified. Rejects generic/placeholder locals.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use rusqlite::{params, OptionalExtension};
 
 use crate::enrich::score;
 
-pub async fn run(domain: &str, name: &str, email: &str, source: Option<&str>) -> Result<()> {
+/// Core add — returns a summary on success, or `Err` if the address is rejected.
+/// Never exits the process (safe to call from the agent tool loop).
+pub async fn add(domain: &str, name: &str, email: &str, source: Option<&str>) -> Result<String> {
     let domain = domain.to_lowercase();
     let email = email.to_lowercase();
     let source = source.unwrap_or("websearch");
 
-    let conf = match score(&email, Some(name)) {
-        Some(c) => c,
-        None => {
-            eprintln!("REJECTED (generic/placeholder): {email}");
-            std::process::exit(2);
-        }
-    };
+    let conf = score(&email, Some(name))
+        .ok_or_else(|| anyhow!("REJECTED (generic/placeholder): {email}"))?;
 
     let email_host = email.split('@').nth(1).unwrap_or("");
     let ok = crate::find::mx_ok(email_host).await;
@@ -45,6 +41,21 @@ pub async fn run(domain: &str, name: &str, email: &str, source: Option<&str>) ->
         params![domain, name, email, source, conf, if ok { 1 } else { 0 }],
     )?;
     crate::db::set_status(&conn, &domain, if ok { "emailed" } else { "named" })?;
-    println!("added {email} [{conf}, {source}] mx_ok={ok} for {domain}");
-    Ok(())
+    Ok(format!(
+        "added {email} [{conf}, {source}] mx_ok={ok} for {domain}"
+    ))
+}
+
+/// CLI entry point: prints the result, exits non-zero on rejection.
+pub async fn run(domain: &str, name: &str, email: &str, source: Option<&str>) -> Result<()> {
+    match add(domain, name, email, source).await {
+        Ok(msg) => {
+            println!("{msg}");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    }
 }

@@ -10,9 +10,11 @@ use crate::setup;
 
 pub async fn status() -> Result<Json<StatusDto>, ApiErr> {
     setup::ensure()?; // idempotent; guarantees workspace + default files exist
-    let provider = setup::read_agent()?;
-    let agents = agents::detect_all()
-        .into_iter()
+    let cfg = crate::config::load();
+    let provider = cfg.agent.clone().unwrap_or_else(|| "claude".into());
+    let detected = agents::detect_all();
+    let agents: Vec<AgentDto> = detected
+        .iter()
         .map(|s| AgentDto {
             kind: s.kind.config_value().to_string(),
             label: s.kind.label().to_string(),
@@ -21,34 +23,68 @@ pub async fn status() -> Result<Json<StatusDto>, ApiErr> {
         })
         .collect();
 
-    let canonical_wired = mcp_wired(provider, "canonical");
-    let gmail_wired = mcp_wired(provider, "gmail");
+    let kind = AgentKind::from_str(&provider); // None for "openai"
+    let canonical_wired = kind.map(|k| mcp_wired(k, "canonical")).unwrap_or(false);
+    let gmail_wired = kind.map(|k| mcp_wired(k, "gmail")).unwrap_or(false);
     let message_customized = file_differs("message.toml", setup::MESSAGE_TOML);
     let contacted_customized = file_differs("contacted.toml", setup::CONTACTED_TOML);
+    let (base_url, model) = cfg
+        .provider
+        .map(|p| (p.base_url, p.model))
+        .unwrap_or((None, None));
+    let key_set = crate::secrets::has_key();
 
-    let onboarded = canonical_wired && message_customized;
+    let provider_ready = match kind {
+        Some(k) => detected.iter().any(|s| s.kind == k && s.present),
+        None => base_url.is_some(), // openai backend
+    };
+    let onboarded = message_customized && provider_ready;
+
     Ok(Json(StatusDto {
-        provider: provider.config_value().to_string(),
+        provider,
         agents,
         canonical_wired,
         gmail_wired,
         message_customized,
         contacted_customized,
         onboarded,
+        base_url,
+        model,
+        key_set,
     }))
 }
 
 pub async fn set_provider(Json(req): Json<ProviderReq>) -> Result<Json<MsgResp>, ApiErr> {
-    let kind = AgentKind::from_str(&req.provider)
-        .ok_or_else(|| anyhow::anyhow!("unknown provider '{}'", req.provider))?;
-    if !agents::detect_all()
-        .iter()
-        .any(|s| s.kind == kind && s.present)
-    {
-        return Err(anyhow::anyhow!("{} is not installed", kind.label()).into());
+    let ne = |s: &String| !s.trim().is_empty();
+    match req.provider.as_str() {
+        "openai" => {
+            let mut c = crate::config::load();
+            c.agent = Some("openai".into());
+            c.provider = Some(crate::config::Provider {
+                base_url: req.base_url.filter(ne),
+                model: req.model.filter(ne),
+            });
+            crate::config::save(&c)?;
+            if let Some(k) = req.api_key.filter(ne) {
+                crate::secrets::set_api_key(&k)?;
+            }
+            Ok(Json(MsgResp::ok()))
+        }
+        other => {
+            let kind = AgentKind::from_str(other)
+                .ok_or_else(|| anyhow::anyhow!("unknown provider '{other}'"))?;
+            if !agents::detect_all()
+                .iter()
+                .any(|s| s.kind == kind && s.present)
+            {
+                return Err(anyhow::anyhow!("{} is not installed", kind.label()).into());
+            }
+            let mut c = crate::config::load();
+            c.agent = Some(kind.config_value().to_string());
+            crate::config::save(&c)?;
+            Ok(Json(MsgResp::ok()))
+        }
     }
-    setup::write_agent(kind)?;
-    Ok(Json(MsgResp::ok()))
 }
 
 pub async fn set_mcp(Json(req): Json<McpReq>) -> Result<Json<MsgResp>, ApiErr> {

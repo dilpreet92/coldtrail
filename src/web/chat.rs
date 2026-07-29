@@ -15,8 +15,8 @@ use tokio_stream::StreamExt;
 
 use super::api::{ChatReq, ChatResp};
 use super::{ApiErr, AppState};
-use crate::provider::cli::{run_turn, Tools};
-use crate::provider::GMAIL_TOOL;
+use crate::provider::cli::Tools;
+use crate::provider::{resolve, run_turn, GMAIL_TOOL};
 
 /// How long an unclaimed run (POSTed but never streamed) lingers before eviction.
 const RUN_TTL: Duration = Duration::from_secs(45);
@@ -25,7 +25,7 @@ pub async fn start(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatReq>,
 ) -> Result<Json<ChatResp>, ApiErr> {
-    let kind = crate::setup::read_agent()?;
+    let backend = resolve();
     let home = crate::home::workspace()?;
 
     let run_id = uuid::Uuid::new_v4().to_string();
@@ -45,7 +45,7 @@ pub async fn start(
             (s.id.clone().unwrap(), !s.created)
         };
         let tools = Tools::Disallow(&[GMAIL_TOOL]); // chat never sends / drafts in Gmail
-        let ok = run_turn(kind, &sid, first, &msg, &home, &tools, tx).await;
+        let ok = run_turn(&backend, &sid, first, &msg, &home, &tools, tx).await;
         let mut s = st.chat.lock().await;
         if ok {
             s.created = true;

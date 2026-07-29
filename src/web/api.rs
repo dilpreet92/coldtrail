@@ -19,6 +19,10 @@ pub struct StatusDto {
     pub message_customized: bool,
     pub contacted_customized: bool,
     pub onboarded: bool,
+    /// OpenAI-compatible backend config (never includes the key).
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub key_set: bool,
 }
 
 #[derive(Serialize)]
@@ -61,6 +65,10 @@ pub struct ChatResp {
 #[derive(Deserialize)]
 pub struct ProviderReq {
     pub provider: String,
+    /// For provider = "openai": endpoint + model + (optional) API key.
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub api_key: Option<String>,
 }
 
 #[derive(Deserialize)]
