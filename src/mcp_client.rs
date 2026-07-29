@@ -46,11 +46,6 @@ impl McpClient {
         Ok(self)
     }
 
-    pub async fn list_tools(&self) -> Result<Vec<Value>> {
-        let (v, _) = self.post("tools/list", json!({}), true).await?;
-        Ok(v["result"]["tools"].as_array().cloned().unwrap_or_default())
-    }
-
     /// Call a tool; returns the JSON-RPC `result` object.
     pub async fn call_tool(&self, name: &str, args: Value) -> Result<Value> {
         let (v, _) = self
