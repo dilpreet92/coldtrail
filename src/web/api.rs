@@ -74,6 +74,9 @@ pub struct CompanyDto {
     pub name: Option<String>,
     pub status: String,
     pub first_seen: String,
+    /// Best verified contact found for this company (surfaced in the Pipeline row).
+    pub founder: Option<String>,
+    pub email: Option<String>,
 }
 
 #[derive(Serialize)]

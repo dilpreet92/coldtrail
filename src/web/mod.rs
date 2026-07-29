@@ -89,6 +89,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(onboarding::connect_destination),
         )
         .route("/api/companies", get(pipeline::companies))
+        .route(
+            "/api/companies/:domain/status",
+            post(pipeline::set_company_status),
+        )
         .route("/api/contacts", get(pipeline::contacts))
         .route("/api/drafts", get(pipeline::drafts))
         .route("/api/overview", get(pipeline::overview))

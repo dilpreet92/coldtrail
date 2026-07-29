@@ -115,8 +115,15 @@ pub async fn overview() -> Result<Json<OverviewDto>, ApiErr> {
 
 pub async fn companies() -> Result<Json<Vec<CompanyDto>>, ApiErr> {
     let c = crate::db::open()?;
+    // Attach the best contact per company (verified first, then most recent) so the
+    // Pipeline row can show who we found — the only place contacts surface in the UI.
     let mut stmt = c.prepare(
-        "SELECT domain, name, status, COALESCE(first_seen,'') FROM companies ORDER BY first_seen DESC",
+        "SELECT c.domain, c.name, c.status, COALESCE(c.first_seen,''), \
+                (SELECT k.founder_name FROM contacts k WHERE k.domain=c.domain AND k.email IS NOT NULL \
+                   ORDER BY k.mx_ok DESC, k.found_at DESC LIMIT 1), \
+                (SELECT k.email FROM contacts k WHERE k.domain=c.domain AND k.email IS NOT NULL \
+                   ORDER BY k.mx_ok DESC, k.found_at DESC LIMIT 1) \
+         FROM companies c ORDER BY c.first_seen DESC",
     )?;
     let rows = stmt
         .query_map([], |r| {
@@ -125,10 +132,58 @@ pub async fn companies() -> Result<Json<Vec<CompanyDto>>, ApiErr> {
                 name: r.get(1)?,
                 status: r.get(2)?,
                 first_seen: r.get(3)?,
+                founder: r.get(4)?,
+                email: r.get(5)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(Json(rows))
+}
+
+/// Curate a company from the Pipeline: `skip` (exclude from outreach) or `restore`
+/// (recompute its natural pre-outreach stage). DB-only — no agent involved.
+pub async fn set_company_status(
+    Path(domain): Path<String>,
+    Json(req): Json<MarkReq>,
+) -> Result<Json<MsgResp>, ApiErr> {
+    use rusqlite::OptionalExtension;
+    let domain = domain.to_lowercase();
+    let c = crate::db::open()?;
+    let new_status = match req.value.as_str() {
+        "skip" => "skip".to_string(),
+        "restore" => {
+            let has_email: bool = c
+                .query_row(
+                    "SELECT 1 FROM contacts WHERE domain=?1 AND email IS NOT NULL AND mx_ok=1 LIMIT 1",
+                    [&domain],
+                    |_| Ok(true),
+                )
+                .optional()?
+                .unwrap_or(false);
+            let has_name: bool = c
+                .query_row(
+                    "SELECT 1 FROM contacts WHERE domain=?1 AND founder_name IS NOT NULL LIMIT 1",
+                    [&domain],
+                    |_| Ok(true),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if has_email {
+                "emailed".into()
+            } else if has_name {
+                "named".into()
+            } else {
+                "sourced".into()
+            }
+        }
+        other => {
+            return Err(
+                anyhow::anyhow!("status value must be 'skip' or 'restore', got '{other}'").into(),
+            )
+        }
+    };
+    crate::db::set_status(&c, &domain, &new_status)?;
+    Ok(Json(MsgResp::ok()))
 }
 
 pub async fn contacts() -> Result<Json<Vec<ContactDto>>, ApiErr> {

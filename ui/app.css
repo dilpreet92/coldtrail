@@ -163,7 +163,16 @@ textarea{resize:vertical; line-height:1.5}
 .s-emailed{color:var(--warn); border-color:#7d652a}
 .s-drafted{color:var(--ember); border-color:var(--ember-dim)}
 .s-sent{color:var(--ok); border-color:#2f6e37}
+.s-replied{color:var(--cyan); border-color:var(--cyan-dim)}
 .s-bounced,.s-skip{color:var(--bad); border-color:#7d3a35}
+
+/* pipeline row extras */
+.grid .co{font-size:13.5px; color:var(--ink)}
+.sub-contact{font-family:var(--mono); font-size:11.5px; color:var(--cyan); margin-top:3px}
+.sub-contact.none{color:var(--faint)}
+.pipe-actions{white-space:nowrap; text-align:right}
+.pipe-actions .btn + .btn{margin-left:6px}
+.btn.mini{padding:4px 11px; font-size:11.5px; border-radius:7px}
 
 /* drafts */
 .drafts-bulk{display:flex; align-items:center; gap:12px; margin-bottom:14px}

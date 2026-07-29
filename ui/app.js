@@ -192,30 +192,80 @@ $("#save-byok").addEventListener("click", async () => {
 });
 
 // --- pipeline ---------------------------------------------------------------
+// Friendly funnel labels — the raw statuses are confusing ('emailed' means "a verified
+// contact was found", NOT "we emailed them"), so relabel everywhere they surface.
+const STAGE_LABEL = {
+  sourced: "sourced", named: "name only", emailed: "contact found",
+  drafted: "in Gmail", sent: "sent", replied: "replied", bounced: "bounced", skip: "skipped",
+};
+const stageLabel = (s) => STAGE_LABEL[s] || s;
+
+// Prefill the chat box with a next-step instruction and jump to Chat.
+function askAgent(text) {
+  const input = $("#chat-input");
+  input.value = text;
+  show("chat");
+  input.focus();
+  input.dispatchEvent(new Event("input")); // trigger auto-resize
+}
+
 let pipeFilter = "all";
 loaders.pipeline = async () => {
   let rows;
   try { rows = await getJSON("/api/companies"); } catch (e) { return; }
   const statuses = [...new Set(rows.map((r) => r.status))];
   $("#pipe-filters").innerHTML =
-    [`all`, ...statuses]
-      .map((s) => `<button class="chip" data-f="${s}" aria-pressed="${s === pipeFilter}">${s}</button>`)
+    ["all", ...statuses]
+      .map((s) => `<button class="chip" data-f="${esc(s)}" aria-pressed="${s === pipeFilter}">${s === "all" ? "all" : esc(stageLabel(s))}</button>`)
       .join("");
   $$("#pipe-filters .chip").forEach((c) =>
     c.addEventListener("click", () => { pipeFilter = c.dataset.f; loaders.pipeline(); })
   );
+
+  const contactLine = (r) => {
+    if (r.email) return `<div class="sub-contact">${esc(r.founder ? r.founder + " · " : "")}${esc(r.email)}</div>`;
+    if (r.status === "skip") return "";
+    return `<div class="sub-contact none">no contact yet</div>`;
+  };
+  const actionsFor = (r) => {
+    if (r.status === "skip") return `<button class="btn mini restore">Restore</button>`;
+    if (r.status === "sourced" || r.status === "named") return `<button class="btn mini primary work" data-mode="enrich">Enrich</button><button class="btn mini skip">Skip</button>`;
+    if (r.status === "emailed") return `<button class="btn mini primary work" data-mode="draft">Draft</button><button class="btn mini skip">Skip</button>`;
+    if (r.status === "drafted") return `<button class="btn mini goto" data-nav="drafts">Drafts →</button>`;
+    return `<button class="btn mini goto" data-nav="followups">Follow-ups →</button>`; // sent/replied/bounced
+  };
+
   const tb = $("#companies-table tbody");
   const shown = rows.filter((r) => pipeFilter === "all" || r.status === pipeFilter);
+  const byDom = {};
+  shown.forEach((r) => { byDom[r.domain] = r; });
   tb.innerHTML = shown.length
     ? shown
-        .map(
-          (r) => `<tr><td>${esc(r.name) || "<span class='dom'>—</span>"}</td>
-        <td class="dom">${esc(r.domain)}</td>
-        <td><span class="status s-${esc(r.status)}">${esc(r.status)}</span></td>
-        <td class="dom">${esc((r.first_seen || "").slice(0, 10))}</td></tr>`
-        )
+        .map((r) => `<tr data-domain="${escAttr(r.domain)}">
+          <td><div class="co">${esc(r.name) || "<span class='dom'>—</span>"}</div>${contactLine(r)}</td>
+          <td class="dom">${esc(r.domain)}</td>
+          <td><span class="status s-${esc(r.status)}">${esc(stageLabel(r.status))}</span></td>
+          <td class="dom">${esc((r.first_seen || "").slice(0, 10))}</td>
+          <td class="pipe-actions">${actionsFor(r)}</td></tr>`)
         .join("")
-    : `<tr><td colspan="4"><div class="empty">No companies yet — start a run in Chat.</div></td></tr>`;
+    : `<tr><td colspan="5"><div class="empty">No companies yet — start a run in Chat.</div></td></tr>`;
+
+  const setStatus = async (dom, value, okMsg) => {
+    try { await postJSON(`/api/companies/${encodeURIComponent(dom)}/status`, { value }); toast(okMsg, "ok"); loaders.pipeline(); }
+    catch (e) { toast(e.message, "err"); }
+  };
+  $$("#companies-table .skip").forEach((b) => b.addEventListener("click", () => setStatus(b.closest("tr").dataset.domain, "skip", "Skipped — won't be contacted.")));
+  $$("#companies-table .restore").forEach((b) => b.addEventListener("click", () => setStatus(b.closest("tr").dataset.domain, "restore", "Restored to the pipeline.")));
+  $$("#companies-table .goto").forEach((b) => b.addEventListener("click", () => show(b.dataset.nav)));
+  $$("#companies-table .work").forEach((b) =>
+    b.addEventListener("click", () => {
+      const r = byDom[b.closest("tr").dataset.domain];
+      const label = r.name ? `${r.name} (${r.domain})` : r.domain;
+      askAgent(b.dataset.mode === "draft"
+        ? `Draft personalized outreach for ${label}.`
+        : `Find a founder contact for ${label}, then draft personalized outreach.`);
+    })
+  );
 };
 
 // --- overview ---------------------------------------------------------------
@@ -241,7 +291,7 @@ loaders.overview = async () => {
       .join("");
   };
   $("#ov-queries").innerHTML = bars(d.queries, (l) => esc(l));
-  $("#ov-funnel").innerHTML = bars(d.funnel, (l) => `<span class="status s-${esc(l)}">${esc(l)}</span>`);
+  $("#ov-funnel").innerHTML = bars(d.funnel, (l) => `<span class="status s-${esc(l)}">${esc(stageLabel(l))}</span>`);
 };
 
 // --- drafts -----------------------------------------------------------------
