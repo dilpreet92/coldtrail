@@ -31,6 +31,12 @@ Canonical + Gmail connectors, and paste your pitch. Then use **Chat** to run the
 **Pipeline** to watch companies flow through statuses, and **Drafts** to review and hit
 **Send** (the only thing that ever sends — a human click).
 
+**Backends.** The agent runs on headless **Claude Code** / **Codex** (reuses your
+subscription + MCP), or on **your own model** — any OpenAI-compatible endpoint or a local
+**Ollama** — via a built-in tool-calling loop. (For BYOK/Ollama today, source by importing a
+Canonical results JSON and send from the Claude backend; native Canonical/Gmail for those
+models arrives with the MCP-client milestone.)
+
 Everything lives in `~/.coldtrail/` — the SQLite state, your private message template, the
 agent brief (`CLAUDE.md`), and the MCP config. The app binds `127.0.0.1` only, guarded by a
 one-time token in the URL. Nothing leaves your machine except the drafts you choose to send.
