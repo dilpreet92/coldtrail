@@ -26,6 +26,7 @@
     <button class="nav-item" data-nav="chat"><span class="dot"></span>Chat</button>
     <button class="nav-item" data-nav="pipeline"><span class="dot"></span>Pipeline</button>
     <button class="nav-item" data-nav="drafts"><span class="dot"></span>Drafts</button>
+    <button class="nav-item" data-nav="followups"><span class="dot"></span>Follow-ups</button>
   </nav>
 
   <div class="rail-foot">
@@ -127,6 +128,16 @@
   <section class="view" id="view-drafts">
     <header class="view-head"><h1>Drafts</h1><p class="sub">Review, then send by hand. <span id="warmup" class="warmup"></span></p></header>
     <div class="drafts" id="drafts-list"></div>
+  </section>
+
+  <!-- FOLLOW-UPS -->
+  <section class="view" id="view-followups">
+    <header class="view-head">
+      <h1>Follow-ups</h1>
+      <p class="sub">Who you've contacted, who replied, and who's due for a nudge.</p>
+      <div class="row" style="margin-top:12px"><button class="btn primary" id="check-replies">Check for replies</button><span class="form-msg" id="fu-msg"></span></div>
+    </header>
+    <div class="fu-list" id="followups-list"></div>
   </section>
 </main>
 

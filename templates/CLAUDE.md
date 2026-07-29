@@ -58,7 +58,8 @@ subcommands — never re-implement their logic, never touch `outreach.db` direct
 | `coldtrail add-contact <domain> "<name>" <email> [src]` | MX-verified contact |
 | `coldtrail find-emails [max]` | best-effort OSINT founder-email finder |
 | `coldtrail draft <domain> --subject "…" --body "…"` | store a personalized draft |
-| `coldtrail mark <domain> <id\|sent\|bounced>` | advance status |
+| `coldtrail followup <domain> --subject "…" --body "…"` | store a follow-up touch (no reply yet) |
+| `coldtrail mark <domain> <id\|sent\|replied\|bounced>` | advance status |
 | `coldtrail seed` | load already-contacted domains (dedupe guard) |
 
 Sourcing is fixed to Canonical (the good part). Everything else — enrichment, the pitch

@@ -289,6 +289,58 @@ loaders.drafts = async () => {
   );
 };
 
+// --- follow-ups -------------------------------------------------------------
+const FU_LABEL = { awaiting: "awaiting reply", due: "due for follow-up", replied: "replied", bounced: "bounced" };
+const FU_CLASS = { awaiting: "emailed", due: "drafted", replied: "sent", bounced: "bounced" };
+loaders.followups = async () => {
+  let rows;
+  try { rows = await getJSON("/api/followups"); } catch (e) { return; }
+  const list = $("#followups-list");
+  if (!rows.length) { list.innerHTML = `<div class="empty">No sent contacts yet — send a draft first.</div>`; return; }
+  list.innerHTML = rows
+    .map((r) => {
+      const open = r.state === "due" || r.state === "awaiting";
+      return `<div class="fu-row" data-domain="${escAttr(r.domain)}">
+        <div class="fu-main"><span class="to">${esc(r.to) || esc(r.domain)}</span>
+          <span class="fu-meta">${r.touches} sent · ${r.days}d ago</span></div>
+        <span class="status s-${FU_CLASS[r.state] || "sourced"}">${FU_LABEL[r.state] || esc(r.state)}</span>
+        <div class="fu-actions">
+          ${r.state === "due" ? `<button class="btn primary fu-draft">Draft follow-up</button>` : ""}
+          ${open ? `<button class="btn fu-mark" data-v="replied">Replied</button><button class="btn fu-mark" data-v="bounced">Bounced</button>` : ""}
+        </div></div>`;
+    })
+    .join("");
+  $$("#followups-list .fu-draft").forEach((b) =>
+    b.addEventListener("click", async () => {
+      const dom = b.closest(".fu-row").dataset.domain;
+      b.disabled = true; b.textContent = "drafting…";
+      try {
+        const r = await postJSON(`/api/followups/${encodeURIComponent(dom)}/draft`, {});
+        alert(r.message || "follow-up drafted");
+        await loaders.followups();
+      } catch (e) { b.disabled = false; b.textContent = "Draft follow-up"; alert(e.message); }
+    })
+  );
+  $$("#followups-list .fu-mark").forEach((b) =>
+    b.addEventListener("click", async () => {
+      const dom = b.closest(".fu-row").dataset.domain;
+      try { await postJSON(`/api/followups/${encodeURIComponent(dom)}/mark`, { value: b.dataset.v }); await loaders.followups(); }
+      catch (e) { alert(e.message); }
+    })
+  );
+};
+$("#check-replies").addEventListener("click", async () => {
+  const btn = $("#check-replies");
+  msg("#fu-msg", "checking Gmail for replies…", true);
+  btn.disabled = true;
+  try {
+    const r = await postJSON("/api/followups/check", {});
+    msg("#fu-msg", r.message || "done", r.ok);
+    await loaders.followups();
+  } catch (e) { msg("#fu-msg", e.message, false); }
+  finally { btn.disabled = false; }
+});
+
 // --- chat -------------------------------------------------------------------
 const log = $("#chat-log");
 function bubble(cls, text) {

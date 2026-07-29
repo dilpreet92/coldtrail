@@ -39,6 +39,12 @@ pub fn defs(canonical_connected: bool) -> Value {
                 "domain":{"type":"string"},"subject":{"type":"string"},"body":{"type":"string"}},
                 "required":["domain","subject","body"]}}}),
         json!({"type":"function","function":{
+            "name":"followup",
+            "description":"Store a follow-up touch (a new email) for an already-contacted company that didn't reply. Never sends.",
+            "parameters":{"type":"object","properties":{
+                "domain":{"type":"string"},"subject":{"type":"string"},"body":{"type":"string"}},
+                "required":["domain","subject","body"]}}}),
+        json!({"type":"function","function":{
             "name":"mark",
             "description":"Advance a company's status: a gmail draft id, or 'sent' / 'bounced'.",
             "parameters":{"type":"object","properties":{
@@ -92,6 +98,16 @@ pub async fn exec(name: &str, args: &Value) -> String {
         "draft" => {
             match crate::draft::add(&s(args, "domain"), &s(args, "subject"), &s(args, "body")) {
                 Ok(_) => format!("drafted {}", s(args, "domain")),
+                Err(e) => format!("error: {e}"),
+            }
+        }
+        "followup" => {
+            match crate::draft::followup_add(
+                &s(args, "domain"),
+                &s(args, "subject"),
+                &s(args, "body"),
+            ) {
+                Ok(_) => format!("follow-up drafted for {}", s(args, "domain")),
                 Err(e) => format!("error: {e}"),
             }
         }

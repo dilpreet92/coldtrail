@@ -46,6 +46,28 @@ pub fn add(domain: &str, subject: &str, body: &str) -> Result<()> {
     Ok(())
 }
 
+/// Store a follow-up as a NEW touch (outreach row) for a domain that was already
+/// contacted. Always inserts — a domain can have several touches over time.
+pub fn followup_add(domain: &str, subject: &str, body: &str) -> Result<()> {
+    let domain = domain.trim().to_lowercase();
+    crate::db::init()?;
+    let conn = crate::db::open()?;
+    let contact_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM contacts WHERE domain=?1 AND email IS NOT NULL ORDER BY found_at DESC LIMIT 1",
+            [&domain],
+            |r| r.get(0),
+        )
+        .optional()?;
+    conn.execute(
+        "INSERT INTO outreach (domain, contact_id, subject, body, status) \
+         VALUES (?1, ?2, ?3, ?4, 'draft_pending')",
+        params![domain, contact_id, subject, body],
+    )?;
+    println!("follow-up drafted for {domain}: {subject}");
+    Ok(())
+}
+
 /// A row eligible for drafting: (contact_id, domain, founder_name, email, company_name).
 type DraftRow = (i64, String, Option<String>, String, Option<String>);
 

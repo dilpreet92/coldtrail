@@ -4,8 +4,63 @@ use axum::extract::Path;
 use axum::Json;
 use rusqlite::params;
 
-use super::api::{CompanyDto, ContactDto, DraftDto, DraftEditReq, MsgResp, OverviewDto};
+use super::api::{
+    CompanyDto, ContactDto, DraftDto, DraftEditReq, FollowupDto, MarkReq, MsgResp, OverviewDto,
+};
 use super::ApiErr;
+
+/// One row per already-contacted domain, with days-since-send and a derived state.
+pub async fn followups() -> Result<Json<Vec<FollowupDto>>, ApiErr> {
+    let c = crate::db::open()?;
+    let mut stmt = c.prepare(
+        "SELECT o.domain, MAX(k.email), \
+                CAST(julianday('now') - julianday(MAX(o.sent_at)) AS INTEGER), \
+                SUM(CASE WHEN o.status IN ('sent','replied','bounced') THEN 1 ELSE 0 END), \
+                MAX(CASE WHEN o.status='replied' THEN 1 ELSE 0 END), \
+                MAX(CASE WHEN o.status='bounced' THEN 1 ELSE 0 END) \
+         FROM outreach o LEFT JOIN contacts k ON k.id = o.contact_id \
+         WHERE EXISTS (SELECT 1 FROM outreach s WHERE s.domain=o.domain AND s.status IN ('sent','replied','bounced')) \
+         GROUP BY o.domain ORDER BY MAX(o.sent_at) DESC",
+    )?;
+    let rows: Vec<FollowupDto> = stmt
+        .query_map([], |r| {
+            let days: Option<i64> = r.get(2)?;
+            let sends: i64 = r.get(3)?;
+            let replied: i64 = r.get(4)?;
+            let bounced: i64 = r.get(5)?;
+            let days = days.unwrap_or(0);
+            let state = if replied != 0 {
+                "replied"
+            } else if bounced != 0 {
+                "bounced"
+            } else if days >= 4 && sends < 3 {
+                "due"
+            } else {
+                "awaiting"
+            };
+            Ok(FollowupDto {
+                domain: r.get(0)?,
+                to: r.get(1)?,
+                days,
+                touches: sends,
+                state: state.to_string(),
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(Json(rows))
+}
+
+/// Manually mark a contact replied / bounced (fallback to the agent reply-check).
+pub async fn mark_touch(
+    axum::extract::Path(domain): axum::extract::Path<String>,
+    Json(req): Json<MarkReq>,
+) -> Result<Json<MsgResp>, ApiErr> {
+    if req.value != "replied" && req.value != "bounced" {
+        return Err(anyhow::anyhow!("mark value must be 'replied' or 'bounced'").into());
+    }
+    crate::mark::run(&domain.to_lowercase(), &req.value)?;
+    Ok(Json(MsgResp::ok()))
+}
 
 /// Edit a draft's subject/body before sending (only reviewable drafts).
 pub async fn save_draft(

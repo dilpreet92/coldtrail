@@ -21,6 +21,13 @@ pub fn run(domain: &str, value: &str) -> Result<()> {
             )?;
             crate::db::set_status(&conn, domain, "bounced")?;
         }
+        "replied" => {
+            conn.execute(
+                "UPDATE outreach SET status='replied' WHERE domain=?1",
+                [domain],
+            )?;
+            crate::db::set_status(&conn, domain, "replied")?;
+        }
         draft_id => {
             conn.execute(
                 "UPDATE outreach SET gmail_draft_id=?1, status='drafted' WHERE domain=?2",

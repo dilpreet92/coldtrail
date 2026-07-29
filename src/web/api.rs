@@ -40,6 +40,23 @@ pub struct DraftEditReq {
 }
 
 #[derive(Serialize)]
+pub struct FollowupDto {
+    pub domain: String,
+    pub to: Option<String>,
+    /// Days since the most recent send.
+    pub days: i64,
+    /// Number of touches sent so far.
+    pub touches: i64,
+    /// awaiting | due | replied | bounced
+    pub state: String,
+}
+
+#[derive(Deserialize)]
+pub struct MarkReq {
+    pub value: String,
+}
+
+#[derive(Serialize)]
 pub struct OverviewDto {
     pub companies: i64,
     pub contacts: i64,

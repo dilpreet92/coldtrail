@@ -3,6 +3,7 @@
 
 pub mod api;
 pub mod chat;
+pub mod followups;
 pub mod onboarding;
 pub mod pipeline;
 pub mod send;
@@ -91,6 +92,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/contacts", get(pipeline::contacts))
         .route("/api/drafts", get(pipeline::drafts))
         .route("/api/overview", get(pipeline::overview))
+        .route("/api/followups", get(pipeline::followups))
+        .route("/api/followups/check", post(followups::check))
+        .route("/api/followups/:domain/mark", post(pipeline::mark_touch))
+        .route("/api/followups/:domain/draft", post(followups::draft))
         .route("/api/chat", post(chat::start))
         .route("/api/chat/stream", get(chat::stream))
         .route("/api/drafts/:domain", post(pipeline::save_draft))

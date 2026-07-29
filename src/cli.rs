@@ -75,6 +75,14 @@ pub enum Commands {
         #[arg(long)]
         body: String,
     },
+    /// Store a follow-up touch for an already-contacted company (never sends)
+    Followup {
+        domain: String,
+        #[arg(long)]
+        subject: String,
+        #[arg(long)]
+        body: String,
+    },
     /// Record a Gmail draft id, or mark sent / bounced
     Mark { domain: String, value: String },
     /// Load already-contacted domains from contacted.toml (dedupe guard)

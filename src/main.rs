@@ -57,6 +57,11 @@ async fn main() -> anyhow::Result<()> {
             subject,
             body,
         }) => draft::add(&domain, &subject, &body),
+        Some(Commands::Followup {
+            domain,
+            subject,
+            body,
+        }) => draft::followup_add(&domain, &subject, &body),
         Some(Commands::Mark { domain, value }) => mark::run(&domain, &value),
         Some(Commands::Seed) => seed::run(),
         Some(Commands::Update) => run::update(),
