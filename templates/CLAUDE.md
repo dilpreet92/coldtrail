@@ -18,7 +18,9 @@ subcommands — never re-implement their logic, never touch `outreach.db` direct
 2. **Enrich.** Get a founder contact per company — prefer free OSINT, escalate as needed:
    - **theHarvester first** (coldtrail installs it during setup): `theHarvester -d <domain> -b all`
      via Bash to pull emails/names, then `coldtrail add-contact <domain> "<Full Name>" <email> theHarvester`.
-     SpiderFoot too if present. If `theHarvester` isn't on PATH, don't stall — use the paths below.
+   - **SpiderFoot** if present (coldtrail can install it too): e.g.
+     `spiderfoot -s <domain> -m sfp_hunter,sfp_emailrep,sfp_names -o json` and mine the output.
+   - If neither OSINT tool is on PATH, don't stall — use the paths below.
    - WebSearch / your knowledge → `coldtrail add-contact <domain> "<Full Name>" <email> [source]`
    - the built-in finder: `coldtrail find-emails [max]` (DuckDuckGo + on-domain scan)
    Every path MX-verifies before storing and rejects generic/placeholder addresses.

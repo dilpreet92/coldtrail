@@ -182,6 +182,21 @@ pub fn run(opts: SetupOpts) -> Result<()> {
              (the agent falls back to its built-in web finder either way)."
         );
     }
+    if osint.spiderfoot {
+        println!("  ✓ SpiderFoot already installed");
+    } else if osint.spiderfoot_can_install {
+        print!("  installing SpiderFoot (clone + venv, a few minutes)… ");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        match crate::osint::install_spiderfoot() {
+            Ok(_) => println!("done"),
+            Err(e) => println!("skipped ({e})"),
+        }
+    } else {
+        println!(
+            "  – SpiderFoot skipped (needs git + Python 3.10–3.12). Install those to enable it."
+        );
+    }
 
     println!("\ndone. run `coldtrail` — OAuth for Canonical/Gmail completes in your browser on first use.");
     Ok(())

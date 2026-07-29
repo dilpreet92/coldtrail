@@ -150,33 +150,36 @@ function msg(el, text, ok) {
   m.className = "form-msg " + (ok ? "ok" : "err");
 }
 
-// Enrichment (OSINT) setup panel: detected / one-click install / can't-install.
+// Enrichment (OSINT) setup panel: one row per tool — detected, one-click install, or why not.
 function renderOsint(o) {
   const state = $("#osint-state");
-  if (state) state.textContent = o.the_harvester ? "· ready" : "";
+  if (state) state.textContent = (o.the_harvester || o.spiderfoot) ? "· ready" : "";
   const body = $("#osint-body");
   if (!body) return;
-  const extra = o.spiderfoot ? `<p class="hint">✓ SpiderFoot also detected.</p>` : "";
-  if (o.the_harvester) {
-    body.innerHTML = `<p class="hint">✓ <strong>theHarvester</strong> is installed — enrichment runs will use it.</p>${extra}`;
-    return;
-  }
-  if (o.can_install) {
-    body.innerHTML = `<div class="row"><button class="btn primary" id="install-osint">Install theHarvester</button><span class="form-msg" id="osint-msg"></span></div>
-      <p class="hint" style="margin-top:8px">One-time, via pipx (~a minute). coldtrail runs the install for you.</p>${extra}`;
-    $("#install-osint").addEventListener("click", async () => {
-      const b = $("#install-osint");
+
+  const row = (tool, label, installed, canInstall, why) => {
+    if (installed) return `<div class="osint-tool"><span class="ok">✓ ${label}</span><span class="osint-note">installed</span></div>`;
+    if (canInstall) return `<div class="osint-tool"><span>${label}</span><button class="btn mini primary osint-install" data-tool="${tool}" data-label="${label}">Install</button></div>`;
+    return `<div class="osint-tool"><span class="muted">${label}</span><span class="osint-note">${why}</span></div>`;
+  };
+
+  body.innerHTML =
+    row("the_harvester", "theHarvester", o.the_harvester, o.the_harvester_can_install, o.pipx ? "unavailable" : "needs pipx") +
+    row("spiderfoot", "SpiderFoot", o.spiderfoot, o.spiderfoot_can_install, "needs git + Python 3.10–3.12") +
+    `<span class="form-msg" id="osint-msg"></span>`;
+
+  $$("#osint-body .osint-install").forEach((b) =>
+    b.addEventListener("click", async () => {
+      const label = b.dataset.label;
       b.disabled = true; b.textContent = "installing…";
-      msg("#osint-msg", "installing via pipx… about a minute", true);
+      msg("#osint-msg", `installing ${label}… this can take a few minutes`, true);
       try {
-        const r = await postJSON("/api/onboarding/osint/install", {});
+        const r = await postJSON("/api/onboarding/osint/install", { tool: b.dataset.tool });
         toast(r.message || (r.ok ? "installed" : "install failed"), r.ok ? "ok" : "err");
         await loadStatus();
-      } catch (e) { b.disabled = false; b.textContent = "Install theHarvester"; msg("#osint-msg", e.message, false); }
-    });
-    return;
-  }
-  body.innerHTML = `<p class="hint">theHarvester isn't installed and <code>pipx</code> wasn't found, so coldtrail can't auto-install it. Install pipx (<code>python3 -m pip install --user pipx &amp;&amp; python3 -m pipx ensurepath</code>) and reload — or just rely on the built-in web finder.</p>${extra}`;
+      } catch (e) { b.disabled = false; b.textContent = "Install"; msg("#osint-msg", e.message, false); }
+    })
+  );
 }
 
 $("#connect-canonical").addEventListener("click", async () => {

@@ -1,12 +1,18 @@
 //! OSINT enrichment tooling. coldtrail's agent does deeper founder-email discovery with
-//! theHarvester when it's on the machine; this module detects it and (best-effort)
-//! installs it via pipx during setup. Everything degrades gracefully to the built-in
-//! web finder when the tools — or pipx — aren't available.
+//! theHarvester and SpiderFoot when they're on the machine; this module detects them and
+//! (best-effort) installs them during setup — theHarvester via pipx, SpiderFoot via a
+//! self-contained git clone + venv (it isn't pip-installable). Everything degrades
+//! gracefully to the built-in web finder when the tools, or their prerequisites, are absent.
 
 use anyhow::{anyhow, Result};
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// SpiderFoot pins `lxml<5`, whose wheels stop at CPython 3.12 — newer interpreters build
+/// from source and fail. Build its venv against one of these (in order), not `python3`.
+const SF_PYTHONS: &[&str] = &["python3.12", "python3.11", "python3.10"];
+const SF_REPO: &str = "https://github.com/smicallef/spiderfoot.git";
 
 /// Is `bin` an executable file on the current PATH?
 pub fn on_path(bin: &str) -> bool {
@@ -32,30 +38,51 @@ pub fn the_harvester_present() -> bool {
     on_path("theHarvester") || on_path("theharvester") || home_local_bin("theHarvester")
 }
 
+/// coldtrail's own SpiderFoot install lives inside the workspace so it's contained.
+fn spiderfoot_dir() -> Option<PathBuf> {
+    crate::home::workspace()
+        .ok()
+        .map(|w| w.join("tools").join("spiderfoot"))
+}
+
 fn spiderfoot_present() -> bool {
-    on_path("spiderfoot") || on_path("sf") || on_path("sfcli")
+    if on_path("spiderfoot") || on_path("sf") || on_path("sfcli") || home_local_bin("spiderfoot") {
+        return true;
+    }
+    spiderfoot_dir()
+        .map(|d| d.join("sf.py").is_file() && d.join(".venv").join("bin").join("python").is_file())
+        .unwrap_or(false)
+}
+
+/// The first PATH-present Python that can build SpiderFoot's deps, if any.
+fn compatible_python() -> Option<&'static str> {
+    SF_PYTHONS.iter().copied().find(|p| on_path(p))
 }
 
 #[derive(Serialize)]
 pub struct OsintStatus {
-    /// theHarvester is installed (the tool coldtrail auto-installs and the agent prefers).
+    /// theHarvester is installed (coldtrail auto-installs it; the agent prefers it).
     pub the_harvester: bool,
-    /// SpiderFoot is installed (optional, detected only — coldtrail doesn't install it).
+    /// pipx present and theHarvester missing — a one-click install is possible.
+    pub the_harvester_can_install: bool,
+    /// SpiderFoot is installed (via coldtrail's contained git-clone + venv).
     pub spiderfoot: bool,
-    /// pipx is available, so coldtrail can install theHarvester for the user.
+    /// git + a compatible Python are present and SpiderFoot is missing — installable.
+    pub spiderfoot_can_install: bool,
+    /// pipx is available (used to explain what's missing in the UI).
     pub pipx: bool,
-    /// pipx is present and theHarvester is missing — i.e. a one-click install is possible.
-    pub can_install: bool,
 }
 
 pub fn status() -> OsintStatus {
     let th = the_harvester_present();
+    let sf = spiderfoot_present();
     let pipx = on_path("pipx");
     OsintStatus {
         the_harvester: th,
-        spiderfoot: spiderfoot_present(),
+        the_harvester_can_install: pipx && !th,
+        spiderfoot: sf,
+        spiderfoot_can_install: !sf && on_path("git") && compatible_python().is_some(),
         pipx,
-        can_install: pipx && !th,
     }
 }
 
@@ -96,6 +123,112 @@ pub fn install_the_harvester() -> Result<String> {
     }
 }
 
+fn tail(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .rev()
+        .take(400)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect()
+}
+
+/// Best-effort install of SpiderFoot. It isn't pip-installable (no packaging metadata),
+/// so coldtrail clones it into `~/.coldtrail/tools/spiderfoot`, builds a venv with a
+/// wheel-compatible Python, installs its requirements, and drops a `spiderfoot` launcher
+/// on PATH. Blocking; run it off the async runtime.
+pub fn install_spiderfoot() -> Result<String> {
+    if spiderfoot_present() {
+        return Ok("SpiderFoot is already installed.".into());
+    }
+    if !on_path("git") {
+        return Err(anyhow!(
+            "git isn't installed, so coldtrail can't fetch SpiderFoot. Install git and retry."
+        ));
+    }
+    let py = compatible_python().ok_or_else(|| {
+        anyhow!(
+            "SpiderFoot needs Python 3.10–3.12 (its lxml pin has no wheels for 3.13+). Install \
+             one (e.g. `brew install python@3.12`) and retry — theHarvester + the built-in web \
+             finder still cover enrichment."
+        )
+    })?;
+    let dir =
+        spiderfoot_dir().ok_or_else(|| anyhow!("couldn't resolve the coldtrail workspace"))?;
+
+    // 1. clone (shallow) if we don't already have the source
+    if !dir.join("sf.py").is_file() {
+        if let Some(parent) = dir.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let out = Command::new("git")
+            .args(["clone", "--depth", "1", SF_REPO])
+            .arg(&dir)
+            .output()
+            .map_err(|e| anyhow!("git clone couldn't start: {e}"))?;
+        if !out.status.success() && !dir.join("sf.py").is_file() {
+            return Err(anyhow!("git clone failed: {}", tail(&out.stderr)));
+        }
+    }
+
+    // 2. venv against a compatible Python
+    let venv = dir.join(".venv");
+    let vpy = venv.join("bin").join("python");
+    if !vpy.is_file() {
+        let out = Command::new(py)
+            .arg("-m")
+            .arg("venv")
+            .arg(&venv)
+            .output()
+            .map_err(|e| anyhow!("couldn't create the venv with {py}: {e}"))?;
+        if !out.status.success() {
+            return Err(anyhow!("venv creation failed: {}", tail(&out.stderr)));
+        }
+    }
+
+    // 3. install requirements (pip finds wheels on the compatible Python)
+    let vpip = venv.join("bin").join("pip");
+    let _ = Command::new(&vpip)
+        .args(["install", "--upgrade", "pip"])
+        .output();
+    let out = Command::new(&vpip)
+        .arg("install")
+        .arg("-r")
+        .arg(dir.join("requirements.txt"))
+        .output()
+        .map_err(|e| anyhow!("pip couldn't start: {e}"))?;
+    if !out.status.success() {
+        return Err(anyhow!("pip install failed: {}", tail(&out.stderr)));
+    }
+
+    // 4. launcher shim on PATH
+    write_spiderfoot_launcher(&vpy, &dir.join("sf.py"))?;
+    Ok("Installed SpiderFoot — new enrichment runs can use it.".into())
+}
+
+/// Write `~/.local/bin/spiderfoot` → runs the venv's Python against `sf.py`.
+fn write_spiderfoot_launcher(venv_python: &Path, sf_py: &Path) -> Result<()> {
+    let bin = dirs::home_dir()
+        .ok_or_else(|| anyhow!("no home directory"))?
+        .join(".local")
+        .join("bin");
+    std::fs::create_dir_all(&bin)?;
+    let launcher = bin.join("spiderfoot");
+    let script = format!(
+        "#!/bin/sh\nexec \"{}\" \"{}\" \"$@\"\n",
+        venv_python.display(),
+        sf_py.display()
+    );
+    std::fs::write(&launcher, script)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,7 +243,10 @@ mod tests {
     #[test]
     fn status_is_internally_consistent() {
         let s = status();
-        // can_install is exactly "pipx present AND theHarvester absent".
-        assert_eq!(s.can_install, s.pipx && !s.the_harvester);
+        // the install flags are exactly their prerequisite conjunctions.
+        assert_eq!(s.the_harvester_can_install, s.pipx && !s.the_harvester);
+        if s.spiderfoot {
+            assert!(!s.spiderfoot_can_install);
+        }
     }
 }

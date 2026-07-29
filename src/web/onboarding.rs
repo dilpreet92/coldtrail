@@ -68,10 +68,18 @@ pub async fn status() -> Result<Json<StatusDto>, ApiErr> {
     }))
 }
 
-/// Auto-install theHarvester (via pipx) on demand from the browser Setup panel.
-/// Runs off the async runtime; degrades gracefully when pipx is unavailable.
-pub async fn install_osint() -> Result<Json<MsgResp>, ApiErr> {
-    let res = tokio::task::spawn_blocking(crate::osint::install_the_harvester).await;
+/// Auto-install an OSINT tool on demand from the browser Setup panel. Runs off the async
+/// runtime; degrades gracefully when prerequisites (pipx / git / a compatible Python) are
+/// missing.
+pub async fn install_osint(
+    Json(req): Json<super::api::OsintInstallReq>,
+) -> Result<Json<MsgResp>, ApiErr> {
+    let installer = match req.tool.as_str() {
+        "spiderfoot" => crate::osint::install_spiderfoot,
+        // default to theHarvester for any other/legacy value
+        _ => crate::osint::install_the_harvester,
+    };
+    let res = tokio::task::spawn_blocking(installer).await;
     let resp = match res {
         Ok(Ok(message)) => MsgResp {
             ok: true,

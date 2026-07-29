@@ -132,6 +132,12 @@ pub struct TomlReq {
     pub toml: String,
 }
 
+#[derive(Deserialize)]
+pub struct OsintInstallReq {
+    /// "the_harvester" | "spiderfoot"
+    pub tool: String,
+}
+
 #[derive(Serialize)]
 pub struct MsgResp {
     pub ok: bool,
