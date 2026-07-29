@@ -10,6 +10,7 @@ use crate::agents::{self, AgentKind, AgentStatus};
 use crate::mcp::{self, McpServer, OAuthClient};
 
 pub const CLAUDE_MD: &str = include_str!("../templates/CLAUDE.md");
+pub const ENRICHMENT_MD: &str = include_str!("../templates/enrichment.md");
 pub const MESSAGE_TOML: &str = include_str!("../templates/message.toml");
 pub const CONTACTED_TOML: &str = include_str!("../templates/contacted.toml");
 pub const CONFIG_TOML: &str = "agent = \"claude\"\n";
@@ -29,6 +30,7 @@ pub struct SetupOpts {
 pub fn ensure() -> Result<()> {
     crate::home::workspace()?;
     crate::home::write_asset("CLAUDE.md", CLAUDE_MD, true)?;
+    crate::home::write_asset("enrichment.md", ENRICHMENT_MD, true)?;
     crate::home::write_asset("message.toml", MESSAGE_TOML, false)?;
     crate::home::write_asset("contacted.toml", CONTACTED_TOML, false)?;
     crate::home::write_asset("config.toml", CONFIG_TOML, false)?;
@@ -401,6 +403,7 @@ mod tests {
             ensure().unwrap();
             for f in [
                 "CLAUDE.md",
+                "enrichment.md",
                 "config.toml",
                 "message.toml",
                 "contacted.toml",

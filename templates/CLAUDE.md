@@ -15,15 +15,11 @@ subcommands — never re-implement their logic, never touch `outreach.db` direct
    to a JSON file, then import it (deduped by domain):
    `coldtrail import <results.json> "<short ICP label>"`
    Already-known domains are skipped automatically.
-2. **Enrich.** Get a founder contact per company — prefer free OSINT, escalate as needed:
-   - **theHarvester first** (coldtrail installs it during setup): `theHarvester -d <domain> -b all`
-     via Bash to pull emails/names, then `coldtrail add-contact <domain> "<Full Name>" <email> theHarvester`.
-   - **SpiderFoot** if present (coldtrail can install it too): e.g.
-     `spiderfoot -s <domain> -m sfp_hunter,sfp_emailrep,sfp_names -o json` and mine the output.
-   - If neither OSINT tool is on PATH, don't stall — use the paths below.
-   - WebSearch / your knowledge → `coldtrail add-contact <domain> "<Full Name>" <email> [source]`
-   - the built-in finder: `coldtrail find-emails [max]` (DuckDuckGo + on-domain scan)
-   Every path MX-verifies before storing and rejects generic/placeholder addresses.
+2. **Enrich.** Get a founder contact per company. **Read `enrichment.md` in this workspace
+   first** — it's coldtrail's technique ladder (OSINT tools, GitHub commit metadata, crt.sh,
+   WHOIS, on-domain/web, and pattern-only-if-confirmed) plus the honesty rules. Work down it,
+   store with provenance via `coldtrail add-contact <domain> "<Full Name>" <email> <source>`
+   (MX-verified; generic/placeholder rejected), and skip any rung your tools can't run.
 3. **Compose a personalized pitch — per company.** Read `message.toml` as your **brief**:
    it carries the user's voice, offer/value-prop, the call-to-action link (keep its
    `{slug}` UTM), and any constraints. **Do not send the template verbatim.** For each

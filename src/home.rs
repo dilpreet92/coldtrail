@@ -29,6 +29,9 @@ pub fn write_asset(name: &str, contents: &str, overwrite: bool) -> Result<bool> 
     if p.exists() && !overwrite {
         return Ok(false);
     }
+    if let Some(parent) = p.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
     fs::write(&p, contents).with_context(|| format!("write {}", p.display()))?;
     Ok(true)
 }
