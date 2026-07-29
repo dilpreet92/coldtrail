@@ -1,9 +1,62 @@
 //! Read-only pipeline data for the dashboard, straight from SQLite.
 
+use axum::extract::Path;
 use axum::Json;
+use rusqlite::params;
 
-use super::api::{CompanyDto, ContactDto, DraftDto};
+use super::api::{CompanyDto, ContactDto, DraftDto, DraftEditReq, MsgResp, OverviewDto};
 use super::ApiErr;
+
+/// Edit a draft's subject/body before sending (only reviewable drafts).
+pub async fn save_draft(
+    Path(domain): Path<String>,
+    Json(req): Json<DraftEditReq>,
+) -> Result<Json<MsgResp>, ApiErr> {
+    let domain = domain.to_lowercase();
+    let c = crate::db::open()?;
+    let n = c.execute(
+        "UPDATE outreach SET subject = COALESCE(?2, subject), body = COALESCE(?3, body) \
+         WHERE domain = ?1 AND status IN ('draft_pending','drafted')",
+        params![domain, req.subject, req.body],
+    )?;
+    if n == 0 {
+        return Err(anyhow::anyhow!("no editable draft for {domain}").into());
+    }
+    Ok(Json(MsgResp::ok()))
+}
+
+/// Pipeline summary: totals, the company-status funnel, and per-ICP query counts.
+pub async fn overview() -> Result<Json<OverviewDto>, ApiErr> {
+    let c = crate::db::open()?;
+    let one = |sql: &str| c.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap_or(0);
+    let companies = one("SELECT count(*) FROM companies");
+    let contacts = one("SELECT count(*) FROM contacts WHERE email IS NOT NULL AND mx_ok = 1");
+    let drafts = one("SELECT count(*) FROM outreach WHERE status IN ('draft_pending','drafted')");
+    let sent = one("SELECT count(*) FROM outreach WHERE status = 'sent'");
+
+    let pairs = |sql: &str| -> Vec<(String, i64)> {
+        c.prepare(sql)
+            .and_then(|mut s| {
+                s.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap_or_default()
+    };
+    let funnel =
+        pairs("SELECT status, count(*) FROM companies GROUP BY status ORDER BY count(*) DESC");
+    let queries = pairs(
+        "SELECT COALESCE(source_query,'—'), count(*) FROM companies GROUP BY source_query ORDER BY count(*) DESC",
+    );
+
+    Ok(Json(OverviewDto {
+        companies,
+        contacts,
+        drafts,
+        sent,
+        funnel,
+        queries,
+    }))
+}
 
 pub async fn companies() -> Result<Json<Vec<CompanyDto>>, ApiErr> {
     let c = crate::db::open()?;

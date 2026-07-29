@@ -22,6 +22,7 @@
 
   <nav class="nav">
     <button class="nav-item" data-nav="onboarding"><span class="dot"></span>Setup</button>
+    <button class="nav-item" data-nav="overview"><span class="dot"></span>Overview</button>
     <button class="nav-item" data-nav="chat"><span class="dot"></span>Chat</button>
     <button class="nav-item" data-nav="pipeline"><span class="dot"></span>Pipeline</button>
     <button class="nav-item" data-nav="drafts"><span class="dot"></span>Drafts</button>
@@ -91,6 +92,16 @@
         <textarea id="contacted-toml" spellcheck="false" rows="8"></textarea>
         <div class="row"><button class="btn" id="save-contacted">Save list</button><span class="form-msg" id="contacted-msg"></span></div>
       </div>
+    </div>
+  </section>
+
+  <!-- OVERVIEW -->
+  <section class="view" id="view-overview">
+    <header class="view-head"><h1>Overview</h1><p class="sub">Your pipeline at a glance — what you searched, who you found, what's drafted and sent.</p></header>
+    <div class="tiles" id="ov-tiles"></div>
+    <div class="ov-cols">
+      <div class="panel"><h2>ICP searches</h2><div class="ov-list" id="ov-queries"></div></div>
+      <div class="panel"><h2>Funnel</h2><div class="ov-list" id="ov-funnel"></div></div>
     </div>
   </section>
 

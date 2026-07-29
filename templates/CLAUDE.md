@@ -15,10 +15,12 @@ subcommands — never re-implement their logic, never touch `outreach.db` direct
    to a JSON file, then import it (deduped by domain):
    `coldtrail import <results.json> "<short ICP label>"`
    Already-known domains are skipped automatically.
-2. **Enrich.** Get a founder contact per company:
-   - from your WebSearch/knowledge: `coldtrail add-contact <domain> "<Full Name>" <email> [source]`
-   - or the built-in finder: `coldtrail find-emails [max]`
-   Both MX-verify before storing and reject generic/placeholder addresses.
+2. **Enrich.** Get a founder contact per company — prefer free sources, escalate as needed:
+   - WebSearch / your knowledge → `coldtrail add-contact <domain> "<Full Name>" <email> [source]`
+   - free OSINT via Bash when installed: `theHarvester -d <domain> -b all` (or SpiderFoot),
+     then `add-contact` the founder address you find
+   - the built-in finder: `coldtrail find-emails [max]` (DuckDuckGo + on-domain scan)
+   Every path MX-verifies before storing and rejects generic/placeholder addresses.
 3. **Compose a personalized pitch — per company.** Read `message.toml` as your **brief**:
    it carries the user's voice, offer/value-prop, the call-to-action link (keep its
    `{slug}` UTM), and any constraints. **Do not send the template verbatim.** For each

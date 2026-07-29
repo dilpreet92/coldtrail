@@ -33,6 +33,24 @@ pub struct GmailConnectReq {
     pub callback_port: Option<u16>,
 }
 
+#[derive(Deserialize)]
+pub struct DraftEditReq {
+    pub subject: Option<String>,
+    pub body: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct OverviewDto {
+    pub companies: i64,
+    pub contacts: i64,
+    pub drafts: i64,
+    pub sent: i64,
+    /// (company status, count), most common first.
+    pub funnel: Vec<(String, i64)>,
+    /// (ICP source_query label, company count).
+    pub queries: Vec<(String, i64)>,
+}
+
 #[derive(Serialize)]
 pub struct CompanyDto {
     pub domain: String,

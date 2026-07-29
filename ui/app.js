@@ -205,43 +205,88 @@ loaders.pipeline = async () => {
     : `<tr><td colspan="4"><div class="empty">No companies yet — start a run in Chat.</div></td></tr>`;
 };
 
+// --- overview ---------------------------------------------------------------
+loaders.overview = async () => {
+  let d;
+  try { d = await getJSON("/api/overview"); } catch (e) { return; }
+  $("#ov-tiles").innerHTML = [
+    ["Companies", d.companies],
+    ["Verified contacts", d.contacts],
+    ["Drafts", d.drafts],
+    ["Sent", d.sent],
+  ].map(([k, v]) => `<div class="tile"><div class="tv">${v}</div><div class="tk">${k}</div></div>`).join("");
+
+  const bars = (rows, labelHtml) => {
+    if (!rows.length) return `<div class="empty">Nothing yet.</div>`;
+    const max = Math.max(1, ...rows.map((r) => r[1]));
+    return rows
+      .map(([label, n]) =>
+        `<div class="ov-row"><span class="ov-label">${labelHtml(label)}</span>
+         <span class="ov-bar"><i style="width:${Math.round((n / max) * 100)}%"></i></span>
+         <span class="ov-n">${n}</span></div>`
+      )
+      .join("");
+  };
+  $("#ov-queries").innerHTML = bars(d.queries, (l) => esc(l));
+  $("#ov-funnel").innerHTML = bars(d.funnel, (l) => `<span class="status s-${esc(l)}">${esc(l)}</span>`);
+};
+
 // --- drafts -----------------------------------------------------------------
+const escAttr = (s) => esc(s).replace(/"/g, "&quot;");
 loaders.drafts = async () => {
   let rows;
   try { rows = await getJSON("/api/drafts"); } catch (e) { return; }
   const sent = rows.filter((r) => r.status === "sent").length;
   $("#warmup").textContent = `${sent} sent · pace new mailboxes to ~5/day`;
   const list = $("#drafts-list");
-  const pending = rows.filter((r) => r.status === "draft_pending" || r.status === "drafted");
   if (!rows.length) { list.innerHTML = `<div class="empty">No drafts yet — ask the agent to draft outreach in Chat.</div>`; return; }
   list.innerHTML = rows
-    .map((r, i) => {
-      const canSend = r.status === "draft_pending" || r.status === "drafted";
-      return `<div class="draft" data-domain="${esc(r.domain)}">
-        <div class="draft-head">
+    .map((r) => {
+      const editable = r.status === "draft_pending" || r.status === "drafted";
+      const head = `<div class="draft-head">
           <span class="to">${esc(r.to) || esc(r.domain)}</span>
-          <span class="subj">${esc(r.subject) || "(no subject)"}</span>
           <span class="spacer"></span>
           <span class="status s-${esc(r.status)}">${esc(r.status)}</span>
-          ${canSend ? `<button class="btn primary send" data-i="${i}">Send</button>` : ""}
-        </div>
-        <div class="draft-body">${esc(r.body) || ""}</div>
-      </div>`;
+          ${editable ? `<button class="btn save">Save</button><button class="btn primary send">Send</button>` : ""}
+        </div>`;
+      const bodyBlock = editable
+        ? `<input class="draft-subj" value="${escAttr(r.subject || "")}" placeholder="subject" />
+           <textarea class="draft-body-edit" rows="9" spellcheck="false">${esc(r.body || "")}</textarea>`
+        : `<div class="draft-subj-ro">${esc(r.subject || "")}</div><div class="draft-body">${esc(r.body || "")}</div>`;
+      return `<div class="draft" data-domain="${escAttr(r.domain)}">${head}${bodyBlock}</div>`;
     })
     .join("");
+
+  const edits = (card) => ({
+    subject: card.querySelector(".draft-subj")?.value,
+    body: card.querySelector(".draft-body-edit")?.value,
+  });
+
+  $$("#drafts-list .save").forEach((b) =>
+    b.addEventListener("click", async () => {
+      const card = b.closest(".draft");
+      b.disabled = true; b.textContent = "saving…";
+      try {
+        await postJSON(`/api/drafts/${encodeURIComponent(card.dataset.domain)}`, edits(card));
+        b.textContent = "saved";
+        setTimeout(() => { b.textContent = "Save"; b.disabled = false; }, 1200);
+      } catch (e) { b.textContent = "Save"; b.disabled = false; alert(e.message); }
+    })
+  );
   $$("#drafts-list .send").forEach((b) =>
     b.addEventListener("click", async () => {
-      const dom = b.closest(".draft").dataset.domain;
-      if (!confirm(`Send the drafted email to ${dom}? This actually sends it.`)) return;
+      const card = b.closest(".draft");
+      const dom = card.dataset.domain;
+      if (!confirm(`Send this email to ${dom}? It actually sends.`)) return;
       b.disabled = true; b.textContent = "sending…";
       try {
+        await postJSON(`/api/drafts/${encodeURIComponent(dom)}`, edits(card)); // persist edits first
         const r = await postJSON(`/api/drafts/${encodeURIComponent(dom)}/send`, {});
         if (r.ok) { await loaders.drafts(); }
         else { b.disabled = false; b.textContent = "Send"; alert(r.message || "send did not complete"); }
       } catch (e) { b.disabled = false; b.textContent = "Send"; alert(e.message); }
     })
   );
-  void pending;
 };
 
 // --- chat -------------------------------------------------------------------
