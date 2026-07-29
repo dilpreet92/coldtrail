@@ -44,9 +44,11 @@ pub async fn status() -> Result<Json<StatusDto>, ApiErr> {
         None => crate::secrets::has_token("canonical"),
     };
     let destination_connected = match kind {
-        Some(_) => gmail_wired,
+        // CLI backends get Gmail from the provider's account connector — treat as ready.
+        Some(_) => true,
         None => crate::secrets::has_token("gmail"),
     };
+    let _ = gmail_wired;
     let onboarded = message_customized && provider_ready && discovery_connected;
 
     Ok(Json(StatusDto {
