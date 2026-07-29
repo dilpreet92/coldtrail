@@ -12,14 +12,6 @@ pub async fn serve(port: Option<u16>, no_open: bool) -> Result<()> {
     crate::setup::ensure()?;
     let token = uuid::Uuid::new_v4().to_string();
 
-    let state = Arc::new(AppState {
-        token: token.clone(),
-        runs: Mutex::new(HashMap::new()),
-        session_id: Mutex::new(None),
-        turns: Mutex::new(0),
-    });
-    let app = web::router(state);
-
     // Prefer the requested/default port; fall back to an OS-assigned one if taken.
     let wanted = SocketAddr::from(([127, 0, 0, 1], port.unwrap_or(8787)));
     let listener = match tokio::net::TcpListener::bind(wanted).await {
@@ -29,6 +21,16 @@ pub async fn serve(port: Option<u16>, no_open: bool) -> Result<()> {
             .context("could not bind a local port")?,
     };
     let addr = listener.local_addr()?;
+
+    let state = Arc::new(AppState {
+        token: token.clone(),
+        port: addr.port(),
+        runs: Mutex::new(HashMap::new()),
+        chat: Mutex::new(web::ChatSession::default()),
+        turn_lock: Mutex::new(()),
+    });
+    let app = web::router(state);
+
     let url = format!("http://{addr}/?t={token}");
 
     println!("\n  coldtrail is running:\n    {url}\n");

@@ -41,12 +41,32 @@ impl IntoResponse for ApiErr {
     }
 }
 
+/// One agent conversation. `created` flips true only after a turn actually seeds
+/// the session, so a failed first turn doesn't poison later `--resume`s.
+#[derive(Default)]
+pub struct ChatSession {
+    pub id: Option<String>,
+    pub created: bool,
+}
+
 /// Server-wide state. Single local user, so one agent session at a time.
 pub struct AppState {
     pub token: String,
+    pub port: u16,
     pub runs: Mutex<HashMap<String, mpsc::Receiver<AgentEvent>>>,
-    pub session_id: Mutex<Option<String>>,
-    pub turns: Mutex<u64>,
+    pub chat: Mutex<ChatSession>,
+    /// Held for the duration of an agent turn so turns never overlap.
+    pub turn_lock: Mutex<()>,
+}
+
+fn loopback_hosts(port: u16) -> [String; 2] {
+    [format!("127.0.0.1:{port}"), format!("localhost:{port}")]
+}
+fn loopback_origins(port: u16) -> [String; 2] {
+    [
+        format!("http://127.0.0.1:{port}"),
+        format!("http://localhost:{port}"),
+    ]
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -94,9 +114,23 @@ fn token_from(headers: &HeaderMap, uri_query: Option<&str>) -> Option<String> {
 async fn auth(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
     let path = req.uri().path();
     if path.starts_with("/api") {
+        let h = req.headers();
+        // Anti-DNS-rebinding: a present Host header must be our loopback addr.
+        let hosts = loopback_hosts(state.port);
+        let host_ok = match h.get(header::HOST).and_then(|v| v.to_str().ok()) {
+            Some(host) => hosts.iter().any(|a| a == host),
+            None => true,
+        };
+        // Anti-CSRF: a present Origin must be our own (SameSite doesn't isolate by
+        // port, so a co-resident 127.0.0.1:<other> page must still be rejected).
+        let origins = loopback_origins(state.port);
+        let origin_ok = match h.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+            Some(o) => origins.iter().any(|a| a == o),
+            None => true,
+        };
         let q = req.uri().query().map(|s| s.to_string());
-        let ok = token_from(req.headers(), q.as_deref()).as_deref() == Some(state.token.as_str());
-        if !ok {
+        let token_ok = token_from(h, q.as_deref()).as_deref() == Some(state.token.as_str());
+        if !(host_ok && origin_ok && token_ok) {
             return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
         }
     }
@@ -145,9 +179,10 @@ mod tests {
     fn state() -> Arc<AppState> {
         Arc::new(AppState {
             token: "secret-tok".into(),
+            port: 8787,
             runs: Mutex::new(HashMap::new()),
-            session_id: Mutex::new(None),
-            turns: Mutex::new(0),
+            chat: Mutex::new(ChatSession::default()),
+            turn_lock: Mutex::new(()),
         })
     }
 
@@ -184,6 +219,38 @@ mod tests {
             .unwrap();
         std::env::remove_var("COLDTRAIL_HOME");
         assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn cross_origin_rejected_even_with_token() {
+        let app = router(state());
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/companies?t=secret-tok")
+                    .header("origin", "http://127.0.0.1:9999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn foreign_host_rejected_even_with_token() {
+        let app = router(state());
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/companies?t=secret-tok")
+                    .header("host", "evil.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

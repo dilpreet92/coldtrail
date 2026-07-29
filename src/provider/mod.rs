@@ -5,6 +5,10 @@ pub mod cli;
 
 use serde::Serialize;
 
+/// Claude-Code tool id prefix for the wired Gmail MCP server. Chat turns disallow it
+/// (no sending during normal work); the Send turn allows only it.
+pub const GMAIL_TOOL: &str = "mcp__gmail";
+
 /// A streamed event from an agent turn, forwarded to the browser over SSE.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]

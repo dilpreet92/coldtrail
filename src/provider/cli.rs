@@ -1,20 +1,27 @@
 //! Headless CLI-agent backend: spawn `claude -p --output-format stream-json` in the
 //! workspace and map its JSONL events to `AgentEvent`s. Codex is best-effort.
 
-use anyhow::{anyhow, Result};
 use serde_json::Value;
 use std::path::Path;
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc::Sender;
 
 use super::AgentEvent;
 use crate::agents::AgentKind;
 
+/// Tool policy for a turn — gate Gmail at the process boundary, not in prose.
+pub enum Tools<'a> {
+    /// Normal chat: the agent may NOT use these tools (e.g. Gmail — no sending).
+    Disallow(&'a [&'a str]),
+    /// Send turn: the agent may use ONLY these tools.
+    AllowOnly(&'a [&'a str]),
+}
+
 /// Build the argv for a headless Claude turn. First turn seeds the session id;
 /// later turns resume it. Kept pure for testing.
-pub fn claude_args(session_id: &str, first_turn: bool, msg: &str) -> Vec<String> {
+pub fn claude_args(session_id: &str, first_turn: bool, msg: &str, tools: &Tools) -> Vec<String> {
     let mut a: Vec<String> = Vec::new();
     if first_turn {
         a.push("--session-id".into());
@@ -28,11 +35,19 @@ pub fn claude_args(session_id: &str, first_turn: bool, msg: &str) -> Vec<String>
     a.push("--output-format".into());
     a.push("stream-json".into());
     a.push("--verbose".into());
-    // Unattended: the agent runs the coldtrail subcommands + Canonical/Gmail MCP for
-    // sourcing/enrichment/drafting. It never sends (CLAUDE.md forbids it; send is a
-    // separate constrained turn triggered by the UI button).
     a.push("--permission-mode".into());
     a.push("bypassPermissions".into());
+    match tools {
+        Tools::Disallow(list) if !list.is_empty() => {
+            a.push("--disallowedTools".into());
+            a.push(list.join(" "));
+        }
+        Tools::AllowOnly(list) if !list.is_empty() => {
+            a.push("--allowedTools".into());
+            a.push(list.join(" "));
+        }
+        _ => {}
+    }
     a
 }
 
@@ -97,17 +112,19 @@ fn content_blocks(v: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-/// Run one agent turn, streaming events into `tx`. Blocks until the turn ends.
+/// Run one agent turn, streaming events into `tx`. Always emits a terminal `Done`
+/// (even on failure). Returns `true` iff the turn finished successfully.
 pub async fn run_turn(
     kind: AgentKind,
     session_id: &str,
     first_turn: bool,
     msg: &str,
     home: &Path,
+    tools: &Tools<'_>,
     tx: Sender<AgentEvent>,
-) -> Result<()> {
+) -> bool {
     match kind {
-        AgentKind::Claude => run_claude(session_id, first_turn, msg, home, tx).await,
+        AgentKind::Claude => run_claude(session_id, first_turn, msg, home, tools, tx).await,
         AgentKind::Codex => {
             let _ = tx
                 .send(AgentEvent::Error {
@@ -122,7 +139,7 @@ pub async fn run_turn(
                     result: None,
                 })
                 .await;
-            Ok(())
+            false
         }
     }
 }
@@ -132,42 +149,140 @@ async fn run_claude(
     first_turn: bool,
     msg: &str,
     home: &Path,
+    tools: &Tools<'_>,
     tx: Sender<AgentEvent>,
-) -> Result<()> {
-    let mut child = Command::new("claude")
-        .args(claude_args(session_id, first_turn, msg))
+) -> bool {
+    let spawn = Command::new("claude")
+        .args(claude_args(session_id, first_turn, msg, tools))
         .current_dir(home)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| anyhow!("failed to spawn claude: {e}"))?;
+        .stderr(Stdio::piped())
+        .spawn();
 
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("no stdout from claude"))?;
+    let mut child = match spawn {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx
+                .send(AgentEvent::Error {
+                    message: format!("failed to launch claude: {e}"),
+                })
+                .await;
+            let _ = tx
+                .send(AgentEvent::Done {
+                    ok: false,
+                    result: None,
+                })
+                .await;
+            return false;
+        }
+    };
+
+    // Drain stderr concurrently so its pipe never blocks the child.
+    let stderr = child.stderr.take();
+    let err_task = tokio::spawn(async move {
+        let mut buf = String::new();
+        if let Some(e) = stderr {
+            let _ = BufReader::new(e).read_to_string(&mut buf).await;
+        }
+        buf
+    });
+
+    let stdout = match child.stdout.take() {
+        Some(o) => o,
+        None => {
+            let _ = tx
+                .send(AgentEvent::Error {
+                    message: "no stdout from claude".into(),
+                })
+                .await;
+            let _ = tx
+                .send(AgentEvent::Done {
+                    ok: false,
+                    result: None,
+                })
+                .await;
+            return false;
+        }
+    };
     let mut lines = BufReader::new(stdout).lines();
-    while let Some(line) = lines.next_line().await? {
-        for ev in parse_stream_line(&line) {
-            if tx.send(ev).await.is_err() {
-                // receiver (browser) went away — stop early
-                let _ = child.start_kill();
-                break;
+
+    let mut saw_done = false;
+    let mut done_ok = false;
+    let mut disconnected = false;
+
+    loop {
+        tokio::select! {
+            // client (browser) went away even while the agent is silent
+            _ = tx.closed() => { disconnected = true; break; }
+            line = lines.next_line() => {
+                match line {
+                    Ok(Some(line)) => {
+                        for ev in parse_stream_line(&line) {
+                            if let AgentEvent::Done { ok, .. } = &ev {
+                                saw_done = true;
+                                done_ok = *ok;
+                            }
+                            if tx.send(ev).await.is_err() { disconnected = true; break; }
+                        }
+                        if disconnected { break; }
+                    }
+                    Ok(None) => break, // stdout closed
+                    Err(_) => break,
+                }
             }
         }
     }
-    let _ = child.wait().await;
-    Ok(())
+
+    if disconnected {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return false;
+    }
+
+    let status = child.wait().await;
+    let err = err_task.await.unwrap_or_default();
+
+    if !saw_done {
+        let tail: String = {
+            let t = err.trim();
+            if t.is_empty() {
+                match status {
+                    Ok(s) if !s.success() => format!("agent exited with {s}"),
+                    _ => "the agent ended without a result".to_string(),
+                }
+            } else {
+                t.lines()
+                    .rev()
+                    .take(6)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        };
+        let _ = tx.send(AgentEvent::Error { message: tail }).await;
+        let _ = tx
+            .send(AgentEvent::Done {
+                ok: false,
+                result: None,
+            })
+            .await;
+        return false;
+    }
+    done_ok
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const NONE: Tools = Tools::Disallow(&[]);
+
     #[test]
     fn args_first_turn_seeds_session() {
-        let a = claude_args("sid-1", true, "hello");
+        let a = claude_args("sid-1", true, "hello", &NONE);
         assert!(a.windows(2).any(|w| w == ["--session-id", "sid-1"]));
         assert!(a.windows(2).any(|w| w == ["-p", "hello"]));
         assert!(a
@@ -178,9 +293,21 @@ mod tests {
 
     #[test]
     fn args_later_turn_resumes() {
-        let a = claude_args("sid-1", false, "again");
+        let a = claude_args("sid-1", false, "again", &NONE);
         assert!(a.windows(2).any(|w| w == ["--resume", "sid-1"]));
         assert!(!a.iter().any(|x| x == "--session-id"));
+    }
+
+    #[test]
+    fn args_gate_tools() {
+        let dis = claude_args("s", true, "m", &Tools::Disallow(&["mcp__gmail"]));
+        assert!(dis
+            .windows(2)
+            .any(|w| w == ["--disallowedTools", "mcp__gmail"]));
+        let allow = claude_args("s", true, "m", &Tools::AllowOnly(&["mcp__gmail"]));
+        assert!(allow
+            .windows(2)
+            .any(|w| w == ["--allowedTools", "mcp__gmail"]));
     }
 
     #[test]

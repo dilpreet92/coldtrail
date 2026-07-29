@@ -1,5 +1,6 @@
-//! Explicit human send: a constrained agent turn that sends exactly one Gmail draft,
-//! then marks the company sent. The only path that ever sends.
+//! Explicit human send: a constrained agent turn allowed to use ONLY the Gmail MCP,
+//! instructed to send exactly one draft. Marks the company sent only on evidence that
+//! the Gmail tool actually ran successfully.
 
 use axum::extract::{Path, State};
 use axum::Json;
@@ -9,7 +10,8 @@ use tokio::sync::mpsc;
 
 use super::api::MsgResp;
 use super::{ApiErr, AppState};
-use crate::provider::AgentEvent;
+use crate::provider::cli::{run_turn, Tools};
+use crate::provider::{AgentEvent, GMAIL_TOOL};
 
 pub async fn send(
     State(_state): State<Arc<AppState>>,
@@ -17,47 +19,69 @@ pub async fn send(
 ) -> Result<Json<MsgResp>, ApiErr> {
     let domain = domain.to_lowercase();
 
-    // Only allow sending something that's actually a reviewed/pending draft.
-    let eligible = {
+    // Only a reviewable draft may be sent.
+    let (subject, body, to) = {
         let c = crate::db::open()?;
-        c.query_row(
-            "SELECT 1 FROM outreach WHERE domain=?1 AND status IN ('draft_pending','drafted') LIMIT 1",
-            [&domain],
-            |_| Ok(true),
-        )
-        .optional()?
-        .unwrap_or(false)
+        let row = c
+            .query_row(
+                "SELECT o.subject, o.body, k.email FROM outreach o \
+                 LEFT JOIN contacts k ON k.id = o.contact_id \
+                 WHERE o.domain=?1 AND o.status IN ('draft_pending','drafted') \
+                 ORDER BY o.created_at DESC LIMIT 1",
+                [&domain],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        match row {
+            Some(r) => r,
+            None => return Err(anyhow::anyhow!("no reviewable draft for {domain}").into()),
+        }
     };
-    if !eligible {
-        return Err(anyhow::anyhow!("no reviewable draft for {domain}").into());
-    }
+    let to = to.ok_or_else(|| anyhow::anyhow!("no recipient email on file for {domain}"))?;
 
     let kind = crate::setup::read_agent()?;
     let home = crate::home::workspace()?;
     let sid = uuid::Uuid::new_v4().to_string();
     let msg = format!(
-        "Send the Gmail draft addressed to the contact at {domain} now — use the Gmail MCP to \
-         send that single existing draft and nothing else. Do NOT source, draft, or contact any \
-         other company. If no such Gmail draft exists, say so and stop."
+        "Send one email via the Gmail MCP and do nothing else:\n\nTo: {to}\nSubject: {}\n\n{}\n\n\
+         Send it now to that single recipient. Do not draft, source, or contact anyone else. \
+         If you cannot send, say why and stop.",
+        subject.as_deref().unwrap_or(""),
+        body.as_deref().unwrap_or("")
     );
 
+    // Constrained: the ONLY turn permitted to use Gmail, and ONLY Gmail.
+    let tools = Tools::AllowOnly(&[GMAIL_TOOL]);
     let (tx, mut rx) = mpsc::channel(64);
     let h = home.clone();
-    let worker = tokio::spawn(async move {
-        let _ = crate::provider::cli::run_turn(kind, &sid, true, &msg, &h, tx).await;
+    tokio::spawn(async move {
+        let _ = run_turn(kind, &sid, true, &msg, &h, &tools, tx).await;
     });
 
-    let mut ok = false;
+    // Require positive evidence: the Gmail tool actually ran and the turn finished ok.
+    let mut used_gmail = false;
+    let mut done_ok = false;
     let mut last: Option<String> = None;
     while let Some(ev) = rx.recv().await {
-        if let AgentEvent::Done { ok: o, result } = ev {
-            ok = o;
-            last = result;
+        match ev {
+            AgentEvent::ToolStart { name, .. } if name.to_lowercase().contains("gmail") => {
+                used_gmail = true
+            }
+            AgentEvent::Done { ok, result } => {
+                done_ok = ok;
+                last = result;
+            }
+            _ => {}
         }
     }
-    let _ = worker.await;
 
-    if ok {
+    if used_gmail && done_ok {
         crate::mark::run(&domain, "sent")?;
         Ok(Json(MsgResp {
             ok: true,
@@ -67,7 +91,9 @@ pub async fn send(
     } else {
         Ok(Json(MsgResp {
             ok: false,
-            message: Some(last.unwrap_or_else(|| "send did not complete".into())),
+            message: Some(
+                last.unwrap_or_else(|| "the agent did not confirm sending the email".into()),
+            ),
             wired: None,
         }))
     }

@@ -62,10 +62,18 @@ pub enum Commands {
         /// Max companies to process (default 20)
         max: Option<usize>,
     },
-    /// Build personalized drafts -> pending_drafts.json (never sends)
+    /// Build personalized drafts from the template -> pending_drafts.json (never sends)
     DraftPrep {
         /// Max drafts to prepare (default 20)
         max: Option<usize>,
+    },
+    /// Store an agent-composed personalized draft for a company (never sends)
+    Draft {
+        domain: String,
+        #[arg(long)]
+        subject: String,
+        #[arg(long)]
+        body: String,
     },
     /// Record a Gmail draft id, or mark sent / bounced
     Mark { domain: String, value: String },

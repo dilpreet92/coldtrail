@@ -3,10 +3,48 @@
 //! `pending_drafts.json`. Never sends anything.
 
 use anyhow::Result;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde_json::json;
 
 use crate::message::Message;
+
+/// Store an agent-composed, personalized draft for a company (subject + body written
+/// by the agent using `message.toml` as a brief). One row per domain; re-drafting a
+/// domain replaces its pending draft. Never sends.
+pub fn add(domain: &str, subject: &str, body: &str) -> Result<()> {
+    let domain = domain.trim().to_lowercase();
+    crate::db::init()?;
+    let conn = crate::db::open()?;
+    let contact_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM contacts WHERE domain=?1 AND email IS NOT NULL ORDER BY found_at DESC LIMIT 1",
+            [&domain],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM outreach WHERE domain=?1 LIMIT 1",
+            [&domain],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if exists {
+        conn.execute(
+            "UPDATE outreach SET subject=?2, body=?3, contact_id=?4, status='draft_pending' WHERE domain=?1",
+            params![domain, subject, body, contact_id],
+        )?;
+    } else {
+        conn.execute(
+            "INSERT INTO outreach (domain, contact_id, subject, body, status) \
+             VALUES (?1, ?2, ?3, ?4, 'draft_pending')",
+            params![domain, contact_id, subject, body],
+        )?;
+    }
+    println!("drafted {domain}: {subject}");
+    Ok(())
+}
 
 /// A row eligible for drafting: (contact_id, domain, founder_name, email, company_name).
 type DraftRow = (i64, String, Option<String>, String, Option<String>);

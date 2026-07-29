@@ -48,6 +48,11 @@ async fn main() -> anyhow::Result<()> {
         }) => contact::run(&domain, &name, &email, source.as_deref()).await,
         Some(Commands::FindEmails { max }) => find::run(max.unwrap_or(20)).await,
         Some(Commands::DraftPrep { max }) => draft::run(max.unwrap_or(20)),
+        Some(Commands::Draft {
+            domain,
+            subject,
+            body,
+        }) => draft::add(&domain, &subject, &body),
         Some(Commands::Mark { domain, value }) => mark::run(&domain, &value),
         Some(Commands::Seed) => seed::run(),
         Some(Commands::Update) => run::update(),
