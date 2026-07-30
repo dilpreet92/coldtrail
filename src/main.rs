@@ -6,6 +6,7 @@ mod db;
 mod draft;
 mod enrich;
 mod find;
+mod gmail;
 mod home;
 mod import;
 mod mark;
@@ -21,6 +22,7 @@ mod secrets;
 mod seed;
 mod serve;
 mod setup;
+mod source;
 mod web;
 
 use clap::Parser;
@@ -44,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
             skip_gmail,
             force,
         }),
+        Some(Commands::Source { query, limit }) => source::run(&query, limit).await,
         Some(Commands::Import { json, label }) => import::run(&json, &label),
         Some(Commands::AddContact {
             domain,

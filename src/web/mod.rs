@@ -3,6 +3,7 @@
 
 pub mod api;
 pub mod chat;
+pub mod chats;
 pub mod followups;
 pub mod onboarding;
 pub mod pipeline;
@@ -42,11 +43,14 @@ impl IntoResponse for ApiErr {
     }
 }
 
-/// One agent conversation. `created` flips true only after a turn actually seeds
-/// the session, so a failed first turn doesn't poison later `--resume`s.
+/// The *active* conversation. `created` flips true only after a turn actually seeds the
+/// provider session, so a failed first turn doesn't poison later `--resume`s.
 #[derive(Default)]
 pub struct ChatSession {
-    pub id: Option<String>,
+    /// coldtrail conversation id (row in `chat_sessions`).
+    pub chat_id: Option<String>,
+    /// provider agent session id (claude/codex `--resume`).
+    pub agent_session_id: Option<String>,
     pub created: bool,
 }
 
@@ -106,6 +110,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/followups/:domain/draft", post(followups::draft))
         .route("/api/chat", post(chat::start))
         .route("/api/chat/stream", get(chat::stream))
+        .route("/api/chats", get(chats::list))
+        .route("/api/chats/new", post(chats::new_chat))
+        .route("/api/chats/:id", get(chats::detail))
+        .route("/api/chats/:id/activate", post(chats::activate))
         .route("/api/drafts/:domain", post(pipeline::save_draft))
         .route("/api/drafts/:domain/send", post(send::send))
         .layer(middleware::from_fn_with_state(state.clone(), auth))

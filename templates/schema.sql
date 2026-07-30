@@ -40,3 +40,20 @@ CREATE TABLE IF NOT EXISTS outreach (
     status          TEXT DEFAULT 'draft_pending',  -- draft_pending -> drafted -> sent -> replied -> bounced
     reply           TEXT
 );
+
+-- Chat history: one row per conversation, with its provider agent-session id for resume.
+CREATE TABLE IF NOT EXISTS chat_sessions (
+    id               TEXT PRIMARY KEY,   -- coldtrail conversation id
+    agent_session_id TEXT,               -- provider session id (claude/codex --resume)
+    title            TEXT,
+    created_at       TEXT DEFAULT (datetime('now')),
+    updated_at       TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT REFERENCES chat_sessions(id),
+    role        TEXT,       -- 'user' | 'assistant'
+    content     TEXT,
+    created_at  TEXT DEFAULT (datetime('now'))
+);

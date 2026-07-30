@@ -122,7 +122,8 @@ pub async fn companies() -> Result<Json<Vec<CompanyDto>>, ApiErr> {
                 (SELECT k.founder_name FROM contacts k WHERE k.domain=c.domain AND k.email IS NOT NULL \
                    ORDER BY k.mx_ok DESC, k.found_at DESC LIMIT 1), \
                 (SELECT k.email FROM contacts k WHERE k.domain=c.domain AND k.email IS NOT NULL \
-                   ORDER BY k.mx_ok DESC, k.found_at DESC LIMIT 1) \
+                   ORDER BY k.mx_ok DESC, k.found_at DESC LIMIT 1), \
+                c.source_query \
          FROM companies c ORDER BY c.first_seen DESC",
     )?;
     let rows = stmt
@@ -134,6 +135,7 @@ pub async fn companies() -> Result<Json<Vec<CompanyDto>>, ApiErr> {
                 first_seen: r.get(3)?,
                 founder: r.get(4)?,
                 email: r.get(5)?,
+                source_query: r.get(6)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;

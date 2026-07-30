@@ -10,11 +10,12 @@ subcommands — never re-implement their logic, never touch `outreach.db` direct
 
 ## The run loop
 
-1. **Source (Canonical, fixed).** Use the Canonical MCP `search_companies` to turn the
-   user's plain-English ICP into a verified, domain-keyed shortlist. Save the tool result
-   to a JSON file, then import it (deduped by domain):
-   `coldtrail import <results.json> "<short ICP label>"`
-   Already-known domains are skipped automatically.
+1. **Source (Canonical, coldtrail-owned).** Turn the user's plain-English ICP into a
+   verified, domain-keyed shortlist with one command — coldtrail queries Canonical through
+   its own connection and imports the result (deduped by domain):
+   `coldtrail source "<plain-English ICP>" [--limit N]`
+   Already-known domains are skipped automatically. Don't call a Canonical MCP tool directly
+   and don't hand-write the JSON — `coldtrail source` owns discovery.
 2. **Enrich.** Get a founder contact per company. **Read `enrichment.md` in this workspace
    first** — it's coldtrail's technique ladder (OSINT tools, GitHub commit metadata, crt.sh,
    WHOIS, on-domain/web, and pattern-only-if-confirmed) plus the honesty rules. Work down it,

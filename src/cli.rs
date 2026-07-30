@@ -42,6 +42,14 @@ pub enum Commands {
         #[arg(long)]
         force: bool,
     },
+    /// Source companies from Canonical (coldtrail's own connection), deduped by domain
+    Source {
+        /// Plain-English ICP query
+        query: String,
+        /// Max companies to request
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Import Canonical search results (JSON), deduped by domain
     Import {
         /// Path to the saved Canonical results JSON

@@ -38,17 +38,11 @@ pub async fn status() -> Result<Json<StatusDto>, ApiErr> {
         Some(k) => detected.iter().any(|s| s.kind == k && s.present),
         None => base_url.is_some(), // openai backend
     };
-    // Unified connected state: MCP-wired for CLI backends, OAuth token for BYOK/Ollama.
-    let discovery_connected = match kind {
-        Some(_) => canonical_wired,
-        None => crate::secrets::has_token("canonical"),
-    };
-    let destination_connected = match kind {
-        // CLI backends get Gmail from the provider's account connector — treat as ready.
-        Some(_) => true,
-        None => crate::secrets::has_token("gmail"),
-    };
-    let _ = gmail_wired;
+    // coldtrail OWNS discovery + destination now: its own OAuth token, same on every
+    // provider (Canonical via `coldtrail source`, Gmail via the Gmail API).
+    let discovery_connected = crate::secrets::has_token("canonical");
+    let destination_connected = crate::secrets::has_token("gmail");
+    let _ = (canonical_wired, gmail_wired);
     let onboarded = message_customized && provider_ready && discovery_connected;
 
     Ok(Json(StatusDto {
@@ -100,37 +94,21 @@ pub async fn install_osint(
     Ok(Json(resp))
 }
 
-/// Connect Discovery (Canonical): wire the MCP for CLI providers, or OAuth for BYOK/Ollama.
+/// Connect Discovery (Canonical): coldtrail's OWN OAuth, on every provider. Sourcing then
+/// runs through `coldtrail source` (coldtrail's MCP client), not the provider's connector.
 pub async fn connect_discovery() -> Result<Json<MsgResp>, ApiErr> {
-    let ws = crate::home::workspace()?;
-    match crate::provider::resolve() {
-        crate::provider::Backend::Cli(kind) => setup::wire_canonical(kind, true, &ws)?,
-        crate::provider::Backend::OpenAi { .. } => crate::oauth::connect_canonical().await?,
-    }
+    crate::oauth::connect_canonical().await?;
     Ok(Json(MsgResp::ok()))
 }
 
-/// Connect Destination (Gmail). CLI providers use their account's Gmail connector
-/// (nothing to wire here); BYOK/Ollama run keyless OAuth with coldtrail's built-in client.
+/// Connect Destination (Gmail): coldtrail's OWN `gmail.compose` OAuth (built-in Google
+/// client), on every provider. coldtrail creates the Gmail draft itself via the Gmail API.
 pub async fn connect_destination(
     Json(req): Json<super::api::GmailConnectReq>,
 ) -> Result<Json<MsgResp>, ApiErr> {
     let port = req.callback_port.unwrap_or(8765);
-    match crate::provider::resolve() {
-        crate::provider::Backend::Cli(_) => Ok(Json(MsgResp {
-            ok: true,
-            message: Some(
-                "Gmail comes from your Claude/Codex account connector — enable it at \
-                 claude.ai → Connectors. Nothing to configure here."
-                    .into(),
-            ),
-            wired: None,
-        })),
-        crate::provider::Backend::OpenAi { .. } => {
-            crate::oauth::connect_gmail(port).await?;
-            Ok(Json(MsgResp::ok()))
-        }
-    }
+    crate::oauth::connect_gmail(port).await?;
+    Ok(Json(MsgResp::ok()))
 }
 
 pub async fn set_provider(Json(req): Json<ProviderReq>) -> Result<Json<MsgResp>, ApiErr> {

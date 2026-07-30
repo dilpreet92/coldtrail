@@ -126,41 +126,13 @@ pub async fn exec(name: &str, args: &Value) -> String {
     }
 }
 
-/// Source companies from Canonical via the in-Rust MCP client, then import (dedupe).
+/// Source companies from Canonical (coldtrail's own connection), then import (dedupe).
+/// Shares one implementation with the `coldtrail source` CLI command.
 async fn discover(args: &Value) -> String {
     let query = s(args, "query");
-    let label = {
-        let l = s(args, "label");
-        if l.is_empty() {
-            "discovery".to_string()
-        } else {
-            l
-        }
-    };
-    let token = match crate::oauth::valid_access("canonical").await {
-        Some(t) => t,
-        None => return "error: Canonical isn't connected — connect it in Setup".to_string(),
-    };
-    let client =
-        match crate::mcp_client::McpClient::connect("https://trycanonical.ai/mcp", Some(&token))
-            .await
-        {
-            Ok(c) => c,
-            Err(e) => return format!("error: connecting Canonical: {e}"),
-        };
-    match client
-        .call_tool("search_companies", json!({"query": query}))
-        .await
-    {
-        Ok(res) => {
-            // MCP tool results carry text content; import_json handles the wrapper shapes.
-            let text = res["content"][0]["text"].as_str().unwrap_or("[]");
-            match crate::import::import_str(text, &label) {
-                Ok((a, sk, t)) => format!("discovered + imported {a} new, {sk} deduped, from {t}"),
-                Err(e) => format!("error: importing discovery results: {e}"),
-            }
-        }
-        Err(e) => format!("error: Canonical search failed: {e}"),
+    match crate::source::fetch_and_import(&query, None).await {
+        Ok((a, sk, t)) => format!("discovered + imported {a} new, {sk} deduped, from {t}"),
+        Err(e) => format!("error: {e}"),
     }
 }
 

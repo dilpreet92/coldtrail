@@ -79,6 +79,8 @@ pub struct CompanyDto {
     /// Best verified contact found for this company (surfaced in the Pipeline row).
     pub founder: Option<String>,
     pub email: Option<String>,
+    /// The ICP query that sourced this company (Pipeline "Sourced by").
+    pub source_query: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -108,6 +110,29 @@ pub struct ChatReq {
 #[derive(Serialize)]
 pub struct ChatResp {
     pub run: String,
+}
+
+#[derive(Serialize)]
+pub struct ChatSummary {
+    pub id: String,
+    pub title: Option<String>,
+    pub updated_at: String,
+    /// True when this is the currently-active conversation.
+    pub active: bool,
+}
+
+#[derive(Serialize)]
+pub struct ChatMessageDto {
+    pub role: String,
+    pub content: String,
+    pub created_at: String,
+}
+
+#[derive(Serialize)]
+pub struct ChatDetail {
+    pub id: String,
+    pub title: Option<String>,
+    pub messages: Vec<ChatMessageDto>,
 }
 
 #[derive(Deserialize)]

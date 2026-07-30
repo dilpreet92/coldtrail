@@ -305,19 +305,6 @@ pub fn wire_mcp(
     Ok(wired)
 }
 
-/// Wire just the Canonical (discovery) MCP into the CLI provider's coldtrail scope.
-pub fn wire_canonical(provider: AgentKind, force: bool, ws: &Path) -> Result<()> {
-    let c = McpServer {
-        name: "canonical".into(),
-        url: CANONICAL_URL.into(),
-        oauth: None,
-    };
-    match provider {
-        AgentKind::Claude => claude_wire(&c, None, force, ws),
-        AgentKind::Codex => codex_wire(&[c]),
-    }
-}
-
 pub fn write_agent(kind: AgentKind) -> Result<()> {
     let p = crate::home::path("config.toml")?;
     std::fs::write(&p, format!("agent = \"{}\"\n", kind.config_value()))?;
