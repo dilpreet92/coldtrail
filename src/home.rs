@@ -22,6 +22,22 @@ pub fn path(name: &str) -> Result<PathBuf> {
     Ok(workspace()?.join(name))
 }
 
+/// Where OAuth tokens + the API key live — deliberately OUTSIDE the workspace, because the
+/// workspace is the agent's working directory and credentials must not sit in the agent's
+/// cwd. With `COLDTRAIL_HOME` set (tests) it's a sibling of that home for isolation;
+/// otherwise the OS config dir (`~/.config/coldtrail`, `~/Library/Application Support/…`).
+pub fn secret_path() -> Result<PathBuf> {
+    let dir = match std::env::var_os("COLDTRAIL_HOME") {
+        Some(v) => PathBuf::from(format!("{}.secrets", v.to_string_lossy())),
+        None => dirs::config_dir()
+            .or_else(dirs::home_dir)
+            .context("could not resolve a config directory")?
+            .join("coldtrail"),
+    };
+    fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    Ok(dir.join("secrets.toml"))
+}
+
 /// Write an embedded asset. When `overwrite` is false an existing file is left
 /// untouched (user-owned files). Returns whether a write happened.
 pub fn write_asset(name: &str, contents: &str, overwrite: bool) -> Result<bool> {

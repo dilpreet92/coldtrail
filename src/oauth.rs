@@ -273,8 +273,9 @@ const CB_PORT: u16 = 8765;
 
 const GOOGLE_AUTH: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN: &str = "https://oauth2.googleapis.com/token";
-const GMAIL_SCOPE: &str =
-    "https://www.googleapis.com/auth/gmail.compose https://www.googleapis.com/auth/gmail.readonly";
+// Least privilege: coldtrail only creates drafts, so it asks for `gmail.compose` alone —
+// NOT `gmail.readonly`. The token can't read the user's mailbox even if it leaked.
+const GMAIL_SCOPE: &str = "https://www.googleapis.com/auth/gmail.compose";
 
 /// coldtrail's built-in Google OAuth client (a Desktop client, so users don't create
 /// their own). Baked in at build time via `COLDTRAIL_GOOGLE_CLIENT_ID`/`_SECRET`, with a

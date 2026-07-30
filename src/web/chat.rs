@@ -98,14 +98,21 @@ pub async fn start(
 
         let mut assistant = String::new();
         let mut ok = false;
+        let mut disconnected = false;
         while let Some(ev) = rx_a.recv().await {
             match &ev {
                 AgentEvent::Text { text } => assistant.push_str(text),
                 AgentEvent::Done { ok: o, .. } => ok = *o,
                 _ => {}
             }
-            let _ = tx_b.send(ev).await; // forward to browser; ignore if it disconnected
+            // Forward to the browser; if it went away, stop and let the inner turn cancel
+            // (dropping rx_a closes tx_a, which run_turn selects on to kill the child).
+            if tx_b.send(ev).await.is_err() {
+                disconnected = true;
+                break;
+            }
         }
+        drop(rx_a);
 
         if !assistant.trim().is_empty() {
             insert_message(&chat_id, "assistant", assistant.trim());
@@ -113,9 +120,16 @@ pub async fn start(
         let mut s = st.chat.lock().await;
         if ok {
             s.created = true;
-        } else if first {
-            // failed first turn never seeded the provider session — fresh id for the retry
-            s.agent_session_id = Some(uuid::Uuid::new_v4().to_string());
+        } else if first && !disconnected {
+            // A genuine first-turn failure (not a browser disconnect) never produced a real
+            // conversation — discard the half-created row so a resend starts clean and no
+            // stale agent_session_id is left behind for a later resume.
+            if let Ok(c) = crate::db::open() {
+                let _ = c.execute("DELETE FROM chat_messages WHERE session_id=?1", [&chat_id]);
+                let _ = c.execute("DELETE FROM chat_sessions WHERE id=?1", [&chat_id]);
+            }
+            s.chat_id = None;
+            s.agent_session_id = None;
             s.created = false;
         }
     });

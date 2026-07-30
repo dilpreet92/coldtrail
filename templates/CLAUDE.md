@@ -36,7 +36,9 @@ subcommands — never re-implement their logic, never touch `outreach.db` direct
 
 - **You never send, and you never touch Gmail in this chat.** Sending happens only when
   the human clicks Send in the app (a separate, constrained step). Your job ends at
-  storing a reviewable draft with `coldtrail draft`.
+  storing a reviewable draft with `coldtrail draft`. You have no Gmail access — do not read
+  coldtrail's stored credentials/tokens and do not call mail APIs (curl, etc.) to send or
+  read email. Creating the Gmail draft is something coldtrail itself does on the human's click.
 - **Dedupe by domain.** Never contact a company twice. Import and seeding enforce this;
   trust the "already-known (deduped)" counts.
 - **Founder-addressed, MX-verified only.** Generic (`info@`, `sales@`, …) and

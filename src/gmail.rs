@@ -8,6 +8,8 @@ use base64::Engine;
 
 /// Build an RFC822 message and base64url-encode it (Gmail's `raw` field).
 fn raw_message(to: &str, subject: &str, body: &str) -> String {
+    // Strip CR/LF from the recipient so it can't inject extra headers (e.g. a Bcc:).
+    let to = to.replace(['\r', '\n'], " ");
     // RFC 2047-encode the subject so non-ASCII (em dashes etc.) survive the header.
     let subj = format!("=?UTF-8?B?{}?=", STANDARD.encode(subject.as_bytes()));
     let mime = format!(

@@ -24,7 +24,7 @@ struct Secrets {
 }
 
 fn load() -> Secrets {
-    crate::home::path("secrets.toml")
+    crate::home::secret_path()
         .ok()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| toml::from_str(&s).ok())
@@ -32,7 +32,7 @@ fn load() -> Secrets {
 }
 
 fn save(s: &Secrets) -> Result<()> {
-    let p = crate::home::path("secrets.toml")?;
+    let p = crate::home::secret_path()?;
     std::fs::write(&p, toml::to_string(s)?)?;
     #[cfg(unix)]
     {
