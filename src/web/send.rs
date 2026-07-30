@@ -65,11 +65,17 @@ pub async fn send(
     {
         Ok(draft_id) => {
             // Record the gmail draft id + status='drafted' (mark's default arm).
-            let id = if draft_id.is_empty() { "gmail" } else { &draft_id };
+            let id = if draft_id.is_empty() {
+                "gmail"
+            } else {
+                &draft_id
+            };
             crate::mark::run(&domain, id)?;
             Ok(Json(MsgResp {
                 ok: true,
-                message: Some("Created in your Gmail Drafts — open Gmail to review and send.".into()),
+                message: Some(
+                    "Created in your Gmail Drafts — open Gmail to review and send.".into(),
+                ),
                 wired: None,
             }))
         }

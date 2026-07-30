@@ -35,11 +35,9 @@ pub async fn list(State(state): State<Arc<AppState>>) -> Result<Json<Vec<ChatSum
 pub async fn detail(Path(id): Path<String>) -> Result<Json<ChatDetail>, ApiErr> {
     let c = crate::db::open()?;
     let title: Option<String> = c
-        .query_row(
-            "SELECT title FROM chat_sessions WHERE id=?1",
-            [&id],
-            |r| r.get(0),
-        )
+        .query_row("SELECT title FROM chat_sessions WHERE id=?1", [&id], |r| {
+            r.get(0)
+        })
         .optional()?
         .flatten();
     let mut stmt = c.prepare(

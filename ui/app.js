@@ -15,6 +15,14 @@ function token() {
   return m ? m[1] : "";
 }
 
+// --- theme (set ASAP to avoid a flash) --------------------------------------
+(function initTheme() {
+  let t = null;
+  try { t = localStorage.getItem("ct-theme"); } catch (_) {}
+  if (!t) t = (window.matchMedia && matchMedia("(prefers-color-scheme: light)").matches) ? "light" : "dark";
+  document.documentElement.dataset.theme = t;
+})();
+
 // --- api --------------------------------------------------------------------
 async function getJSON(path) {
   const r = await fetch(path, { credentials: "same-origin" });
@@ -82,14 +90,12 @@ async function loadStatus() {
   if (st) st.textContent = s.discovery_connected ? "· connected" : "";
   const dt = $("#dest-state");
   if (dt) dt.textContent = s.destination_connected ? "· connected" : "";
-  // Destination is provider-aware: CLI uses the account connector (no keys); BYOK/Ollama connects keyless via coldtrail's Google client.
-  const cliProvider = s.provider === "claude" || s.provider === "codex";
-  const ga = $("#gmail-account"), gb = $("#gmail-byo");
-  if (ga) ga.hidden = !cliProvider;
-  if (gb) gb.hidden = cliProvider;
 
   // enrichment (OSINT)
   renderOsint(s.osint || {});
+
+  // wizard (first run) vs settings (once onboarded)
+  renderSetup(s);
 
   // checklist
   const items = [
@@ -148,6 +154,67 @@ function msg(el, text, ok) {
   const m = $(el);
   m.textContent = text;
   m.className = "form-msg " + (ok ? "ok" : "err");
+}
+
+// --- setup: stepper wizard (first run) / flat settings (once onboarded) -----
+const WIZARD_STEPS = [
+  { step: "provider", label: "Provider", done: (s) => !!s.provider },
+  { step: "discovery", label: "Discovery", done: (s) => s.discovery_connected },
+  { step: "destination", label: "Destination", done: (s) => s.destination_connected },
+  { step: "brief", label: "Brief", done: (s) => s.message_customized },
+];
+let wizardIdx = 0;
+let wizardInit = false;
+
+function renderSetup(s) {
+  const wizard = !s.onboarded;
+  const panels = $("#panels"), bar = $("#wizard-bar"), checklist = $("#checklist");
+  $("#nav-setup-label").textContent = wizard ? "Setup" : "Settings";
+  $("#setup-title").textContent = wizard ? "Get set up" : "Settings";
+  $("#setup-sub").textContent = wizard
+    ? "A few steps to get coldtrail running. coldtrail owns sourcing (Canonical) and drafting (Gmail); drafts are never auto-sent — you send by hand."
+    : "Change your provider, connections, brief, and enrichment anytime. coldtrail owns Canonical + Gmail directly.";
+
+  if (!wizard) {
+    panels.classList.remove("wizard");
+    bar.hidden = true;
+    checklist.hidden = true;
+    $$("#panels .panel").forEach((p) => p.classList.remove("wizard-active"));
+    wizardInit = false; // so a later reset re-enters the wizard cleanly
+    return;
+  }
+
+  checklist.hidden = true;
+  panels.classList.add("wizard");
+  bar.hidden = false;
+  if (!wizardInit) {
+    const firstIncomplete = WIZARD_STEPS.findIndex((w) => !w.done(s));
+    wizardIdx = firstIncomplete === -1 ? 0 : firstIncomplete;
+    wizardInit = true;
+  }
+  wizardIdx = Math.max(0, Math.min(WIZARD_STEPS.length - 1, wizardIdx));
+  const cur = WIZARD_STEPS[wizardIdx];
+  $$("#panels .panel").forEach((p) => p.classList.toggle("wizard-active", p.dataset.step === cur.step));
+
+  const steps = WIZARD_STEPS
+    .map((w, i) => {
+      const cls = i === wizardIdx ? "active" : w.done(s) ? "done" : "";
+      return `<span class="ws ${cls}"><span class="wn">${w.done(s) ? "✓" : i + 1}</span>${w.label}</span>`;
+    })
+    .join(`<span class="wsep"></span>`);
+  const atLast = wizardIdx === WIZARD_STEPS.length - 1;
+  bar.innerHTML = `<div class="wizard-steps">${steps}</div>
+    <div class="wizard-actions">
+      ${wizardIdx > 0 ? `<button class="btn" id="wiz-back">Back</button>` : ""}
+      <button class="btn primary" id="wiz-next">${atLast ? "Finish" : "Next →"}</button>
+    </div>`;
+  const back = $("#wiz-back");
+  if (back) back.addEventListener("click", () => { wizardIdx -= 1; renderSetup(s); });
+  $("#wiz-next").addEventListener("click", () => {
+    if (atLast) { wizardInit = false; loadStatus(); return; }
+    wizardIdx += 1;
+    renderSetup(s);
+  });
 }
 
 // Enrichment (OSINT) setup panel: one row per tool — detected, one-click install, or why not.
@@ -245,6 +312,7 @@ function askAgent(text) {
 }
 
 let pipeFilter = "all";
+let pipeQuery = "all";
 loaders.pipeline = async () => {
   let rows;
   try { rows = await getJSON("/api/companies"); } catch (e) { return; }
@@ -255,6 +323,19 @@ loaders.pipeline = async () => {
       .join("");
   $$("#pipe-filters .chip").forEach((c) =>
     c.addEventListener("click", () => { pipeFilter = c.dataset.f; loaders.pipeline(); })
+  );
+
+  // Query filter (which ICP search sourced the company) — only when there's ≥1 query.
+  const queries = [...new Set(rows.map((r) => r.source_query).filter(Boolean))];
+  const qrow = $("#pipe-query-row");
+  if (queries.length && !queries.includes(pipeQuery) && pipeQuery !== "all") pipeQuery = "all";
+  qrow.innerHTML = queries.length
+    ? [`<span class="filter-label">sourced by</span>`, "all", ...queries]
+        .map((q, i) => i === 0 ? q : `<button class="chip" data-q="${escAttr(q)}" aria-pressed="${q === pipeQuery}">${q === "all" ? "all queries" : esc(q)}</button>`)
+        .join("")
+    : "";
+  $$("#pipe-query-row .chip").forEach((c) =>
+    c.addEventListener("click", () => { pipeQuery = c.dataset.q; loaders.pipeline(); })
   );
 
   const contactLine = (r) => {
@@ -271,7 +352,9 @@ loaders.pipeline = async () => {
   };
 
   const tb = $("#companies-table tbody");
-  const shown = rows.filter((r) => pipeFilter === "all" || r.status === pipeFilter);
+  const shown = rows.filter(
+    (r) => (pipeFilter === "all" || r.status === pipeFilter) && (pipeQuery === "all" || r.source_query === pipeQuery)
+  );
   const byDom = {};
   shown.forEach((r) => { byDom[r.domain] = r; });
   tb.innerHTML = shown.length
@@ -280,10 +363,11 @@ loaders.pipeline = async () => {
           <td><div class="co">${esc(r.name) || "<span class='dom'>—</span>"}</div>${contactLine(r)}</td>
           <td class="dom">${esc(r.domain)}</td>
           <td><span class="status s-${esc(r.status)}">${esc(stageLabel(r.status))}</span></td>
+          <td class="src-q" title="${escAttr(r.source_query || "")}">${esc(r.source_query || "—")}</td>
           <td class="dom">${esc((r.first_seen || "").slice(0, 10))}</td>
           <td class="pipe-actions">${actionsFor(r)}</td></tr>`)
         .join("")
-    : `<tr><td colspan="5"><div class="empty">No companies yet — start a run in Chat.</div></td></tr>`;
+    : `<tr><td colspan="6"><div class="empty">No companies yet — start a run in Chat.</div></td></tr>`;
 
   const setStatus = async (dom, value, okMsg) => {
     try { await postJSON(`/api/companies/${encodeURIComponent(dom)}/status`, { value }); toast(okMsg, "ok"); loaders.pipeline(); }
@@ -525,6 +609,45 @@ function showWorking() {
 }
 function hideWorking() { if (workingEl) workingEl.remove(); }
 
+// --- chat history -----------------------------------------------------------
+loaders.chat = async () => { await loadChatList(); };
+
+async function loadChatList() {
+  let chats;
+  try { chats = await getJSON("/api/chats"); } catch (_) { return; }
+  const list = $("#chat-list");
+  if (!chats.length) { list.innerHTML = `<div class="empty">No chats yet.</div>`; return; }
+  list.innerHTML = chats
+    .map((c) => `<button class="chat-item" data-id="${escAttr(c.id)}" aria-current="${c.active ? "true" : "false"}">
+        <span class="ct">${esc(c.title) || "(untitled)"}</span>
+        <span class="cm">${esc((c.updated_at || "").slice(0, 16).replace("T", " "))}</span>
+      </button>`)
+    .join("");
+  $$("#chat-list .chat-item").forEach((b) => b.addEventListener("click", () => openChat(b.dataset.id)));
+}
+
+async function openChat(id) {
+  try {
+    const d = await getJSON(`/api/chats/${encodeURIComponent(id)}`);
+    await postJSON(`/api/chats/${encodeURIComponent(id)}/activate`, {});
+    log.innerHTML = "";
+    d.messages.forEach((m) => {
+      if (m.role === "user") bubble("user", m.content);
+      else { const el = bubble("agent", ""); el.innerHTML = mdInline(m.content); }
+    });
+    await loadChatList();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+$("#chat-new").addEventListener("click", async () => {
+  try {
+    await postJSON("/api/chats/new", {});
+    log.innerHTML = "";
+    await loadChatList();
+    $("#chat-input").focus();
+  } catch (e) { toast(e.message, "err"); }
+});
+
 const input = $("#chat-input");
 input.addEventListener("input", () => { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, 200) + "px"; });
 $("#chat-form").addEventListener("submit", (e) => { e.preventDefault(); sendChat(); });
@@ -574,11 +697,27 @@ async function sendChat() {
       done();
       loaders.pipeline();
       loaders.drafts();
+      loadChatList();
     }
   };
   es.onerror = () => done();
 }
 
+// --- theme toggle -----------------------------------------------------------
+function setThemeIcon() {
+  const t = document.documentElement.dataset.theme;
+  const icon = $("#theme-icon"), label = $("#theme-label");
+  if (icon) icon.textContent = t === "light" ? "☀" : "☾";
+  if (label) label.textContent = t;
+}
+$("#theme-toggle").addEventListener("click", () => {
+  const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
+  document.documentElement.dataset.theme = next;
+  try { localStorage.setItem("ct-theme", next); } catch (_) {}
+  setThemeIcon();
+});
+
 // --- boot -------------------------------------------------------------------
+setThemeIcon();
 loadStatus();
 show("onboarding");

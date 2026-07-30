@@ -22,7 +22,7 @@
   </div>
 
   <nav class="nav">
-    <button class="nav-item" data-nav="onboarding"><span class="dot"></span>Setup</button>
+    <button class="nav-item" data-nav="onboarding"><span class="dot"></span><span class="nav-label" id="nav-setup-label">Setup</span></button>
     <button class="nav-item" data-nav="overview"><span class="dot"></span>Overview</button>
     <button class="nav-item" data-nav="chat"><span class="dot"></span>Chat</button>
     <button class="nav-item" data-nav="pipeline"><span class="dot"></span>Pipeline</button>
@@ -34,26 +34,28 @@
     <div class="conn"><span class="led" id="led-provider"></span><span id="provider-label">—</span></div>
     <div class="conn"><span class="led" id="led-canonical"></span>canonical</div>
     <div class="conn"><span class="led" id="led-gmail"></span>gmail</div>
+    <button class="theme-toggle" id="theme-toggle" type="button" title="Toggle light / dark" aria-label="Toggle theme"><span id="theme-icon">◐</span> <span id="theme-label">theme</span></button>
   </div>
 </aside>
 
 <main class="stage">
-  <!-- ONBOARDING -->
+  <!-- ONBOARDING / SETTINGS -->
   <section class="view" id="view-onboarding">
     <header class="view-head">
-      <h1>Get set up</h1>
-      <p class="sub">Discovery-first outreach. Sourcing is fixed to Canonical; drafts are never auto-sent — you send by hand.</p>
+      <h1 id="setup-title">Get set up</h1>
+      <p class="sub" id="setup-sub">Discovery-first outreach. coldtrail owns sourcing (Canonical) and drafting (Gmail); drafts are never auto-sent — you send by hand.</p>
     </header>
 
     <ol class="checklist" id="checklist"></ol>
+    <div class="wizard-bar" id="wizard-bar" hidden></div>
 
-    <div class="panels">
-      <div class="panel" id="panel-provider">
+    <div class="panels" id="panels">
+      <div class="panel" data-step="provider" id="panel-provider">
         <h2>1 · Agent</h2>
         <p class="hint">coldtrail drives an agent. Use a headless CLI (Claude Code / Codex) or bring your own model.</p>
         <div class="agent-row" id="agent-row"></div>
         <div id="byok" class="byok" hidden>
-          <p class="hint">Any OpenAI-compatible endpoint — local <strong>Ollama</strong> or a BYOK gateway. <em>Note: sourcing (Canonical) &amp; sending (Gmail) need the Claude/Codex backend for now.</em></p>
+          <p class="hint">Any OpenAI-compatible endpoint — local <strong>Ollama</strong> or a BYOK gateway. Sourcing (Canonical) and drafting (Gmail) are coldtrail's own — they work on every backend.</p>
           <div class="row"><button class="btn" type="button" id="ollama-preset">Ollama (localhost)</button></div>
           <label>Base URL <input id="byok-base" placeholder="http://localhost:11434/v1" autocomplete="off" /></label>
           <label>Model <input id="byok-model" placeholder="llama3.1" autocomplete="off" /></label>
@@ -62,40 +64,34 @@
         </div>
       </div>
 
-      <div class="panel" id="panel-discovery">
+      <div class="panel" data-step="discovery" id="panel-discovery">
         <h2>2 · Discovery <span class="conn-state" id="disc-state"></span></h2>
-        <p class="hint">Where companies come from. <strong>Canonical</strong> — verified, long-tail company search. Connecting authorizes it for your chosen provider (in-browser for BYOK/Ollama).</p>
+        <p class="hint">Where companies come from. <strong>Canonical</strong> — verified, long-tail company search, connected to <strong>coldtrail itself</strong> (one browser consent). Works the same on every provider; the agent sources with <code>coldtrail source</code>.</p>
         <div class="row"><button class="btn primary" id="connect-canonical">Connect Canonical</button><span class="form-msg" id="disc-msg"></span></div>
       </div>
 
-      <div class="panel" id="panel-destination">
+      <div class="panel" data-step="destination" id="panel-destination">
         <h2>3 · Destination <span class="conn-state" id="dest-state"></span></h2>
-        <p class="hint">Where outreach goes. <strong>Gmail</strong> — you review every draft and hit Send; coldtrail never auto-sends.</p>
-        <div id="gmail-account" hidden>
-          <p class="hint">✓ Gmail is provided by your <strong>account's Gmail connector</strong> — already available on Claude Code / Codex, no keys to enter. Manage it at <a href="https://claude.ai/settings/connectors" target="_blank" rel="noreferrer">claude.ai → Connectors</a>.</p>
-        </div>
-        <div id="gmail-byo" hidden>
-          <p class="hint">One browser consent, no keys — coldtrail brings its own Google client. You'll pass Google's "unverified app" screen (Advanced → continue).</p>
-          <div class="row"><button class="btn primary" id="connect-gmail">Connect Gmail</button><span class="form-msg" id="dest-msg"></span></div>
-        </div>
+        <p class="hint">Where outreach goes. <strong>Gmail</strong>, connected to <strong>coldtrail itself</strong> — one browser consent, no keys; coldtrail brings its own Google client. coldtrail creates the draft in your Gmail; you review and hit Send. It never auto-sends. You'll pass Google's "unverified app" screen (Advanced → continue).</p>
+        <div class="row"><button class="btn primary" id="connect-gmail">Connect Gmail</button><span class="form-msg" id="dest-msg"></span></div>
         <p class="hint" style="margin-top:12px;opacity:.55">also a destination: <span class="status s-sourced">LinkedIn — coming</span></p>
       </div>
 
-      <div class="panel" id="panel-osint">
-        <h2>Enrichment · OSINT <span class="conn-state" id="osint-state"></span></h2>
-        <p class="hint">Deeper founder-email discovery. The agent uses <strong>theHarvester</strong> when it's installed, and always falls back to its built-in web finder — nothing breaks if it's missing.</p>
-        <div id="osint-body"></div>
-      </div>
-
-      <div class="panel" id="panel-message">
+      <div class="panel" data-step="brief" id="panel-message">
         <h2>4 · Your brief</h2>
         <p class="hint">Your outreach brief (<code>message.toml</code>) — your voice, offer, and link. The agent writes a <em>personalized</em> pitch per company from it; it never sends this verbatim. Stays local.</p>
         <textarea id="message-toml" spellcheck="false" rows="12"></textarea>
         <div class="row"><button class="btn" id="save-message">Save pitch</button><span class="form-msg" id="message-msg"></span></div>
       </div>
 
-      <div class="panel" id="panel-contacted">
-        <h2>5 · Already contacted</h2>
+      <div class="panel" data-step="extra" id="panel-osint">
+        <h2>Enrichment · OSINT <span class="conn-state" id="osint-state"></span></h2>
+        <p class="hint">Deeper founder-email discovery. The agent uses <strong>theHarvester</strong> / <strong>SpiderFoot</strong> when installed, and always falls back to its built-in web finder — nothing breaks if they're missing.</p>
+        <div id="osint-body"></div>
+      </div>
+
+      <div class="panel" data-step="extra" id="panel-contacted">
+        <h2>Already contacted</h2>
         <p class="hint">Domains you've reached before (<code>contacted.toml</code>) so coldtrail never double-contacts.</p>
         <textarea id="contacted-toml" spellcheck="false" rows="8"></textarea>
         <div class="row"><button class="btn" id="save-contacted">Save list</button><span class="form-msg" id="contacted-msg"></span></div>
@@ -115,20 +111,28 @@
 
   <!-- CHAT -->
   <section class="view" id="view-chat">
-    <header class="view-head"><h1>Run the loop</h1><p class="sub">Tell the agent what you want. It sources via Canonical, enriches, and drafts — you review and send.</p></header>
-    <div class="chat" id="chat-log"></div>
-    <form class="composer" id="chat-form">
-      <textarea id="chat-input" rows="1" placeholder="e.g. Find 20 companies like Linear and draft intros to the founders"></textarea>
-      <button class="btn primary" type="submit" id="chat-send">Send ↵</button>
-    </form>
+    <div class="chat-wrap">
+      <aside class="chat-history">
+        <button class="btn primary chat-new" id="chat-new" type="button">+ New chat</button>
+        <div class="chat-list" id="chat-list"></div>
+      </aside>
+      <div class="chat-main">
+        <div class="chat" id="chat-log"></div>
+        <form class="composer" id="chat-form">
+          <textarea id="chat-input" rows="1" placeholder="e.g. Source 20 companies like Linear and draft intros to the founders"></textarea>
+          <button class="btn primary" type="submit" id="chat-send">Send ↵</button>
+        </form>
+      </div>
+    </div>
   </section>
 
   <!-- PIPELINE -->
   <section class="view" id="view-pipeline">
     <header class="view-head"><h1>Pipeline</h1><p class="sub">Every company you've sourced, deduped by domain. Stages: <em>sourced → contact found → in&nbsp;Gmail → sent</em>. Act on any row — enrich, draft, or skip.</p>
       <div class="filters" id="pipe-filters"></div>
+      <div class="filters" id="pipe-query-row"></div>
     </header>
-    <div class="table-wrap"><table class="grid" id="companies-table"><thead><tr><th>Company</th><th>Domain</th><th>Status</th><th>First seen</th><th></th></tr></thead><tbody></tbody></table></div>
+    <div class="table-wrap"><table class="grid" id="companies-table"><thead><tr><th>Company</th><th>Domain</th><th>Status</th><th>Sourced by</th><th>First seen</th><th></th></tr></thead><tbody></tbody></table></div>
   </section>
 
   <!-- DRAFTS -->
