@@ -89,6 +89,9 @@ pub enum AgentEvent {
     ToolEnd { ok: bool },
     /// A non-fatal error message to show the user.
     Error { message: String },
+    /// The provider assigned a session id (codex thread) — consumed internally to persist
+    /// for resume; not shown to the user.
+    Session { id: String },
     /// The turn finished.
     Done { ok: bool, result: Option<String> },
 }

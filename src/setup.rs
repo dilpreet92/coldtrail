@@ -30,6 +30,8 @@ pub struct SetupOpts {
 pub fn ensure() -> Result<()> {
     crate::home::workspace()?;
     crate::home::write_asset("CLAUDE.md", CLAUDE_MD, true)?;
+    // Codex reads AGENTS.md (not CLAUDE.md) — same brief so both CLI backends get the loop.
+    crate::home::write_asset("AGENTS.md", CLAUDE_MD, true)?;
     crate::home::write_asset("enrichment.md", ENRICHMENT_MD, true)?;
     crate::home::write_asset("message.toml", MESSAGE_TOML, false)?;
     crate::home::write_asset("contacted.toml", CONTACTED_TOML, false)?;
@@ -390,6 +392,7 @@ mod tests {
             ensure().unwrap();
             for f in [
                 "CLAUDE.md",
+                "AGENTS.md",
                 "enrichment.md",
                 "config.toml",
                 "message.toml",

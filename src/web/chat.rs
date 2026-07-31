@@ -99,10 +99,16 @@ pub async fn start(
         let mut assistant = String::new();
         let mut ok = false;
         let mut disconnected = false;
+        let mut new_session: Option<String> = None;
         while let Some(ev) = rx_a.recv().await {
             match &ev {
                 AgentEvent::Text { text } => assistant.push_str(text),
                 AgentEvent::Done { ok: o, .. } => ok = *o,
+                // codex assigns its own thread id — capture it for resume, don't show it.
+                AgentEvent::Session { id } => {
+                    new_session = Some(id.clone());
+                    continue;
+                }
                 _ => {}
             }
             // Forward to the browser; if it went away, stop and let the inner turn cancel
@@ -114,10 +120,22 @@ pub async fn start(
         }
         drop(rx_a);
 
+        // Persist the provider-assigned session id (codex) so a later resume targets it.
+        if let Some(sid) = &new_session {
+            if let Ok(c) = crate::db::open() {
+                let _ = c.execute(
+                    "UPDATE chat_sessions SET agent_session_id=?1 WHERE id=?2",
+                    params![sid, chat_id],
+                );
+            }
+        }
         if !assistant.trim().is_empty() {
             insert_message(&chat_id, "assistant", assistant.trim());
         }
         let mut s = st.chat.lock().await;
+        if let Some(sid) = new_session {
+            s.agent_session_id = Some(sid);
+        }
         if ok {
             s.created = true;
         } else if first && !disconnected {

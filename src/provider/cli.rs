@@ -1,5 +1,6 @@
-//! Headless CLI-agent backend: spawn `claude -p --output-format stream-json` in the
-//! workspace and map its JSONL events to `AgentEvent`s. Codex is best-effort.
+//! Headless CLI-agent backends: spawn `claude -p --output-format stream-json` or
+//! `codex exec --json` in the workspace and map their JSONL events to `AgentEvent`s.
+//! Both share `stream_child`; codex assigns its own thread id (surfaced as a `Session` event).
 
 use serde_json::Value;
 use std::path::Path;
@@ -125,12 +126,138 @@ pub async fn run_turn(
 ) -> bool {
     match kind {
         AgentKind::Claude => run_claude(session_id, first_turn, msg, home, tools, tx).await,
-        AgentKind::Codex => {
+        AgentKind::Codex => run_codex(session_id, first_turn, msg, home, tx).await,
+    }
+}
+
+/// Build the argv for a headless Codex turn (`codex exec … --json`). First turn starts a new
+/// thread (codex assigns the id, surfaced via a `thread.started` event); later turns resume
+/// it by id. cwd is set on the Command, so no `-C` here.
+pub fn codex_args(session_id: &str, first_turn: bool, msg: &str) -> Vec<String> {
+    let mut a: Vec<String> = vec!["exec".into()];
+    if !first_turn {
+        a.push("resume".into());
+        a.push(session_id.into());
+    }
+    a.push("--json".into());
+    // Headless automation: run tool/shell commands without approval prompts (the workspace is
+    // the user's own machine). Codex has no per-tool gate; the brief (AGENTS.md) forbids Gmail.
+    a.push("--dangerously-bypass-approvals-and-sandbox".into());
+    a.push("--skip-git-repo-check".into());
+    a.push(msg.into());
+    a
+}
+
+/// Map one line of `codex exec --json` (JSONL) to zero or more events.
+fn parse_codex_line(line: &str) -> Vec<AgentEvent> {
+    let v: Value = match serde_json::from_str(line.trim()) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    match v["type"].as_str().unwrap_or("") {
+        "thread.started" => v["thread_id"]
+            .as_str()
+            .map(|id| vec![AgentEvent::Session { id: id.to_string() }])
+            .unwrap_or_default(),
+        "item.started" => {
+            let it = &v["item"];
+            match it["type"].as_str().unwrap_or("") {
+                "agent_message" | "reasoning" => vec![],
+                _ => vec![AgentEvent::ToolStart {
+                    name: codex_item_name(it),
+                    input: it.clone(),
+                }],
+            }
+        }
+        "item.completed" => {
+            let it = &v["item"];
+            match it["type"].as_str().unwrap_or("") {
+                "agent_message" => it["text"]
+                    .as_str()
+                    .filter(|t| !t.is_empty())
+                    .map(|t| {
+                        vec![AgentEvent::Text {
+                            text: t.to_string(),
+                        }]
+                    })
+                    .unwrap_or_default(),
+                "reasoning" => vec![],
+                _ => {
+                    let ok = it["exit_code"]
+                        .as_i64()
+                        .map(|c| c == 0)
+                        .unwrap_or_else(|| it["status"].as_str() != Some("failed"));
+                    vec![AgentEvent::ToolEnd { ok }]
+                }
+            }
+        }
+        "turn.completed" => vec![AgentEvent::Done {
+            ok: true,
+            result: None,
+        }],
+        "turn.failed" | "error" => {
+            let msg = v["error"]["message"]
+                .as_str()
+                .or_else(|| v["message"].as_str())
+                .unwrap_or("codex turn failed")
+                .to_string();
+            vec![
+                AgentEvent::Error { message: msg },
+                AgentEvent::Done {
+                    ok: false,
+                    result: None,
+                },
+            ]
+        }
+        _ => vec![],
+    }
+}
+
+/// A short label for a codex tool/command item (shown as a chip).
+fn codex_item_name(it: &Value) -> String {
+    match it["type"].as_str().unwrap_or("item") {
+        "command_execution" => {
+            let cmd: String = it["command"]
+                .as_str()
+                .unwrap_or("")
+                .chars()
+                .take(48)
+                .collect();
+            if cmd.trim().is_empty() {
+                "shell".into()
+            } else {
+                format!("$ {cmd}")
+            }
+        }
+        "mcp_tool_call" => it["tool"]
+            .as_str()
+            .or_else(|| it["name"].as_str())
+            .unwrap_or("mcp")
+            .to_string(),
+        other => other.to_string(),
+    }
+}
+
+async fn run_codex(
+    session_id: &str,
+    first_turn: bool,
+    msg: &str,
+    home: &Path,
+    tx: Sender<AgentEvent>,
+) -> bool {
+    let spawn = Command::new("codex")
+        .args(codex_args(session_id, first_turn, msg))
+        .current_dir(home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let child = match spawn {
+        Ok(c) => c,
+        Err(e) => {
             let _ = tx
                 .send(AgentEvent::Error {
-                    message: "The Codex backend isn't wired into the app yet — run \
-                              `coldtrail setup --provider claude` to use Claude Code."
-                        .into(),
+                    message: format!("failed to launch codex: {e}"),
                 })
                 .await;
             let _ = tx
@@ -139,9 +266,10 @@ pub async fn run_turn(
                     result: None,
                 })
                 .await;
-            false
+            return false;
         }
-    }
+    };
+    stream_child(child, parse_codex_line, tx).await
 }
 
 async fn run_claude(
@@ -160,7 +288,7 @@ async fn run_claude(
         .stderr(Stdio::piped())
         .spawn();
 
-    let mut child = match spawn {
+    let child = match spawn {
         Ok(c) => c,
         Err(e) => {
             let _ = tx
@@ -178,6 +306,17 @@ async fn run_claude(
         }
     };
 
+    stream_child(child, parse_stream_line, tx).await
+}
+
+/// Stream a spawned agent child's stdout (JSONL) through `parse`, forwarding events to `tx`.
+/// Kills the child on browser disconnect, captures stderr, and synthesizes a terminal Done
+/// when the child ends without one. Returns true iff the turn finished ok.
+async fn stream_child(
+    mut child: tokio::process::Child,
+    parse: fn(&str) -> Vec<AgentEvent>,
+    tx: Sender<AgentEvent>,
+) -> bool {
     // Drain stderr concurrently so its pipe never blocks the child.
     let stderr = child.stderr.take();
     let err_task = tokio::spawn(async move {
@@ -193,7 +332,7 @@ async fn run_claude(
         None => {
             let _ = tx
                 .send(AgentEvent::Error {
-                    message: "no stdout from claude".into(),
+                    message: "no stdout from the agent".into(),
                 })
                 .await;
             let _ = tx
@@ -218,7 +357,7 @@ async fn run_claude(
             line = lines.next_line() => {
                 match line {
                     Ok(Some(line)) => {
-                        for ev in parse_stream_line(&line) {
+                        for ev in parse(&line) {
                             if let AgentEvent::Done { ok, .. } = &ev {
                                 saw_done = true;
                                 done_ok = *ok;
@@ -279,6 +418,45 @@ mod tests {
     use super::*;
 
     const NONE: Tools = Tools::Disallow(&[]);
+
+    #[test]
+    fn codex_args_first_and_resume() {
+        let first = codex_args("t-1", true, "hi");
+        assert_eq!(first[0], "exec");
+        assert!(!first.iter().any(|x| x == "resume"));
+        assert!(first.iter().any(|x| x == "--json"));
+        assert_eq!(first.last().unwrap(), "hi");
+        let resume = codex_args("t-1", false, "again");
+        assert!(resume.windows(2).any(|w| w == ["resume", "t-1"]));
+    }
+
+    #[test]
+    fn parse_codex_events() {
+        assert_eq!(
+            parse_codex_line(r#"{"type":"thread.started","thread_id":"abc"}"#),
+            vec![AgentEvent::Session { id: "abc".into() }]
+        );
+        assert_eq!(
+            parse_codex_line(
+                r#"{"type":"item.completed","item":{"type":"agent_message","text":"hello"}}"#
+            ),
+            vec![AgentEvent::Text {
+                text: "hello".into()
+            }]
+        );
+        assert_eq!(
+            parse_codex_line(r#"{"type":"turn.completed","usage":{}}"#),
+            vec![AgentEvent::Done {
+                ok: true,
+                result: None
+            }]
+        );
+        // a command-execution item becomes a tool chip
+        let started = parse_codex_line(
+            r#"{"type":"item.started","item":{"type":"command_execution","command":"echo hi"}}"#,
+        );
+        assert!(matches!(started.as_slice(), [AgentEvent::ToolStart { .. }]));
+    }
 
     #[test]
     fn args_first_turn_seeds_session() {
