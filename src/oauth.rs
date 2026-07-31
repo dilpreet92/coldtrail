@@ -55,12 +55,18 @@ pub fn authorize_url(
     state: &str,
     challenge: &str,
 ) -> String {
+    // Omit `scope` entirely when empty — Canonical (dynamic-client-registration) rejects a
+    // literal `scope=` it wasn't registered with ("invalid_scope"); no param = registered defaults.
+    let scope_param = if scope.is_empty() {
+        String::new()
+    } else {
+        format!("&scope={}", enc(scope))
+    };
     format!(
-        "{auth_endpoint}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}\
+        "{auth_endpoint}?response_type=code&client_id={}&redirect_uri={}{scope_param}&state={}\
          &code_challenge={}&code_challenge_method=S256&access_type=offline&prompt=consent",
         enc(client_id),
         enc(redirect_uri),
-        enc(scope),
         enc(state),
         enc(challenge),
     )
@@ -231,20 +237,46 @@ async fn wait_for_code(port: u16, expect_state: &str) -> Result<String> {
         .and_then(|l| l.split_whitespace().nth(1))
         .unwrap_or("");
     let (code, state) = parse_callback(target);
-    let body = "<html><body style='font-family:sans-serif'>coldtrail connected — you can close this tab.</body></html>";
+    let error = query_field(target, "error");
+    // Only claim success when we actually got a code and no error came back.
+    let succeeded = code.is_some() && error.is_none();
+    let body = if succeeded {
+        "<html><body style='font-family:sans-serif'>coldtrail connected — you can close this tab.</body></html>"
+    } else {
+        "<html><body style='font-family:sans-serif'>coldtrail could not connect — return to the app and try again. You can close this tab.</body></html>"
+    };
     let _ = sock
         .write_all(
             format!(
-                "HTTP/1.1 200 OK\r\nContent-Type:text/html\r\nContent-Length:{}\r\n\r\n{body}",
+                "HTTP/1.1 200 OK\r\nContent-Type:text/html; charset=utf-8\r\nContent-Length:{}\r\n\r\n{body}",
                 body.len()
             )
             .as_bytes(),
         )
         .await;
+    if let Some(err) = error {
+        let desc = query_field(target, "error_description").unwrap_or_default();
+        return Err(anyhow!("authorization failed: {err} {desc}")
+            .context("Canonical/Gmail rejected the authorization"));
+    }
     if state.as_deref() != Some(expect_state) {
         return Err(anyhow!("OAuth state mismatch (possible CSRF) — aborting"));
     }
     code.ok_or_else(|| anyhow!("no authorization code in callback"))
+}
+
+/// Pull a single query-string field from a `/callback?…` request target.
+fn query_field(target: &str, key: &str) -> Option<String> {
+    let query = target.split('?').nth(1).unwrap_or("");
+    for pair in query.split('&') {
+        let mut it = pair.splitn(2, '=');
+        if it.next() == Some(key) {
+            return it
+                .next()
+                .map(|v| urlencoding::decode(v).unwrap_or_default().into_owned());
+        }
+    }
+    None
 }
 
 /// Extract (code, state) from a `/callback?code=…&state=…` request target.
@@ -416,6 +448,24 @@ mod tests {
         assert!(u.contains("client_id=cid.apps"));
         assert!(u.contains("redirect_uri=http%3A%2F%2Flocalhost%3A8765%2Fcallback"));
         assert!(u.contains("gmail.compose"));
+    }
+
+    #[test]
+    fn authorize_url_omits_empty_scope() {
+        // Canonical rejects a literal `scope=` it wasn't registered with, so it must be absent.
+        let u = authorize_url(
+            "https://as.example/auth",
+            "cid",
+            "http://localhost:8765/callback",
+            "",
+            "st",
+            "chal",
+        );
+        assert!(
+            !u.contains("scope="),
+            "empty scope must be omitted, got: {u}"
+        );
+        assert!(u.contains("state=st"));
     }
 
     #[test]
