@@ -19,13 +19,43 @@ fn raw_message(to: &str, subject: &str, body: &str) -> String {
     URL_SAFE_NO_PAD.encode(mime.as_bytes())
 }
 
-/// Create a Gmail draft as the authenticated user. Returns the Gmail draft id.
-pub async fn create_draft(token: &str, to: &str, subject: &str, body: &str) -> Result<String> {
+/// The best available Gmail token: coldtrail's own OAuth if connected, else gcloud ADC
+/// (keyless — reuses Google's gcloud client). Returns (access_token, quota_project).
+pub async fn token() -> Result<(String, Option<String>)> {
+    if let Some(t) = crate::oauth::valid_access("gmail").await {
+        return Ok((t, None));
+    }
+    if crate::gcloud::available() {
+        let t = crate::gcloud::access_token().await?;
+        return Ok((t, crate::gcloud::quota_project()));
+    }
+    Err(anyhow!(
+        "Gmail isn't connected. Keyless option: run `{}` and set a quota project with the \
+         Gmail API enabled (`gcloud auth application-default set-quota-project <PROJECT>`). \
+         Or set COLDTRAIL_GOOGLE_CLIENT_ID/SECRET for coldtrail's own client.",
+        crate::gcloud::ADC_LOGIN_HINT
+    ))
+}
+
+/// Create a Gmail draft as the authenticated user. `quota_project` (for gcloud ADC) is sent
+/// as `x-goog-user-project` so the API attributes the call to a project with Gmail enabled.
+/// Returns the Gmail draft id.
+pub async fn create_draft(
+    token: &str,
+    quota_project: Option<&str>,
+    to: &str,
+    subject: &str,
+    body: &str,
+) -> Result<String> {
     let raw = raw_message(to, subject, body);
-    let resp = reqwest::Client::new()
+    let mut req = reqwest::Client::new()
         .post("https://gmail.googleapis.com/gmail/v1/users/me/drafts")
         .header("authorization", format!("Bearer {token}"))
-        .header("content-type", "application/json")
+        .header("content-type", "application/json");
+    if let Some(p) = quota_project {
+        req = req.header("x-goog-user-project", p);
+    }
+    let resp = req
         .body(serde_json::json!({ "message": { "raw": raw } }).to_string())
         .send()
         .await

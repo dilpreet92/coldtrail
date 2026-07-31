@@ -28,6 +28,10 @@ pub struct StatusDto {
     pub destination_connected: bool,
     /// OSINT enrichment tooling (theHarvester) detection + install-ability.
     pub osint: crate::osint::OsintStatus,
+    /// coldtrail's own Google client is configured (COLDTRAIL_GOOGLE_CLIENT_ID/SECRET).
+    pub gmail_client_configured: bool,
+    /// gcloud Application Default Credentials are present (keyless Gmail path).
+    pub gcloud_available: bool,
 }
 
 #[derive(Deserialize, Default)]

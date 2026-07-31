@@ -72,7 +72,8 @@
 
       <div class="panel" data-step="destination" id="panel-destination">
         <h2>3 · Destination <span class="conn-state" id="dest-state"></span></h2>
-        <p class="hint">Where outreach goes. <strong>Gmail</strong>, connected to <strong>coldtrail itself</strong> — one browser consent, no keys; coldtrail brings its own Google client. coldtrail creates the draft in your Gmail; you review and hit Send. It never auto-sends. You'll pass Google's "unverified app" screen (Advanced → continue).</p>
+        <p class="hint" id="dest-hint">Where outreach goes. <strong>Gmail</strong> — coldtrail creates the draft; you review and hit Send. It never auto-sends.</p>
+        <div id="dest-gcloud"></div>
         <div class="row"><button class="btn primary" id="connect-gmail">Connect Gmail</button><span class="form-msg" id="dest-msg"></span></div>
         <p class="hint" style="margin-top:12px;opacity:.55">also a destination: <span class="status s-sourced">LinkedIn — coming</span></p>
       </div>

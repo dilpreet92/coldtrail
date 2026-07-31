@@ -151,6 +151,8 @@ textarea{resize:vertical; line-height:1.5}
 .byok{margin-top:16px; padding-top:16px; border-top:1px solid var(--line); display:flex; flex-direction:column; gap:11px}
 .byok[hidden]{display:none}
 .conn-state{font-family:var(--mono); font-size:11px; color:var(--ok); text-transform:none; letter-spacing:0; margin-left:6px}
+.cmd{font-family:var(--mono); font-size:11.5px; color:var(--cyan); background:var(--field); border:1px solid var(--line2);
+  border-radius:8px; padding:10px 12px; margin:0 0 10px; overflow-x:auto; white-space:pre; line-height:1.5}
 
 /* chat */
 .chat-wrap{display:flex; gap:20px; align-items:flex-start}

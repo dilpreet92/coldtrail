@@ -42,14 +42,12 @@ pub async fn send(
     };
     let to = to.ok_or_else(|| anyhow::anyhow!("no recipient email on file for {domain}"))?;
 
-    let token = match crate::oauth::valid_access("gmail").await {
-        Some(t) => t,
-        None => {
+    let (token, quota) = match crate::gmail::token().await {
+        Ok(v) => v,
+        Err(e) => {
             return Ok(Json(MsgResp {
                 ok: false,
-                message: Some(
-                    "Gmail isn't connected — connect it in Settings → Destination.".into(),
-                ),
+                message: Some(e.to_string()),
                 wired: None,
             }))
         }
@@ -57,6 +55,7 @@ pub async fn send(
 
     match crate::gmail::create_draft(
         &token,
+        quota.as_deref(),
         &to,
         subject.as_deref().unwrap_or(""),
         body.as_deref().unwrap_or(""),

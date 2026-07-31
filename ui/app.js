@@ -94,6 +94,7 @@ async function loadStatus() {
   if (st) st.textContent = s.discovery_connected ? "· connected" : "";
   const dt = $("#dest-state");
   if (dt) dt.textContent = s.destination_connected ? "· connected" : "";
+  renderDestination(s);
 
   // enrichment (OSINT)
   renderOsint(s.osint || {});
@@ -219,6 +220,27 @@ function renderSetup(s) {
     wizardIdx += 1;
     renderSetup(s);
   });
+}
+
+// Destination (Gmail) — coldtrail's own client if configured, else the keyless gcloud path.
+const GCLOUD_CMD = "gcloud auth application-default login --scopes=https://www.googleapis.com/auth/gmail.compose,https://www.googleapis.com/auth/cloud-platform";
+function renderDestination(s) {
+  const hint = $("#dest-hint"), gc = $("#dest-gcloud"), btn = $("#connect-gmail");
+  if (!hint || !gc || !btn) return;
+  if (s.gmail_client_configured) {
+    hint.innerHTML = `Where outreach goes. <strong>Gmail</strong>, via <strong>coldtrail's own Google client</strong> — one browser consent, no keys to paste. coldtrail creates the draft in your Gmail; you review and hit Send (never auto-sends). You'll pass Google's "unverified app" screen (Advanced → continue).`;
+    gc.innerHTML = "";
+    btn.textContent = "Connect Gmail";
+    return;
+  }
+  // keyless gcloud (ADC) path
+  hint.innerHTML = `Where outreach goes. <strong>Gmail</strong>, keyless via <strong>gcloud</strong> — no client id/secret. coldtrail mints a token from your Application Default Credentials; you review each draft and hit Send (never auto-sends).`;
+  gc.innerHTML = `<p class="hint" style="margin-bottom:6px">One-time, in your terminal:</p>
+    <pre class="cmd">${esc(GCLOUD_CMD)}</pre>
+    <p class="hint">${s.gcloud_available
+      ? "✓ gcloud credentials detected — click <strong>Use gcloud</strong> to connect. Also set a quota project with the Gmail API enabled: <code>gcloud auth application-default set-quota-project &lt;PROJECT&gt;</code>."
+      : "gcloud credentials not detected yet — run the command above (and install the Google Cloud SDK if needed), then click <strong>Use gcloud</strong>."}</p>`;
+  btn.textContent = "Use gcloud";
 }
 
 // Enrichment (OSINT) setup panel: one row per tool — detected, one-click install, or why not.

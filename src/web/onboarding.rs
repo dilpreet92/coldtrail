@@ -39,9 +39,10 @@ pub async fn status() -> Result<Json<StatusDto>, ApiErr> {
         None => base_url.is_some(), // openai backend
     };
     // coldtrail OWNS discovery + destination now: its own OAuth token, same on every
-    // provider (Canonical via `coldtrail source`, Gmail via the Gmail API).
+    // provider (Canonical via `coldtrail source`, Gmail via the Gmail API). Gmail can be
+    // keyless via gcloud ADC, so that also counts as connected.
     let discovery_connected = crate::secrets::has_token("canonical");
-    let destination_connected = crate::secrets::has_token("gmail");
+    let destination_connected = crate::secrets::has_token("gmail") || crate::gcloud::available();
     let _ = (canonical_wired, gmail_wired);
     let onboarded = message_customized && provider_ready && discovery_connected;
 
@@ -59,6 +60,8 @@ pub async fn status() -> Result<Json<StatusDto>, ApiErr> {
         discovery_connected,
         destination_connected,
         osint: crate::osint::status(),
+        gmail_client_configured: crate::oauth::google_client().is_some(),
+        gcloud_available: crate::gcloud::available(),
     }))
 }
 
@@ -113,13 +116,33 @@ pub async fn connect_discovery() -> Result<Json<MsgResp>, ApiErr> {
     Ok(connect_result(crate::oauth::connect_canonical().await))
 }
 
-/// Connect Destination (Gmail): coldtrail's OWN `gmail.compose` OAuth (built-in Google
-/// client), on every provider. coldtrail creates the Gmail draft itself via the Gmail API.
+/// Connect Destination (Gmail). If coldtrail's own Google client is configured, run the
+/// browser OAuth (works on every backend). Otherwise use the keyless gcloud ADC path —
+/// verify a Gmail token can be minted from `gcloud auth application-default` credentials.
 pub async fn connect_destination(
     Json(req): Json<super::api::GmailConnectReq>,
 ) -> Result<Json<MsgResp>, ApiErr> {
-    let port = req.callback_port.unwrap_or(8765);
-    Ok(connect_result(crate::oauth::connect_gmail(port).await))
+    if crate::oauth::google_client().is_some() {
+        let port = req.callback_port.unwrap_or(8765);
+        return Ok(connect_result(crate::oauth::connect_gmail(port).await));
+    }
+    // Keyless: confirm gcloud ADC yields a usable token (scope is checked at draft time).
+    match crate::gmail::token().await {
+        Ok(_) => Ok(Json(MsgResp {
+            ok: true,
+            message: Some(
+                "Gmail ready via gcloud. If a draft later fails, log in with the Gmail scope \
+                 and set a quota project with the Gmail API enabled."
+                    .into(),
+            ),
+            wired: None,
+        })),
+        Err(e) => Ok(Json(MsgResp {
+            ok: false,
+            message: Some(e.to_string()),
+            wired: None,
+        })),
+    }
 }
 
 pub async fn set_provider(Json(req): Json<ProviderReq>) -> Result<Json<MsgResp>, ApiErr> {
