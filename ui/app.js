@@ -36,8 +36,12 @@ async function postJSON(path, body) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body || {}),
   });
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data.message || (await r.text().catch(() => "")) || r.statusText);
+  // Read the body once; error responses are plain text (not JSON), so parsing the same
+  // string is what lets the real error surface instead of a generic "Internal Server Error".
+  const raw = await r.text();
+  let data = {};
+  try { data = raw ? JSON.parse(raw) : {}; } catch (_) {}
+  if (!r.ok) throw new Error(data.message || raw || r.statusText);
   return data;
 }
 const $ = (s, r = document) => r.querySelector(s);
@@ -252,7 +256,8 @@ function renderOsint(o) {
 $("#connect-canonical").addEventListener("click", async () => {
   msg("#disc-msg", "connecting… authorize in the browser tab if one opens", true);
   try {
-    await postJSON("/api/discovery/canonical/connect", {});
+    const r = await postJSON("/api/discovery/canonical/connect", {});
+    if (r.ok === false) { msg("#disc-msg", r.message || "could not connect", false); return; }
     msg("#disc-msg", "connected", true);
     await loadStatus();
   } catch (e) { msg("#disc-msg", e.message, false); }
@@ -260,7 +265,8 @@ $("#connect-canonical").addEventListener("click", async () => {
 $("#connect-gmail").addEventListener("click", async () => {
   msg("#dest-msg", "connecting… authorize in the browser tab that opens", true);
   try {
-    await postJSON("/api/destination/gmail/connect", { callback_port: 8765 });
+    const r = await postJSON("/api/destination/gmail/connect", { callback_port: 8765 });
+    if (r.ok === false) { msg("#dest-msg", r.message || "could not connect", false); return; }
     msg("#dest-msg", "connected", true);
     await loadStatus();
   } catch (e) { msg("#dest-msg", e.message, false); }

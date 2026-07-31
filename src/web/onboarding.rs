@@ -94,11 +94,23 @@ pub async fn install_osint(
     Ok(Json(resp))
 }
 
+/// Turn a connect result into a handled response — a clear `ok:false` message instead of a
+/// bare 500, so the browser can show *why* (e.g. no Google client configured, consent denied).
+fn connect_result(r: anyhow::Result<()>) -> Json<MsgResp> {
+    match r {
+        Ok(()) => Json(MsgResp::ok()),
+        Err(e) => Json(MsgResp {
+            ok: false,
+            message: Some(e.to_string()),
+            wired: None,
+        }),
+    }
+}
+
 /// Connect Discovery (Canonical): coldtrail's OWN OAuth, on every provider. Sourcing then
 /// runs through `coldtrail source` (coldtrail's MCP client), not the provider's connector.
 pub async fn connect_discovery() -> Result<Json<MsgResp>, ApiErr> {
-    crate::oauth::connect_canonical().await?;
-    Ok(Json(MsgResp::ok()))
+    Ok(connect_result(crate::oauth::connect_canonical().await))
 }
 
 /// Connect Destination (Gmail): coldtrail's OWN `gmail.compose` OAuth (built-in Google
@@ -107,8 +119,7 @@ pub async fn connect_destination(
     Json(req): Json<super::api::GmailConnectReq>,
 ) -> Result<Json<MsgResp>, ApiErr> {
     let port = req.callback_port.unwrap_or(8765);
-    crate::oauth::connect_gmail(port).await?;
-    Ok(Json(MsgResp::ok()))
+    Ok(connect_result(crate::oauth::connect_gmail(port).await))
 }
 
 pub async fn set_provider(Json(req): Json<ProviderReq>) -> Result<Json<MsgResp>, ApiErr> {
