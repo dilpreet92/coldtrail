@@ -130,6 +130,23 @@ mod tests {
     }
 
     #[test]
+    fn parses_real_canonical_search_envelope() {
+        // The actual shape `search_companies` returns: {query,count,results:[…]} with extra
+        // per-company fields (description, dimensions, verdict) we ignore.
+        let raw = r#"{"query":"x","count":1,"credits_used":1,"results":[
+            {"name":"Djinni.ai","domain":"djinni.ai","description":"…","headquarters":"Jersey City, NJ, US",
+             "employee_count":1,"founding_year":2023,"funding":null,"dimensions":{},"verdict":"relevant"}
+        ]}"#;
+        let v = parse_results(raw).unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].domain, "djinni.ai");
+        assert_eq!(v[0].name.as_deref(), Some("Djinni.ai"));
+        assert_eq!(v[0].hq.as_deref(), Some("Jersey City, NJ, US"));
+        assert_eq!(v[0].employees, Some(1));
+        assert_eq!(v[0].founding_year, Some(2023));
+    }
+
+    #[test]
     fn employee_count_as_string_is_coerced() {
         let v = parse_results(r#"[{"domain":"a.com","employee_count":"17"}]"#).unwrap();
         assert_eq!(v[0].employees, Some(17));
