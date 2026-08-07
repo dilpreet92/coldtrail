@@ -226,6 +226,82 @@ pub async fn set_contacted(Json(req): Json<TomlReq>) -> Result<Json<MsgResp>, Ap
     Ok(Json(MsgResp::ok()))
 }
 
+/// Assemble the outreach brief (message.toml) from the product form — the user's own words,
+/// no invented claims. The agent still personalizes per company at draft time.
+pub async fn set_pitch(Json(req): Json<super::api::PitchReq>) -> Result<Json<MsgResp>, ApiErr> {
+    let toml = build_brief(&req);
+    // Validate it parses as a Message before writing (guards the template shape).
+    toml::from_str::<crate::message::Message>(&toml)
+        .map_err(|e| anyhow::anyhow!("generated brief didn't parse: {e}"))?;
+    std::fs::write(crate::home::path("message.toml")?, &toml)?;
+    Ok(Json(MsgResp::ok()))
+}
+
+/// Keep a `{slug}` in the CTA link so each send gets its own utm_content (attribution).
+fn ensure_slug(link: &str) -> String {
+    let link = link.trim();
+    if link.is_empty() {
+        return "https://example.com/?utm_content={slug}".into();
+    }
+    if link.contains("{slug}") {
+        return link.to_string();
+    }
+    let sep = if link.contains('?') { '&' } else { '?' };
+    format!("{link}{sep}utm_content={{slug}}")
+}
+
+/// Build a valid message.toml from the product form. Serialized via the toml crate so any
+/// quotes/newlines in the user's text are escaped correctly.
+fn build_brief(req: &super::api::PitchReq) -> String {
+    #[derive(serde::Serialize)]
+    struct Brief {
+        link: String,
+        subject: String,
+        paragraphs: Vec<String>,
+        cta_plain: String,
+        cta_html: String,
+    }
+    let sender = {
+        let s = req.sender.trim();
+        if s.is_empty() {
+            "Your Name".to_string()
+        } else {
+            s.to_string()
+        }
+    };
+    let product = req.product.trim();
+    let opening = if product.is_empty() {
+        "I came across {company} recently and wanted to reach out.".to_string()
+    } else {
+        format!("I came across {{company}} while looking for teams that might get value from {product}.")
+    };
+    let mut paragraphs = vec!["Hi {fn},".to_string(), opening];
+    let value = req.value.trim();
+    if !value.is_empty() {
+        paragraphs.push(value.to_string());
+    }
+    let offer = req.offer.trim();
+    if !offer.is_empty() {
+        paragraphs.push(offer.to_string());
+    }
+    paragraphs.push("__CTA__".to_string());
+    paragraphs.push(format!("— {sender}"));
+
+    let subject = if product.is_empty() {
+        "{company} — quick idea".to_string()
+    } else {
+        format!("{product} for {{company}}")
+    };
+    let brief = Brief {
+        link: ensure_slug(&req.link),
+        subject,
+        paragraphs,
+        cta_plain: "Take a look — no need to book a demo: {link}".to_string(),
+        cta_html: "Take a look — no need to book a demo: <a href=\"{link}\">here</a>".to_string(),
+    };
+    toml::to_string_pretty(&brief).unwrap_or_default()
+}
+
 /// Is `name` present in the chosen provider's coldtrail-scoped MCP config?
 fn mcp_wired(provider: AgentKind, name: &str) -> bool {
     match provider {
@@ -255,4 +331,38 @@ fn file_differs(name: &str, default: &str) -> bool {
         .and_then(|p| std::fs::read_to_string(p).ok())
         .map(|s| s.trim() != default.trim())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_brief_parses_and_keeps_placeholders() {
+        let req = crate::web::api::PitchReq {
+            product: "Canonical".into(),
+            value: "Plain-English company search that finds the long tail.".into(),
+            offer: "design partners: free credits".into(),
+            link: "https://trycanonical.ai".into(),
+            sender: "Dilpreet".into(),
+        };
+        let toml = build_brief(&req);
+        let m: crate::message::Message = toml::from_str(&toml).expect("brief must parse");
+        assert!(m.link.contains("{slug}"), "link keeps {{slug}}: {}", m.link);
+        assert!(m.paragraphs.iter().any(|p| p == "__CTA__"));
+        assert!(m.paragraphs.iter().any(|p| p.contains("Dilpreet")));
+        assert!(m.paragraphs.iter().any(|p| p.contains("Plain-English")));
+        assert!(m.paragraphs.iter().any(|p| p.contains("Canonical")));
+    }
+
+    #[test]
+    fn ensure_slug_appends_when_missing() {
+        assert!(ensure_slug("https://x.com").contains("utm_content={slug}"));
+        assert_eq!(
+            ensure_slug("https://x.com?a=1&utm_content={slug}")
+                .matches("{slug}")
+                .count(),
+            1
+        );
+    }
 }

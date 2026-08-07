@@ -79,23 +79,19 @@
       </div>
 
       <div class="panel" data-step="brief" id="panel-message">
-        <h2>4 · Your brief</h2>
-        <p class="hint">Your outreach brief (<code>message.toml</code>) — your voice, offer, and link. The agent writes a <em>personalized</em> pitch per company from it; it never sends this verbatim. Stays local.</p>
-        <textarea id="message-toml" spellcheck="false" rows="12"></textarea>
-        <div class="row"><button class="btn" id="save-message">Save pitch</button><span class="form-msg" id="message-msg"></span></div>
-      </div>
-
-      <div class="panel" data-step="extra" id="panel-osint">
-        <h2>Enrichment · OSINT <span class="conn-state" id="osint-state"></span></h2>
-        <p class="hint">Deeper founder-email discovery. The agent uses <strong>theHarvester</strong> / <strong>SpiderFoot</strong> when installed, and always falls back to its built-in web finder — nothing breaks if they're missing.</p>
-        <div id="osint-body"></div>
-      </div>
-
-      <div class="panel" data-step="extra" id="panel-contacted">
-        <h2>Already contacted</h2>
-        <p class="hint">Domains you've reached before (<code>contacted.toml</code>) so coldtrail never double-contacts.</p>
-        <textarea id="contacted-toml" spellcheck="false" rows="8"></textarea>
-        <div class="row"><button class="btn" id="save-contacted">Save list</button><span class="form-msg" id="contacted-msg"></span></div>
+        <h2>4 · Your product</h2>
+        <p class="hint">Tell coldtrail what you sell — it builds your outreach brief from <em>your</em> words (it won't invent claims about your product). The agent then writes a personalized pitch per company from that brief; nothing is sent verbatim, and it all stays local.</p>
+        <label>Product name <input id="pi-product" placeholder="e.g. Canonical" autocomplete="off" /></label>
+        <label>What it does &amp; who it helps <textarea id="pi-value" rows="3" placeholder="e.g. Canonical turns a plain-English description of your ideal customers into a verified, domain-keyed company list — including the long-tail accounts standard databases miss. Built for founders and sales teams doing outbound."></textarea></label>
+        <label>Your offer <span style="text-transform:none">(optional)</span> <input id="pi-offer" placeholder="e.g. design partners: generous free credits + a direct line to me" autocomplete="off" /></label>
+        <label>Call-to-action link <input id="pi-link" placeholder="https://yourproduct.com" autocomplete="off" /></label>
+        <label>Your name <input id="pi-sender" placeholder="e.g. Dilpreet" autocomplete="off" /></label>
+        <div class="row"><button class="btn primary" id="build-pitch">Build my brief</button><span class="form-msg" id="pitch-msg"></span></div>
+        <details class="advanced">
+          <summary>Advanced — edit the raw brief (message.toml)</summary>
+          <textarea id="message-toml" spellcheck="false" rows="12"></textarea>
+          <div class="row"><button class="btn" id="save-message">Save raw</button><span class="form-msg" id="message-msg"></span></div>
+        </details>
       </div>
     </div>
   </section>

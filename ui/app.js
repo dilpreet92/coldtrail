@@ -96,9 +96,6 @@ async function loadStatus() {
   if (dt) dt.textContent = s.destination_connected ? "· connected" : "";
   renderDestination(s);
 
-  // enrichment (OSINT)
-  renderOsint(s.osint || {});
-
   // wizard (first run) vs settings (once onboarded)
   renderSetup(s);
 
@@ -144,12 +141,12 @@ async function loadStatus() {
     })
   );
 
-  // prefill editors once
+  // prefill the raw brief editor once
   if (!loadStatus._filled) {
     try {
       const f = await getJSON("/api/onboarding/files");
-      $("#message-toml").value = f.message || "";
-      $("#contacted-toml").value = f.contacted || "";
+      const mt = $("#message-toml");
+      if (mt) mt.value = f.message || "";
       loadStatus._filled = true;
     } catch (_) {}
   }
@@ -166,7 +163,7 @@ const WIZARD_STEPS = [
   { step: "provider", label: "Provider", done: (s) => !!s.provider },
   { step: "discovery", label: "Discovery", done: (s) => s.discovery_connected },
   { step: "destination", label: "Destination", done: (s) => s.destination_connected },
-  { step: "brief", label: "Brief", done: (s) => s.message_customized },
+  { step: "brief", label: "Product", done: (s) => s.message_customized },
 ];
 let wizardIdx = 0;
 let wizardInit = false;
@@ -293,13 +290,28 @@ $("#connect-gmail").addEventListener("click", async () => {
     await loadStatus();
   } catch (e) { msg("#dest-msg", e.message, false); }
 });
+// Build the outreach brief (message.toml) from the product form.
+$("#build-pitch").addEventListener("click", async () => {
+  const body = {
+    product: $("#pi-product").value.trim(),
+    value: $("#pi-value").value.trim(),
+    offer: $("#pi-offer").value.trim(),
+    link: $("#pi-link").value.trim(),
+    sender: $("#pi-sender").value.trim(),
+  };
+  if (!body.value) { msg("#pitch-msg", "tell coldtrail what your product does first", false); return; }
+  msg("#pitch-msg", "building your brief…", true);
+  try {
+    await postJSON("/api/onboarding/pitch", body);
+    // refresh the raw editor with the generated brief
+    try { const f = await getJSON("/api/onboarding/files"); const mt = $("#message-toml"); if (mt) mt.value = f.message || ""; } catch (_) {}
+    msg("#pitch-msg", "brief ready — the agent will personalize it per company", true);
+    await loadStatus();
+  } catch (e) { msg("#pitch-msg", e.message, false); }
+});
 $("#save-message").addEventListener("click", async () => {
   try { await postJSON("/api/onboarding/message", { toml: $("#message-toml").value }); msg("#message-msg", "saved", true); await loadStatus(); }
   catch (e) { msg("#message-msg", e.message, false); }
-});
-$("#save-contacted").addEventListener("click", async () => {
-  try { await postJSON("/api/onboarding/contacted", { toml: $("#contacted-toml").value }); msg("#contacted-msg", "saved", true); }
-  catch (e) { msg("#contacted-msg", e.message, false); }
 });
 $("#ollama-preset").addEventListener("click", () => {
   $("#byok-base").value = "http://localhost:11434/v1";

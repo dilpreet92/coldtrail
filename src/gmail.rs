@@ -64,6 +64,18 @@ pub async fn create_draft(
     let ok = resp.status().is_success();
     let text = resp.text().await.unwrap_or_default();
     if !ok {
+        let lower = text.to_lowercase();
+        // The most common gcloud-ADC failure: the login didn't include the Gmail scope.
+        if lower.contains("insufficient")
+            && (lower.contains("scope") || lower.contains("permission"))
+        {
+            return Err(anyhow!(
+                "Gmail rejected the draft — your gcloud login is missing the Gmail scope. Re-run:\n  \
+                 gcloud auth application-default login --scopes=https://www.googleapis.com/auth/gmail.compose,https://www.googleapis.com/auth/cloud-platform\n\
+                 then point it at a project with the Gmail API enabled:\n  \
+                 gcloud auth application-default set-quota-project <PROJECT>"
+            ));
+        }
         return Err(anyhow!(
             "Gmail draft failed: {}",
             text.chars().take(300).collect::<String>()

@@ -161,6 +161,17 @@ pub struct TomlReq {
     pub toml: String,
 }
 
+/// The product form → coldtrail assembles the outreach brief (message.toml) from these.
+#[derive(Deserialize)]
+pub struct PitchReq {
+    pub product: String,
+    pub value: String,
+    #[serde(default)]
+    pub offer: String,
+    pub link: String,
+    pub sender: String,
+}
+
 #[derive(Deserialize)]
 pub struct OsintInstallReq {
     /// "the_harvester" | "spiderfoot"
