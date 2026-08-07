@@ -231,12 +231,14 @@ function renderDestination(s) {
     return;
   }
   // keyless gcloud (ADC) path
-  hint.innerHTML = `Where outreach goes. <strong>Gmail</strong>, keyless via <strong>gcloud</strong> — no client id/secret. coldtrail mints a token from your Application Default Credentials; you review each draft and hit Send (never auto-sends).`;
-  gc.innerHTML = `<p class="hint" style="margin-bottom:6px">One-time, in your terminal:</p>
-    <pre class="cmd">${esc(GCLOUD_CMD)}</pre>
-    <p class="hint">${s.gcloud_available
-      ? "✓ gcloud credentials detected — click <strong>Use gcloud</strong> to connect. Also set a quota project with the Gmail API enabled: <code>gcloud auth application-default set-quota-project &lt;PROJECT&gt;</code>."
-      : "gcloud credentials not detected yet — run the command above (and install the Google Cloud SDK if needed), then click <strong>Use gcloud</strong>."}</p>`;
+  hint.innerHTML = `Where outreach goes. <strong>Gmail</strong>, keyless via <strong>gcloud</strong> — no client id/secret. Click <strong>Use gcloud</strong>: it opens a browser to grant the Gmail scope, then coldtrail drafts with your credentials. You review each draft and hit Send (never auto-sends).`;
+  gc.innerHTML = `<p class="hint">${s.gcloud_available
+      ? "✓ gcloud detected. <strong>Use gcloud</strong> will grant the <code>gmail.compose</code> scope in your browser if it isn't already. You also need a quota project with the Gmail API enabled — coldtrail sets your default gcloud project automatically."
+      : "Needs the Google Cloud SDK. Install it, then <strong>Use gcloud</strong> handles the browser sign-in."}</p>
+    <details class="advanced"><summary>Prefer the terminal?</summary>
+      <pre class="cmd">${esc(GCLOUD_CMD)}</pre>
+      <pre class="cmd">gcloud auth application-default set-quota-project &lt;PROJECT&gt;</pre>
+    </details>`;
   btn.textContent = "Use gcloud";
 }
 

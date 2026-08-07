@@ -92,6 +92,75 @@ pub async fn access_token() -> Result<String> {
         .ok_or_else(|| anyhow!("no access_token in gcloud refresh response"))
 }
 
+/// Does the current ADC token actually carry the Gmail draft scope? (ADC files don't store
+/// scopes, so we ask Google's tokeninfo.) This is what "connected" should really mean.
+pub async fn token_has_gmail_scope() -> bool {
+    let t = match access_token().await {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    let url = format!(
+        "https://oauth2.googleapis.com/tokeninfo?access_token={}",
+        urlencoding::encode(&t)
+    );
+    match reqwest::get(&url).await {
+        Ok(r) => {
+            let body = r.text().await.unwrap_or_default();
+            let v: Value = serde_json::from_str(&body).unwrap_or_default();
+            v["scope"]
+                .as_str()
+                .map(|s| s.contains("gmail.compose"))
+                .unwrap_or(false)
+        }
+        Err(_) => false,
+    }
+}
+
+/// The project gcloud is configured to use (for the ADC quota project), if any.
+async fn default_project() -> Option<String> {
+    let out = tokio::process::Command::new("gcloud")
+        .args(["config", "get-value", "project"])
+        .output()
+        .await
+        .ok()?;
+    let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!p.is_empty() && p != "(unset)").then_some(p)
+}
+
+/// Run `gcloud auth application-default login` WITH the Gmail scope (opens a browser consent),
+/// then best-effort point ADC at a quota project. This is what the "Use gcloud" button does
+/// when the scope is missing — so the user doesn't have to touch the terminal.
+pub async fn login_with_gmail_scope() -> Result<()> {
+    let status = tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        tokio::process::Command::new("gcloud")
+            .args([
+                "auth",
+                "application-default",
+                "login",
+                "--scopes=https://www.googleapis.com/auth/gmail.compose,https://www.googleapis.com/auth/cloud-platform",
+            ])
+            .status(),
+    )
+    .await
+    .map_err(|_| {
+        anyhow!("gcloud login timed out — finish the browser consent, then click Use gcloud again")
+    })?
+    .map_err(|e| anyhow!("couldn't run gcloud (is the Google Cloud SDK installed?): {e}"))?;
+    if !status.success() {
+        return Err(anyhow!(
+            "gcloud login didn't complete. Run it yourself:\n  {ADC_LOGIN_HINT}"
+        ));
+    }
+    if let Some(proj) = default_project().await {
+        let _ = tokio::process::Command::new("gcloud")
+            .args(["auth", "application-default", "set-quota-project", &proj])
+            .status()
+            .await;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
