@@ -313,6 +313,10 @@ const GMAIL_SCOPE: &str = "https://www.googleapis.com/auth/gmail.compose";
 /// their own). Baked in at build time via `COLDTRAIL_GOOGLE_CLIENT_ID`/`_SECRET`, with a
 /// runtime env override. `None` if this build has no client configured.
 pub fn google_client() -> Option<(String, Option<String>)> {
+    // Prefer a client the user pasted in Settings, then a build-time/env-provided one.
+    if let Some(c) = crate::secrets::google_client() {
+        return Some(c);
+    }
     let id = std::env::var("COLDTRAIL_GOOGLE_CLIENT_ID")
         .ok()
         .or_else(|| option_env!("COLDTRAIL_GOOGLE_CLIENT_ID").map(str::to_string))

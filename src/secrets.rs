@@ -19,8 +19,28 @@ pub struct TokenRec {
 #[derive(Default, Serialize, Deserialize)]
 struct Secrets {
     api_key: Option<String>,
+    /// A bring-your-own Google OAuth client (id + secret) for Gmail, pasted in Settings.
+    #[serde(default)]
+    google_client_id: Option<String>,
+    #[serde(default)]
+    google_client_secret: Option<String>,
     #[serde(default)]
     tokens: BTreeMap<String, TokenRec>,
+}
+
+/// Store a user-provided Google OAuth client (for Gmail).
+pub fn set_google_client(id: &str, secret: &str) -> Result<()> {
+    let mut s = load();
+    s.google_client_id = Some(id.trim().to_string());
+    s.google_client_secret = Some(secret.trim().to_string());
+    save(&s)
+}
+
+/// The stored Google client, if any: (client_id, client_secret).
+pub fn google_client() -> Option<(String, Option<String>)> {
+    let s = load();
+    let id = s.google_client_id.filter(|v| !v.trim().is_empty())?;
+    Some((id, s.google_client_secret.filter(|v| !v.trim().is_empty())))
 }
 
 fn load() -> Secrets {

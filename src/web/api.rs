@@ -39,6 +39,14 @@ pub struct GmailConnectReq {
     pub callback_port: Option<u16>,
 }
 
+/// A bring-your-own Google OAuth client (Desktop app) for Gmail.
+#[derive(Deserialize)]
+pub struct GmailClientReq {
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: String,
+}
+
 #[derive(Deserialize)]
 pub struct DraftEditReq {
     pub subject: Option<String>,

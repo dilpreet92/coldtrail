@@ -219,27 +219,48 @@ function renderSetup(s) {
   });
 }
 
-// Destination (Gmail) — coldtrail's own client if configured, else the keyless gcloud path.
-const GCLOUD_CMD = "gcloud auth application-default login --scopes=https://www.googleapis.com/auth/gmail.compose,https://www.googleapis.com/auth/cloud-platform";
+// Destination (Gmail) — coldtrail's OAuth using a Google client (bring-your-own, or a
+// build-time/verified one). Google gates gmail.compose behind a verified/own client, so
+// there is no zero-client path here (Claude's connector is the keyless alternative).
 function renderDestination(s) {
   const hint = $("#dest-hint"), gc = $("#dest-gcloud"), btn = $("#connect-gmail");
   if (!hint || !gc || !btn) return;
   if (s.gmail_client_configured) {
-    hint.innerHTML = `Where outreach goes. <strong>Gmail</strong>, via <strong>coldtrail's own Google client</strong> — one browser consent, no keys to paste. coldtrail creates the draft in your Gmail; you review and hit Send (never auto-sends). You'll pass Google's "unverified app" screen (Advanced → continue).`;
+    hint.innerHTML = `Where outreach goes. <strong>Gmail</strong>, via your Google client — one browser consent. coldtrail creates the draft in your Gmail; you review and hit Send (never auto-sends). You'll pass Google's "unverified app" screen (Advanced → continue).`;
     gc.innerHTML = "";
+    btn.style.display = "";
     btn.textContent = "Connect Gmail";
     return;
   }
-  // keyless gcloud (ADC) path
-  hint.innerHTML = `Where outreach goes. <strong>Gmail</strong>, keyless via <strong>gcloud</strong> — no client id/secret. Click <strong>Use gcloud</strong>: it opens a browser to grant the Gmail scope, then coldtrail drafts with your credentials. You review each draft and hit Send (never auto-sends).`;
-  gc.innerHTML = `<p class="hint">${s.gcloud_available
-      ? "✓ gcloud detected. <strong>Use gcloud</strong> will grant the <code>gmail.compose</code> scope in your browser if it isn't already. You also need a quota project with the Gmail API enabled — coldtrail sets your default gcloud project automatically."
-      : "Needs the Google Cloud SDK. Install it, then <strong>Use gcloud</strong> handles the browser sign-in."}</p>
-    <details class="advanced"><summary>Prefer the terminal?</summary>
-      <pre class="cmd">${esc(GCLOUD_CMD)}</pre>
-      <pre class="cmd">gcloud auth application-default set-quota-project &lt;PROJECT&gt;</pre>
-    </details>`;
-  btn.textContent = "Use gcloud";
+  // No client yet → bring your own (one-time, no Google verification in test-user mode).
+  btn.style.display = "none";
+  hint.innerHTML = `Where outreach goes. <strong>Gmail</strong> — coldtrail drafts, you review and hit Send (never auto-sends). Google requires an OAuth client for Gmail's restricted scope, so bring your own (one-time, ~5 min, no verification needed in test mode).`;
+  gc.innerHTML = `
+    <details class="advanced" open><summary>Get a Google client (~5 min)</summary>
+      <ol class="steps">
+        <li><a href="https://console.cloud.google.com/" target="_blank" rel="noreferrer">Google Cloud Console</a> → create or pick a project.</li>
+        <li>APIs &amp; Services → Library → <strong>enable the Gmail API</strong>.</li>
+        <li>OAuth consent screen → <strong>External</strong>, status <strong>Testing</strong>; add your Gmail as a <strong>Test user</strong>; add scope <code>.../auth/gmail.compose</code>.</li>
+        <li>Credentials → Create credentials → <strong>OAuth client ID</strong> → type <strong>Desktop app</strong>. Copy the client id + secret.</li>
+      </ol>
+    </details>
+    <label>Client ID <input id="byo-id" placeholder="…apps.googleusercontent.com" autocomplete="off" /></label>
+    <label>Client secret <input id="byo-secret" type="password" placeholder="GOCSPX-…" autocomplete="off" /></label>
+    <div class="row"><button class="btn primary" id="byo-connect">Save &amp; Connect Gmail</button></div>`;
+  const bc = $("#byo-connect");
+  if (bc) bc.addEventListener("click", async () => {
+    const id = $("#byo-id").value.trim(), secret = $("#byo-secret").value.trim();
+    if (!id) { msg("#dest-msg", "paste your client id first", false); return; }
+    msg("#dest-msg", "saving client…", true);
+    try {
+      await postJSON("/api/destination/gmail/client", { client_id: id, client_secret: secret });
+      msg("#dest-msg", "opening Google consent in your browser…", true);
+      const r = await postJSON("/api/destination/gmail/connect", { callback_port: 8765 });
+      if (r.ok === false) { msg("#dest-msg", r.message || "could not connect", false); return; }
+      msg("#dest-msg", "connected", true);
+      await loadStatus();
+    } catch (e) { msg("#dest-msg", e.message, false); }
+  });
 }
 
 // Enrichment (OSINT) setup panel: one row per tool — detected, one-click install, or why not.

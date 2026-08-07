@@ -42,7 +42,8 @@ pub async fn status() -> Result<Json<StatusDto>, ApiErr> {
     // provider (Canonical via `coldtrail source`, Gmail via the Gmail API). Gmail can be
     // keyless via gcloud ADC, so that also counts as connected.
     let discovery_connected = crate::secrets::has_token("canonical");
-    let destination_connected = crate::secrets::has_token("gmail") || crate::gcloud::available();
+    // "connected" means coldtrail holds a Gmail OAuth token (via a verified/BYO client).
+    let destination_connected = crate::secrets::has_token("gmail");
     let _ = (canonical_wired, gmail_wired);
     let onboarded = message_customized && provider_ready && discovery_connected;
 
@@ -122,47 +123,31 @@ pub async fn connect_discovery() -> Result<Json<MsgResp>, ApiErr> {
 pub async fn connect_destination(
     Json(req): Json<super::api::GmailConnectReq>,
 ) -> Result<Json<MsgResp>, ApiErr> {
-    if crate::oauth::google_client().is_some() {
-        let port = req.callback_port.unwrap_or(8765);
-        return Ok(connect_result(crate::oauth::connect_gmail(port).await));
-    }
-    // Keyless gcloud path. "Connected" must mean the token actually has the Gmail scope —
-    // ADC created by a plain `gcloud auth application-default login` does NOT. If it's
-    // missing, run the scoped login for the user (opens a browser consent).
-    if crate::gcloud::token_has_gmail_scope().await {
+    if crate::oauth::google_client().is_none() {
         return Ok(Json(MsgResp {
-            ok: true,
-            message: Some("Gmail is ready via gcloud.".into()),
+            ok: false,
+            message: Some(
+                "Add your Google OAuth client (client id + secret) below first, then Connect Gmail."
+                    .into(),
+            ),
             wired: None,
         }));
     }
-    let ok = match crate::gcloud::login_with_gmail_scope().await {
-        Ok(()) => crate::gcloud::token_has_gmail_scope().await,
-        Err(e) => {
-            return Ok(Json(MsgResp {
-                ok: false,
-                message: Some(e.to_string()),
-                wired: None,
-            }))
-        }
-    };
-    if ok {
-        Ok(Json(MsgResp {
-            ok: true,
-            message: Some("Connected — gcloud now has the Gmail scope.".into()),
-            wired: None,
-        }))
-    } else {
-        Ok(Json(MsgResp {
-            ok: false,
-            message: Some(format!(
-                "Signed in, but the Gmail scope still isn't granted — approve `gmail.compose` \
-                 on the consent screen, or run:\n  {}",
-                crate::gcloud::ADC_LOGIN_HINT
-            )),
-            wired: None,
-        }))
+    let port = req.callback_port.unwrap_or(8765);
+    Ok(connect_result(crate::oauth::connect_gmail(port).await))
+}
+
+/// Store a bring-your-own Google OAuth client (Desktop app) for Gmail. coldtrail's Connect
+/// Gmail then runs its own OAuth with it — the reliable path for a restricted scope you can't
+/// get through the shared gcloud client.
+pub async fn set_gmail_client(
+    Json(req): Json<super::api::GmailClientReq>,
+) -> Result<Json<MsgResp>, ApiErr> {
+    if req.client_id.trim().is_empty() {
+        return Err(anyhow::anyhow!("client id is required").into());
     }
+    crate::secrets::set_google_client(&req.client_id, &req.client_secret)?;
+    Ok(Json(MsgResp::ok()))
 }
 
 pub async fn set_provider(Json(req): Json<ProviderReq>) -> Result<Json<MsgResp>, ApiErr> {

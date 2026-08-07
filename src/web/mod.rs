@@ -97,6 +97,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/destination/gmail/connect",
             post(onboarding::connect_destination),
         )
+        .route(
+            "/api/destination/gmail/client",
+            post(onboarding::set_gmail_client),
+        )
         .route("/api/companies", get(pipeline::companies))
         .route(
             "/api/companies/:domain/status",
