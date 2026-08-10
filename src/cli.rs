@@ -42,11 +42,14 @@ pub enum Commands {
         #[arg(long)]
         force: bool,
     },
-    /// Source companies from Canonical (coldtrail's own connection), deduped by domain
+    /// Source companies from Canonical (coldtrail's own connection), deduped by domain.
+    /// Pass several angles (diverse phrasings / regions / segments) to widen recall — they're
+    /// searched in parallel and their union is deduped by domain.
     Source {
-        /// Plain-English ICP query
-        query: String,
-        /// Max companies to request
+        /// One or more plain-English ICP angles
+        #[arg(required = true, num_args = 1..)]
+        queries: Vec<String>,
+        /// Max companies to request per angle
         #[arg(long)]
         limit: Option<usize>,
     },

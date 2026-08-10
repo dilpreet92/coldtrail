@@ -59,11 +59,10 @@ pub fn defs(canonical_connected: bool) -> Value {
     if canonical_connected {
         v.push(json!({"type":"function","function":{
             "name":"discover_companies",
-            "description":"Discover verified companies from Canonical for a plain-English ICP, imported (deduped) into the pipeline.",
+            "description":"Discover verified companies from Canonical, imported (deduped by domain) into the pipeline. Prefer `queries`: 3–5 DIVERSE angles (expand acronyms/regions into distinct phrasings; never negate) — they're searched in parallel and their union is deduped, so more angles = better recall, not duplicates.",
             "parameters":{"type":"object","properties":{
-                "query":{"type":"string","description":"plain-English ICP"},
-                "label":{"type":"string","description":"short label"}},
-                "required":["query"]}}}));
+                "queries":{"type":"array","items":{"type":"string"},"description":"3–5 diverse plain-English ICP angles (preferred)"},
+                "query":{"type":"string","description":"a single plain-English ICP (use only for a quick, unambiguous ICP)"}}}}}));
     }
     Value::Array(v)
 }
@@ -129,9 +128,30 @@ pub async fn exec(name: &str, args: &Value) -> String {
 /// Source companies from Canonical (coldtrail's own connection), then import (dedupe).
 /// Shares one implementation with the `coldtrail source` CLI command.
 async fn discover(args: &Value) -> String {
-    let query = s(args, "query");
-    match crate::source::fetch_and_import(&query, None).await {
-        Ok((a, sk, t)) => format!("discovered + imported {a} new, {sk} deduped, from {t}"),
+    let mut angles: Vec<String> = args
+        .get("queries")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::trim).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    if angles.is_empty() {
+        let q = s(args, "query");
+        if !q.trim().is_empty() {
+            angles.push(q.trim().to_string());
+        }
+    }
+    angles.retain(|a| !a.is_empty());
+    if angles.is_empty() {
+        return "error: no query given".into();
+    }
+    match crate::source::fetch_and_import_many(&angles, None).await {
+        Ok((a, sk, t)) => format!(
+            "discovered + imported {a} new, {sk} deduped, from {t} results across {} angle(s)",
+            angles.len()
+        ),
         Err(e) => format!("error: {e}"),
     }
 }

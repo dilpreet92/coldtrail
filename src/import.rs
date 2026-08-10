@@ -151,4 +151,25 @@ mod tests {
         let v = parse_results(r#"[{"domain":"a.com","employee_count":"17"}]"#).unwrap();
         assert_eq!(v[0].employees, Some(17));
     }
+
+    #[test]
+    fn cross_angle_import_dedupes_by_domain() {
+        // What multi-angle sourcing relies on: importing several angles' results in sequence
+        // dedupes their union by domain, and a company keeps the FIRST angle that found it.
+        crate::testutil::with_home("ct-import-cross-angle", |_| {
+            let a1 = import_str(r#"[{"domain":"acme.com"},{"domain":"beta.com"}]"#, "angle one").unwrap();
+            assert_eq!(a1, (2, 0, 2));
+            let a2 = import_str(r#"[{"domain":"beta.com"},{"domain":"gamma.com"}]"#, "angle two").unwrap();
+            assert_eq!(a2, (1, 1, 2), "beta deduped, gamma new");
+            let conn = crate::db::open().unwrap();
+            let src = |d: &str| {
+                conn.query_row("SELECT source_query FROM companies WHERE domain=?1", [d], |r| {
+                    r.get::<_, Option<String>>(0)
+                })
+                .unwrap()
+            };
+            assert_eq!(src("beta.com").as_deref(), Some("angle one"), "keeps first angle");
+            assert_eq!(src("gamma.com").as_deref(), Some("angle two"));
+        });
+    }
 }

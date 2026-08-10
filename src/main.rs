@@ -49,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
             skip_gmail,
             force,
         }),
-        Some(Commands::Source { query, limit }) => source::run(&query, limit).await,
+        Some(Commands::Source { queries, limit }) => source::run(&queries, limit).await,
         Some(Commands::Import { json, label }) => import::run(&json, &label),
         Some(Commands::AddContact {
             domain,

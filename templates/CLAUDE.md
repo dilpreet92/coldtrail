@@ -11,11 +11,22 @@ subcommands — never re-implement their logic, never touch `outreach.db` direct
 ## The run loop
 
 1. **Source (Canonical, coldtrail-owned).** Turn the user's plain-English ICP into a
-   verified, domain-keyed shortlist with one command — coldtrail queries Canonical through
-   its own connection and imports the result (deduped by domain):
-   `coldtrail source "<plain-English ICP>" [--limit N]`
+   verified, domain-keyed shortlist. A single phrasing usually under-recalls, so **plan 3–5
+   diverse angles first** and pass them all in one command — they're searched in parallel and
+   their union is deduped by domain:
+   `coldtrail source "<angle 1>" "<angle 2>" "<angle 3>" [--limit N]`
+   How to choose angles (borrowed from Canonical's own planner):
+   - **Expand acronyms / vague tokens** into the words companies use about themselves — e.g.
+     "GTM" → "go-to-market software for sales teams", "sales engagement / outbound automation",
+     "revenue intelligence and pipeline analytics" (three angles, not one).
+   - **Name regions explicitly** — "Europe" → separate angles naming the actual countries;
+     don't rely on a region word.
+   - **Keep angles genuinely different** (product framing, geography, or size band) — two
+     near-synonyms just re-fetch the same companies.
+   - **Never negate in an angle** ("fintech but not consulting"): search the positive concept.
    Already-known domains are skipped automatically. Don't call a Canonical MCP tool directly
-   and don't hand-write the JSON — `coldtrail source` owns discovery.
+   and don't hand-write the JSON — `coldtrail source` owns discovery. For a quick, unambiguous
+   ICP a single angle is fine.
 2. **Enrich.** Get a founder contact per company. **Read `enrichment.md` in this workspace
    first** — it's coldtrail's technique ladder (OSINT tools, GitHub commit metadata, crt.sh,
    WHOIS, on-domain/web, and pattern-only-if-confirmed) plus the honesty rules. Work down it,
