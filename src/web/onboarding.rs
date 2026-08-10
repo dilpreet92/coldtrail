@@ -27,6 +27,11 @@ pub async fn status() -> Result<Json<StatusDto>, ApiErr> {
     let canonical_wired = kind.map(|k| mcp_wired(k, "canonical")).unwrap_or(false);
     let gmail_wired = kind.map(|k| mcp_wired(k, "gmail")).unwrap_or(false);
     let message_customized = file_differs("message.toml", setup::MESSAGE_TOML);
+    let product_set = crate::home::path("product.md")
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
     let contacted_customized = file_differs("contacted.toml", setup::CONTACTED_TOML);
     let (base_url, model) = cfg
         .provider
@@ -54,6 +59,7 @@ pub async fn status() -> Result<Json<StatusDto>, ApiErr> {
         canonical_wired,
         gmail_wired,
         message_customized,
+        product_set,
         contacted_customized,
         onboarded,
         base_url,
@@ -265,7 +271,41 @@ pub async fn set_pitch(Json(req): Json<super::api::PitchReq>) -> Result<Json<Msg
     toml::from_str::<crate::message::Message>(&toml)
         .map_err(|e| anyhow::anyhow!("generated brief didn't parse: {e}"))?;
     std::fs::write(crate::home::path("message.toml")?, &toml)?;
+    std::fs::write(crate::home::path("product.md")?, build_product_md(&req))?;
     Ok(Json(MsgResp::ok()))
+}
+
+/// Render the rich product brief the agent composes from. Prose, not a template — every
+/// email is written fresh per company from this context. Only the user's words; no invented
+/// claims (the interview + review gate enforce that upstream).
+fn build_product_md(req: &super::api::PitchReq) -> String {
+    let line = |label: &str, val: &str| {
+        let v = val.trim();
+        if v.is_empty() {
+            String::new()
+        } else {
+            format!("**{label}:** {v}\n\n")
+        }
+    };
+    let product = if req.product.trim().is_empty() {
+        "your product".to_string()
+    } else {
+        req.product.trim().to_string()
+    };
+    let mut s = format!("# {product} — outreach brief\n\n");
+    s.push_str(&line("What it does / who it helps", &req.value));
+    s.push_str(&line("The pain / value", &req.pain_value));
+    s.push_str(&line("Proof / differentiator", &req.proof));
+    s.push_str(&line("Offer", &req.offer));
+    s.push_str(&line("Voice / tone", &req.voice));
+    s.push_str(&line("Call to action", &ensure_slug(&req.link)));
+    s.push_str(&line("From", &req.sender));
+    s.push_str(
+        "---\n\nUse this as context. Write each email fresh for the specific company — \
+         reference what they actually do and why it's a fit, in the sender's voice. \
+         **Never send this verbatim. Don't invent claims beyond what's here.**\n",
+    );
+    s
 }
 
 /// Keep a `{slug}` in the CTA link so each send gets its own utm_content (attribution).
@@ -310,6 +350,10 @@ fn build_brief(req: &super::api::PitchReq) -> String {
     let value = req.value.trim();
     if !value.is_empty() {
         paragraphs.push(value.to_string());
+    }
+    let pain = req.pain_value.trim();
+    if !pain.is_empty() {
+        paragraphs.push(pain.to_string());
     }
     let offer = req.offer.trim();
     if !offer.is_empty() {
@@ -373,7 +417,10 @@ mod tests {
         let req = crate::web::api::PitchReq {
             product: "Canonical".into(),
             value: "Plain-English company search that finds the long tail.".into(),
+            pain_value: String::new(),
+            proof: String::new(),
             offer: "design partners: free credits".into(),
+            voice: String::new(),
             link: "https://trycanonical.ai".into(),
             sender: "Dilpreet".into(),
         };
@@ -384,6 +431,44 @@ mod tests {
         assert!(m.paragraphs.iter().any(|p| p.contains("Dilpreet")));
         assert!(m.paragraphs.iter().any(|p| p.contains("Plain-English")));
         assert!(m.paragraphs.iter().any(|p| p.contains("Canonical")));
+    }
+
+    #[test]
+    fn build_brief_folds_pain_value() {
+        let req = crate::web::api::PitchReq {
+            product: "Canonical".into(),
+            value: "Plain-English company search.".into(),
+            pain_value: "Standard databases miss the long tail.".into(),
+            proof: "Used by 100 outbound teams.".into(),
+            offer: "free credits".into(),
+            voice: "warm, direct".into(),
+            link: "https://trycanonical.ai".into(),
+            sender: "Dilpreet".into(),
+        };
+        let toml = build_brief(&req);
+        let m: crate::message::Message = toml::from_str(&toml).expect("brief must parse");
+        assert!(m.paragraphs.iter().any(|p| p.contains("long tail")));
+    }
+
+    #[test]
+    fn product_md_has_link_and_context_note() {
+        let req = crate::web::api::PitchReq {
+            product: "Canonical".into(),
+            value: "Plain-English company search.".into(),
+            pain_value: String::new(),
+            proof: String::new(),
+            offer: String::new(),
+            voice: String::new(),
+            link: "https://trycanonical.ai".into(),
+            sender: "Dilpreet".into(),
+        };
+        let md = build_product_md(&req);
+        assert!(md.contains("trycanonical.ai"), "keeps CTA link");
+        assert!(
+            md.to_lowercase().contains("never send"),
+            "carries the compose-fresh instruction"
+        );
+        assert!(md.contains("Canonical"));
     }
 
     #[test]

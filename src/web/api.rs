@@ -17,6 +17,8 @@ pub struct StatusDto {
     pub canonical_wired: bool,
     pub gmail_wired: bool,
     pub message_customized: bool,
+    /// The user has captured a product brief (product.md exists and is non-empty).
+    pub product_set: bool,
     pub contacted_customized: bool,
     pub onboarded: bool,
     /// OpenAI-compatible backend config (never includes the key).
@@ -176,15 +178,36 @@ pub struct TomlReq {
     pub toml: String,
 }
 
-/// The product form → coldtrail assembles the outreach brief (message.toml) from these.
+/// The product interview/form → coldtrail assembles the outreach brief from these.
 #[derive(Deserialize)]
 pub struct PitchReq {
     pub product: String,
+    /// What it does + who it helps.
     pub value: String,
     #[serde(default)]
+    pub pain_value: String,
+    #[serde(default)]
+    pub proof: String,
+    #[serde(default)]
     pub offer: String,
+    #[serde(default)]
+    pub voice: String,
     pub link: String,
     pub sender: String,
+}
+
+/// One turn of the product interview, held by the browser and re-sent each turn.
+#[derive(Deserialize)]
+pub struct TranscriptTurn {
+    pub role: String,
+    pub text: String,
+}
+
+/// The running product-interview transcript (stateless — carries full context each turn).
+#[derive(Deserialize)]
+pub struct InterviewReq {
+    #[serde(default)]
+    pub transcript: Vec<TranscriptTurn>,
 }
 
 #[derive(Deserialize)]
