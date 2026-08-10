@@ -104,7 +104,7 @@ async function loadStatus() {
     ["Provider", !!s.provider],
     ["Discovery", s.discovery_connected],
     ["Destination", s.destination_connected],
-    ["Pitch", s.message_customized],
+    ["Company", s.product_set],
   ];
   $("#checklist").innerHTML = items
     .map(([n, done]) => `<li class="${done ? "done" : ""}"><span class="tick">${done ? "✓" : ""}</span>${n}</li>`)
@@ -140,16 +140,6 @@ async function loadStatus() {
       catch (e) { toast(e.message, "err"); }
     })
   );
-
-  // prefill the raw brief editor once
-  if (!loadStatus._filled) {
-    try {
-      const f = await getJSON("/api/onboarding/files");
-      const mt = $("#message-toml");
-      if (mt) mt.value = f.message || "";
-      loadStatus._filled = true;
-    } catch (_) {}
-  }
 }
 
 function msg(el, text, ok) {
@@ -163,7 +153,7 @@ const WIZARD_STEPS = [
   { step: "provider", label: "Provider", done: (s) => !!s.provider },
   { step: "discovery", label: "Discovery", done: (s) => s.discovery_connected },
   { step: "destination", label: "Destination", done: (s) => s.destination_connected },
-  { step: "brief", label: "Product", done: (s) => s.product_set || s.message_customized },
+  { step: "brief", label: "Company", done: (s) => s.product_set },
 ];
 let wizardIdx = 0;
 let wizardInit = false;
@@ -183,11 +173,6 @@ function renderSetup(s) {
     checklist.hidden = true;
     $$("#panels .panel").forEach((p) => p.classList.remove("wizard-active"));
     wizardInit = false; // so a later reset re-enters the wizard cleanly
-    // Settings (already onboarded): show the editable brief form; the interview is a
-    // first-run nicety, so here we keep the direct form (+ raw editor) available.
-    wireProductStep();
-    const rev = $("#pi-review");
-    if (rev) rev.hidden = false;
     return;
   }
 
@@ -202,7 +187,7 @@ function renderSetup(s) {
   wizardIdx = Math.max(0, Math.min(WIZARD_STEPS.length - 1, wizardIdx));
   const cur = WIZARD_STEPS[wizardIdx];
   $$("#panels .panel").forEach((p) => p.classList.toggle("wizard-active", p.dataset.step === cur.step));
-  if (cur.step === "brief") { wireProductStep(); maybeStartInterview(); }
+  if (cur.step === "brief") renderCompany($("#company-mount-wizard"));
 
   const steps = WIZARD_STEPS
     .map((w, i) => {
@@ -375,122 +360,85 @@ $("#connect-gmail").addEventListener("click", async () => {
   } catch (e) { msg("#dest-msg", e.message, false); }
 });
 // Build the outreach brief (message.toml) from the product form.
-// --- Product interview (Setup step 4) ---
-let piTranscript = [];
-let piStarted = false;
+// --- Company canvas (chat left + live product.md right) ---------------------
+const CANVAS_HTML = `
+  <div class="company-canvas">
+    <div class="cc-chat-pane">
+      <div class="cc-chat"></div>
+      <div class="cc-composer"><input class="cc-input" placeholder="Tell coldtrail about your company…" autocomplete="off" /><button class="btn primary cc-send">Send</button></div>
+    </div>
+    <div class="cc-doc-pane">
+      <div class="cc-doc-head">Company profile <span class="cc-doc-status"></span></div>
+      <textarea class="cc-doc" spellcheck="false" placeholder="Your profile builds here as you chat — you can also type in it directly."></textarea>
+    </div>
+  </div>`;
 
-function escapeHtml(s) {
-  return (s || "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+// Split assistant text into the chat reply and the fenced ```company-doc block (if present).
+function ccSplit(text) {
+  const m = text.match(/```company-doc\s*([\s\S]*?)```/);
+  if (!m) return { reply: text.trim(), doc: null };
+  return { reply: text.replace(m[0], "").trim(), doc: m[1].trim() };
 }
 
-function piRenderChat() {
-  const box = $("#pi-chat");
-  if (!box) return;
-  box.hidden = false;
-  $("#pi-composer").hidden = false;
-  box.innerHTML = piTranscript
-    .map((t) => `<div class="pi-turn ${t.role}">${escapeHtml(t.text)}</div>`)
-    .join("");
-  box.scrollTop = box.scrollHeight;
+function ccBubble(chat, role, text) {
+  const el = document.createElement("div");
+  el.className = "cc-turn " + role;
+  el.textContent = text;
+  chat.appendChild(el);
+  chat.scrollTop = chat.scrollHeight;
+  return el;
 }
 
-// Pull a ```coldtrail-brief {json}``` block out of assistant text. Returns {fields, clean}.
-function piExtractBrief(text) {
-  const m = text.match(/```coldtrail-brief\s*([\s\S]*?)```/);
-  if (!m) return { fields: null, clean: text };
-  let fields = null;
-  try { fields = JSON.parse(m[1].trim()); } catch (_) { fields = null; }
-  return { fields, clean: text.replace(m[0], "").trim() };
-}
-
-async function piRunTurn() {
-  const box = $("#pi-chat");
-  const holder = document.createElement("div");
-  holder.className = "pi-turn assistant";
-  holder.textContent = "…";
-  box.appendChild(holder);
-  let run;
+async function ccSaveDoc(root, doc) {
+  const status = root.querySelector(".cc-doc-status");
   try {
-    ({ run } = await postJSON("/api/onboarding/interview", { transcript: piTranscript }));
-  } catch (e) { holder.textContent = "(couldn't start the interview: " + e.message + ")"; return; }
+    await postJSON("/api/company", { doc });
+    if (status) { status.textContent = "saved"; setTimeout(() => { if (status.textContent === "saved") status.textContent = ""; }, 1500); }
+  } catch (e) { if (status) status.textContent = "save failed"; }
+}
+
+async function ccTurn(root, message) {
+  const chat = root.querySelector(".cc-chat"), docEl = root.querySelector(".cc-doc");
+  if (message) ccBubble(chat, "user", message);
+  const holder = ccBubble(chat, "assistant", "…");
+  let run;
+  try { ({ run } = await postJSON("/api/company/turn", { doc: docEl.value, message })); }
+  catch (e) { holder.textContent = "(couldn't reach the agent: " + e.message + ")"; return; }
   const es = new EventSource(`/api/chat/stream?run=${encodeURIComponent(run)}&t=${encodeURIComponent(token())}`);
   let acc = "";
   es.onmessage = (e) => {
     let ev; try { ev = JSON.parse(e.data); } catch (_) { return; }
-    if (ev.type === "text") { acc += ev.text; holder.textContent = piExtractBrief(acc).clean || "…"; box.scrollTop = box.scrollHeight; }
+    if (ev.type === "text") { acc += ev.text; holder.textContent = ccSplit(acc).reply || "…"; chat.scrollTop = chat.scrollHeight; }
     if (ev.type === "done") {
       es.close();
-      const { fields, clean } = piExtractBrief(acc);
-      holder.textContent = clean || "…";
-      piTranscript.push({ role: "assistant", text: clean });
-      if (fields) piShowReview(fields);
+      const { reply, doc } = ccSplit(acc);
+      holder.textContent = reply || "(updated your profile →)";
+      if (doc !== null && doc !== docEl.value) { docEl.value = doc; ccSaveDoc(root, doc); }
     }
   };
-  es.onerror = () => { es.close(); if (holder.textContent === "…") holder.textContent = "(the agent didn't respond — check your provider in step 1)"; };
+  es.onerror = () => { es.close(); if (holder.textContent === "…") holder.textContent = "(no response — check your provider in Settings)"; };
 }
 
-function piShowReview(f) {
-  $("#pi-product").value = f.product || "";
-  $("#pi-value").value = f.value || "";
-  $("#pi-pain").value = f.pain_value || "";
-  $("#pi-proof").value = f.proof || "";
-  $("#pi-offer").value = f.offer || "";
-  $("#pi-voice").value = f.voice || "";
-  $("#pi-link").value = f.link || "";
-  $("#pi-sender").value = f.sender || "";
-  $("#pi-review").hidden = false;
-  $("#pi-review").scrollIntoView({ behavior: "smooth", block: "nearest" });
+// Build the canvas into `root` once; on later calls just refresh the doc (unless being edited).
+async function renderCompany(root) {
+  if (!root) return;
+  if (root._ccInit) {
+    const d = root.querySelector(".cc-doc");
+    if (d && document.activeElement !== d) { try { const { doc } = await getJSON("/api/company"); d.value = doc || ""; } catch (_) {} }
+    return;
+  }
+  root._ccInit = true;
+  root.innerHTML = CANVAS_HTML;
+  const input = root.querySelector(".cc-input"), send = root.querySelector(".cc-send"), docEl = root.querySelector(".cc-doc");
+  const doSend = () => { const v = input.value.trim(); if (!v) return; input.value = ""; ccTurn(root, v); };
+  send.addEventListener("click", doSend);
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") doSend(); });
+  let t; docEl.addEventListener("input", () => { clearTimeout(t); t = setTimeout(() => ccSaveDoc(root, docEl.value), 800); });
+  let s = {};
+  try { const [{ doc }, st] = await Promise.all([getJSON("/api/company"), getJSON("/api/status").catch(() => ({}))]); docEl.value = doc || ""; s = st; } catch (_) {}
+  if (!docEl.value.trim() && s.provider) ccTurn(root, ""); // greet + skeleton once a provider is set
 }
-
-function wireProductStep() {
-  const send = $("#pi-send"), input = $("#pi-input");
-  const doSend = async () => {
-    const v = input.value.trim();
-    if (!v) return;
-    piTranscript.push({ role: "user", text: v });
-    input.value = "";
-    piRenderChat();
-    await piRunTurn();
-  };
-  if (send && !send._wired) { send._wired = true; send.addEventListener("click", doSend); }
-  if (input && !input._wired) { input._wired = true; input.addEventListener("keydown", (e) => { if (e.key === "Enter") doSend(); }); }
-  const manual = $("#pi-manual");
-  if (manual && !manual._wired) { manual._wired = true; manual.addEventListener("click", (e) => { e.preventDefault(); $("#pi-review").hidden = false; $("#pi-chat").hidden = true; $("#pi-composer").hidden = true; }); }
-}
-
-// Kick the interview once, when step 4 becomes visible.
-function maybeStartInterview() {
-  if (piStarted) return;
-  piStarted = true;
-  piRenderChat();
-  piRunTurn();
-}
-
-$("#build-pitch").addEventListener("click", async () => {
-  const body = {
-    product: $("#pi-product").value.trim(),
-    value: $("#pi-value").value.trim(),
-    pain_value: $("#pi-pain").value.trim(),
-    proof: $("#pi-proof").value.trim(),
-    offer: $("#pi-offer").value.trim(),
-    voice: $("#pi-voice").value.trim(),
-    link: $("#pi-link").value.trim(),
-    sender: $("#pi-sender").value.trim(),
-  };
-  if (!body.value) { msg("#pitch-msg", "tell coldtrail what your product does first", false); return; }
-  msg("#pitch-msg", "building your brief…", true);
-  try {
-    await postJSON("/api/onboarding/pitch", body);
-    // refresh the raw editor with the generated brief
-    try { const f = await getJSON("/api/onboarding/files"); const mt = $("#message-toml"); if (mt) mt.value = f.message || ""; } catch (_) {}
-    msg("#pitch-msg", "brief ready — the agent will personalize it per company", true);
-    await loadStatus();
-  } catch (e) { msg("#pitch-msg", e.message, false); }
-});
-$("#save-message").addEventListener("click", async () => {
-  try { await postJSON("/api/onboarding/message", { toml: $("#message-toml").value }); msg("#message-msg", "saved", true); await loadStatus(); }
-  catch (e) { msg("#message-msg", e.message, false); }
-});
+loaders.company = () => renderCompany($("#company-mount"));
 $("#ollama-preset").addEventListener("click", () => {
   $("#byok-base").value = "http://localhost:11434/v1";
   if (!$("#byok-model").value) $("#byok-model").value = "llama3.1";

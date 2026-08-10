@@ -189,36 +189,25 @@ pub struct TomlReq {
     pub toml: String,
 }
 
-/// The product interview/form → coldtrail assembles the outreach brief from these.
+/// One Company-canvas turn: the browser holds the current doc + sends the founder's message.
 #[derive(Deserialize)]
-pub struct PitchReq {
-    pub product: String,
-    /// What it does + who it helps.
-    pub value: String,
+pub struct CompanyTurnReq {
     #[serde(default)]
-    pub pain_value: String,
+    pub doc: String,
     #[serde(default)]
-    pub proof: String,
-    #[serde(default)]
-    pub offer: String,
-    #[serde(default)]
-    pub voice: String,
-    pub link: String,
-    pub sender: String,
+    pub message: String,
 }
 
-/// One turn of the product interview, held by the browser and re-sent each turn.
+/// Save/load the company profile (`product.md`).
 #[derive(Deserialize)]
-pub struct TranscriptTurn {
-    pub role: String,
-    pub text: String,
+pub struct CompanyDocReq {
+    #[serde(default)]
+    pub doc: String,
 }
 
-/// The running product-interview transcript (stateless — carries full context each turn).
-#[derive(Deserialize)]
-pub struct InterviewReq {
-    #[serde(default)]
-    pub transcript: Vec<TranscriptTurn>,
+#[derive(Serialize)]
+pub struct CompanyDocResp {
+    pub doc: String,
 }
 
 #[derive(Deserialize)]

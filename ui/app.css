@@ -308,3 +308,20 @@ a.btn{display:inline-block; text-decoration:none}
 .autosend .switch{display:flex; align-items:center; gap:9px; cursor:pointer; font-weight:600}
 .autosend .cap-row{display:flex; align-items:center; gap:9px; margin-top:8px; font-family:var(--mono); font-size:12px; color:var(--mut)}
 .autosend .cap-row input{width:72px}
+
+/* Company canvas — chat (left) + live product.md (right) */
+.company-canvas-mount{margin-top:8px}
+.company-canvas{display:flex; gap:16px; align-items:stretch; min-height:60vh}
+.cc-chat-pane{flex:1; min-width:0; display:flex; flex-direction:column}
+.cc-chat{flex:1; display:flex; flex-direction:column; gap:10px; overflow-y:auto; max-height:64vh; padding:4px 2px 10px}
+.cc-turn{max-width:88%; padding:10px 13px; border-radius:12px; border:1px solid var(--line); white-space:pre-wrap; word-break:break-word}
+.cc-turn.assistant{align-self:flex-start; background:var(--panel)}
+.cc-turn.user{align-self:flex-end; background:rgba(79,214,201,.08); border-color:rgba(79,214,201,.25)}
+.cc-composer{display:flex; gap:10px; padding-top:10px}
+.cc-input{flex:1}
+.cc-doc-pane{flex:1; min-width:0; display:flex; flex-direction:column; border:1px solid var(--line); border-radius:12px; background:var(--panel); overflow:hidden}
+.cc-doc-head{padding:10px 14px; border-bottom:1px solid var(--line); background:var(--bg2); font-size:13px; color:var(--mut); display:flex; justify-content:space-between; align-items:center}
+.cc-doc-status{font-family:var(--mono); font-size:11px; color:var(--cyan)}
+.cc-doc{flex:1; border:0; resize:none; padding:14px; font-family:var(--mono); font-size:12.5px; line-height:1.6; background:transparent; color:var(--ink); min-height:52vh}
+.cc-doc:focus{outline:none}
+@media (max-width:760px){ .company-canvas{flex-direction:column} .cc-doc{min-height:36vh} }

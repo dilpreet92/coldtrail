@@ -23,6 +23,7 @@
 
   <nav class="nav">
     <button class="nav-item" data-nav="onboarding"><span class="dot"></span><span class="nav-label" id="nav-setup-label">Setup</span></button>
+    <button class="nav-item" data-nav="company"><span class="dot"></span>Company</button>
     <button class="nav-item" data-nav="overview"><span class="dot"></span>Overview</button>
     <button class="nav-item" data-nav="chat"><span class="dot"></span>Chat</button>
     <button class="nav-item" data-nav="pipeline"><span class="dot"></span>Pipeline</button>
@@ -79,33 +80,17 @@
       </div>
 
       <div class="panel" data-step="brief" id="panel-message">
-        <h2>4 · Your product</h2>
-        <p class="hint" id="pi-hint">Tell coldtrail what you sell — it asks a few questions, then builds your brief from <em>your</em> words (it won't invent claims). The agent writes a fresh, personalized email per company from that brief; nothing is sent verbatim, and it stays local.</p>
-        <div id="pi-chat" class="pi-chat" hidden></div>
-        <div class="row" id="pi-composer" hidden>
-          <input id="pi-input" placeholder="Type your answer…" autocomplete="off" />
-          <button class="btn primary" id="pi-send">Send</button>
-        </div>
-        <div id="pi-review" hidden>
-          <p class="hint">Here's what coldtrail captured — edit anything, then build your brief.</p>
-          <label>Product name <input id="pi-product" placeholder="e.g. Canonical" autocomplete="off" /></label>
-          <label>What it does &amp; who it helps <textarea id="pi-value" rows="3"></textarea></label>
-          <label>The pain / value <span style="text-transform:none">(optional)</span> <textarea id="pi-pain" rows="2"></textarea></label>
-          <label>Proof / differentiator <span style="text-transform:none">(optional)</span> <input id="pi-proof" autocomplete="off" /></label>
-          <label>Your offer <span style="text-transform:none">(optional)</span> <input id="pi-offer" autocomplete="off" /></label>
-          <label>Voice / tone <span style="text-transform:none">(optional)</span> <input id="pi-voice" autocomplete="off" /></label>
-          <label>Call-to-action link <input id="pi-link" placeholder="https://yourproduct.com" autocomplete="off" /></label>
-          <label>Your name <input id="pi-sender" placeholder="e.g. Dilpreet" autocomplete="off" /></label>
-          <div class="row"><button class="btn primary" id="build-pitch">Build my brief</button><span class="form-msg" id="pitch-msg"></span></div>
-        </div>
-        <p class="hint" style="margin-top:10px"><a href="#" id="pi-manual">Prefer to fill it in yourself?</a></p>
-        <details class="advanced">
-          <summary>Advanced — edit the raw brief (message.toml)</summary>
-          <textarea id="message-toml" spellcheck="false" rows="12"></textarea>
-          <div class="row"><button class="btn" id="save-message">Save raw</button><span class="form-msg" id="message-msg"></span></div>
-        </details>
+        <h2>4 · Your company</h2>
+        <p class="hint">Chat with coldtrail about what you sell — it builds your company profile (on the right) from <em>your</em> words. The agent writes each cold email fresh from this profile; it won't invent claims, and it all stays local. You can edit the profile directly, and refine it anytime in the <strong>Company</strong> tab.</p>
+        <div id="company-mount-wizard" class="company-canvas-mount"></div>
       </div>
     </div>
+  </section>
+
+  <!-- COMPANY -->
+  <section class="view" id="view-company">
+    <header class="view-head"><h1>Company</h1><p class="sub">Chat with coldtrail about what you sell — it builds a company profile (on the right) from <em>your</em> words. The agent writes each cold email fresh from this profile; it never invents claims, and it all stays local. You can edit the profile directly too.</p></header>
+    <div id="company-mount" class="company-canvas-mount"></div>
   </section>
 
   <!-- OVERVIEW -->
