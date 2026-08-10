@@ -297,3 +297,8 @@ a.btn{display:inline-block; text-decoration:none}
 .pi-turn.user{align-self:flex-end; background:rgba(79,214,201,.08); border-color:rgba(79,214,201,.25)}
 #pi-composer{gap:10px}
 #pi-input{flex:1}
+
+/* Pipeline "sourced by" filter — a compact dropdown that scales with many queries */
+.pipe-select{font-family:var(--mono); font-size:11.5px; color:var(--ink); background:var(--panel);
+  border:1px solid var(--line); border-radius:999px; padding:5px 10px; cursor:pointer; max-width:min(60vw,420px)}
+.pipe-select:focus{outline:none; border-color:var(--ember-dim)}

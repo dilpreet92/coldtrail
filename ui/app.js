@@ -513,18 +513,24 @@ loaders.pipeline = async () => {
     c.addEventListener("click", () => { pipeFilter = c.dataset.f; loaders.pipeline(); })
   );
 
-  // Query filter (which ICP search sourced the company) — only when there's ≥1 query.
-  const queries = [...new Set(rows.map((r) => r.source_query).filter(Boolean))];
+  // Query filter (which ICP search sourced each company). A compact dropdown with per-query
+  // counts so it scales as searches pile up (a chip row got unmanageable). Only shown when
+  // there's ≥1 query.
+  const counts = {};
+  rows.forEach((r) => { if (r.source_query) counts[r.source_query] = (counts[r.source_query] || 0) + 1; });
+  const queries = Object.keys(counts).sort((a, b) => counts[b] - counts[a]);
   const qrow = $("#pipe-query-row");
   if (queries.length && !queries.includes(pipeQuery) && pipeQuery !== "all") pipeQuery = "all";
+  const clip = (q) => (q.length > 60 ? q.slice(0, 57) + "…" : q);
   qrow.innerHTML = queries.length
-    ? [`<span class="filter-label">sourced by</span>`, "all", ...queries]
-        .map((q, i) => i === 0 ? q : `<button class="chip" data-q="${escAttr(q)}" aria-pressed="${q === pipeQuery}">${q === "all" ? "all queries" : esc(q)}</button>`)
-        .join("")
+    ? `<label class="filter-label" for="pipe-query-select">sourced by</label>
+       <select id="pipe-query-select" class="pipe-select">
+         <option value="all"${pipeQuery === "all" ? " selected" : ""}>all queries (${rows.length})</option>
+         ${queries.map((q) => `<option value="${escAttr(q)}"${q === pipeQuery ? " selected" : ""}>${esc(clip(q))} (${counts[q]})</option>`).join("")}
+       </select>`
     : "";
-  $$("#pipe-query-row .chip").forEach((c) =>
-    c.addEventListener("click", () => { pipeQuery = c.dataset.q; loaders.pipeline(); })
-  );
+  const qsel = $("#pipe-query-select");
+  if (qsel) qsel.addEventListener("change", () => { pipeQuery = qsel.value; loaders.pipeline(); });
 
   const contactLine = (r) => {
     if (r.email) return `<div class="sub-contact">${esc(r.founder ? r.founder + " · " : "")}${esc(r.email)}</div>`;
