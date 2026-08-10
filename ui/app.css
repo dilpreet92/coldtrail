@@ -289,3 +289,11 @@ a.btn{display:inline-block; text-decoration:none}
   body{flex-direction:column}
   .stage{margin:0; padding:24px 18px 60px}
 }
+
+/* Product interview (Setup step 4) — mirrors the chat bubbles */
+.pi-chat{display:flex; flex-direction:column; gap:10px; max-height:340px; overflow-y:auto; padding:6px 0 10px}
+.pi-turn{max-width:80%; padding:10px 13px; border-radius:12px; border:1px solid var(--line); white-space:pre-wrap; word-break:break-word}
+.pi-turn.assistant{align-self:flex-start; background:var(--panel)}
+.pi-turn.user{align-self:flex-end; background:rgba(79,214,201,.08); border-color:rgba(79,214,201,.25)}
+#pi-composer{gap:10px}
+#pi-input{flex:1}

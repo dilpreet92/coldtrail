@@ -163,7 +163,7 @@ const WIZARD_STEPS = [
   { step: "provider", label: "Provider", done: (s) => !!s.provider },
   { step: "discovery", label: "Discovery", done: (s) => s.discovery_connected },
   { step: "destination", label: "Destination", done: (s) => s.destination_connected },
-  { step: "brief", label: "Product", done: (s) => s.message_customized },
+  { step: "brief", label: "Product", done: (s) => s.product_set || s.message_customized },
 ];
 let wizardIdx = 0;
 let wizardInit = false;
@@ -183,6 +183,11 @@ function renderSetup(s) {
     checklist.hidden = true;
     $$("#panels .panel").forEach((p) => p.classList.remove("wizard-active"));
     wizardInit = false; // so a later reset re-enters the wizard cleanly
+    // Settings (already onboarded): show the editable brief form; the interview is a
+    // first-run nicety, so here we keep the direct form (+ raw editor) available.
+    wireProductStep();
+    const rev = $("#pi-review");
+    if (rev) rev.hidden = false;
     return;
   }
 
@@ -197,6 +202,7 @@ function renderSetup(s) {
   wizardIdx = Math.max(0, Math.min(WIZARD_STEPS.length - 1, wizardIdx));
   const cur = WIZARD_STEPS[wizardIdx];
   $$("#panels .panel").forEach((p) => p.classList.toggle("wizard-active", p.dataset.step === cur.step));
+  if (cur.step === "brief") { wireProductStep(); maybeStartInterview(); }
 
   const steps = WIZARD_STEPS
     .map((w, i) => {
@@ -339,11 +345,105 @@ $("#connect-gmail").addEventListener("click", async () => {
   } catch (e) { msg("#dest-msg", e.message, false); }
 });
 // Build the outreach brief (message.toml) from the product form.
+// --- Product interview (Setup step 4) ---
+let piTranscript = [];
+let piStarted = false;
+
+function escapeHtml(s) {
+  return (s || "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function piRenderChat() {
+  const box = $("#pi-chat");
+  if (!box) return;
+  box.hidden = false;
+  $("#pi-composer").hidden = false;
+  box.innerHTML = piTranscript
+    .map((t) => `<div class="pi-turn ${t.role}">${escapeHtml(t.text)}</div>`)
+    .join("");
+  box.scrollTop = box.scrollHeight;
+}
+
+// Pull a ```coldtrail-brief {json}``` block out of assistant text. Returns {fields, clean}.
+function piExtractBrief(text) {
+  const m = text.match(/```coldtrail-brief\s*([\s\S]*?)```/);
+  if (!m) return { fields: null, clean: text };
+  let fields = null;
+  try { fields = JSON.parse(m[1].trim()); } catch (_) { fields = null; }
+  return { fields, clean: text.replace(m[0], "").trim() };
+}
+
+async function piRunTurn() {
+  const box = $("#pi-chat");
+  const holder = document.createElement("div");
+  holder.className = "pi-turn assistant";
+  holder.textContent = "…";
+  box.appendChild(holder);
+  let run;
+  try {
+    ({ run } = await postJSON("/api/onboarding/interview", { transcript: piTranscript }));
+  } catch (e) { holder.textContent = "(couldn't start the interview: " + e.message + ")"; return; }
+  const es = new EventSource(`/api/chat/stream?run=${encodeURIComponent(run)}&t=${encodeURIComponent(token())}`);
+  let acc = "";
+  es.onmessage = (e) => {
+    let ev; try { ev = JSON.parse(e.data); } catch (_) { return; }
+    if (ev.type === "text") { acc += ev.text; holder.textContent = piExtractBrief(acc).clean || "…"; box.scrollTop = box.scrollHeight; }
+    if (ev.type === "done") {
+      es.close();
+      const { fields, clean } = piExtractBrief(acc);
+      holder.textContent = clean || "…";
+      piTranscript.push({ role: "assistant", text: clean });
+      if (fields) piShowReview(fields);
+    }
+  };
+  es.onerror = () => { es.close(); if (holder.textContent === "…") holder.textContent = "(the agent didn't respond — check your provider in step 1)"; };
+}
+
+function piShowReview(f) {
+  $("#pi-product").value = f.product || "";
+  $("#pi-value").value = f.value || "";
+  $("#pi-pain").value = f.pain_value || "";
+  $("#pi-proof").value = f.proof || "";
+  $("#pi-offer").value = f.offer || "";
+  $("#pi-voice").value = f.voice || "";
+  $("#pi-link").value = f.link || "";
+  $("#pi-sender").value = f.sender || "";
+  $("#pi-review").hidden = false;
+  $("#pi-review").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+function wireProductStep() {
+  const send = $("#pi-send"), input = $("#pi-input");
+  const doSend = async () => {
+    const v = input.value.trim();
+    if (!v) return;
+    piTranscript.push({ role: "user", text: v });
+    input.value = "";
+    piRenderChat();
+    await piRunTurn();
+  };
+  if (send && !send._wired) { send._wired = true; send.addEventListener("click", doSend); }
+  if (input && !input._wired) { input._wired = true; input.addEventListener("keydown", (e) => { if (e.key === "Enter") doSend(); }); }
+  const manual = $("#pi-manual");
+  if (manual && !manual._wired) { manual._wired = true; manual.addEventListener("click", (e) => { e.preventDefault(); $("#pi-review").hidden = false; $("#pi-chat").hidden = true; $("#pi-composer").hidden = true; }); }
+}
+
+// Kick the interview once, when step 4 becomes visible.
+function maybeStartInterview() {
+  if (piStarted) return;
+  piStarted = true;
+  piRenderChat();
+  piRunTurn();
+}
+
 $("#build-pitch").addEventListener("click", async () => {
   const body = {
     product: $("#pi-product").value.trim(),
     value: $("#pi-value").value.trim(),
+    pain_value: $("#pi-pain").value.trim(),
+    proof: $("#pi-proof").value.trim(),
     offer: $("#pi-offer").value.trim(),
+    voice: $("#pi-voice").value.trim(),
     link: $("#pi-link").value.trim(),
     sender: $("#pi-sender").value.trim(),
   };
