@@ -21,7 +21,13 @@ type Tls = BufReader<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
 fn dot_stuff(rfc822: &str) -> String {
     let crlf = rfc822.replace("\r\n", "\n").replace('\n', "\r\n");
     crlf.split("\r\n")
-        .map(|l| if l.starts_with('.') { format!(".{l}") } else { l.to_string() })
+        .map(|l| {
+            if l.starts_with('.') {
+                format!(".{l}")
+            } else {
+                l.to_string()
+            }
+        })
         .collect::<Vec<_>>()
         .join("\r\n")
 }
@@ -105,7 +111,9 @@ pub async fn send(email: &str, app_password: &str, to: &str, rfc822: &str) -> Re
     let body = dot_stuff(rfc822);
     s.write_all(body.as_bytes()).await?;
     s.write_all(b"\r\n.\r\n").await?;
-    read_code(&mut s).await.context("message rejected on send")?;
+    read_code(&mut s)
+        .await
+        .context("message rejected on send")?;
     let _ = cmd(&mut s, "QUIT").await;
     Ok(())
 }

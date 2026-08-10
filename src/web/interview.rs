@@ -35,7 +35,11 @@ fn build_prompt(transcript: &[TranscriptTurn]) -> String {
     }
     s.push_str("\n\n--- conversation so far ---\n");
     for t in transcript {
-        let who = if t.role == "assistant" { "you" } else { "founder" };
+        let who = if t.role == "assistant" {
+            "you"
+        } else {
+            "founder"
+        };
         s.push_str(&format!("{who}: {}\n", t.text.trim()));
     }
     s.push_str("\nContinue: ask the next short question, or if you have enough, output the coldtrail-brief block now.");

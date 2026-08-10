@@ -36,7 +36,10 @@ async fn fetch_one(query: &str, top_k: usize, token: &str) -> Result<String> {
 /// single-writer, and sequential import lets domain-dedupe carry across angles — a company found
 /// by two angles is added once, deduped the second time). Each company's `source_query` records
 /// the angle that surfaced it. Returns (added, deduped, total_results).
-pub async fn fetch_and_import_many(angles: &[String], limit: Option<usize>) -> Result<(u32, u32, usize)> {
+pub async fn fetch_and_import_many(
+    angles: &[String],
+    limit: Option<usize>,
+) -> Result<(u32, u32, usize)> {
     let token = crate::oauth::valid_access("canonical")
         .await
         .ok_or_else(|| anyhow!("Canonical isn't connected — connect it in Settings → Discovery"))?;

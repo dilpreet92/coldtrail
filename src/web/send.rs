@@ -123,9 +123,11 @@ async fn auto_send(
         crate::smtp::send(&email, &pw, to, &mime).await.map(|_| ())
     } else {
         match crate::gmail::token().await {
-            Ok((token, quota)) => crate::gmail::send_message(&token, quota.as_deref(), to, subject, body)
-                .await
-                .map(|_| ()),
+            Ok((token, quota)) => {
+                crate::gmail::send_message(&token, quota.as_deref(), to, subject, body)
+                    .await
+                    .map(|_| ())
+            }
             Err(e) => Err(e),
         }
     };
