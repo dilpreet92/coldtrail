@@ -24,6 +24,7 @@ mod secrets;
 mod seed;
 mod serve;
 mod setup;
+mod smtp;
 mod source;
 mod web;
 

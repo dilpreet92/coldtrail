@@ -285,13 +285,43 @@ function renderDestination(s) {
   if (!hint || !gc || !btn) return;
   btn.style.display = "none"; // forms carry their own buttons
   if (s.destination_connected) {
-    hint.innerHTML = `<strong>Gmail</strong> connected. coldtrail creates each draft in your Gmail; you review and hit Send (never auto-sends).`;
-    gc.innerHTML = `<p class="hint">✓ connected.</p><details class="advanced"><summary>Reconnect with different credentials</summary>${AP_FORM}${BYO_DETAILS}</details>`;
+    hint.innerHTML = s.auto_send
+      ? `<strong>Gmail</strong> connected — <strong>auto-send is ON</strong>. Hitting Send on the Drafts screen sends the email immediately (capped at ${s.daily_send_cap}/day).`
+      : `<strong>Gmail</strong> connected. coldtrail creates each draft in your Gmail; you review and hit Send (never auto-sends).`;
+    gc.innerHTML = `<p class="hint">✓ connected.</p>${autoSendBlock(s)}<details class="advanced"><summary>Reconnect with different credentials</summary>${AP_FORM}${BYO_DETAILS}</details>`;
   } else {
     hint.innerHTML = `Where outreach goes. <strong>Gmail</strong> — coldtrail drafts, you review &amp; hit Send (never auto-sends). Easiest is a <strong>Gmail app password</strong>: keyless, no Google Cloud, ~2 min.`;
     gc.innerHTML = AP_FORM + BYO_DETAILS;
   }
   wireDestinationForms();
+  wireAutoSend();
+}
+
+// Opt-in auto-send control (only meaningful once a destination is connected). Deliberately
+// relaxes the draft-only default, so it's an explicit toggle with a plain-language warning.
+function autoSendBlock(s) {
+  return `<div class="autosend">
+    <label class="switch"><input type="checkbox" id="as-toggle"${s.auto_send ? " checked" : ""} /> <span>Auto-send (skip the manual Gmail step)</span></label>
+    <p class="hint">When on, <strong>Send</strong> on the Drafts screen sends the email for real instead of saving a draft. Turn this on only once you trust the drafts. There's no undo on a sent email.</p>
+    <label class="cap-row">Daily send cap <input type="number" id="as-cap" min="1" max="500" value="${s.daily_send_cap}" /></label>
+    <span class="form-msg" id="as-msg"></span>
+  </div>`;
+}
+
+function wireAutoSend() {
+  const t = $("#as-toggle");
+  if (!t || t._wired) return;
+  t._wired = true;
+  const save = async () => {
+    const enabled = t.checked;
+    const cap = Math.max(1, parseInt($("#as-cap").value, 10) || 20);
+    if (enabled && !confirm(`Turn ON auto-send? Hitting Send will email people for real (up to ${cap}/day). There's no undo.`)) { t.checked = false; return; }
+    try { await postJSON("/api/destination/auto-send", { enabled, daily_cap: cap }); msg("#as-msg", enabled ? `auto-send on · ${cap}/day` : "auto-send off — back to draft-only", true); await loadStatus(); }
+    catch (e) { msg("#as-msg", e.message, false); }
+  };
+  t.addEventListener("change", save);
+  const cap = $("#as-cap");
+  if (cap) cap.addEventListener("change", () => { if (t.checked) save(); });
 }
 
 // Enrichment (OSINT) setup panel: one row per tool — detected, one-click install, or why not.
@@ -611,11 +641,15 @@ loaders.overview = async () => {
 const escAttr = (s) => esc(s).replace(/"/g, "&quot;");
 const DRAFT_LABEL = { draft_pending: "draft", drafted: "in Gmail" };
 loaders.drafts = async () => {
-  let rows, ov;
-  try { [rows, ov] = await Promise.all([getJSON("/api/drafts"), getJSON("/api/overview").catch(() => ({ sent: 0 }))]); }
+  let rows, ov, st;
+  try { [rows, ov, st] = await Promise.all([getJSON("/api/drafts"), getJSON("/api/overview").catch(() => ({ sent: 0 })), getJSON("/api/status").catch(() => ({}))]); }
   catch (e) { return; }
+  const auto = !!st.auto_send;
+  const cap = st.daily_send_cap || 20;
   const sent = ov.sent || 0;
-  $("#warmup").textContent = sent ? `${sent} sent · pace new mailboxes to ~5/day` : "pace new mailboxes to ~5/day";
+  $("#warmup").textContent = auto
+    ? `${sent} sent · auto-send ON · cap ${cap}/day`
+    : (sent ? `${sent} sent · pace new mailboxes to ~5/day` : "pace new mailboxes to ~5/day");
   const list = $("#drafts-list");
   const bulkHost = $("#drafts-bulk");
   if (!rows.length) {
@@ -633,7 +667,7 @@ loaders.drafts = async () => {
           <span class="to">${esc(r.to) || esc(r.domain)}</span>
           <span class="spacer"></span>
           <span class="status s-${esc(r.status)}">${esc(DRAFT_LABEL[r.status] || r.status)}</span>
-          ${draftable ? `<button class="btn save">Save</button><button class="btn primary push">Create Gmail draft</button>` : ""}
+          ${draftable ? `<button class="btn save">Save</button><button class="btn primary push">${auto ? "Send now" : "Create Gmail draft"}</button>` : ""}
           ${inGmail ? `<a class="btn" href="https://mail.google.com/mail/u/0/#drafts" target="_blank" rel="noreferrer">Open Gmail</a><button class="btn marksent">Mark sent</button>` : ""}
         </div>`;
       const gmailNote = inGmail
@@ -657,13 +691,16 @@ loaders.drafts = async () => {
   const bulk = $("#drafts-bulk");
   if (bulk) {
     bulk.innerHTML = pending.length >= 2
-      ? `<button class="btn primary" id="bulk-draft">Create all Gmail drafts (${pending.length})</button><span class="form-msg" id="bulk-msg"></span>`
+      ? `<button class="btn primary" id="bulk-draft">${auto ? `Send all (${pending.length})` : `Create all Gmail drafts (${pending.length})`}</button><span class="form-msg" id="bulk-msg"></span>`
       : "";
   }
   const bulkBtn = $("#bulk-draft");
   if (bulkBtn)
     bulkBtn.addEventListener("click", async () => {
-      if (!confirm(`Create Gmail drafts for all ${pending.length} pending? Each is created as a draft — nothing is sent.`)) return;
+      const confirmMsg = auto
+        ? `Send all ${pending.length} pending emails FOR REAL now (cap ${cap}/day)? There's no undo.`
+        : `Create Gmail drafts for all ${pending.length} pending? Each is created as a draft — nothing is sent.`;
+      if (!confirm(confirmMsg)) return;
       const msg = $("#bulk-msg");
       $$("#drafts-list .push, #drafts-list .save").forEach((b) => (b.disabled = true));
       bulkBtn.disabled = true;
@@ -682,7 +719,9 @@ loaders.drafts = async () => {
           if (r.ok) ok++; else fails.push(`${dom}: ${r.message || "failed"}`);
         } catch (e) { fails.push(`${dom}: ${e.message}`); }
       }
-      let summary = `Created ${ok} Gmail draft${ok === 1 ? "" : "s"}.`;
+      let summary = auto
+        ? `Sent ${ok} email${ok === 1 ? "" : "s"}.`
+        : `Created ${ok} Gmail draft${ok === 1 ? "" : "s"}.`;
       if (fails.length) summary += ` ${fails.length} failed — see below.`;
       toast(summary, fails.length ? "err" : "ok");
       if (fails.length) toast(`Not created:\n${fails.join("\n")}`, "err");
@@ -704,13 +743,14 @@ loaders.drafts = async () => {
     b.addEventListener("click", async () => {
       const card = b.closest(".draft");
       const dom = card.dataset.domain;
-      b.disabled = true; b.textContent = "creating…";
+      const label = auto ? "Send now" : "Create Gmail draft";
+      b.disabled = true; b.textContent = auto ? "sending…" : "creating…";
       try {
         await postJSON(`/api/drafts/${encodeURIComponent(dom)}`, edits(card)); // persist edits first
-        const r = await postJSON(`/api/drafts/${encodeURIComponent(dom)}/send`, {}); // creates a Gmail draft
-        if (r.ok) { toast(r.message || "Created in your Gmail Drafts.", "ok"); await loaders.drafts(); }
-        else { b.disabled = false; b.textContent = "Create Gmail draft"; toast(r.message || "could not create the Gmail draft", "err"); }
-      } catch (e) { b.disabled = false; b.textContent = "Create Gmail draft"; toast(e.message, "err"); }
+        const r = await postJSON(`/api/drafts/${encodeURIComponent(dom)}/send`, {}); // send or draft, per auto_send
+        if (r.ok) { toast(r.message || (auto ? "Sent." : "Created in your Gmail Drafts."), "ok"); await loaders.drafts(); }
+        else { b.disabled = false; b.textContent = label; toast(r.message || "could not complete", "err"); }
+      } catch (e) { b.disabled = false; b.textContent = label; toast(e.message, "err"); }
     })
   );
   $$("#drafts-list .marksent").forEach((b) =>

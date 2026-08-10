@@ -90,6 +90,41 @@ pub async fn create_draft(
     Ok(v["id"].as_str().unwrap_or_default().to_string())
 }
 
+/// Send the message immediately via the Gmail API (`messages.send`). The `gmail.compose` scope
+/// covers sending, so the same token used for drafts works. Only reached when the human has
+/// opted into auto-send. Returns the sent message id.
+pub async fn send_message(
+    token: &str,
+    quota_project: Option<&str>,
+    to: &str,
+    subject: &str,
+    body: &str,
+) -> Result<String> {
+    let raw = raw_message(to, subject, body);
+    let mut req = reqwest::Client::new()
+        .post("https://gmail.googleapis.com/gmail/v1/users/me/messages/send")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json");
+    if let Some(p) = quota_project {
+        req = req.header("x-goog-user-project", p);
+    }
+    let resp = req
+        .body(serde_json::json!({ "raw": raw }).to_string())
+        .send()
+        .await
+        .map_err(|e| anyhow!("Gmail send request failed: {e}"))?;
+    let ok = resp.status().is_success();
+    let text = resp.text().await.unwrap_or_default();
+    if !ok {
+        return Err(anyhow!(
+            "Gmail send failed: {}",
+            text.chars().take(300).collect::<String>()
+        ));
+    }
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    Ok(v["id"].as_str().unwrap_or_default().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

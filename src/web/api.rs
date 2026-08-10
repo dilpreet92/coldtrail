@@ -28,6 +28,10 @@ pub struct StatusDto {
     /// Unified connected state for the chosen provider (MCP-wired for CLI, token for BYOK).
     pub discovery_connected: bool,
     pub destination_connected: bool,
+    /// Opt-in auto-send is enabled (default false = draft-only).
+    pub auto_send: bool,
+    /// The per-day auto-send cap in effect.
+    pub daily_send_cap: u32,
     /// OSINT enrichment tooling (theHarvester) detection + install-ability.
     pub osint: crate::osint::OsintStatus,
     /// coldtrail's own Google client is configured (COLDTRAIL_GOOGLE_CLIENT_ID/SECRET).
@@ -54,6 +58,13 @@ pub struct GmailClientReq {
 pub struct AppPasswordReq {
     pub email: String,
     pub app_password: String,
+}
+
+/// Toggle opt-in auto-send and (optionally) set the per-day cap.
+#[derive(Deserialize)]
+pub struct AutoSendReq {
+    pub enabled: bool,
+    pub daily_cap: Option<u32>,
 }
 
 #[derive(Deserialize)]

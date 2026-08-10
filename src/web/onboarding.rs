@@ -67,6 +67,10 @@ pub async fn status() -> Result<Json<StatusDto>, ApiErr> {
         key_set,
         discovery_connected,
         destination_connected,
+        auto_send: cfg.auto_send,
+        daily_send_cap: cfg
+            .daily_send_cap
+            .unwrap_or(crate::config::DEFAULT_DAILY_SEND_CAP),
         osint: crate::osint::status(),
         gmail_client_configured: crate::oauth::google_client().is_some(),
         gcloud_available: crate::gcloud::available(),
@@ -179,6 +183,20 @@ pub async fn set_gmail_app_password(
         }));
     }
     crate::secrets::set_gmail_app_password(email, &pw)?;
+    Ok(Json(MsgResp::ok()))
+}
+
+/// Opt into (or out of) auto-send, and set the per-day cap. Off by default — this deliberately
+/// relaxes the draft-only guardrail, so it's an explicit human toggle in Settings.
+pub async fn set_auto_send(
+    Json(req): Json<super::api::AutoSendReq>,
+) -> Result<Json<MsgResp>, ApiErr> {
+    let mut c = crate::config::load();
+    c.auto_send = req.enabled;
+    if let Some(cap) = req.daily_cap {
+        c.daily_send_cap = Some(cap.max(1));
+    }
+    crate::config::save(&c)?;
     Ok(Json(MsgResp::ok()))
 }
 

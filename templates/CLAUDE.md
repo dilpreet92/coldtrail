@@ -41,6 +41,9 @@ subcommands — never re-implement their logic, never touch `outreach.db` direct
   storing a reviewable draft with `coldtrail draft`. You have no Gmail access — do not read
   coldtrail's stored credentials/tokens and do not call mail APIs (curl, etc.) to send or
   read email. Creating the Gmail draft is something coldtrail itself does on the human's click.
+  (The human may have enabled auto-send in Settings so that their click sends for real — that
+  is their decision and their action, not yours. It changes nothing about your job: you only
+  ever store drafts with `coldtrail draft`.)
 - **Dedupe by domain.** Never contact a company twice. Import and seeding enforce this;
   trust the "already-known (deduped)" counts.
 - **Founder-addressed, MX-verified only.** Generic (`info@`, `sales@`, …) and
