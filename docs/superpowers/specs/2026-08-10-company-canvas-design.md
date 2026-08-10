@@ -1,7 +1,17 @@
 # Company canvas — design
 
 **Date:** 2026-08-10
-**Status:** approved, ready to build (replaces the v0.6.0 interview + review-form step 4)
+**Status:** built v0.8.0, then simplified in v0.8.1 — see amendment below.
+
+## Amendment (v0.8.1): drop the chat, keep the editable profile
+
+The chat pane added ceremony without enough payoff; the editable profile alone is sufficient.
+The Company tab is now **just the editable markdown doc** (`product.md`), full-width, auto-saved
+as you type, with a starter skeleton (section headings) shown when empty (guidance only — it
+saves once you actually edit). Removed: the `company-doc` turn contract, `POST /api/company/turn`,
+`company::turn`/`build_prompt`/`PREAMBLE`, `api::CompanyTurnReq`, and all chat JS
+(`ccTurn`/`ccSplit`/`ccBubble`). Kept: `GET/POST /api/company`, `product.md` as source of truth,
+`product_set` gating. The rest of the original design below stands (minus the chat turn).
 
 ## Idea
 

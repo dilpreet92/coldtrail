@@ -360,34 +360,33 @@ $("#connect-gmail").addEventListener("click", async () => {
   } catch (e) { msg("#dest-msg", e.message, false); }
 });
 // Build the outreach brief (message.toml) from the product form.
-// --- Company canvas (chat left + live product.md right) ---------------------
-const CANVAS_HTML = `
-  <div class="company-canvas">
-    <div class="cc-chat-pane">
-      <div class="cc-chat"></div>
-      <div class="cc-composer"><input class="cc-input" placeholder="Tell coldtrail about your company…" autocomplete="off" /><button class="btn primary cc-send">Send</button></div>
-    </div>
-    <div class="cc-doc-pane">
-      <div class="cc-doc-head">Company profile <span class="cc-doc-status"></span></div>
-      <textarea class="cc-doc" spellcheck="false" placeholder="Your profile builds here as you chat — you can also type in it directly."></textarea>
-    </div>
+// --- Company profile (editable product.md) ----------------------------------
+const COMPANY_DOC_HTML = `
+  <div class="company-doc-only">
+    <div class="cc-doc-head">Company profile <span class="cc-doc-status"></span></div>
+    <textarea class="cc-doc" spellcheck="false" placeholder="Describe your company here (markdown). This is what the agent writes each cold email from."></textarea>
   </div>`;
 
-// Split assistant text into the chat reply and the fenced ```company-doc block (if present).
-function ccSplit(text) {
-  const m = text.match(/```company-doc\s*([\s\S]*?)```/);
-  if (!m) return { reply: text.trim(), doc: null };
-  return { reply: text.replace(m[0], "").trim(), doc: m[1].trim() };
-}
+// A starter template shown when the profile is empty — guidance only, not saved until edited.
+const COMPANY_SKELETON = `# <Your company / product> — profile
 
-function ccBubble(chat, role, text) {
-  const el = document.createElement("div");
-  el.className = "cc-turn " + role;
-  el.textContent = text;
-  chat.appendChild(el);
-  chat.scrollTop = chat.scrollHeight;
-  return el;
-}
+## What we do / who we help
+`+`
+
+## The pain / value
+`+`
+
+## Proof / differentiator
+`+`
+
+## Offer
+`+`
+
+## Call to action
+https://yourproduct.com/?utm_content={slug}
+
+## Voice & sign-off
+`;
 
 async function ccSaveDoc(root, doc) {
   const status = root.querySelector(".cc-doc-status");
@@ -397,46 +396,23 @@ async function ccSaveDoc(root, doc) {
   } catch (e) { if (status) status.textContent = "save failed"; }
 }
 
-async function ccTurn(root, message) {
-  const chat = root.querySelector(".cc-chat"), docEl = root.querySelector(".cc-doc");
-  if (message) ccBubble(chat, "user", message);
-  const holder = ccBubble(chat, "assistant", "…");
-  let run;
-  try { ({ run } = await postJSON("/api/company/turn", { doc: docEl.value, message })); }
-  catch (e) { holder.textContent = "(couldn't reach the agent: " + e.message + ")"; return; }
-  const es = new EventSource(`/api/chat/stream?run=${encodeURIComponent(run)}&t=${encodeURIComponent(token())}`);
-  let acc = "";
-  es.onmessage = (e) => {
-    let ev; try { ev = JSON.parse(e.data); } catch (_) { return; }
-    if (ev.type === "text") { acc += ev.text; holder.textContent = ccSplit(acc).reply || "…"; chat.scrollTop = chat.scrollHeight; }
-    if (ev.type === "done") {
-      es.close();
-      const { reply, doc } = ccSplit(acc);
-      holder.textContent = reply || "(updated your profile →)";
-      if (doc !== null && doc !== docEl.value) { docEl.value = doc; ccSaveDoc(root, doc); }
-    }
-  };
-  es.onerror = () => { es.close(); if (holder.textContent === "…") holder.textContent = "(no response — check your provider in Settings)"; };
-}
-
-// Build the canvas into `root` once; on later calls just refresh the doc (unless being edited).
+// Build the editor into `root` once; on later calls refresh the doc unless it's being edited.
 async function renderCompany(root) {
   if (!root) return;
   if (root._ccInit) {
     const d = root.querySelector(".cc-doc");
-    if (d && document.activeElement !== d) { try { const { doc } = await getJSON("/api/company"); d.value = doc || ""; } catch (_) {} }
+    if (d && document.activeElement !== d) {
+      try { const { doc } = await getJSON("/api/company"); d.value = doc && doc.trim() ? doc : COMPANY_SKELETON; } catch (_) {}
+    }
     return;
   }
   root._ccInit = true;
-  root.innerHTML = CANVAS_HTML;
-  const input = root.querySelector(".cc-input"), send = root.querySelector(".cc-send"), docEl = root.querySelector(".cc-doc");
-  const doSend = () => { const v = input.value.trim(); if (!v) return; input.value = ""; ccTurn(root, v); };
-  send.addEventListener("click", doSend);
-  input.addEventListener("keydown", (e) => { if (e.key === "Enter") doSend(); });
-  let t; docEl.addEventListener("input", () => { clearTimeout(t); t = setTimeout(() => ccSaveDoc(root, docEl.value), 800); });
-  let s = {};
-  try { const [{ doc }, st] = await Promise.all([getJSON("/api/company"), getJSON("/api/status").catch(() => ({}))]); docEl.value = doc || ""; s = st; } catch (_) {}
-  if (!docEl.value.trim() && s.provider) ccTurn(root, ""); // greet + skeleton once a provider is set
+  root.innerHTML = COMPANY_DOC_HTML;
+  const docEl = root.querySelector(".cc-doc");
+  let t;
+  docEl.addEventListener("input", () => { clearTimeout(t); t = setTimeout(() => ccSaveDoc(root, docEl.value), 800); });
+  try { const { doc } = await getJSON("/api/company"); docEl.value = doc || ""; } catch (_) {}
+  if (!docEl.value.trim()) docEl.value = COMPANY_SKELETON; // guidance; saves once they edit
 }
 loaders.company = () => renderCompany($("#company-mount"));
 $("#ollama-preset").addEventListener("click", () => {

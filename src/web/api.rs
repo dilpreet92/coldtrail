@@ -189,15 +189,6 @@ pub struct TomlReq {
     pub toml: String,
 }
 
-/// One Company-canvas turn: the browser holds the current doc + sends the founder's message.
-#[derive(Deserialize)]
-pub struct CompanyTurnReq {
-    #[serde(default)]
-    pub doc: String,
-    #[serde(default)]
-    pub message: String,
-}
-
 /// Save/load the company profile (`product.md`).
 #[derive(Deserialize)]
 pub struct CompanyDocReq {

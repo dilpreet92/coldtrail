@@ -1,6 +1,6 @@
 [package]
 name = "coldtrail"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
 description = "Discovery-first, deduped outreach — drafts you send by hand."
 license = "MIT"

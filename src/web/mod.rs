@@ -88,7 +88,6 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/company",
             get(company::get_doc).post(company::save_doc),
         )
-        .route("/api/company/turn", post(company::turn))
         .route("/api/onboarding/contacted", post(onboarding::set_contacted))
         .route(
             "/api/onboarding/osint/install",
