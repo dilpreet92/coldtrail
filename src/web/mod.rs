@@ -5,6 +5,7 @@ pub mod api;
 pub mod chat;
 pub mod chats;
 pub mod followups;
+pub mod interview;
 pub mod onboarding;
 pub mod pipeline;
 pub mod send;
@@ -84,6 +85,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/onboarding/mcp", post(onboarding::set_mcp))
         .route("/api/onboarding/message", post(onboarding::set_message))
         .route("/api/onboarding/pitch", post(onboarding::set_pitch))
+        .route("/api/onboarding/interview", post(interview::start))
         .route("/api/onboarding/contacted", post(onboarding::set_contacted))
         .route(
             "/api/onboarding/osint/install",
