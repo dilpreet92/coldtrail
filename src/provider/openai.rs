@@ -133,7 +133,9 @@ async fn fail(tx: &Sender<AgentEvent>, msg: String) -> bool {
 }
 
 fn system_prompt(home: &Path) -> String {
-    let brief = std::fs::read_to_string(home.join("message.toml")).unwrap_or_default();
+    let brief = std::fs::read_to_string(home.join("product.md"))
+        .or_else(|_| std::fs::read_to_string(home.join("message.toml")))
+        .unwrap_or_default();
     format!(
         "You are coldtrail's outreach agent: discovery-first, deduped cold outreach. Drive the \
          loop with the provided tools; never invent data.\n\n\
@@ -147,7 +149,7 @@ fn system_prompt(home: &Path) -> String {
          action in the app. Founder-addressed only; no generic/placeholder addresses. No \
          fabrication. Keep drafts short and human.\n\n\
          --- enrichment methodology (enrichment.md) ---\n{playbook}\n\n\
-         --- brief (message.toml) ---\n{brief}",
+         --- product brief ---\n{brief}",
         playbook = crate::setup::ENRICHMENT_MD,
     )
 }
@@ -166,6 +168,21 @@ mod tests {
             v.push(e);
         }
         v
+    }
+
+    #[test]
+    fn system_prompt_prefers_product_md() {
+        let tmp = std::env::temp_dir().join("ct-openai-brief-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("message.toml"), "subject='x'").unwrap();
+        std::fs::write(
+            tmp.join("product.md"),
+            "# Acme — outreach brief\nrich context",
+        )
+        .unwrap();
+        let p = super::system_prompt(&tmp);
+        assert!(p.contains("rich context"), "uses product.md when present");
     }
 
     #[tokio::test]

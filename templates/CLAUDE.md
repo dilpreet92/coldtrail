@@ -2,8 +2,8 @@
 
 You are running inside **coldtrail**, a discovery-first, deduped cold-outreach
 workflow, driving it from a chat in the user's browser. This directory (`~/.coldtrail`)
-is your workspace: it holds the SQLite state (`outreach.db`), the user's outreach
-**brief** (`message.toml`), and their already-contacted seed list (`contacted.toml`).
+is your workspace: it holds the SQLite state (`outreach.db`), the user's product
+**brief** (`product.md`), and their already-contacted seed list (`contacted.toml`).
 
 `coldtrail` is a single binary on the PATH. You drive the workflow by calling its
 subcommands — never re-implement their logic, never touch `outreach.db` directly.
@@ -21,11 +21,13 @@ subcommands — never re-implement their logic, never touch `outreach.db` direct
    WHOIS, on-domain/web, and pattern-only-if-confirmed) plus the honesty rules. Work down it,
    store with provenance via `coldtrail add-contact <domain> "<Full Name>" <email> <source>`
    (MX-verified; generic/placeholder rejected), and skip any rung your tools can't run.
-3. **Compose a personalized pitch — per company.** Read `message.toml` as your **brief**:
-   it carries the user's voice, offer/value-prop, the call-to-action link (keep its
-   `{slug}` UTM), and any constraints. **Do not send the template verbatim.** For each
-   company, write a genuinely tailored subject + body — reference what the company
-   actually does and why it's a fit — in the user's voice, honest, short. Then store it:
+3. **Compose a personalized pitch — per company.** Read `product.md` as your **product
+   brief**: it carries what the product is + who it helps, the pain/value, proof, the offer,
+   the call-to-action link (keep its `{slug}` UTM), the sender's voice, and any constraints.
+   (`message.toml` is a structural fallback for the CLI batch path — you don't need it.)
+   **Do not send anything verbatim.** For each company, write a genuinely tailored subject +
+   body — reference what the company actually does and why it's a fit — in the user's voice,
+   honest, short. Then store it:
    `coldtrail draft <domain> --subject "<subject>" --body "<body>"`
    This writes a DB row only. It does not create a Gmail draft and does not send.
 4. **Hand off.** Tell the user the drafts are ready in the **Drafts** tab. They review/edit
