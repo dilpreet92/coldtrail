@@ -47,6 +47,13 @@ pub struct GmailClientReq {
     pub client_secret: String,
 }
 
+/// Keyless Gmail via an IMAP app password.
+#[derive(Deserialize)]
+pub struct AppPasswordReq {
+    pub email: String,
+    pub app_password: String,
+}
+
 #[derive(Deserialize)]
 pub struct DraftEditReq {
     pub subject: Option<String>,

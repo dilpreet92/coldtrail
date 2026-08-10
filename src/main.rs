@@ -9,6 +9,7 @@ mod find;
 mod gcloud;
 mod gmail;
 mod home;
+mod imap_draft;
 mod import;
 mod mark;
 mod mcp;

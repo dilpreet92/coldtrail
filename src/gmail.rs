@@ -6,17 +6,22 @@ use anyhow::{anyhow, Result};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 
-/// Build an RFC822 message and base64url-encode it (Gmail's `raw` field).
-fn raw_message(to: &str, subject: &str, body: &str) -> String {
+/// Build the RFC822 message (CRLF headers, RFC2047 subject, plain-text body). Shared by the
+/// Gmail API path (base64url) and the IMAP APPEND path (raw literal).
+pub fn mime_message(to: &str, subject: &str, body: &str) -> String {
     // Strip CR/LF from the recipient so it can't inject extra headers (e.g. a Bcc:).
     let to = to.replace(['\r', '\n'], " ");
     // RFC 2047-encode the subject so non-ASCII (em dashes etc.) survive the header.
     let subj = format!("=?UTF-8?B?{}?=", STANDARD.encode(subject.as_bytes()));
-    let mime = format!(
+    format!(
         "To: {to}\r\nSubject: {subj}\r\nMIME-Version: 1.0\r\n\
          Content-Type: text/plain; charset=\"UTF-8\"\r\n\r\n{body}"
-    );
-    URL_SAFE_NO_PAD.encode(mime.as_bytes())
+    )
+}
+
+/// The base64url `raw` form for the Gmail API.
+fn raw_message(to: &str, subject: &str, body: &str) -> String {
+    URL_SAFE_NO_PAD.encode(mime_message(to, subject, body).as_bytes())
 }
 
 /// The best available Gmail token: coldtrail's own OAuth if connected, else gcloud ADC

@@ -219,34 +219,45 @@ function renderSetup(s) {
   });
 }
 
-// Destination (Gmail) — coldtrail's OAuth using a Google client (bring-your-own, or a
-// build-time/verified one). Google gates gmail.compose behind a verified/own client, so
-// there is no zero-client path here (Claude's connector is the keyless alternative).
-function renderDestination(s) {
-  const hint = $("#dest-hint"), gc = $("#dest-gcloud"), btn = $("#connect-gmail");
-  if (!hint || !gc || !btn) return;
-  if (s.gmail_client_configured) {
-    hint.innerHTML = `Where outreach goes. <strong>Gmail</strong>, via your Google client — one browser consent. coldtrail creates the draft in your Gmail; you review and hit Send (never auto-sends). You'll pass Google's "unverified app" screen (Advanced → continue).`;
-    gc.innerHTML = "";
-    btn.style.display = "";
-    btn.textContent = "Connect Gmail";
-    return;
-  }
-  // No client yet → bring your own (one-time, no Google verification in test-user mode).
-  btn.style.display = "none";
-  hint.innerHTML = `Where outreach goes. <strong>Gmail</strong> — coldtrail drafts, you review and hit Send (never auto-sends). Google requires an OAuth client for Gmail's restricted scope, so bring your own (one-time, ~5 min, no verification needed in test mode).`;
-  gc.innerHTML = `
-    <details class="advanced" open><summary>Get a Google client (~5 min)</summary>
-      <ol class="steps">
-        <li><a href="https://console.cloud.google.com/" target="_blank" rel="noreferrer">Google Cloud Console</a> → create or pick a project.</li>
-        <li>APIs &amp; Services → Library → <strong>enable the Gmail API</strong>.</li>
-        <li>OAuth consent screen → <strong>External</strong>, status <strong>Testing</strong>; add your Gmail as a <strong>Test user</strong>; add scope <code>.../auth/gmail.compose</code>.</li>
-        <li>Credentials → Create credentials → <strong>OAuth client ID</strong> → type <strong>Desktop app</strong>. Copy the client id + secret.</li>
-      </ol>
-    </details>
+// Destination (Gmail). Primary = keyless IMAP app password (no Google Cloud); advanced =
+// bring-your-own OAuth client. Google gates gmail.compose behind a verified/own client, so
+// there is no zero-input path — an app password is the least setup.
+const AP_FORM = `
+  <label>Gmail address <input id="ap-email" placeholder="you@gmail.com" autocomplete="off" /></label>
+  <label>App password <input id="ap-pw" type="password" placeholder="16-character app password" autocomplete="off" /></label>
+  <div class="row"><button class="btn primary" id="ap-connect">Connect Gmail</button></div>
+  <details class="advanced"><summary>How to get an app password (~2 min)</summary>
+    <ol class="steps">
+      <li>Turn on <a href="https://myaccount.google.com/security" target="_blank" rel="noreferrer">2-Step Verification</a>.</li>
+      <li>Create an <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noreferrer">App password</a> (name it "coldtrail"); copy the 16 characters.</li>
+      <li>Enable IMAP: Gmail → Settings → Forwarding and POP/IMAP → <strong>Enable IMAP</strong>.</li>
+    </ol>
+  </details>`;
+const BYO_DETAILS = `
+  <details class="advanced"><summary>Prefer your own OAuth client instead?</summary>
+    <ol class="steps">
+      <li><a href="https://console.cloud.google.com/" target="_blank" rel="noreferrer">Google Cloud Console</a> → create/pick a project; enable the <strong>Gmail API</strong>.</li>
+      <li>OAuth consent screen → <strong>External</strong>, <strong>Testing</strong>; add yourself as a <strong>Test user</strong>; add scope <code>.../auth/gmail.compose</code>.</li>
+      <li>Credentials → <strong>OAuth client ID</strong> → <strong>Desktop app</strong>; copy id + secret.</li>
+    </ol>
     <label>Client ID <input id="byo-id" placeholder="…apps.googleusercontent.com" autocomplete="off" /></label>
     <label>Client secret <input id="byo-secret" type="password" placeholder="GOCSPX-…" autocomplete="off" /></label>
-    <div class="row"><button class="btn primary" id="byo-connect">Save &amp; Connect Gmail</button></div>`;
+    <div class="row"><button class="btn" id="byo-connect">Save &amp; Connect (OAuth)</button></div>
+  </details>`;
+
+function wireDestinationForms() {
+  const ap = $("#ap-connect");
+  if (ap) ap.addEventListener("click", async () => {
+    const email = $("#ap-email").value.trim(), pw = $("#ap-pw").value.trim();
+    if (!email || !pw) { msg("#dest-msg", "enter your Gmail address and app password", false); return; }
+    msg("#dest-msg", "checking the app password…", true);
+    try {
+      const r = await postJSON("/api/destination/gmail/app-password", { email, app_password: pw });
+      if (r.ok === false) { msg("#dest-msg", r.message || "could not connect", false); return; }
+      msg("#dest-msg", "connected", true);
+      await loadStatus();
+    } catch (e) { msg("#dest-msg", e.message, false); }
+  });
   const bc = $("#byo-connect");
   if (bc) bc.addEventListener("click", async () => {
     const id = $("#byo-id").value.trim(), secret = $("#byo-secret").value.trim();
@@ -261,6 +272,20 @@ function renderDestination(s) {
       await loadStatus();
     } catch (e) { msg("#dest-msg", e.message, false); }
   });
+}
+
+function renderDestination(s) {
+  const hint = $("#dest-hint"), gc = $("#dest-gcloud"), btn = $("#connect-gmail");
+  if (!hint || !gc || !btn) return;
+  btn.style.display = "none"; // forms carry their own buttons
+  if (s.destination_connected) {
+    hint.innerHTML = `<strong>Gmail</strong> connected. coldtrail creates each draft in your Gmail; you review and hit Send (never auto-sends).`;
+    gc.innerHTML = `<p class="hint">✓ connected.</p><details class="advanced"><summary>Reconnect with different credentials</summary>${AP_FORM}${BYO_DETAILS}</details>`;
+  } else {
+    hint.innerHTML = `Where outreach goes. <strong>Gmail</strong> — coldtrail drafts, you review &amp; hit Send (never auto-sends). Easiest is a <strong>Gmail app password</strong>: keyless, no Google Cloud, ~2 min.`;
+    gc.innerHTML = AP_FORM + BYO_DETAILS;
+  }
+  wireDestinationForms();
 }
 
 // Enrichment (OSINT) setup panel: one row per tool — detected, one-click install, or why not.

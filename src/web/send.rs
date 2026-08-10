@@ -41,35 +41,30 @@ pub async fn send(
         }
     };
     let to = to.ok_or_else(|| anyhow::anyhow!("no recipient email on file for {domain}"))?;
+    let subject = subject.as_deref().unwrap_or("");
+    let body = body.as_deref().unwrap_or("");
 
-    let (token, quota) = match crate::gmail::token().await {
-        Ok(v) => v,
-        Err(e) => {
-            return Ok(Json(MsgResp {
-                ok: false,
-                message: Some(e.to_string()),
-                wired: None,
-            }))
+    // Prefer the keyless app-password path (IMAP APPEND); fall back to coldtrail's Gmail
+    // OAuth token (own/verified client). Either way it's a DRAFT — the human sends.
+    let outcome = if let Some((email, pw)) = crate::secrets::gmail_app_password() {
+        let mime = crate::gmail::mime_message(&to, subject, body);
+        crate::imap_draft::append_draft(&email, &pw, &mime)
+            .await
+            .map(|_| ())
+    } else {
+        match crate::gmail::token().await {
+            Ok((token, quota)) => {
+                crate::gmail::create_draft(&token, quota.as_deref(), &to, subject, body)
+                    .await
+                    .map(|_| ())
+            }
+            Err(e) => Err(e),
         }
     };
 
-    match crate::gmail::create_draft(
-        &token,
-        quota.as_deref(),
-        &to,
-        subject.as_deref().unwrap_or(""),
-        body.as_deref().unwrap_or(""),
-    )
-    .await
-    {
-        Ok(draft_id) => {
-            // Record the gmail draft id + status='drafted' (mark's default arm).
-            let id = if draft_id.is_empty() {
-                "gmail"
-            } else {
-                &draft_id
-            };
-            crate::mark::run(&domain, id)?;
+    match outcome {
+        Ok(()) => {
+            crate::mark::run(&domain, "gmail")?; // records a gmail draft + status='drafted'
             Ok(Json(MsgResp {
                 ok: true,
                 message: Some(

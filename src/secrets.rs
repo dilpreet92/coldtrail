@@ -24,6 +24,11 @@ struct Secrets {
     google_client_id: Option<String>,
     #[serde(default)]
     google_client_secret: Option<String>,
+    /// Keyless Gmail via IMAP app password.
+    #[serde(default)]
+    gmail_address: Option<String>,
+    #[serde(default)]
+    gmail_app_password: Option<String>,
     #[serde(default)]
     tokens: BTreeMap<String, TokenRec>,
 }
@@ -41,6 +46,22 @@ pub fn google_client() -> Option<(String, Option<String>)> {
     let s = load();
     let id = s.google_client_id.filter(|v| !v.trim().is_empty())?;
     Some((id, s.google_client_secret.filter(|v| !v.trim().is_empty())))
+}
+
+/// Store a Gmail app password (keyless IMAP drafting): the address + app password.
+pub fn set_gmail_app_password(email: &str, app_password: &str) -> Result<()> {
+    let mut s = load();
+    s.gmail_address = Some(email.trim().to_string());
+    s.gmail_app_password = Some(app_password.trim().to_string());
+    save(&s)
+}
+
+/// The stored Gmail app-password credentials, if any: (email, app_password).
+pub fn gmail_app_password() -> Option<(String, String)> {
+    let s = load();
+    let email = s.gmail_address.filter(|v| !v.trim().is_empty())?;
+    let pw = s.gmail_app_password.filter(|v| !v.trim().is_empty())?;
+    Some((email, pw))
 }
 
 fn load() -> Secrets {

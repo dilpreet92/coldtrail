@@ -42,8 +42,9 @@ pub async fn status() -> Result<Json<StatusDto>, ApiErr> {
     // provider (Canonical via `coldtrail source`, Gmail via the Gmail API). Gmail can be
     // keyless via gcloud ADC, so that also counts as connected.
     let discovery_connected = crate::secrets::has_token("canonical");
-    // "connected" means coldtrail holds a Gmail OAuth token (via a verified/BYO client).
-    let destination_connected = crate::secrets::has_token("gmail");
+    // Connected = a Gmail app password (keyless IMAP) OR a Gmail OAuth token (own client).
+    let destination_connected =
+        crate::secrets::gmail_app_password().is_some() || crate::secrets::has_token("gmail");
     let _ = (canonical_wired, gmail_wired);
     let onboarded = message_customized && provider_ready && discovery_connected;
 
@@ -147,6 +148,31 @@ pub async fn set_gmail_client(
         return Err(anyhow::anyhow!("client id is required").into());
     }
     crate::secrets::set_google_client(&req.client_id, &req.client_secret)?;
+    Ok(Json(MsgResp::ok()))
+}
+
+/// Connect Gmail keyless via an app password: verify it (IMAP login) before storing, so the
+/// user gets immediate feedback. coldtrail then drafts by IMAP APPEND — no OAuth client.
+pub async fn set_gmail_app_password(
+    Json(req): Json<super::api::AppPasswordReq>,
+) -> Result<Json<MsgResp>, ApiErr> {
+    let email = req.email.trim();
+    let pw = req.app_password.replace(' ', "");
+    if email.is_empty() || pw.is_empty() {
+        return Ok(Json(MsgResp {
+            ok: false,
+            message: Some("enter your Gmail address and a 16-character app password".into()),
+            wired: None,
+        }));
+    }
+    if let Err(e) = crate::imap_draft::verify(email, &pw).await {
+        return Ok(Json(MsgResp {
+            ok: false,
+            message: Some(e.to_string()),
+            wired: None,
+        }));
+    }
+    crate::secrets::set_gmail_app_password(email, &pw)?;
     Ok(Json(MsgResp::ok()))
 }
 
