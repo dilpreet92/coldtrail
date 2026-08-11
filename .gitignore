@@ -3,3 +3,6 @@
 .DS_Store
 
 # Runtime state lives in ~/.coldtrail/, never in the repo.
+
+# superpowers design docs (internal planning artifacts) stay local
+docs/superpowers/
