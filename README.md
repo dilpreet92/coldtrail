@@ -1,16 +1,26 @@
 # coldtrail
 
-> The deduped, discovery-first outreach workflow I actually use — built on [Canonical](https://trycanonical.ai).
-> Build-in-public: this is my real pipeline, not a polished product.
+> **Discovery-first cold outreach for solo founders & one-person sales teams.**
+> Find the companies other tools miss, draft each email in your own voice, send from your own
+> Gmail — all on your machine. Built on [Canonical](https://trycanonical.ai).
 
-Most outreach tools start from a list you already have and optimize the *sending*. This
-starts from the opposite end: **discovery**. Canonical turns a plain-English ICP into
-verified, long-tail companies standard databases miss; everything downstream is
-state-tracking and drafts you review by hand. It never sends anything on its own.
+Most outreach tools start from a list you already have and optimize the *sending*. coldtrail
+starts from the opposite end: **discovery**. You describe who you want to reach in plain English;
+Canonical returns verified, long-tail companies the big databases miss; an agent enriches a
+founder contact, writes a genuinely personalized email from *your* company profile, and (only if
+you say so) sends it. No CRM to feed, no seat to buy, nothing leaves your laptop except the
+emails you approve.
 
-`coldtrail` is a single binary. Run it and it opens a **local app in your browser** — a
-chat that drives an embedded agent (headless Claude Code / Codex) to source, enrich, and
-draft, plus a pipeline dashboard and a drafts view where you review and send by hand.
+`coldtrail` is a single binary. Run it and it opens a **local app in your browser** — a chat that
+drives an agent (Claude Code / Codex, or your own model) to source, enrich, and draft, plus a
+pipeline dashboard, an editable company profile, and a drafts view.
+
+## Demo
+
+_A 60-second walkthrough of a full run — source → profile → draft → send — is coming._
+
+<!-- To add it: drag a .mp4/.gif into the GitHub README editor (GitHub hosts it for you),
+     or commit docs/demo.gif and reference it here:  ![coldtrail demo](docs/demo.gif) -->
 
 ## Install
 
@@ -18,160 +28,124 @@ draft, plus a pipeline dashboard and a drafts view where you review and send by 
 curl -fsSL https://raw.githubusercontent.com/dilpreet92/coldtrail/main/install.sh | bash
 ```
 
-The only runtime dependency is an agent CLI — [Claude Code](https://claude.com/claude-code)
-(`claude`) or [Codex](https://github.com/openai/codex) (`codex`). The installer checks for
-one and tells you how to get it if it's missing. Then:
+You need a **provider** (the brain): [Claude Code](https://claude.com/claude-code) (`claude`) or
+[Codex](https://github.com/openai/codex) (`codex`) — which reuse your existing subscription — or
+any OpenAI-compatible endpoint / local **Ollama**. The installer checks for one and tells you how
+to get it if it's missing. Then:
 
 ```bash
-coldtrail           # opens the app at http://127.0.0.1:8787
+coldtrail            # opens the app at http://127.0.0.1:8787
 ```
 
-On first run it opens your browser to the **Setup** screen: pick your agent, wire the
-Canonical + Gmail connectors, and paste your pitch. Then use **Chat** to run the loop,
-**Pipeline** to watch companies flow through statuses, and **Drafts** to review and hit
-**Send** (the only thing that ever sends — a human click).
+## Getting set up (first run)
 
-Setup has three pluggable slots:
+The browser opens to a short **Setup** wizard:
 
-- **Provider** (the brain) — headless **Claude Code** / **Codex** (reuses your subscription
-  + MCP), or **your own model**: any OpenAI-compatible endpoint or local **Ollama**, via a
-  built-in tool-calling loop.
-- **Discovery** (where companies come from) — **Canonical**. Extensible.
-- **Destination** (where outreach goes) — **Gmail**; **LinkedIn** and others later.
+1. **Provider** — pick Claude Code / Codex, or point at your own OpenAI-compatible/Ollama model.
+2. **Discovery — Canonical** (sourcing). Keyless: click Connect and approve in the browser.
+3. **Destination — Gmail.** Easiest is a **Gmail app password** (keyless, ~2 min): turn on
+   2-Step Verification, create an app password, enable IMAP. (Advanced: bring your own Google
+   OAuth client instead.)
+4. **Company** — chat-free, just an editable profile. Describe what you sell, who it helps, your
+   offer, your link, your voice. The agent writes **every email from this**, in your words — it
+   never invents claims. Edit it anytime in the **Company** tab; it saves as you type.
 
-**Connect** is provider-aware and keyless. For **Claude/Codex** the connectors come from the
-provider — Canonical is wired into its config and Gmail from your account's Gmail connector;
-OAuth happens in-browser on first use, no keys to enter. For **BYOK/Ollama** coldtrail's own
-MCP client does the OAuth (Canonical auto-registers; Gmail uses coldtrail's built-in Google
-client) — you just consent in the browser.
+Then use **Chat** to run the loop, **Pipeline** to watch companies move through statuses,
+**Drafts** to review, and **Follow-ups** to track replies.
 
-> **Maintainer note:** the keyless Gmail path for BYOK/Ollama needs coldtrail's own Google
-> OAuth client. Create a Google **Desktop** OAuth client with the Gmail API + Gmail MCP API
-> enabled, then build/run with `COLDTRAIL_GOOGLE_CLIENT_ID` and `COLDTRAIL_GOOGLE_CLIENT_SECRET`
-> set. Until Google verifies the app for the `gmail.compose` scope, users pass an
-> "unverified app" consent screen (Advanced → continue).
+## How a run works
 
-Everything lives in `~/.coldtrail/` — the SQLite state, your private message template, the
-agent brief (`CLAUDE.md`), and the MCP config. The app binds `127.0.0.1` only, guarded by a
-one-time token in the URL. Nothing leaves your machine except the drafts you choose to send.
+In **Chat**, say something like _"find companies for &lt;my ICP&gt; and draft intros."_ The agent
+runs the whole loop:
 
-### Command-line surface
-
-Bare `coldtrail` serves the app. The workflow also runs headless for power users / CI:
-
-```bash
-coldtrail serve --port 9000 --no-open   # serve without opening a browser
-coldtrail setup                         # the terminal setup wizard (see below)
-coldtrail agent                         # launch the raw terminal agent in the workspace
-coldtrail import / add-contact / find-emails / draft-prep / mark / seed
-```
-
-### `coldtrail setup` — the wizard
-
-`setup` is idempotent and re-runnable. It:
-
-1. **Detects** which agent CLIs you have (`claude`, `codex`) and whether they're signed in.
-2. **Picks a default provider** — if both are present it asks; otherwise it uses the one it
-   finds. Saved to `~/.coldtrail/config.toml` (`agent = "claude"` | `"codex"`). `coldtrail`
-   launches whichever you chose.
-3. **Wires Canonical** (sourcing) into coldtrail's own scope — for Claude that's
-   `~/.coldtrail/.mcp.json`; for Codex, `~/.codex/config.toml`. OAuth completes in-browser on
-   first use.
-4. **Wires Gmail** (drafts) — Google's Gmail MCP (`https://gmailmcp.googleapis.com/mcp/v1`).
-   This needs a one-time Google Cloud OAuth client: enable the Gmail API + Gmail MCP API,
-   create an OAuth 2.0 Web client, add scopes `gmail.readonly` + `gmail.compose`, and register
-   the redirect URI `http://localhost:8765/callback`. setup prints these steps and takes your
-   client id/secret (the secret is never written to the repo).
-
-Flags / env for non-interactive use:
-
-```bash
-coldtrail setup --provider claude              # skip the provider prompt
-coldtrail setup --skip-gmail                   # Canonical only
-coldtrail setup --gmail-callback-port 9000     # change the OAuth redirect port
-coldtrail setup --force                        # re-wire servers already configured
-# Gmail creds without a prompt:
-COLDTRAIL_GMAIL_CLIENT_ID=…  COLDTRAIL_GMAIL_CLIENT_SECRET=…  coldtrail setup
-```
-
-## How it's wired
+1. **Source (Canonical).** It plans several diverse search angles (expanding acronyms/regions into
+   real phrasings), searches them in parallel, and imports the **union deduped by domain** — so
+   you cover the long tail without double-contacting anyone.
+2. **Enrich.** A founder contact per company, working down coldtrail's technique ladder (OSINT
+   tools, GitHub commit metadata, crt.sh, WHOIS, on-domain) — MX-verified, founder-addressed only.
+3. **Draft.** A tailored subject + body per company, composed fresh from your Company profile and
+   what the company actually does. Nothing is sent verbatim.
+4. **Send — your call.** By default drafts wait for you in the **Drafts** tab. If you've turned on
+   **auto-send**, the agent asks _"send these now?"_ and, on your yes, sends them (under your daily
+   cap). It works in **warmup-sized batches** (~5 at a time) so you never outrun a healthy pace.
 
 ```
-Canonical (sourcing, fixed)      ← describe an ICP, get verified companies
+Canonical (sourcing)      ← plain-English ICP → verified companies the big DBs miss
         │
         ▼
-local SQLite state               ← dedupe by domain, status per company (never double-contact)
+local SQLite              ← deduped by domain, one status per company (no double-contact)
         │
         ▼
-enrichment (BYOK, your choice)   ← your Apollo/Hunter key · an OSINT tool · the built-in
-        │                          finder · or add contacts by hand
-        ▼
-drafts (never auto-sent)         ← personalized bodies + your link; YOU review and hit send
+enrichment                ← founder email per company (OSINT ladder · your key · by hand)
         │
         ▼
-status tracking                  ← drafted → sent → replied / bounced
+draft (your voice)        ← personalized from your Company profile; never verbatim
+        │
+        ▼
+send                      ← drafts by default; opt-in auto-send (capped) when you trust it
 ```
 
-**Sourcing is fixed to Canonical** (that's the good part). **Everything else is yours** —
-your enrichment provider, your message, your sending, your data.
+## Sending: off by default, yours to turn on
 
-## The loop
-
-The launched agent (Claude Code) drives this via the Canonical + Gmail MCPs and the
-`coldtrail` subcommands. You can also run any step by hand:
-
-| Command | What it does |
-|---|---|
-| `coldtrail import <results.json> "<label>"` | dedupe-import a Canonical `search_companies` result |
-| `coldtrail add-contact <domain> "<Name>" <email> [source]` | add a founder contact by hand (MX-verified) |
-| `coldtrail find-emails [max]` | best-effort OSINT founder-email finder (MX-verified) |
-| `coldtrail draft-prep [max]` | build personalized drafts → `~/.coldtrail/pending_drafts.json` |
-| `coldtrail mark <domain> <draft_id\|sent\|bounced>` | advance status |
-| `coldtrail seed` | load already-contacted domains from `contacted.toml` |
-
-1. **Source** — the agent runs Canonical `search_companies`, saves the JSON, and
-   `coldtrail import`s it. Already-known domains are skipped automatically.
-2. **Enrich** — a founder email per company, via your own key, an OSINT tool,
-   `coldtrail find-emails`, or `coldtrail add-contact`.
-3. **Draft** — `coldtrail draft-prep` builds bodies from your `message.toml` and writes
-   `pending_drafts.json`. It writes DB rows only; it sends nothing.
-4. **Create Gmail drafts** — the agent creates each as a *draft* via the Gmail MCP; record
-   the id with `coldtrail mark <domain> <draft_id>`.
-5. **After you send by hand** — `coldtrail mark <domain> sent` (or `bounced`).
+The standing default is **draft-only** — a human reviews and sends every message. When you're
+confident the drafts are good, flip on **Auto-send** in Settings → Destination (with a daily cap).
+Then the Drafts screen sends for real on your click, and the agent can send within a run after you
+confirm. Sending is gated two ways — it won't fire unless *both* auto-send is on *and* you say yes
+— so nothing goes out by accident.
 
 ## Guardrails baked in
 
 - **Dedupe by domain** — you can't double-contact a company.
-- **MX-verified before drafting** — kills the bounce problem from guessed addresses.
-- **Founder-addressed only** — generic (`info@`/`sales@`) and placeholder/example
-  addresses are rejected.
-- **Drafts, never auto-send** — a human reviews and sends every message. Pace warmup
-  yourself (~5/day on a new mailbox).
+- **MX-verified, founder-addressed only** — generic (`info@`/`sales@`) and placeholder addresses
+  are rejected, so guessed addresses don't bounce.
+- **No fabrication** — emails are written from your profile and real facts about the company.
+- **Draft-first, gated send** — sending is off until you enable it, capped for warmup, and the
+  agent can only trigger `coldtrail send` (it never touches your credentials or mail APIs directly).
 
-## Migrating from the Python version
+## Everything stays local
 
-State moved out of the repo into `~/.coldtrail/`. If you ran the old Python scripts:
+State lives in `~/.coldtrail/` — the SQLite pipeline, your `product.md` profile, the agent brief
+(`CLAUDE.md`), the enrichment playbook, and config. **Credentials live outside the workspace**
+(in a sibling secrets dir), so the agent that runs shell commands can't read them. The app binds
+`127.0.0.1` only, guarded by a one-time token in the URL. Nothing leaves your machine except the
+emails you approve.
 
-- copy your old `outreach.db` → `~/.coldtrail/outreach.db`
-- translate `message.py` → `~/.coldtrail/message.toml` and `seed_contacted.py` →
-  `~/.coldtrail/contacted.toml` (small files, by hand)
+## Command-line surface
+
+Bare `coldtrail` serves the app; every step also runs headless for power users / CI:
+
+```bash
+coldtrail serve --port 9000 --no-open    # serve without opening a browser
+coldtrail setup                          # terminal setup wizard (idempotent)
+coldtrail agent                          # raw terminal agent in the workspace
+```
+
+| Command | What it does |
+|---|---|
+| `coldtrail source "<angle>" ["<angle>" …]` | source from Canonical across angles, deduped by domain |
+| `coldtrail add-contact <domain> "<Name>" <email> [source]` | add a founder contact (MX-verified) |
+| `coldtrail find-emails [max]` | best-effort OSINT founder-email finder |
+| `coldtrail draft <domain> --subject "…" --body "…"` | store a personalized draft (never sends) |
+| `coldtrail send <domain>` | send a reviewed draft (refuses unless auto-send is on) |
+| `coldtrail followup <domain> --subject "…" --body "…"` | store a follow-up touch |
+| `coldtrail mark <domain> <sent\|replied\|bounced>` | advance status |
+| `coldtrail seed` | load already-contacted domains from `contacted.toml` |
 
 ## Build from source
 
 ```bash
 git clone https://github.com/dilpreet92/coldtrail && cd coldtrail
 cargo build --release          # -> target/release/coldtrail
-cargo test                     # unit tests
+cargo test
 ```
 
 ## Powered by Canonical
 
-The sourcing engine is [Canonical](https://trycanonical.ai) — verified, long-tail company
-search, available as an [MCP server + Claude Code plugin](https://github.com/vy-labs/canonical-mcp)
-and a ChatGPT app. Free tier: 250 credits, no card.
+The sourcing engine is [Canonical](https://trycanonical.ai) — verified, long-tail company search,
+available as an [MCP server](https://github.com/vy-labs/canonical-mcp) and a ChatGPT app. Free
+tier: 250 credits, no card.
 
-## Note
+## License
 
-This is a **personal, build-in-public workflow**, not a supported product — no roadmap, no
-promises. Shared under MIT in case the bones are useful to another founder doing their own
-outreach.
+MIT. Built in public by a solo maintainer — no roadmap or SLAs, but issues and PRs are welcome if
+the bones are useful for your own outreach.
