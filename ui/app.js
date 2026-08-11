@@ -172,10 +172,13 @@ function renderSetup(s) {
     bar.hidden = true;
     checklist.hidden = true;
     $$("#panels .panel").forEach((p) => p.classList.remove("wizard-active"));
+    // Company has its own tab — no need to repeat the profile editor in flat Settings.
+    $("#panel-message").style.display = "none";
     wizardInit = false; // so a later reset re-enters the wizard cleanly
     return;
   }
 
+  $("#panel-message").style.display = ""; // shown in the first-run wizard
   checklist.hidden = true;
   panels.classList.add("wizard");
   bar.hidden = false;
