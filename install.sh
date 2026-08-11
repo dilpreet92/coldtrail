@@ -15,12 +15,19 @@ BIN="${BIN_DIR}/coldtrail"
 info() { printf '  %s\n' "$*"; }
 err()  { printf 'error: %s\n' "$*" >&2; }
 
-# --- 1. dependency check: only `claude` is needed at runtime ------------------
-if ! command -v claude >/dev/null 2>&1; then
-  err "the Claude Code CLI (\`claude\`) was not found on your PATH."
-  info "install it, then re-run this script:"
-  info "    npm i -g @anthropic-ai/claude-code"
-  exit 1
+# --- 1. provider check (non-fatal) --------------------------------------------
+# coldtrail needs a "brain": a CLI agent (Claude Code or Codex) is easiest, but you can also
+# bring your own OpenAI-compatible endpoint / local Ollama and pick it in Setup — no CLI needed.
+# So this is informational; installation continues regardless.
+if command -v claude >/dev/null 2>&1; then
+  info "found Claude Code (\`claude\`)."
+elif command -v codex >/dev/null 2>&1; then
+  info "found Codex (\`codex\`)."
+else
+  info "no agent CLI found yet — that's fine. In Setup you can use either:"
+  info "    Claude Code:  npm i -g @anthropic-ai/claude-code"
+  info "    Codex:        npm i -g @openai/codex"
+  info "  …or pick BYOK / Ollama (any OpenAI-compatible endpoint), which needs no CLI."
 fi
 
 # --- 2. detect platform target ------------------------------------------------
@@ -70,6 +77,15 @@ else
 fi
 
 chmod +x "${BIN}" 2>/dev/null || true
+
+# --- macOS Gatekeeper: a downloaded binary is quarantined and would be blocked
+# ("cannot be opened — Apple cannot check it for malicious software"). Clear the quarantine
+# flag and ad-hoc-sign so it runs. (Not notarization — fine for install-it-yourself testing.)
+if [ "$(uname -s)" = "Darwin" ]; then
+  xattr -d com.apple.quarantine "${BIN}" >/dev/null 2>&1 || true
+  codesign --force --sign - "${BIN}" >/dev/null 2>&1 || true
+fi
+
 info "installed coldtrail -> ${BIN}"
 
 # --- 4. PATH guidance (we don't edit your shell rc) ---------------------------
@@ -88,4 +104,4 @@ printf '\n'
 info "done. now run:"
 info "    coldtrail"
 info "  it opens the app in your browser — pick a provider, connect Discovery"
-info "  (Canonical) + Destination (Gmail), write your pitch, then run the loop in Chat."
+info "  (Canonical) + Destination (Gmail), write your Company profile, then run the loop in Chat."
