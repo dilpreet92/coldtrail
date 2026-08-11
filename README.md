@@ -17,10 +17,10 @@ pipeline dashboard, an editable company profile, and a drafts view.
 
 ## Demo
 
-_A 60-second walkthrough of a full run — source → profile → draft → send — is coming._
+![coldtrail — company profile, a run, the pipeline, and a personalized draft](docs/demo.gif)
 
-<!-- To add it: drag a .mp4/.gif into the GitHub README editor (GitHub hosts it for you),
-     or commit docs/demo.gif and reference it here:  ![coldtrail demo](docs/demo.gif) -->
+_Your **company profile** → a **run** in Chat (source → enrich → draft) → the **pipeline** of
+verified companies → a **personalized draft** ready to send. ([higher-quality MP4](docs/demo.mp4))_
 
 ## Install
 
