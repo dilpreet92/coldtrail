@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod contact;
 mod db;
+mod deliver;
 mod draft;
 mod enrich;
 mod find;
@@ -70,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
             body,
         }) => draft::followup_add(&domain, &subject, &body),
         Some(Commands::Mark { domain, value }) => mark::run(&domain, &value),
+        Some(Commands::Send { domain }) => deliver::run(&domain).await,
         Some(Commands::Seed) => seed::run(),
         Some(Commands::Update) => run::update(),
     }

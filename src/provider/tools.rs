@@ -45,6 +45,10 @@ pub fn defs(canonical_connected: bool) -> Value {
                 "domain":{"type":"string"},"subject":{"type":"string"},"body":{"type":"string"}},
                 "required":["domain","subject","body"]}}}),
         json!({"type":"function","function":{
+            "name":"send_outreach",
+            "description":"SEND a stored draft for real. Only works if the human enabled auto-send (else it refuses); enforces a daily cap. Only call after the human confirms in chat that they want these sent.",
+            "parameters":{"type":"object","properties":{"domain":{"type":"string"}},"required":["domain"]}}}),
+        json!({"type":"function","function":{
             "name":"mark",
             "description":"Advance a company's status: a gmail draft id, or 'sent' / 'bounced'.",
             "parameters":{"type":"object","properties":{
@@ -121,6 +125,16 @@ pub async fn exec(name: &str, args: &Value) -> String {
             "SELECT domain, COALESCE(subject,''), status FROM outreach ORDER BY created_at DESC",
         ),
         "discover_companies" => discover(args).await,
+        "send_outreach" => {
+            let domain = s(args, "domain").trim().to_lowercase();
+            match crate::deliver::reviewable(&domain) {
+                Ok(d) => match crate::deliver::send(&domain, &d).await {
+                    Ok(m) => format!("{domain}: {m}"),
+                    Err(e) => format!("error: {e}"),
+                },
+                Err(e) => format!("error: {e}"),
+            }
+        }
         other => format!("error: unknown tool '{other}'"),
     }
 }

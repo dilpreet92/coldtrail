@@ -8,7 +8,12 @@ is your workspace: it holds the SQLite state (`outreach.db`), the user's product
 `coldtrail` is a single binary on the PATH. You drive the workflow by calling its
 subcommands — never re-implement their logic, never touch `outreach.db` directly.
 
-## The run loop
+## The run loop — carry it through, don't stop after sourcing
+
+A request to "find / source companies for <X>" means run the WHOLE loop by default:
+**source → enrich → draft → hand off (and send if configured)**. Don't sit at a summary after
+sourcing and wait — keep going through enrichment and drafting — unless the user explicitly said
+"just source" / "only find companies."
 
 1. **Source (Canonical, coldtrail-owned).** Turn the user's plain-English ICP into a
    verified, domain-keyed shortlist. A single phrasing usually under-recalls, so **plan 3–5
@@ -27,11 +32,13 @@ subcommands — never re-implement their logic, never touch `outreach.db` direct
    Already-known domains are skipped automatically. Don't call a Canonical MCP tool directly
    and don't hand-write the JSON — `coldtrail source` owns discovery. For a quick, unambiguous
    ICP a single angle is fine.
-2. **Enrich.** Get a founder contact per company. **Read `enrichment.md` in this workspace
-   first** — it's coldtrail's technique ladder (OSINT tools, GitHub commit metadata, crt.sh,
-   WHOIS, on-domain/web, and pattern-only-if-confirmed) plus the honesty rules. Work down it,
-   store with provenance via `coldtrail add-contact <domain> "<Full Name>" <email> <source>`
-   (MX-verified; generic/placeholder rejected), and skip any rung your tools can't run.
+2. **Enrich a warmup-sized batch.** Take about **5 companies** (or up to the human's daily send
+   cap), not the whole list — that's a healthy review/send pace; the rest stay sourced for next
+   time. For each, get a founder contact. **Read `enrichment.md` in this workspace first** — it's
+   coldtrail's technique ladder (OSINT tools, GitHub commit metadata, crt.sh, WHOIS, on-domain/web,
+   and pattern-only-if-confirmed) plus the honesty rules. Work down it, store with provenance via
+   `coldtrail add-contact <domain> "<Full Name>" <email> <source>` (MX-verified;
+   generic/placeholder rejected), and skip any rung your tools can't run.
 3. **Compose a personalized pitch — per company.** Read `product.md` as your **product
    brief**: it carries what the product is + who it helps, the pain/value, proof, the offer,
    the call-to-action link (keep its `{slug}` UTM), the sender's voice, and any constraints.
@@ -41,20 +48,26 @@ subcommands — never re-implement their logic, never touch `outreach.db` direct
    honest, short. Then store it:
    `coldtrail draft <domain> --subject "<subject>" --body "<body>"`
    This writes a DB row only. It does not create a Gmail draft and does not send.
-4. **Hand off.** Tell the user the drafts are ready in the **Drafts** tab. They review/edit
-   each, click **Create Gmail draft** (coldtrail pushes it to their Gmail Drafts via
-   `create_draft` — it never sends), then send it from Gmail by hand. You never send.
+4. **Report, then hand off or send.** Show what you did: the **contacts you found**
+   (name · email · source) and the drafts you wrote. Then decide the ending by the human's send
+   setting — read `config.toml`:
+   - **`auto_send = true`** → they've turned on real sending. Offer it: "Auto-send is on — want me
+     to send these <N> now?" On an explicit **yes**, send each with `coldtrail send <domain>`
+     (it enforces the daily cap; when it says the cap's reached, stop for today).
+   - **otherwise** → the drafts are review-only. Tell them the <N> drafts are in the **Drafts**
+     tab to review and send (they can also flip on auto-send in Settings → Destination).
+   `coldtrail send` refuses unless auto-send is on, so you can't send by accident. Always get an
+   explicit yes before sending — this is the one place you stop and ask.
 
 ## Guardrails — non-negotiable
 
-- **You never send, and you never touch Gmail in this chat.** Sending happens only when
-  the human clicks Send in the app (a separate, constrained step). Your job ends at
-  storing a reviewable draft with `coldtrail draft`. You have no Gmail access — do not read
-  coldtrail's stored credentials/tokens and do not call mail APIs (curl, etc.) to send or
-  read email. Creating the Gmail draft is something coldtrail itself does on the human's click.
-  (The human may have enabled auto-send in Settings so that their click sends for real — that
-  is their decision and their action, not yours. It changes nothing about your job: you only
-  ever store drafts with `coldtrail draft`.)
+- **Sending is gated, not forbidden — and only through `coldtrail send`.** You may send ONLY via
+  `coldtrail send <domain>`, and ONLY after BOTH: (a) the human enabled auto-send in Settings, and
+  (b) they said **yes** in this chat. `coldtrail send` refuses when auto-send is off, so an
+  accidental or injected "send everything" can't fire. Never read coldtrail's stored
+  credentials/tokens and never call mail APIs (curl, SMTP, etc.) directly — `coldtrail send` does
+  the actual delivery; you only trigger it, with consent. If auto-send is off, your job ends at a
+  stored draft and a hand-off to the Drafts tab.
 - **Dedupe by domain.** Never contact a company twice. Import and seeding enforce this;
   trust the "already-known (deduped)" counts.
 - **Founder-addressed, MX-verified only.** Generic (`info@`, `sales@`, …) and
@@ -62,11 +75,12 @@ subcommands — never re-implement their logic, never touch `outreach.db` direct
   around it.
 - **No fabrication.** Personalize from real, verifiable facts about the company. If you
   don't know something, don't invent it.
-- **Pace warmup.** On a new mailbox, ~5 sends/day. Don't bulk-draft beyond what the human
-  will actually review and send.
-- **Don't pause mid-run to ask.** If the ICP is ambiguous, pick the most reasonable
-  interpretation, state it in one line, and keep going — the human refines and re-runs.
-  Never phrase it as if you're waiting for an answer.
+- **Pace warmup.** ~5/day on a new mailbox. Enrich, draft, and send in warmup-sized batches;
+  don't bulk past what the human will actually review and send.
+- **Don't pause mid-run to ask — except before sending.** If the ICP is ambiguous, pick the most
+  reasonable interpretation, state it in one line, and keep going through enrich + draft; the
+  human refines and re-runs. The single exception is sending: always stop for an explicit yes
+  before `coldtrail send`.
 
 ## Commands
 
@@ -77,6 +91,7 @@ subcommands — never re-implement their logic, never touch `outreach.db` direct
 | `coldtrail find-emails [max]` | best-effort OSINT founder-email finder |
 | `coldtrail draft <domain> --subject "…" --body "…"` | store a personalized draft |
 | `coldtrail followup <domain> --subject "…" --body "…"` | store a follow-up touch (no reply yet) |
+| `coldtrail send <domain>` | send a reviewed draft for real (refuses unless auto-send is on) |
 | `coldtrail mark <domain> <id\|sent\|replied\|bounced>` | advance status |
 | `coldtrail seed` | load already-contacted domains (dedupe guard) |
 

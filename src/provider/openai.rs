@@ -147,10 +147,15 @@ fn system_prompt(home: &Path) -> String {
          follow the enrichment methodology below, applying what your tools allow. \
          (3) Compose a PERSONALIZED pitch per company — use the brief below for voice, offer, and \
          link, but write a genuinely tailored subject + body for each company; then store it with \
-         `draft`. Use `list_companies` / `list_drafts` to see current state.\n\n\
-         Hard rules: you NEVER send email and have no send tool — sending is a separate human \
-         action in the app. Founder-addressed only; no generic/placeholder addresses. No \
-         fabrication. Keep drafts short and human.\n\n\
+         `draft`. Use `list_companies` / `list_drafts` to see current state. \
+         (4) Hand off — run the WHOLE loop by default (source → enrich → draft a warmup-sized \
+         batch of ~5), report the contacts you found and the drafts, then offer to send. \
+         SENDING: only via `send_outreach`, and only after the human says yes in chat. It refuses \
+         unless the human enabled auto-send — if it refuses, tell them to review and send from the \
+         Drafts tab.\n\n\
+         Hard rules: never send without `send_outreach` + the human's yes; never touch mail APIs \
+         directly. Founder-addressed only; no generic/placeholder addresses. No fabrication. Keep \
+         drafts short and human. Pace to ~5/day.\n\n\
          --- enrichment methodology (enrichment.md) ---\n{playbook}\n\n\
          --- product brief ---\n{brief}",
         playbook = crate::setup::ENRICHMENT_MD,

@@ -53,6 +53,11 @@ pub enum Commands {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Send a reviewed draft for real (requires auto-send enabled in Settings)
+    Send {
+        /// The company domain whose draft to send
+        domain: String,
+    },
     /// Import Canonical search results (JSON), deduped by domain
     Import {
         /// Path to the saved Canonical results JSON
