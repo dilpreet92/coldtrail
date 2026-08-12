@@ -34,6 +34,9 @@ pub async fn serve(port: Option<u16>, no_open: bool) -> Result<()> {
     let url = format!("http://{addr}/?t={token}");
 
     println!("\n  coldtrail is running:\n    {url}\n");
+    if let Ok(log) = crate::home::path("coldtrail.log") {
+        println!("  logs stream here and to {}\n", log.display());
+    }
     if no_open {
         println!("  (open that URL in your browser)");
     } else if open::that(&url).is_err() {

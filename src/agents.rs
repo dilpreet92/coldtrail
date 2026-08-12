@@ -21,7 +21,7 @@ impl AgentKind {
     pub fn label(&self) -> &'static str {
         match self {
             AgentKind::Claude => "Claude Code",
-            AgentKind::Codex => "Codex",
+            AgentKind::Codex => "Codex CLI",
         }
     }
 

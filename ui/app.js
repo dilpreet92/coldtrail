@@ -218,13 +218,14 @@ function renderSetup(s) {
 // there is no zero-input path — an app password is the least setup.
 const AP_FORM = `
   <label>Gmail address <input id="ap-email" placeholder="you@gmail.com" autocomplete="off" /></label>
-  <label>App password <input id="ap-pw" type="password" placeholder="16-character app password" autocomplete="off" /></label>
+  <label>App password <input id="ap-pw" type="password" placeholder="paste the app password Google gave you" autocomplete="off" /></label>
   <div class="row"><button class="btn primary" id="ap-connect">Connect Gmail</button></div>
   <details class="advanced"><summary>How to get an app password (~2 min)</summary>
     <ol class="steps">
-      <li>Turn on <a href="https://myaccount.google.com/security" target="_blank" rel="noreferrer">2-Step Verification</a>.</li>
-      <li>Create an <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noreferrer">App password</a> (name it "coldtrail"); copy the 16 characters.</li>
-      <li>Enable IMAP: Gmail → Settings → Forwarding and POP/IMAP → <strong>Enable IMAP</strong>.</li>
+      <li>Turn on <a href="https://myaccount.google.com/security" target="_blank" rel="noreferrer">2-Step Verification</a> (required before you can create an app password).</li>
+      <li>Open <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noreferrer">App passwords</a>, type a name like "coldtrail", and click <strong>Create</strong>.</li>
+      <li>Google pops up a <strong>16-character password in a yellow box</strong> — <strong>copy it from there</strong> and paste it into the App password field above. (The spaces don't matter.)</li>
+      <li>Enable IMAP: Gmail → <strong>Settings</strong> → <strong>Forwarding and POP/IMAP</strong> → <strong>Enable IMAP</strong> → Save.</li>
     </ol>
   </details>`;
 const BYO_DETAILS = `

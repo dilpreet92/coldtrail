@@ -94,13 +94,27 @@ pub fn parse_stream_line(line: &str) -> Vec<AgentEvent> {
                 _ => None,
             })
             .collect(),
-        Some("result") => vec![AgentEvent::Done {
-            ok: !v.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false),
-            result: v
+        Some("result") => {
+            let is_error = v.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false);
+            let result = v
                 .get("result")
                 .and_then(|r| r.as_str())
-                .map(|s| s.to_string()),
-        }],
+                .map(|s| s.to_string());
+            if is_error {
+                // Claude can exit 0 but report an error in the `result` payload (auth, MCP,
+                // rate limits). Surface it as a visible Error instead of a silent failed turn.
+                let message = result
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| "the agent reported an error (see the log)".into());
+                vec![
+                    AgentEvent::Error { message },
+                    AgentEvent::Done { ok: false, result },
+                ]
+            } else {
+                vec![AgentEvent::Done { ok: true, result }]
+            }
+        }
         _ => vec![], // system / rate_limit_event / anything else
     }
 }
@@ -245,6 +259,10 @@ async fn run_codex(
     home: &Path,
     tx: Sender<AgentEvent>,
 ) -> bool {
+    crate::logf::log(&format!(
+        "codex turn: session={session_id} ({})",
+        if first_turn { "new" } else { "resume" }
+    ));
     let spawn = Command::new("codex")
         .args(codex_args(session_id, first_turn, msg))
         .current_dir(home)
@@ -266,10 +284,11 @@ async fn run_codex(
                     result: None,
                 })
                 .await;
+            crate::logf::log(&format!("codex failed to launch: {e}"));
             return false;
         }
     };
-    stream_child(child, parse_codex_line, tx).await
+    stream_child(child, "codex", parse_codex_line, tx).await
 }
 
 async fn run_claude(
@@ -280,6 +299,10 @@ async fn run_claude(
     tools: &Tools<'_>,
     tx: Sender<AgentEvent>,
 ) -> bool {
+    crate::logf::log(&format!(
+        "claude turn: session={session_id} ({})",
+        if first_turn { "new" } else { "resume" }
+    ));
     let spawn = Command::new("claude")
         .args(claude_args(session_id, first_turn, msg, tools))
         .current_dir(home)
@@ -302,11 +325,12 @@ async fn run_claude(
                     result: None,
                 })
                 .await;
+            crate::logf::log(&format!("claude failed to launch: {e}"));
             return false;
         }
     };
 
-    stream_child(child, parse_stream_line, tx).await
+    stream_child(child, "claude", parse_stream_line, tx).await
 }
 
 /// Stream a spawned agent child's stdout (JSONL) through `parse`, forwarding events to `tx`.
@@ -314,6 +338,7 @@ async fn run_claude(
 /// when the child ends without one. Returns true iff the turn finished ok.
 async fn stream_child(
     mut child: tokio::process::Child,
+    label: &str,
     parse: fn(&str) -> Vec<AgentEvent>,
     tx: Sender<AgentEvent>,
 ) -> bool {
@@ -381,6 +406,16 @@ async fn stream_child(
 
     let status = child.wait().await;
     let err = err_task.await.unwrap_or_default();
+
+    // Log the outcome (+ any stderr) so a tester can see why a backend failed, even when the
+    // browser only shows a generic failure.
+    let code = status.as_ref().ok().and_then(|s| s.code());
+    crate::logf::log(&format!(
+        "{label} ended: exit={code:?} saw_result={saw_done} ok={done_ok}"
+    ));
+    if !err.trim().is_empty() {
+        crate::logf::log(&format!("{label} stderr:\n{}", err.trim()));
+    }
 
     if !saw_done {
         let tail: String = {

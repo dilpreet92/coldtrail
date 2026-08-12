@@ -12,6 +12,7 @@ mod gmail;
 mod home;
 mod imap_draft;
 mod import;
+mod logf;
 mod mark;
 mod mcp;
 mod mcp_client;
