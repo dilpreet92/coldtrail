@@ -148,6 +148,66 @@ pub async fn connect_destination(
     Ok(connect_result(crate::oauth::connect_gmail(port).await))
 }
 
+/// Probe the configured provider with a tiny real turn — the honest "am I signed in?" check.
+/// The file-existence heuristic can't see an expired token; this runs the actual CLI/model so
+/// an expired login surfaces as a clear, actionable error. Tools disabled; ~45s cap.
+pub async fn probe_provider() -> Result<Json<MsgResp>, ApiErr> {
+    use crate::provider::cli::Tools;
+    use crate::provider::{resolve, run_turn, AgentEvent};
+
+    let backend = resolve();
+    let home = crate::home::workspace()?;
+    let sid = uuid::Uuid::new_v4().to_string();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(256);
+    let tools = Tools::Disallow(&["Bash", "mcp__gmail", "mcp__canonical"]);
+
+    let turn = run_turn(
+        &backend,
+        &sid,
+        true,
+        "Reply with exactly: ok",
+        &home,
+        &tools,
+        tx,
+    );
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(45), turn).await;
+
+    let mut err = None;
+    while let Ok(ev) = rx.try_recv() {
+        if let AgentEvent::Error { message } = ev {
+            err = Some(message);
+        }
+    }
+    let agent = crate::config::load()
+        .agent
+        .unwrap_or_else(|| "claude".into());
+    let provider = AgentKind::from_str(&agent)
+        .map(|k| k.label())
+        .unwrap_or("Your model");
+
+    Ok(Json(match outcome {
+        Ok(true) => MsgResp {
+            ok: true,
+            message: Some(format!("{provider} is signed in and responding.")),
+            wired: None,
+        },
+        Ok(false) => MsgResp {
+            ok: false,
+            message: Some(
+                err.unwrap_or_else(|| "the provider didn't respond — check the log".into()),
+            ),
+            wired: None,
+        },
+        Err(_) => MsgResp {
+            ok: false,
+            message: Some(format!(
+                "{provider} timed out — check the log at ~/.coldtrail/coldtrail.log"
+            )),
+            wired: None,
+        },
+    }))
+}
+
 /// Store a bring-your-own Google OAuth client (Desktop app) for Gmail. coldtrail's Connect
 /// Gmail then runs its own OAuth with it — the reliable path for a restricted scope you can't
 /// get through the shared gcloud client.

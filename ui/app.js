@@ -131,12 +131,22 @@ async function loadStatus() {
   const authEl = $("#agent-auth");
   if (authEl && sel && sel.present && LOGIN[sel.kind]) {
     authEl.hidden = false;
-    authEl.innerHTML = (sel.authed
-      ? `<span class="hint">Signed in via the <strong>${esc(sel.label)}</strong> CLI. If a run fails with an auth error, re-authenticate in your terminal — <code>${esc(LOGIN[sel.kind])}</code> — then</span>`
-      : `<span class="hint warn">⚠ <strong>${esc(sel.label)}</strong> looks signed out. In your terminal run <code>${esc(LOGIN[sel.kind])}</code>, then</span>`) +
-      ` <button class="btn mini" id="agent-recheck">Re-check</button>`;
+    // Re-auth for a CLI provider happens in the *terminal* (coldtrail can't log you in).
+    // "Test connection" runs a tiny real turn so you can confirm it actually works now.
+    authEl.innerHTML =
+      `<span class="hint">Sign-in for <strong>${esc(sel.label)}</strong> happens in your terminal — run <code>${esc(LOGIN[sel.kind])}</code> to (re)authenticate. Then confirm it here:</span>` +
+      ` <button class="btn mini" id="agent-recheck">Test connection</button>` +
+      ` <span class="form-msg" id="agent-probe-msg"></span>`;
     const rc = $("#agent-recheck");
-    if (rc) rc.addEventListener("click", () => loadStatus());
+    if (rc) rc.addEventListener("click", async () => {
+      rc.disabled = true; rc.textContent = "testing…";
+      msg("#agent-probe-msg", "running a quick check…", true);
+      try {
+        const r = await postJSON("/api/provider/probe", {});
+        msg("#agent-probe-msg", (r.ok ? "✓ " : "⚠ ") + (r.message || ""), r.ok);
+      } catch (e) { msg("#agent-probe-msg", e.message, false); }
+      rc.disabled = false; rc.textContent = "Test connection";
+    });
   } else if (authEl) {
     authEl.hidden = true;
   }
