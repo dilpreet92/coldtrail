@@ -112,13 +112,22 @@ async fn download_and_swap() -> Result<()> {
         std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
     }
     if std::env::consts::OS == "macos" {
+        // Quiet: a tar-extracted binary usually has no quarantine attr, and codesign chatters
+        // to stderr — neither should show up in the user's update output.
+        let quiet = || (std::process::Stdio::null(), std::process::Stdio::null());
+        let (o1, e1) = quiet();
         let _ = std::process::Command::new("xattr")
             .args(["-d", "com.apple.quarantine"])
             .arg(&staged)
+            .stdout(o1)
+            .stderr(e1)
             .status();
+        let (o2, e2) = quiet();
         let _ = std::process::Command::new("codesign")
             .args(["--force", "--sign", "-"])
             .arg(&staged)
+            .stdout(o2)
+            .stderr(e2)
             .status();
     }
     std::fs::rename(&staged, &exe)?; // replacing a running binary is fine on unix
