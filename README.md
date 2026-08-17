@@ -37,6 +37,10 @@ to get it if it's missing. Then:
 coldtrail            # opens the app at http://127.0.0.1:8787
 ```
 
+coldtrail keeps itself current: on launch it checks for a newer release and updates in place
+before starting (run `coldtrail update` to do it on demand, or `COLDTRAIL_NO_UPDATE=1 coldtrail`
+to skip the check).
+
 ## Getting set up (first run)
 
 The browser opens to a short **Setup** wizard:

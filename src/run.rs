@@ -1,10 +1,8 @@
-//! Launch the configured agent (Claude Code or Codex) in the workspace, and the
-//! self-update stub.
+//! Launch the configured agent (Claude Code or Codex) in the workspace.
+//! (Self-update lives in `crate::update`.)
 
 use anyhow::Result;
 use std::path::Path;
-
-const INSTALL_URL: &str = "https://raw.githubusercontent.com/dilpreet92/coldtrail/main/install.sh";
 
 pub async fn run() -> Result<()> {
     crate::setup::ensure()?;
@@ -33,10 +31,4 @@ fn launch(bin: &str, ws: &Path) -> Result<()> {
 fn launch(bin: &str, ws: &Path) -> Result<()> {
     let status = std::process::Command::new(bin).current_dir(ws).status()?;
     std::process::exit(status.code().unwrap_or(1));
-}
-
-pub fn update() -> Result<()> {
-    println!("To update coldtrail, re-run the installer:");
-    println!("  curl -fsSL {INSTALL_URL} | bash");
-    Ok(())
 }

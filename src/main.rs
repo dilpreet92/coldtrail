@@ -28,6 +28,7 @@ mod serve;
 mod setup;
 mod smtp;
 mod source;
+mod update;
 mod web;
 
 use clap::Parser;
@@ -37,7 +38,10 @@ use cli::{Cli, Commands};
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        None => serve::serve(None, false).await,
+        None => {
+            update::auto_update().await; // best-effort; may relaunch, never blocks a launch
+            serve::serve(None, false).await
+        }
         Some(Commands::Serve { port, no_open }) => serve::serve(port, no_open).await,
         Some(Commands::Agent) => run::run().await,
         Some(Commands::Setup {
@@ -74,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Mark { domain, value }) => mark::run(&domain, &value),
         Some(Commands::Send { domain }) => deliver::run(&domain).await,
         Some(Commands::Seed) => seed::run(),
-        Some(Commands::Update) => run::update(),
+        Some(Commands::Update) => update::run().await,
     }
 }
 
