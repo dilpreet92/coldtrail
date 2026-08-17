@@ -52,6 +52,24 @@ pub fn claude_args(session_id: &str, first_turn: bool, msg: &str, tools: &Tools)
     a
 }
 
+/// Turn a raw agent error into a plain, actionable message when it's an auth/expiry failure
+/// (the common one: the CLI's login token expired and headless mode can't re-auth). `cli` is the
+/// display name, `relogin` the command to run. Returns None for non-auth errors.
+fn auth_hint(raw: &str, cli: &str, relogin: &str) -> Option<String> {
+    let low = raw.to_lowercase();
+    let is_auth = low.contains("authentication_error")
+        || low.contains("oauth access token has expired")
+        || low.contains("re-authenticate")
+        || low.contains("401 unauthorized")
+        || (low.contains("\"status\":401") || low.contains("error: 401"));
+    is_auth.then(|| {
+        format!(
+            "{cli} needs to sign in again — its login expired. In a terminal run `{relogin}` and \
+             complete sign-in, then re-check in Settings and resend."
+        )
+    })
+}
+
 /// Parse one line of Claude's stream-json output into zero or more events.
 /// Ignores hook/system/rate-limit noise; captures assistant text + tool calls + the
 /// terminal result. Unparseable lines yield an empty vec.
@@ -102,10 +120,11 @@ pub fn parse_stream_line(line: &str) -> Vec<AgentEvent> {
                 .map(|s| s.to_string());
             if is_error {
                 // Claude can exit 0 but report an error in the `result` payload (auth, MCP,
-                // rate limits). Surface it as a visible Error instead of a silent failed turn.
-                let message = result
-                    .clone()
-                    .filter(|s| !s.trim().is_empty())
+                // rate limits). Surface it as a visible Error instead of a silent failed turn —
+                // and translate the common expired-login case into an actionable message.
+                let raw = result.clone().unwrap_or_default();
+                let message = auth_hint(&raw, "Claude Code", "claude  (then /login)")
+                    .or_else(|| result.clone().filter(|s| !s.trim().is_empty()))
                     .unwrap_or_else(|| "the agent reported an error (see the log)".into());
                 vec![
                     AgentEvent::Error { message },
@@ -210,11 +229,12 @@ fn parse_codex_line(line: &str) -> Vec<AgentEvent> {
             result: None,
         }],
         "turn.failed" | "error" => {
-            let msg = v["error"]["message"]
+            let raw = v["error"]["message"]
                 .as_str()
                 .or_else(|| v["message"].as_str())
                 .unwrap_or("codex turn failed")
                 .to_string();
+            let msg = auth_hint(&raw, "Codex CLI", "codex login").unwrap_or(raw);
             vec![
                 AgentEvent::Error { message: msg },
                 AgentEvent::Done {
@@ -436,7 +456,13 @@ async fn stream_child(
                     .join("\n")
             }
         };
-        let _ = tx.send(AgentEvent::Error { message: tail }).await;
+        let (cli, relogin) = if label == "codex" {
+            ("Codex CLI", "codex login")
+        } else {
+            ("Claude Code", "claude  (then /login)")
+        };
+        let message = auth_hint(&err, cli, relogin).unwrap_or(tail);
+        let _ = tx.send(AgentEvent::Error { message }).await;
         let _ = tx
             .send(AgentEvent::Done {
                 ok: false,
@@ -453,6 +479,15 @@ mod tests {
     use super::*;
 
     const NONE: Tools = Tools::Disallow(&[]);
+
+    #[test]
+    fn auth_hint_detects_expired_login() {
+        let raw = r#"401 {"type":"error","error":{"type":"authentication_error","message":"OAuth access token has expired. Re-authenticate to continue."}}"#;
+        let m = super::auth_hint(raw, "Claude Code", "claude").expect("should detect auth error");
+        assert!(m.contains("sign in again"));
+        assert!(m.contains("claude"));
+        assert!(super::auth_hint("some other failure", "Claude Code", "claude").is_none());
+    }
 
     #[test]
     fn codex_args_first_and_resume() {
