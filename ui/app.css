@@ -316,3 +316,9 @@ a.btn{display:inline-block; text-decoration:none}
 .cc-doc-status{font-family:var(--mono); font-size:11px; color:var(--cyan)}
 .cc-doc{border:0; resize:vertical; padding:14px; font-family:var(--mono); font-size:12.5px; line-height:1.65; background:transparent; color:var(--ink); min-height:58vh}
 .cc-doc:focus{outline:none}
+
+/* Provider sign-in / re-auth helper */
+.agent-auth{margin-top:12px; display:flex; align-items:center; gap:10px; flex-wrap:wrap}
+.agent-auth code{font-family:var(--mono); font-size:11.5px; background:var(--hair,rgba(0,0,0,.06)); padding:2px 7px; border-radius:6px; color:var(--ink)}
+.agent-auth .hint.warn{color:var(--ember)}
+.btn.mini{font-size:11.5px; padding:5px 11px}

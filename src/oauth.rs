@@ -256,8 +256,17 @@ async fn wait_for_code(port: u16, expect_state: &str) -> Result<String> {
         .await;
     if let Some(err) = error {
         let desc = query_field(target, "error_description").unwrap_or_default();
-        return Err(anyhow!("authorization failed: {err} {desc}")
-            .context("Canonical/Gmail rejected the authorization"));
+        // Distinguish "you denied it" from a real provider-side failure — the old copy
+        // ("… rejected the authorization") implied the service refused when the user just
+        // clicked Deny (or closed the window).
+        let msg = if err == "access_denied" {
+            "Authorization was cancelled — you didn't approve access on the consent screen. Click Connect to try again.".to_string()
+        } else if desc.is_empty() {
+            format!("Authorization didn't complete ({err}). Click Connect to try again.")
+        } else {
+            format!("Authorization didn't complete ({err}: {desc}). Click Connect to try again.")
+        };
+        return Err(anyhow!(msg));
     }
     if state.as_deref() != Some(expect_state) {
         return Err(anyhow!("OAuth state mismatch (possible CSRF) — aborting"));

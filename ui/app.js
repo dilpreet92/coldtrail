@@ -123,6 +123,24 @@ async function loadStatus() {
       <div class="an">BYOK / Local</div><div class="as">OpenAI-compatible · Ollama</div></button>`;
   $("#agent-row").innerHTML = cards;
 
+  // Sign-in / re-auth helper for the selected CLI provider. The auth check is a heuristic and
+  // can be stale, and there was no in-app way to re-authenticate — so always show the login
+  // command + a Re-check button (a stronger warning when it looks signed-out).
+  const LOGIN = { claude: "claude   (sign in when it opens; or type /login)", codex: "codex login" };
+  const sel = s.agents.find((a) => a.kind === s.provider);
+  const authEl = $("#agent-auth");
+  if (authEl && sel && sel.present && LOGIN[sel.kind]) {
+    authEl.hidden = false;
+    authEl.innerHTML = (sel.authed
+      ? `<span class="hint">Signed in via the <strong>${esc(sel.label)}</strong> CLI. If a run fails with an auth error, re-authenticate in your terminal — <code>${esc(LOGIN[sel.kind])}</code> — then</span>`
+      : `<span class="hint warn">⚠ <strong>${esc(sel.label)}</strong> looks signed out. In your terminal run <code>${esc(LOGIN[sel.kind])}</code>, then</span>`) +
+      ` <button class="btn mini" id="agent-recheck">Re-check</button>`;
+    const rc = $("#agent-recheck");
+    if (rc) rc.addEventListener("click", () => loadStatus());
+  } else if (authEl) {
+    authEl.hidden = true;
+  }
+
   // prefill + reveal the BYOK form
   $("#byok-base").value = s.base_url || "";
   $("#byok-model").value = s.model || "";
