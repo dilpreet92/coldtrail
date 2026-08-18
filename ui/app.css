@@ -121,7 +121,7 @@ input:focus,textarea:focus{border-color:var(--ember); box-shadow:0 0 0 3px rgba(
 textarea{resize:vertical; line-height:1.5}
 .row{display:flex; align-items:center; gap:12px; margin-top:12px}
 
-.btn{all:unset; cursor:pointer; font-family:var(--mono); font-size:13px; color:var(--ink);
+.btn{all:unset; box-sizing:border-box; cursor:pointer; font-family:var(--mono); font-size:13px; color:var(--ink);
   background:var(--btn); border:1px solid var(--line2); padding:9px 15px; border-radius:8px; transition:.15s; text-align:center}
 .btn:hover{border-color:var(--faint); background:var(--btn-hover)}
 .btn.primary{background:linear-gradient(180deg,#ff8a4f,#ef6a2c); color:#160a04; border-color:#ff8a4f; font-weight:600;
