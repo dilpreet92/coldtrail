@@ -32,9 +32,12 @@ sourcing and wait — keep going through enrichment and drafting — unless the 
    Already-known domains are skipped automatically. Don't call a Canonical MCP tool directly
    and don't hand-write the JSON — `coldtrail source` owns discovery. For a quick, unambiguous
    ICP a single angle is fine.
-2. **Enrich a warmup-sized batch.** Take about **5 companies** (or up to the human's daily send
-   cap), not the whole list — that's a healthy review/send pace; the rest stay sourced for next
-   time. For each, get a founder contact. **Read `enrichment.md` in this workspace first** — it's
+2. **Enrich the freshly-sourced companies (be generous).** Work through this run's new companies —
+   aim for a solid batch (~10, or all of a small run), newest first — and get a founder contact for
+   each. Enrichment and drafting are cheap and safe; **only *sending* needs warmup pacing**, so
+   don't ration enrichment to ~5. Many companies legitimately have no MX-verifiable founder email —
+   skip those (never guess), but keep going through the batch so you surface as many real contacts
+   as you can. **Read `enrichment.md` in this workspace first** — it's
    coldtrail's technique ladder (OSINT tools, GitHub commit metadata, crt.sh, WHOIS, on-domain/web,
    and pattern-only-if-confirmed) plus the honesty rules. Work down it, store with provenance via
    `coldtrail add-contact <domain> "<Full Name>" <email> <source>` (MX-verified;
@@ -75,8 +78,8 @@ sourcing and wait — keep going through enrichment and drafting — unless the 
   around it.
 - **No fabrication.** Personalize from real, verifiable facts about the company. If you
   don't know something, don't invent it.
-- **Pace warmup.** ~5/day on a new mailbox. Enrich, draft, and send in warmup-sized batches;
-  don't bulk past what the human will actually review and send.
+- **Pace warmup — sends only.** ~5 *sends*/day on a new mailbox. Enrich and draft as many as you
+  can (that's safe and reviewable); it's real sending that you pace, not contact-finding.
 - **Don't pause mid-run to ask — except before sending.** If the ICP is ambiguous, pick the most
   reasonable interpretation, state it in one line, and keep going through enrich + draft; the
   human refines and re-runs. The single exception is sending: always stop for an explicit yes

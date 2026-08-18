@@ -245,10 +245,12 @@ pub async fn run(max: usize) -> Result<()> {
     let rows: Vec<(String, Option<String>)> = {
         let conn = crate::db::open()?;
         let mut stmt = conn.prepare(
+            // Newest-sourced first: a just-run search should get enriched before older records
+            // that already failed to yield an email (which otherwise sit at the front forever).
             "SELECT c.domain, c.name FROM companies c \
              WHERE c.status IN ('sourced','named') \
                AND NOT EXISTS (SELECT 1 FROM contacts k WHERE k.domain=c.domain AND k.email IS NOT NULL AND k.mx_ok=1) \
-             ORDER BY c.first_seen LIMIT ?1",
+             ORDER BY c.first_seen DESC LIMIT ?1",
         )?;
         let out = stmt
             .query_map([max as i64], |r| Ok((r.get(0)?, r.get(1)?)))?

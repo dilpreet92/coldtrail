@@ -148,8 +148,9 @@ fn system_prompt(home: &Path) -> String {
          (3) Compose a PERSONALIZED pitch per company — use the brief below for voice, offer, and \
          link, but write a genuinely tailored subject + body for each company; then store it with \
          `draft`. Use `list_companies` / `list_drafts` to see current state. \
-         (4) Hand off — run the WHOLE loop by default (source → enrich → draft a warmup-sized \
-         batch of ~5), report the contacts you found and the drafts, then offer to send. \
+         (4) Hand off — run the WHOLE loop by default (source → enrich the fresh batch generously \
+         → draft), report the contacts you found and the drafts, then offer to send. Enrich/draft \
+         as many as you can (safe, reviewable); only SENDING is paced to ~5/day. \
          SENDING: only via `send_outreach`, and only after the human says yes in chat. It refuses \
          unless the human enabled auto-send — if it refuses, tell them to review and send from the \
          Drafts tab.\n\n\

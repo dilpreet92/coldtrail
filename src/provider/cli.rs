@@ -38,6 +38,10 @@ pub fn claude_args(session_id: &str, first_turn: bool, msg: &str, tools: &Tools)
     a.push("--verbose".into());
     a.push("--permission-mode".into());
     a.push("bypassPermissions".into());
+    // The agent drives coldtrail via its CLI (Bash), never via MCP — so run with NO MCP servers.
+    // This isolates it from the user's own (possibly broken/expired) global MCP config, which
+    // otherwise crashes the turn on init.
+    a.push("--strict-mcp-config".into());
     match tools {
         Tools::Disallow(list) if !list.is_empty() => {
             a.push("--disallowedTools".into());
@@ -177,6 +181,10 @@ pub fn codex_args(session_id: &str, first_turn: bool, msg: &str) -> Vec<String> 
     // the user's own machine). Codex has no per-tool gate; the brief (AGENTS.md) forbids Gmail.
     a.push("--dangerously-bypass-approvals-and-sandbox".into());
     a.push("--skip-git-repo-check".into());
+    // Skip the user's ~/.codex/config.toml — the agent needs only Bash + the coldtrail CLI, and
+    // the user's own MCP servers there (e.g. a broken/expired one) otherwise crash the turn.
+    // Auth still comes from CODEX_HOME.
+    a.push("--ignore-user-config".into());
     a.push(msg.into());
     a
 }
@@ -496,8 +504,15 @@ mod tests {
         assert!(!first.iter().any(|x| x == "resume"));
         assert!(first.iter().any(|x| x == "--json"));
         assert_eq!(first.last().unwrap(), "hi");
+        assert!(first.iter().any(|x| x == "--ignore-user-config")); // isolate from user MCP
         let resume = codex_args("t-1", false, "again");
         assert!(resume.windows(2).any(|w| w == ["resume", "t-1"]));
+    }
+
+    #[test]
+    fn claude_args_isolate_mcp() {
+        let a = claude_args("s", true, "m", &NONE);
+        assert!(a.iter().any(|x| x == "--strict-mcp-config")); // no user MCP servers
     }
 
     #[test]
