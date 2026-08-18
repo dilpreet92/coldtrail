@@ -33,7 +33,7 @@ sourcing and wait — keep going through enrichment and drafting — unless the 
    and don't hand-write the JSON — `coldtrail source` owns discovery. For a quick, unambiguous
    ICP a single angle is fine.
 2. **Enrich the freshly-sourced companies (be generous).** Work through this run's new companies —
-   aim for a solid batch (~10, or all of a small run), newest first — and get a founder contact for
+   aim for a solid batch (~40, or all of a small run), newest first — and get a founder contact for
    each. Enrichment and drafting are cheap and safe; **only *sending* needs warmup pacing**, so
    don't ration enrichment to ~5. Many companies legitimately have no MX-verifiable founder email —
    skip those (never guess), but keep going through the batch so you surface as many real contacts
@@ -42,6 +42,10 @@ sourcing and wait — keep going through enrichment and drafting — unless the 
    and pattern-only-if-confirmed) plus the honesty rules. Work down it, store with provenance via
    `coldtrail add-contact <domain> "<Full Name>" <email> <source>` (MX-verified;
    generic/placeholder rejected), and skip any rung your tools can't run.
+   `coldtrail find-emails [max]` automates the DuckDuckGo + on-domain rung and now runs ~6
+   companies in parallel (so a bigger `max` is cheap); it prints coverage —
+   `hunting emails for N of M un-enriched companies` and a closing
+   `enriched K new · Z still un-enriched` — **note that `Z` and carry it to the hand-off.**
 3. **Compose a personalized pitch — per company.** Read `product.md` as your **product
    brief**: it carries what the product is + who it helps, the pain/value, proof, the offer,
    the call-to-action link (keep its `{slug}` UTM), the sender's voice, and any constraints.
@@ -51,9 +55,15 @@ sourcing and wait — keep going through enrichment and drafting — unless the 
    honest, short. Then store it:
    `coldtrail draft <domain> --subject "<subject>" --body "<body>"`
    This writes a DB row only. It does not create a Gmail draft and does not send.
-4. **Report, then hand off or send.** Show what you did: the **contacts you found**
-   (name · email · source) and the drafts you wrote. Then decide the ending by the human's send
-   setting — read `config.toml`:
+4. **Report coverage, then hand off or send.** Show what you did: the **contacts you found**
+   (name · email · source) and the drafts you wrote. **Always state coverage explicitly and
+   honestly** — never present a partial run as if it were the whole job. Say, in one line:
+   how many you **sourced** this run, how many you **worked**, how many **contacts** came out,
+   and **how many companies remain un-enriched** (the `Z` from `find-emails`, or count the
+   `sourced`/`named` companies with no verified contact). If any remain, **offer to continue** —
+   "I worked 22 of 228; want me to enrich the next batch, or source more?" — instead of stopping
+   at a summary that reads as done. Then decide the ending by the human's send setting — read
+   `config.toml`:
    - **`auto_send = true`** → they've turned on real sending. Offer it: "Auto-send is on — want me
      to send these <N> now?" On an explicit **yes**, send each with `coldtrail send <domain>`
      (it enforces the daily cap; when it says the cap's reached, stop for today).

@@ -151,6 +151,9 @@ fn system_prompt(home: &Path) -> String {
          (4) Hand off — run the WHOLE loop by default (source → enrich the fresh batch generously \
          → draft), report the contacts you found and the drafts, then offer to send. Enrich/draft \
          as many as you can (safe, reviewable); only SENDING is paced to ~5/day. \
+         Always report coverage honestly — how many you sourced this run, how many you worked, and \
+         how many companies remain un-enriched — and if any remain, OFFER TO CONTINUE (enrich the \
+         next batch, or source more) rather than presenting a partial run as finished. \
          SENDING: only via `send_outreach`, and only after the human says yes in chat. It refuses \
          unless the human enabled auto-send — if it refuses, tell them to review and send from the \
          Drafts tab.\n\n\
