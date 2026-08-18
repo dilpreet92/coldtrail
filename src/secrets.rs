@@ -29,8 +29,24 @@ struct Secrets {
     gmail_address: Option<String>,
     #[serde(default)]
     gmail_app_password: Option<String>,
+    /// Persistent loopback session token so restarting coldtrail doesn't invalidate open tabs.
+    #[serde(default)]
+    session_token: Option<String>,
     #[serde(default)]
     tokens: BTreeMap<String, TokenRec>,
+}
+
+/// The loopback app's session token. Persistent across restarts (created once, stored 0600),
+/// so a restart doesn't strand an already-open browser tab with a stale token.
+pub fn session_token() -> String {
+    let mut s = load();
+    if let Some(t) = s.session_token.as_ref().filter(|t| !t.trim().is_empty()) {
+        return t.clone();
+    }
+    let t = uuid::Uuid::new_v4().to_string();
+    s.session_token = Some(t.clone());
+    let _ = save(&s);
+    t
 }
 
 /// Store a user-provided Google OAuth client (for Gmail).
@@ -140,6 +156,20 @@ mod tests {
             assert!(has_token("canonical"));
             assert_eq!(token("canonical").unwrap().access, "a1");
             assert!(!has_token("gmail"));
+        });
+    }
+
+    #[test]
+    fn session_token_is_stable() {
+        crate::testutil::with_home("ct-session-token", |_| {
+            crate::home::workspace().unwrap();
+            let a = session_token();
+            assert!(!a.is_empty());
+            assert_eq!(
+                a,
+                session_token(),
+                "same token across calls (survives restart)"
+            );
         });
     }
 }

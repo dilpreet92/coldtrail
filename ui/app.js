@@ -24,8 +24,12 @@ function token() {
 })();
 
 // --- api --------------------------------------------------------------------
+// A 401 means the loopback token didn't match — usually a browser tab left open from an older
+// run. Give an actionable message instead of the raw "unauthorized".
+const SESSION_EXPIRED = "This tab's session is stale — reopen coldtrail from the URL your terminal printed.";
 async function getJSON(path) {
   const r = await fetch(path, { credentials: "same-origin" });
+  if (r.status === 401) throw new Error(SESSION_EXPIRED);
   if (!r.ok) throw new Error((await r.text()) || r.statusText);
   return r.json();
 }
@@ -36,6 +40,7 @@ async function postJSON(path, body) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body || {}),
   });
+  if (r.status === 401) throw new Error(SESSION_EXPIRED);
   // Read the body once; error responses are plain text (not JSON), so parsing the same
   // string is what lets the real error surface instead of a generic "Internal Server Error".
   const raw = await r.text();

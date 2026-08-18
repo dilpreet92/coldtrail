@@ -10,7 +10,8 @@ use crate::web::{self, AppState};
 
 pub async fn serve(port: Option<u16>, no_open: bool) -> Result<()> {
     crate::setup::ensure()?;
-    let token = uuid::Uuid::new_v4().to_string();
+    // Persistent across restarts so an already-open browser tab keeps working after a relaunch.
+    let token = crate::secrets::session_token();
 
     // Prefer the requested/default port; fall back to an OS-assigned one if taken.
     let wanted = SocketAddr::from(([127, 0, 0, 1], port.unwrap_or(8787)));

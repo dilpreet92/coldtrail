@@ -156,7 +156,10 @@ pub async fn probe_provider() -> Result<Json<MsgResp>, ApiErr> {
     use crate::provider::{resolve, run_turn, AgentEvent};
 
     let backend = resolve();
-    let home = crate::home::workspace()?;
+    // Run in a CLEAN temp dir — no CLAUDE.md/.mcp.json — so the CLI starts fast and this tests
+    // pure auth, not MCP init (which is what made the probe time out in the real workspace).
+    let home = std::env::temp_dir().join(format!("coldtrail-probe-{}", uuid::Uuid::new_v4()));
+    let _ = std::fs::create_dir_all(&home);
     let sid = uuid::Uuid::new_v4().to_string();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(256);
     let tools = Tools::Disallow(&["Bash", "mcp__gmail", "mcp__canonical"]);
@@ -170,7 +173,8 @@ pub async fn probe_provider() -> Result<Json<MsgResp>, ApiErr> {
         &tools,
         tx,
     );
-    let outcome = tokio::time::timeout(std::time::Duration::from_secs(45), turn).await;
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), turn).await;
+    let _ = std::fs::remove_dir_all(&home);
 
     let mut err = None;
     while let Ok(ev) = rx.try_recv() {
