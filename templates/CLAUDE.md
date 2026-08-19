@@ -42,8 +42,11 @@ sourcing and wait — keep going through enrichment and drafting — unless the 
    and pattern-only-if-confirmed) plus the honesty rules. Work down it, store with provenance via
    `coldtrail add-contact <domain> "<Full Name>" <email> <source>` (MX-verified;
    generic/placeholder rejected), and skip any rung your tools can't run.
-   `coldtrail find-emails [max]` automates the DuckDuckGo + on-domain rung and now runs ~6
-   companies in parallel (so a bigger `max` is cheap); it prints coverage —
+   **Prefer your own web tools for the web rung.** If you have `WebSearch`/`WebFetch` (Claude Code)
+   or `web_search` (Codex), use them to hunt founder emails — ranked, real results, far higher
+   signal than scraping. `coldtrail find-emails [max]` is the **fallback** for backends without a
+   web tool (BYOK / local models): it automates the DuckDuckGo + on-domain rung, runs ~6 companies
+   in parallel (so a bigger `max` is cheap), and prints coverage —
    `hunting emails for N of M un-enriched companies` and a closing
    `enriched K new · Z still un-enriched` — **note that `Z` and carry it to the hand-off.**
 3. **Compose a personalized pitch — per company.** Read `product.md` as your **product

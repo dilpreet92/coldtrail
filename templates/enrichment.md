@@ -28,7 +28,12 @@ everywhere) — skip a rung you can't run rather than stalling.
    mail host and confirm the domain accepts mail.
 
 5. **On-domain + web** — about / team / contact pages, and a web search for
-   "<founder> <company> email". `coldtrail find-emails` automates DuckDuckGo + an on-domain scan.
+   "<founder> <company> email". **If your runtime has its own web tools, use them for this rung** —
+   Claude Code's `WebSearch` + `WebFetch`, or Codex's built-in `web_search`. They return ranked,
+   real results and extract far better than HTML scraping. `coldtrail find-emails` is the
+   **fallback** for backends with no web tool (BYOK / local models): it automates a DuckDuckGo +
+   on-domain scan, but it's slower and lower-signal (snippet noise, throttling), so reach for your
+   native search first whenever you have it.
 
 6. **Pattern — last resort, and only when confirmed.** If aggregators report a house pattern
    (e.g. `{first}@domain`), treat it as a *hypothesis*. Confirm it against at least one

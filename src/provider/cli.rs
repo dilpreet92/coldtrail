@@ -185,6 +185,12 @@ pub fn codex_args(session_id: &str, first_turn: bool, msg: &str) -> Vec<String> 
     // the user's own MCP servers there (e.g. a broken/expired one) otherwise crash the turn.
     // Auth still comes from CODEX_HOME.
     a.push("--ignore-user-config".into());
+    // Guarantee the native web_search tool for the enrichment "web" rung. It's on by default in
+    // current Codex, but --ignore-user-config drops any user setting and a future default could
+    // flip — so pin it explicitly. Harmless when already on; unknown keys are ignored (we don't
+    // pass --strict-config), so this can't break an older Codex.
+    a.push("-c".into());
+    a.push("tools.web_search=true".into());
     a.push(msg.into());
     a
 }
@@ -505,6 +511,9 @@ mod tests {
         assert!(first.iter().any(|x| x == "--json"));
         assert_eq!(first.last().unwrap(), "hi");
         assert!(first.iter().any(|x| x == "--ignore-user-config")); // isolate from user MCP
+        assert!(first
+            .windows(2)
+            .any(|w| w == ["-c", "tools.web_search=true"])); // pin web search
         let resume = codex_args("t-1", false, "again");
         assert!(resume.windows(2).any(|w| w == ["resume", "t-1"]));
     }
