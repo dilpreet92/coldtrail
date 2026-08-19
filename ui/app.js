@@ -78,6 +78,10 @@ function show(view) {
   $$(".view").forEach((v) => v.classList.toggle("active", v.id === "view-" + view));
   $$(".nav-item").forEach((n) => n.setAttribute("aria-current", n.dataset.nav === view));
   document.documentElement.dataset.view = view;
+  // The page scrolls, and views share it — so a switch should land at a sensible spot, not wherever
+  // the last view was scrolled to. Pages start at the top; chat follows its latest message.
+  if (view === "chat") scrollChatToBottom();
+  else window.scrollTo(0, 0);
   if (loaders[view]) loaders[view]();
 }
 $$(".nav-item").forEach((n) => n.addEventListener("click", () => show(n.dataset.nav)));
@@ -778,12 +782,22 @@ $("#check-replies").addEventListener("click", async () => {
 
 // --- chat -------------------------------------------------------------------
 const log = $("#chat-log");
+// UI teardown for an in-flight chat stream (set while streaming; see sendChat). Switching
+// chats calls this so a running turn's tool chips / dots don't bleed into the chat on screen.
+let teardownStream = null;
+// The page (window) is the scroll container — #chat-log has no height of its own — so follow
+// new chat output by scrolling the window, not the log element (log.scrollTop was a no-op).
+// Guarded to the chat view so a stray event can't yank another screen.
+function scrollChatToBottom() {
+  if (!$("#view-chat").classList.contains("active")) return;
+  requestAnimationFrame(() => window.scrollTo({ top: document.documentElement.scrollHeight }));
+}
 function bubble(cls, text) {
   const d = document.createElement("div");
   d.className = "msg " + cls;
   d.textContent = text || "";
   log.appendChild(d);
-  log.scrollTop = log.scrollHeight;
+  scrollChatToBottom();
   return d;
 }
 function toolChip(name) {
@@ -791,7 +805,7 @@ function toolChip(name) {
   d.className = "tool";
   d.innerHTML = `<span class="st"></span><span class="tn">${esc(name)}</span>`;
   log.appendChild(d);
-  log.scrollTop = log.scrollHeight;
+  scrollChatToBottom();
   return d;
 }
 // Animated "working" indicator — kept at the bottom while the agent is busy between
@@ -800,7 +814,7 @@ let workingEl = null;
 function showWorking() {
   if (!workingEl) { workingEl = document.createElement("div"); workingEl.className = "working"; workingEl.innerHTML = "<i></i><i></i><i></i>"; }
   log.appendChild(workingEl); // moves it to the end
-  log.scrollTop = log.scrollHeight;
+  scrollChatToBottom();
 }
 function hideWorking() { if (workingEl) workingEl.remove(); }
 
@@ -822,6 +836,7 @@ async function loadChatList() {
 }
 
 async function openChat(id) {
+  if (teardownStream) teardownStream(); // stop the previous chat's live stream leaking in here
   try {
     const d = await getJSON(`/api/chats/${encodeURIComponent(id)}`);
     await postJSON(`/api/chats/${encodeURIComponent(id)}/activate`, {});
@@ -835,6 +850,7 @@ async function openChat(id) {
 }
 
 $("#chat-new").addEventListener("click", async () => {
+  if (teardownStream) teardownStream(); // don't let a running turn stream into the fresh chat
   try {
     await postJSON("/api/chats/new", {});
     log.innerHTML = "";
@@ -866,9 +882,17 @@ async function sendChat() {
   let pendingTool = null;
   // Only ever one live (blinking) bubble: clear it on every transition.
   const finishLive = () => { if (agentBubble) { agentBubble.classList.remove("live"); agentBubble = null; agentRaw = ""; } };
-  const done = () => { finishLive(); hideWorking(); es.close(); busy = false; $("#chat-send").disabled = false; };
 
   const es = new EventSource(`/api/chat/stream?run=${encodeURIComponent(run)}&t=${encodeURIComponent(token())}`);
+  // Stop this stream's UI: on done/error, and when the user switches to another chat (the server
+  // run keeps going in the background and persists its reply, so nothing is lost — we just stop
+  // painting its chips/dots into whatever chat is now on screen).
+  teardownStream = () => {
+    teardownStream = null;
+    finishLive(); hideWorking(); pendingTool = null;
+    try { es.close(); } catch (_) {}
+    busy = false; $("#chat-send").disabled = false;
+  };
   es.onmessage = (ev) => {
     let e;
     try { e = JSON.parse(ev.data); } catch (_) { return; }
@@ -877,7 +901,7 @@ async function sendChat() {
       if (!agentBubble) { agentBubble = bubble("agent live", ""); agentRaw = ""; }
       agentRaw += e.text;
       agentBubble.innerHTML = mdInline(agentRaw);
-      log.scrollTop = log.scrollHeight;
+      scrollChatToBottom();
     } else if (e.type === "tool_start") {
       finishLive();
       pendingTool = toolChip(e.name);
@@ -889,13 +913,13 @@ async function sendChat() {
       finishLive();
       bubble("agent", "⚠ " + e.message);
     } else if (e.type === "done") {
-      done();
+      if (teardownStream) teardownStream();
       loaders.pipeline();
       loaders.drafts();
       loadChatList();
     }
   };
-  es.onerror = () => done();
+  es.onerror = () => { if (teardownStream) teardownStream(); };
 }
 
 // --- theme toggle -----------------------------------------------------------
