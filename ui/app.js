@@ -800,13 +800,41 @@ function bubble(cls, text) {
   scrollChatToBottom();
   return d;
 }
-function toolChip(name) {
+function toolChip(name, parent = log) {
   const d = document.createElement("div");
   d.className = "tool";
   d.innerHTML = `<span class="st"></span><span class="tn">${esc(name)}</span>`;
-  log.appendChild(d);
+  parent.appendChild(d);
   scrollChatToBottom();
   return d;
+}
+
+// Consecutive tool calls in one "step" collapse into a single expandable row, so a burst of
+// dozens of WebSearch/WebFetch/Bash calls stays one compact line you can scroll past (and expand
+// on demand) instead of hundreds of stacked chips burying the conversation.
+function newToolGroup() {
+  const wrap = document.createElement("div");
+  wrap.className = "tool-group running";
+  wrap.innerHTML =
+    `<button class="tool-group-head"><span class="tg-caret">▸</span><span class="tg-dot"></span>` +
+    `<span class="tg-summary"></span></button><div class="tool-group-body"></div>`;
+  wrap.querySelector(".tool-group-head").addEventListener("click", () => wrap.classList.toggle("open"));
+  log.appendChild(wrap);
+  scrollChatToBottom();
+  return { wrap, body: wrap.querySelector(".tool-group-body"), summary: wrap.querySelector(".tg-summary"), counts: {}, total: 0 };
+}
+function toolGroupAdd(g, name) {
+  g.total++;
+  g.counts[name] = (g.counts[name] || 0) + 1;
+  const chip = toolChip(name, g.body);
+  renderToolSummary(g, true);
+  return chip;
+}
+function renderToolSummary(g, running) {
+  const label = g.total === 1 ? "1 tool call" : `${g.total} tool calls`;
+  const parts = Object.entries(g.counts).map(([n, c]) => (c > 1 ? `${n} ×${c}` : n)).join(", ");
+  g.summary.textContent = running ? `working… ${label}` : `${label} · ${parts}`;
+  g.wrap.classList.toggle("running", !!running);
 }
 // Animated "working" indicator — kept at the bottom while the agent is busy between
 // visible text, so a long tool call never looks frozen.
@@ -879,9 +907,12 @@ async function sendChat() {
 
   let agentBubble = null;
   let agentRaw = "";
-  let pendingTool = null;
+  let toolGroup = null; // current collapsed run of tool calls (until text/end resumes)
+  let currentChip = null; // the tool_start awaiting its tool_end
   // Only ever one live (blinking) bubble: clear it on every transition.
   const finishLive = () => { if (agentBubble) { agentBubble.classList.remove("live"); agentBubble = null; agentRaw = ""; } };
+  // Freeze the current tool group into its collapsed summary and start a fresh one next burst.
+  const closeToolGroup = () => { if (toolGroup) { renderToolSummary(toolGroup, false); toolGroup = null; currentChip = null; } };
 
   const es = new EventSource(`/api/chat/stream?run=${encodeURIComponent(run)}&t=${encodeURIComponent(token())}`);
   // Stop this stream's UI: on done/error, and when the user switches to another chat (the server
@@ -889,7 +920,7 @@ async function sendChat() {
   // painting its chips/dots into whatever chat is now on screen).
   teardownStream = () => {
     teardownStream = null;
-    finishLive(); hideWorking(); pendingTool = null;
+    finishLive(); closeToolGroup(); hideWorking();
     try { es.close(); } catch (_) {}
     busy = false; $("#chat-send").disabled = false;
   };
@@ -897,20 +928,20 @@ async function sendChat() {
     let e;
     try { e = JSON.parse(ev.data); } catch (_) { return; }
     if (e.type === "text") {
-      hideWorking(); // the streaming cursor is the activity now
+      hideWorking(); closeToolGroup(); // the streaming cursor is the activity now
       if (!agentBubble) { agentBubble = bubble("agent live", ""); agentRaw = ""; }
       agentRaw += e.text;
       agentBubble.innerHTML = mdInline(agentRaw);
       scrollChatToBottom();
     } else if (e.type === "tool_start") {
       finishLive();
-      pendingTool = toolChip(e.name);
-      showWorking(); // keep motion below the running tool
+      hideWorking(); // the group's own running dot is the activity now
+      if (!toolGroup) toolGroup = newToolGroup();
+      currentChip = toolGroupAdd(toolGroup, e.name);
     } else if (e.type === "tool_end") {
-      if (pendingTool) { pendingTool.classList.add("done"); if (!e.ok) pendingTool.classList.add("fail"); pendingTool = null; }
-      showWorking(); // still thinking about the next step
+      if (currentChip) { currentChip.classList.add("done"); if (!e.ok) currentChip.classList.add("fail"); currentChip = null; }
     } else if (e.type === "error") {
-      finishLive();
+      finishLive(); closeToolGroup();
       bubble("agent", "⚠ " + e.message);
     } else if (e.type === "done") {
       if (teardownStream) teardownStream();

@@ -187,6 +187,19 @@ ol.steps li{margin-bottom:4px}
 .tool.done .st{background:var(--ok);box-shadow:0 0 6px var(--ok); animation:none}
 .tool.fail .st{background:var(--bad)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.2}}
+/* collapsed run of tool calls — one row per "step", expand to see the individual chips */
+.tool-group{align-self:stretch; max-width:76ch}
+.tool-group-head{all:unset; box-sizing:border-box; cursor:pointer; display:flex; align-items:center; gap:8px;
+  font-family:var(--mono); font-size:12px; color:var(--mut);
+  border:1px dashed var(--line2); border-radius:8px; padding:7px 11px}
+.tool-group-head:hover{color:var(--ink); border-color:var(--faint)}
+.tool-group .tg-caret{display:inline-block; transition:transform .15s; color:var(--faint)}
+.tool-group.open .tg-caret{transform:rotate(90deg)}
+.tool-group .tg-dot{width:6px; height:6px; border-radius:50%; background:var(--ok); flex:none}
+.tool-group.running .tg-dot{background:var(--warn); box-shadow:0 0 6px var(--warn); animation:pulse 1s ease-in-out infinite}
+.tool-group-body{display:none; flex-direction:column; gap:8px; margin:8px 0 0 12px; padding-left:12px; border-left:1px solid var(--line)}
+.tool-group.open .tool-group-body{display:flex}
+
 .working{align-self:flex-start; display:flex; gap:5px; align-items:center; padding:11px 15px}
 .working i{width:7px; height:7px; border-radius:50%; background:var(--ember); display:inline-block; animation:bounce 1.2s infinite ease-in-out}
 .working i:nth-child(2){animation-delay:.15s}
