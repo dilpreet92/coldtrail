@@ -113,6 +113,11 @@ pub enum Commands {
         /// Produce drafts only — hard-blocked from sending, ignores auto_send
         #[arg(long)]
         draft_only: bool,
+        /// Override the recorded trigger label (e.g. "manual", "dry"). Used by the web
+        /// server's run-now endpoint, which re-invokes this binary as a detached subprocess
+        /// so the dry-run env gate stays isolated to the child.
+        #[arg(long)]
+        trigger: Option<String>,
     },
     /// Reconcile OS timers to the saved schedules (after a reinstall).
     Schedule {

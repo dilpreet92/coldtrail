@@ -1,7 +1,7 @@
 //! `/api/schedules` collection API: CRUD over `db::Schedule` rows plus `/:id/run` (kick a
 //! detached run now) and `/api/runs` (recent run history across all schedules). Replaces the
-//! old singular `/api/schedule` (settings-panel cadence) — see `src/schedule.rs::apply` for the
-//! CLI-only installer that still uses that shape until a later task removes it.
+//! old singular `/api/schedule` (settings-panel cadence) — timers are now installed per-schedule
+//! via `src/schedule.rs::apply_one`/`remove_one`, keyed by schedule id.
 
 use super::{ApiErr, AppState};
 use axum::extract::{Path, State};
@@ -225,9 +225,16 @@ pub async fn remove(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-/// Kick a run now for schedule `id`. The run is detached (spawned, not awaited): it creates and
-/// records its own chat + `scheduled_runs` row, so the UI finds out by polling `/api/runs`
-/// rather than from this response. Mirrors `web::chat::start`'s spawn pattern.
+/// Kick a run now for schedule `id`. The run is a detached subprocess (a re-invocation of this
+/// same binary via `run --schedule <id> --trigger ...`), not an in-process spawn: a dry run sets
+/// the process-global `COLDTRAIL_NO_SEND` env var (see `deliver::send`), and this server process
+/// also handles the Drafts Send button, chat `send_outreach`, and other concurrent run-now
+/// requests. Setting that env var in-process would spuriously block legitimate concurrent sends
+/// during a dry run, or (with overlapping dry runs and auto_send on) let a dry run actually send.
+/// A subprocess isolates the env gate to the child, exactly like the OS timer path
+/// (`schedule.rs::apply_one`). The HTTP handler returns immediately; a background task awaits the
+/// child so it's reaped, and the UI finds out by polling `/api/runs` rather than from this
+/// response.
 pub async fn run_now(
     State(_s): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -237,8 +244,14 @@ pub async fn run_now(
         return Ok((StatusCode::NOT_FOUND, "schedule not found").into_response());
     }
     let draft_only = req.draft_only;
+    let exe = std::env::current_exe().map_err(|e| ApiErr(anyhow::anyhow!(e)))?;
+    let trigger = if draft_only { "dry" } else { "manual" };
+    // Detached: a background task awaits the child so it's reaped, but the HTTP handler returns now.
     tokio::spawn(async move {
-        let _ = crate::scheduled::run(Some(&id), if draft_only { "dry" } else { "manual" }).await;
+        let _ = tokio::process::Command::new(exe)
+            .args(["run", "--schedule", &id, "--trigger", trigger])
+            .status()
+            .await;
     });
     Ok(Json(serde_json::json!({ "ok": true })).into_response())
 }
