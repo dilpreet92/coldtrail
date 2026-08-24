@@ -18,7 +18,13 @@ pub fn brief() -> String {
 
 #[allow(dead_code)] // wired into `coldtrail run` / the scheduler by the next task
 pub async fn run_once() -> Result<()> {
-    crate::db::init()?;
+    // Every fallible step below is best-effort: the doc comment above promises this function
+    // ALWAYS resolves to Ok, because Task 7 wires it directly to the OS timer — an `Err` here
+    // would make the timer loop on a run that otherwise completed fine.
+    if let Err(e) = crate::db::init() {
+        crate::logf::log(&format!("scheduled run aborted: {e}"));
+        return Ok(());
+    }
     let backend = resolve();
 
     // Auth gate first — a doomed turn helps no one. Record + bail cleanly if not signed in.
@@ -50,21 +56,45 @@ pub async fn run_once() -> Result<()> {
         }
     }
 
-    let home = crate::home::workspace()?;
-    let before = {
-        let c = crate::db::open()?;
-        crate::db::counts(&c)?
+    let home = match crate::home::workspace() {
+        Ok(h) => h,
+        Err(e) => {
+            crate::logf::log(&format!("scheduled run aborted: {e}"));
+            return Ok(());
+        }
+    };
+
+    let zero = crate::db::Counts {
+        companies: 0,
+        contacts: 0,
+        outreach: 0,
+        sent_today: 0,
+    };
+    let before = match crate::db::open().and_then(|c| crate::db::counts(&c)) {
+        Ok(c) => c,
+        Err(e) => {
+            crate::logf::log(&format!(
+                "scheduled run: before-snapshot failed, assuming zero counts: {e}"
+            ));
+            zero
+        }
     };
     // Title is just "Scheduled run" — the chat list already shows each row's timestamp
     // (updated_at), so no date crate is needed here.
-    let (chat_id, agent_sid) = crate::chat_store::create_session("Scheduled run")?;
-    crate::chat_store::insert_message(&chat_id, "user", &brief());
+    let (chat_id, agent_sid) = match crate::chat_store::create_session("Scheduled run") {
+        Ok(v) => v,
+        Err(e) => {
+            crate::logf::log(&format!("scheduled run aborted: {e}"));
+            return Ok(());
+        }
+    };
+    let msg = brief();
+    crate::chat_store::insert_message(&chat_id, "user", &msg);
     crate::logf::log(&format!("scheduled run started (chat {chat_id})"));
 
     // Drive one turn; accumulate the reply + capture a provider session id; log events.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(128);
     let tools = Tools::Disallow(&[GMAIL_TOOL]);
-    let msg = brief();
     let turn = run_turn(&backend, &agent_sid, true, &msg, &home, &tools, tx);
     let mut assistant = String::new();
     let mut new_session: Option<String> = None;
@@ -88,12 +118,19 @@ pub async fn run_once() -> Result<()> {
         crate::chat_store::insert_message(&chat_id, "assistant", assistant.trim());
     }
 
-    let after = {
-        let c = crate::db::open()?;
-        crate::db::counts(&c)?
+    let after = match crate::db::open().and_then(|c| crate::db::counts(&c)) {
+        Ok(c) => c,
+        Err(e) => {
+            crate::logf::log(&format!(
+                "scheduled run: after-snapshot failed, deltas will read as zero: {e}"
+            ));
+            before
+        }
     };
     let status = if ok { "ok" } else { "error" };
-    crate::db::record_run(status, before, after, Some(&chat_id), None)?;
+    if let Err(e) = crate::db::record_run(status, before, after, Some(&chat_id), None) {
+        crate::logf::log(&format!("scheduled run: failed to record outcome: {e}"));
+    }
     crate::logf::log(&format!(
         "scheduled run {status}: sourced {} · contacts {} · drafts {} · sent {}",
         (after.companies - before.companies).max(0),
