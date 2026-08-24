@@ -152,36 +152,12 @@ pub async fn connect_destination(
 /// The file-existence heuristic can't see an expired token; this runs the actual CLI/model so
 /// an expired login surfaces as a clear, actionable error. Tools disabled; ~45s cap.
 pub async fn probe_provider() -> Result<Json<MsgResp>, ApiErr> {
-    use crate::provider::cli::Tools;
-    use crate::provider::{resolve, run_turn, AgentEvent};
+    use crate::probe::{probe, Outcome};
+    use crate::provider::resolve;
 
     let backend = resolve();
-    // Run in a CLEAN temp dir — no CLAUDE.md/.mcp.json — so the CLI starts fast and this tests
-    // pure auth, not MCP init (which is what made the probe time out in the real workspace).
-    let home = std::env::temp_dir().join(format!("coldtrail-probe-{}", uuid::Uuid::new_v4()));
-    let _ = std::fs::create_dir_all(&home);
-    let sid = uuid::Uuid::new_v4().to_string();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(256);
-    let tools = Tools::Disallow(&["Bash", "mcp__gmail", "mcp__canonical"]);
+    let outcome = probe(&backend).await;
 
-    let turn = run_turn(
-        &backend,
-        &sid,
-        true,
-        "Reply with exactly: ok",
-        &home,
-        &tools,
-        tx,
-    );
-    let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), turn).await;
-    let _ = std::fs::remove_dir_all(&home);
-
-    let mut err = None;
-    while let Ok(ev) = rx.try_recv() {
-        if let AgentEvent::Error { message } = ev {
-            err = Some(message);
-        }
-    }
     let agent = crate::config::load()
         .agent
         .unwrap_or_else(|| "claude".into());
@@ -190,19 +166,17 @@ pub async fn probe_provider() -> Result<Json<MsgResp>, ApiErr> {
         .unwrap_or("Your model");
 
     Ok(Json(match outcome {
-        Ok(true) => MsgResp {
+        Outcome::Ok => MsgResp {
             ok: true,
             message: Some(format!("{provider} is signed in and responding.")),
             wired: None,
         },
-        Ok(false) => MsgResp {
+        Outcome::Failed(m) => MsgResp {
             ok: false,
-            message: Some(
-                err.unwrap_or_else(|| "the provider didn't respond — check the log".into()),
-            ),
+            message: Some(m),
             wired: None,
         },
-        Err(_) => MsgResp {
+        Outcome::TimedOut => MsgResp {
             ok: false,
             message: Some(format!(
                 "{provider} timed out — check the log at ~/.coldtrail/coldtrail.log"

@@ -20,6 +20,7 @@ mod mcp_client;
 mod message;
 mod oauth;
 mod osint;
+mod probe;
 mod prompt;
 mod provider;
 mod run;
