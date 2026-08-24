@@ -12,6 +12,9 @@ fn hh_mm(time: &str) -> (u32, u32) {
 }
 
 // launchd Weekday: 0/7=Sun,1=Mon..6=Sat — matches our 0=Sun..6=Sat for 0..=6.
+/// Only reachable from `apply()`'s `target_os = "macos"` path; on Linux it's exercised
+/// directly by the unit tests below, so it's dead in the shipped Linux binary.
+#[allow(dead_code)]
 pub fn launchd_plist(bin: &str, path_env: &str, home_env: Option<&str>, s: &Schedule) -> String {
     let (h, m) = hh_mm(&s.time);
     let weekday = if s.freq == "weekly" {
@@ -104,10 +107,10 @@ pub fn apply(s: &Schedule) -> Result<()> {
         std::fs::write(&p, plist)?;
         let uid = users_uid();
         let _ = std::process::Command::new("launchctl")
-            .args(["bootout", &format!("gui/{uid}"), p.to_str().unwrap()])
+            .args(["bootout", &format!("gui/{uid}"), p.to_str().unwrap_or("")])
             .output();
         std::process::Command::new("launchctl")
-            .args(["bootstrap", &format!("gui/{uid}"), p.to_str().unwrap()])
+            .args(["bootstrap", &format!("gui/{uid}"), p.to_str().unwrap_or("")])
             .output()
             .context("launchctl bootstrap")?;
     }

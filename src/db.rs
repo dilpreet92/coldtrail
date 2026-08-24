@@ -8,7 +8,9 @@ pub const SCHEMA: &str = include_str!("../templates/schema.sql");
 /// Open the workspace database with foreign keys enforced.
 pub fn open() -> Result<Connection> {
     let c = Connection::open(crate::home::path("outreach.db")?)?;
-    c.execute_batch("PRAGMA foreign_keys = ON;")?;
+    c.execute_batch(
+        "PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 3000; PRAGMA foreign_keys = ON;",
+    )?;
     Ok(c)
 }
 
