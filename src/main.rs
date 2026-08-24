@@ -83,6 +83,45 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Send { domain }) => deliver::run(&domain).await,
         Some(Commands::Seed) => seed::run(),
         Some(Commands::Update) => update::run().await,
+        Some(Commands::Run) => scheduled::run_once().await,
+        Some(Commands::Schedule {
+            daily: _daily,
+            weekly,
+            time,
+            weekday,
+            off,
+        }) => {
+            let mut cfg = config::load();
+            let sched = if off {
+                config::Schedule {
+                    enabled: false,
+                    ..Default::default()
+                }
+            } else {
+                config::Schedule {
+                    enabled: true,
+                    freq: if weekly {
+                        "weekly".into()
+                    } else {
+                        "daily".into()
+                    },
+                    time,
+                    weekday,
+                }
+            };
+            cfg.schedule = Some(sched.clone());
+            config::save(&cfg)?;
+            schedule::apply(&sched)?;
+            println!(
+                "{}",
+                if sched.enabled {
+                    format!("scheduled: {} at {}", sched.freq, sched.time)
+                } else {
+                    "schedule off".into()
+                }
+            );
+            Ok(())
+        }
     }
 }
 
