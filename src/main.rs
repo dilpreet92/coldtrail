@@ -24,6 +24,7 @@ mod probe;
 mod prompt;
 mod provider;
 mod run;
+mod scheduled;
 mod secrets;
 mod seed;
 mod serve;
