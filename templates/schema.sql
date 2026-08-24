@@ -70,3 +70,16 @@ CREATE TABLE IF NOT EXISTS scheduled_runs (
     chat_id     TEXT,
     note        TEXT
 );
+
+CREATE TABLE IF NOT EXISTS schedules (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    freq        TEXT NOT NULL,
+    time        TEXT NOT NULL,
+    weekday     INTEGER,
+    task_mode   TEXT NOT NULL,
+    prompt      TEXT,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);

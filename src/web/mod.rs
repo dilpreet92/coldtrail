@@ -8,7 +8,7 @@ pub mod company;
 pub mod followups;
 pub mod onboarding;
 pub mod pipeline;
-pub mod schedule;
+pub mod schedules;
 pub mod send;
 
 use axum::{
@@ -17,7 +17,7 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, patch, post},
     Router,
 };
 use std::collections::HashMap;
@@ -123,7 +123,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/contacts", get(pipeline::contacts))
         .route("/api/drafts", get(pipeline::drafts))
         .route("/api/overview", get(pipeline::overview))
-        .route("/api/schedule", get(schedule::get).post(schedule::post))
+        .route(
+            "/api/schedules",
+            get(schedules::list).post(schedules::create),
+        )
+        .route(
+            "/api/schedules/:id",
+            patch(schedules::update).delete(schedules::remove),
+        )
+        .route("/api/schedules/:id/run", post(schedules::run_now))
+        .route("/api/runs", get(schedules::runs))
         .route("/api/followups", get(pipeline::followups))
         .route("/api/followups/check", post(followups::check))
         .route("/api/followups/:domain/mark", post(pipeline::mark_touch))

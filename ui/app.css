@@ -117,6 +117,9 @@ label{font-family:var(--mono); font-size:11.5px; color:var(--mut); display:flex;
 label.check{flex-direction:row; align-items:center; text-transform:none; letter-spacing:0; gap:8px; color:var(--ink)}
 input,textarea{font-family:var(--mono); font-size:13px; color:var(--ink); background:var(--field);
   border:1px solid var(--line2); border-radius:8px; padding:9px 11px; outline:none; transition:.15s; width:100%}
+/* checkboxes/radios must keep their native intrinsic size — the width:100% above is meant for
+   text/time/textarea fields only and would otherwise stretch them inside a flex row */
+input[type="checkbox"],input[type="radio"]{width:auto; flex:none; padding:0}
 input:focus,textarea:focus{border-color:var(--ember); box-shadow:0 0 0 3px rgba(255,122,61,.12)}
 textarea{resize:vertical; line-height:1.5}
 .row{display:flex; align-items:center; gap:12px; margin-top:12px}
@@ -322,9 +325,36 @@ a.btn{display:inline-block; text-decoration:none}
 .autosend .cap-row{display:flex; align-items:center; gap:9px; margin-top:8px; font-family:var(--mono); font-size:12px; color:var(--mut)}
 .autosend .cap-row input{width:72px}
 
-/* Scheduled runs (Settings → Destination), reuses .autosend */
-.sched-status{font-family:var(--mono); font-size:11.5px; color:var(--mut); margin-top:8px}
-.sched-status.warn{color:var(--ember)}
+/* Cron tab — multi-schedule cards, the New/Edit form, and run history.
+   Mirrors .autosend (card shell), .draft (panel-with-header rhythm), and .fu-row (list rows). */
+.cron-list{display:flex; flex-direction:column; gap:14px; margin-bottom:22px}
+.cron-card{border:1px solid var(--line); border-radius:12px; background:var(--panel); padding:14px 16px; display:flex; flex-direction:column; gap:10px}
+.cron-card-head{display:flex; align-items:center; gap:10px; flex-wrap:wrap}
+.cron-card-head .switch{display:flex; align-items:center; gap:8px; cursor:pointer}
+.cron-badge{font-family:var(--mono); font-size:11px; color:var(--mut); border:1px solid var(--line2); border-radius:999px; padding:3px 10px; white-space:nowrap}
+.cron-badge.task{color:var(--cyan); border-color:var(--cyan-dim); max-width:38ch; overflow:hidden; text-overflow:ellipsis}
+.cron-meta{display:flex; align-items:center; gap:12px; flex-wrap:wrap; font-family:var(--mono); font-size:12px; color:var(--mut)}
+.cron-next{color:var(--faint)}
+.cron-lastrun.warn{color:var(--ember)}
+.cron-lastrun a, .cron-run-row a{margin-left:6px}
+.cron-actions{display:flex; gap:8px; flex-wrap:wrap}
+.cron-actions .btn{padding:5px 12px; font-size:11.5px}
+
+.cron-form{max-width:640px; margin-bottom:22px}
+.cron-form[hidden]{display:none}
+.cron-form .cap-row{display:flex; align-items:center; gap:9px; margin:10px 0; font-family:var(--mono); font-size:12px; color:var(--mut)}
+.cf-taskmode{display:flex; gap:16px; margin:10px 0}
+.cf-taskmode label{flex-direction:row; align-items:center; gap:7px; text-transform:none; letter-spacing:0; color:var(--ink)}
+#cf-prompt[hidden]{display:none}
+
+.cron-runs{display:flex; flex-direction:column; gap:8px}
+.cron-run-row{display:flex; align-items:center; gap:12px; flex-wrap:wrap; font-family:var(--mono); font-size:12px; color:var(--mut); border-bottom:1px solid var(--line); padding:8px 0}
+.cron-run-row:last-child{border-bottom:none}
+.cr-name{color:var(--ink)}
+.cr-status.ok{color:var(--ok)}
+.cr-status.bad{color:var(--bad)}
+.cr-status.warn{color:var(--warn)}
+.cr-counts{color:var(--faint)}
 
 /* Company profile — a single editable markdown doc (product.md) */
 .company-canvas-mount{margin-top:8px}

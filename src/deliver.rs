@@ -74,6 +74,9 @@ pub fn sent_today() -> u32 {
 /// SEND for real. Refuses unless the human enabled `auto_send`; enforces the per-day cap; sends
 /// via SMTP (app-password) or the Gmail API (OAuth); marks the row `sent`. Returns a status line.
 pub async fn send(domain: &str, d: &Draft) -> Result<String> {
+    if std::env::var("COLDTRAIL_NO_SEND").is_ok() {
+        return Err(anyhow!("dry run: sending is disabled for this run"));
+    }
     let cfg = crate::config::load();
     if !cfg.auto_send {
         return Err(anyhow!(
@@ -133,5 +136,23 @@ mod tests {
                 .to_string();
             assert!(err.contains("auto-send is off"), "got: {err}");
         });
+    }
+
+    // The dry-run gate is the very first statement in `send`, so it fires before config/db
+    // are touched at all — no workspace or auto_send setup needed here.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn no_send_env_blocks_send_even_before_config() {
+        let _g = crate::testutil::env_guard();
+        std::env::set_var("COLDTRAIL_NO_SEND", "1");
+        let d = Draft {
+            to: "a@example.com".into(),
+            subject: "s".into(),
+            body: "b".into(),
+        };
+        let res = send("example.com", &d).await;
+        std::env::remove_var("COLDTRAIL_NO_SEND");
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("dry run"), "got: {err}");
     }
 }

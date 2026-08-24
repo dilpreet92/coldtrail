@@ -26,6 +26,7 @@
     <button class="nav-item" data-nav="company"><span class="dot"></span>Company</button>
     <button class="nav-item" data-nav="overview"><span class="dot"></span>Overview</button>
     <button class="nav-item" data-nav="chat"><span class="dot"></span>Chat</button>
+    <button class="nav-item" data-nav="cron"><span class="dot"></span>Cron</button>
     <button class="nav-item" data-nav="pipeline"><span class="dot"></span>Pipeline</button>
     <button class="nav-item" data-nav="drafts"><span class="dot"></span>Drafts</button>
     <button class="nav-item" data-nav="followups"><span class="dot"></span>Follow-ups</button>
@@ -78,23 +79,6 @@
         <div id="dest-gcloud"></div>
         <div class="row"><button class="btn primary" id="connect-gmail">Connect Gmail</button><span class="form-msg" id="dest-msg"></span></div>
         <p class="hint" style="margin-top:12px;opacity:.55">also a destination: <span class="status s-sourced">LinkedIn — coming</span></p>
-
-        <div class="autosend" id="schedule-panel">
-          <label class="switch"><input type="checkbox" id="sched-enabled"> Run on a schedule</label>
-          <div class="cap-row">
-            <select id="sched-freq" class="pipe-select">
-              <option value="daily">Daily</option>
-              <option value="weekly">Weekly</option>
-            </select>
-            <input type="time" id="sched-time" value="09:00">
-            <select id="sched-weekday" class="pipe-select" hidden>
-              <option value="1">Mon</option><option value="2">Tue</option><option value="3">Wed</option>
-              <option value="4">Thu</option><option value="5">Fri</option><option value="6">Sat</option><option value="0">Sun</option>
-            </select>
-            <button class="btn mini primary" id="sched-save">Save</button>
-          </div>
-          <div class="sched-status" id="sched-status"></div>
-        </div>
       </div>
 
       <div class="panel" data-step="brief" id="panel-message">
@@ -135,6 +119,49 @@
           <button class="btn primary" type="submit" id="chat-send">Send ↵</button>
         </form>
       </div>
+    </div>
+  </section>
+
+  <!-- CRON -->
+  <section class="view" id="view-cron">
+    <header class="view-head">
+      <h1>Cron</h1>
+      <p class="sub">Run coldtrail on a schedule while you're away — source, enrich, draft, and (only if auto-send is on) send. Dry run always drafts only, regardless of auto-send.</p>
+      <div class="row" style="margin-top:12px"><button class="btn primary" id="cron-new" type="button">+ New schedule</button></div>
+    </header>
+
+    <div class="cron-list" id="cron-list"></div>
+
+    <form class="panel cron-form" id="cron-form" hidden>
+      <h2 id="cron-form-title">New schedule</h2>
+      <input type="hidden" id="cf-id" />
+      <label>Name <input id="cf-name" placeholder="e.g. Morning source + draft" autocomplete="off" /></label>
+      <div class="cap-row">
+        <select id="cf-freq" class="pipe-select">
+          <option value="daily">Daily</option>
+          <option value="weekly">Weekly</option>
+        </select>
+        <input type="time" id="cf-time" value="09:00">
+        <select id="cf-weekday" class="pipe-select" hidden>
+          <option value="1">Mon</option><option value="2">Tue</option><option value="3">Wed</option>
+          <option value="4">Thu</option><option value="5">Fri</option><option value="6">Sat</option><option value="0">Sun</option>
+        </select>
+      </div>
+      <div class="cf-taskmode">
+        <label class="check"><input type="radio" name="cf-task-mode" value="agent" checked> Agent decides</label>
+        <label class="check"><input type="radio" name="cf-task-mode" value="custom"> Custom instruction</label>
+      </div>
+      <textarea id="cf-prompt" rows="4" placeholder="e.g. Source 20 companies like Linear and draft intros to the founders" hidden></textarea>
+      <div class="row">
+        <button class="btn primary" type="submit" id="cf-save">Save</button>
+        <button class="btn" type="button" id="cf-cancel">Cancel</button>
+        <span class="form-msg" id="cf-msg"></span>
+      </div>
+    </form>
+
+    <div class="panel">
+      <h2>Run history</h2>
+      <div class="cron-runs" id="cron-runs"></div>
     </div>
   </section>
 
