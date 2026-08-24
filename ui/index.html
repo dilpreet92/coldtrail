@@ -78,6 +78,23 @@
         <div id="dest-gcloud"></div>
         <div class="row"><button class="btn primary" id="connect-gmail">Connect Gmail</button><span class="form-msg" id="dest-msg"></span></div>
         <p class="hint" style="margin-top:12px;opacity:.55">also a destination: <span class="status s-sourced">LinkedIn — coming</span></p>
+
+        <div class="autosend" id="schedule-panel">
+          <label class="switch"><input type="checkbox" id="sched-enabled"> Run on a schedule</label>
+          <div class="cap-row">
+            <select id="sched-freq" class="pipe-select">
+              <option value="daily">Daily</option>
+              <option value="weekly">Weekly</option>
+            </select>
+            <input type="time" id="sched-time" value="09:00">
+            <select id="sched-weekday" class="pipe-select" hidden>
+              <option value="1">Mon</option><option value="2">Tue</option><option value="3">Wed</option>
+              <option value="4">Thu</option><option value="5">Fri</option><option value="6">Sat</option><option value="0">Sun</option>
+            </select>
+            <button class="btn mini primary" id="sched-save">Save</button>
+          </div>
+          <div class="sched-status" id="sched-status"></div>
+        </div>
       </div>
 
       <div class="panel" data-step="brief" id="panel-message">
