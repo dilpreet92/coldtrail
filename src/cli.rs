@@ -105,24 +105,24 @@ pub enum Commands {
     Seed,
     /// Re-download the latest release binary in place
     Update,
-    /// Run one scheduled cycle now (source → enrich → draft; send if auto_send). What the timer calls.
-    Run,
-    /// Install/update or remove the OS timer for scheduled runs.
-    Schedule {
-        /// Run every day
-        #[arg(long, conflicts_with_all = ["weekly", "off"])]
-        daily: bool,
-        /// Run once a week
-        #[arg(long, conflicts_with_all = ["daily", "off"])]
-        weekly: bool,
-        /// Time of day, HH:MM (default 09:00)
-        #[arg(long, default_value = "09:00")]
-        time: String,
-        /// Weekday for --weekly: 0=Sun..6=Sat (default 1=Mon)
+    /// Run one cycle now: agent-decides, or a specific schedule's task. What the timer invokes.
+    Run {
+        /// Run a specific schedule by id (the OS timer passes this)
         #[arg(long)]
-        weekday: Option<u8>,
-        /// Turn the schedule off and remove the timer
+        schedule: Option<String>,
+        /// Produce drafts only — hard-blocked from sending, ignores auto_send
         #[arg(long)]
-        off: bool,
+        draft_only: bool,
     },
+    /// Reconcile OS timers to the saved schedules (after a reinstall).
+    Schedule {
+        #[command(subcommand)]
+        cmd: ScheduleCmd,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ScheduleCmd {
+    /// Reinstall timers for all enabled schedules
+    Sync,
 }

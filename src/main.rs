@@ -83,45 +83,22 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Send { domain }) => deliver::run(&domain).await,
         Some(Commands::Seed) => seed::run(),
         Some(Commands::Update) => update::run().await,
-        Some(Commands::Run) => scheduled::run_once().await,
-        Some(Commands::Schedule {
-            daily: _daily,
-            weekly,
-            time,
-            weekday,
-            off,
+        Some(Commands::Run {
+            schedule,
+            draft_only,
         }) => {
-            let mut cfg = config::load();
-            let sched = if off {
-                config::Schedule {
-                    enabled: false,
-                    ..Default::default()
-                }
+            let trigger = if draft_only {
+                "dry"
+            } else if schedule.is_some() {
+                "scheduled"
             } else {
-                config::Schedule {
-                    enabled: true,
-                    freq: if weekly {
-                        "weekly".into()
-                    } else {
-                        "daily".into()
-                    },
-                    time,
-                    weekday,
-                }
+                "manual"
             };
-            cfg.schedule = Some(sched.clone());
-            config::save(&cfg)?;
-            schedule::apply(&sched)?;
-            println!(
-                "{}",
-                if sched.enabled {
-                    format!("scheduled: {} at {}", sched.freq, sched.time)
-                } else {
-                    "schedule off".into()
-                }
-            );
-            Ok(())
+            scheduled::run(schedule.as_deref(), trigger).await
         }
+        Some(Commands::Schedule { cmd }) => match cmd {
+            cli::ScheduleCmd::Sync => schedule::sync(),
+        },
     }
 }
 

@@ -26,12 +26,6 @@ pub fn custom_brief(instruction: &str) -> String {
     )
 }
 
-/// Kept as a thin wrapper so `main.rs`'s `coldtrail run` still compiles until a later task
-/// wires it directly to `run(schedule_id, trigger)`.
-pub async fn run_once() -> Result<()> {
-    run(None, "manual").await
-}
-
 /// One unattended cycle, optionally attributed to a schedule and tagged with the trigger that
 /// started it ("manual", "cron", "dry", ...). Always returns Ok after recording an outcome so
 /// the OS timer never loops on failure.
@@ -229,12 +223,12 @@ mod tests {
         assert!(c.to_lowercase().contains("don't ask") || c.to_lowercase().contains("do not ask"));
     }
 
-    // Happy path against a mock OpenAI backend: run_once writes a scheduled_runs row + a chat.
+    // Happy path against a mock OpenAI backend: run() writes a scheduled_runs row + a chat.
     // Async temp-home pattern mirrors src/provider/openai.rs::loop_runs_tool_then_finishes —
     // testutil::with_home is sync-only, so hold env_guard and set COLDTRAIL_HOME manually.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn run_once_records_a_run_and_a_chat() {
+    async fn run_records_a_run_and_a_chat() {
         use axum::{routing::post, Json, Router};
         use serde_json::json;
 
@@ -265,7 +259,7 @@ mod tests {
         })
         .unwrap();
 
-        run_once().await.unwrap();
+        run(None, "manual").await.unwrap();
 
         let r = crate::db::last_run().unwrap().unwrap();
         assert_eq!(r.status, "ok");

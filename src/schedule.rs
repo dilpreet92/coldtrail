@@ -1,7 +1,6 @@
 //! Install/remove an OS timer that fires `coldtrail run` on the user's cadence, even when the app
 //! is closed. macOS: a launchd LaunchAgent. Linux: a systemd --user timer (cron fallback). The
 //! timer runs with a minimal env, so we bake the current PATH (+ COLDTRAIL_HOME) into the unit.
-use crate::config::Schedule;
 use crate::db::Schedule as DbSchedule;
 use anyhow::{Context, Result};
 
@@ -14,8 +13,8 @@ fn hh_mm(time: &str) -> (u32, u32) {
 
 // launchd Weekday: 0/7=Sun,1=Mon..6=Sat — matches our 0=Sun..6=Sat for 0..=6.
 /// Shared core for building a launchd plist body. `label` is the `Label` key, `run_args` become
-/// the `ProgramArguments` after `bin` (e.g. `["run"]` for the singular timer, `["run",
-/// "--schedule", id]` for a per-schedule one), and `log_file` names the log under `home_env`.
+/// the `ProgramArguments` after `bin` (e.g. `["run", "--schedule", id]`), and `log_file` names
+/// the log under `home_env`.
 #[allow(clippy::too_many_arguments)]
 fn launchd_plist_core(
     label: &str,
@@ -66,24 +65,7 @@ fn launchd_plist_core(
     )
 }
 
-/// Only reachable from `apply()`'s `target_os = "macos"` path; on Linux it's exercised
-/// directly by the unit tests below, so it's dead in the shipped Linux binary.
-#[allow(dead_code)]
-pub fn launchd_plist(bin: &str, path_env: &str, home_env: Option<&str>, s: &Schedule) -> String {
-    launchd_plist_core(
-        "ai.coldtrail.run",
-        bin,
-        path_env,
-        home_env,
-        &["run"],
-        &s.freq,
-        &s.time,
-        s.weekday,
-        "schedule.log",
-    )
-}
-
-/// Per-schedule variant of [`launchd_plist`]: labels the agent `ai.coldtrail.run.<id>` and points
+/// Per-schedule variant: labels the agent `ai.coldtrail.run.<id>` and points
 /// argv at `run --schedule <id>` so launchd fires the right schedule row.
 #[allow(dead_code)] // only called from apply_one()'s macos path (later task) + tests
 pub fn launchd_plist_for(
@@ -139,27 +121,7 @@ fn systemd_units_core(
     (service, timer)
 }
 
-/// Only reachable from `apply()`'s `target_os = "linux"` path; on macOS it's exercised
-/// directly by the unit tests below, so it's dead in the shipped macOS binary.
-#[allow(dead_code)]
-pub fn systemd_units(
-    bin: &str,
-    path_env: &str,
-    home_env: Option<&str>,
-    s: &Schedule,
-) -> (String, String) {
-    systemd_units_core(
-        bin,
-        path_env,
-        home_env,
-        &["run"],
-        &s.freq,
-        &s.time,
-        s.weekday,
-    )
-}
-
-/// Per-schedule variant of [`systemd_units`]: `ExecStart` runs `run --schedule <id>` so the unit
+/// Per-schedule variant: `ExecStart` runs `run --schedule <id>` so the unit
 /// (named `coldtrail-<id>.{service,timer}` by the caller) fires the right schedule row.
 #[allow(dead_code)] // only called from apply_one()/remove_one()'s linux path (later task) + tests
 pub fn systemd_units_for(
@@ -189,78 +151,10 @@ fn bin_path() -> Result<String> {
     Ok(std::env::current_exe()?.to_string_lossy().into_owned())
 }
 
-/// Install (or remove, if `s.enabled` is false) the OS timer for the current platform.
-#[allow(dead_code)] // wired into the setup/CLI flow by a later task
-pub fn apply(s: &Schedule) -> Result<()> {
-    if !s.enabled {
-        return uninstall();
-    }
-    let bin = bin_path()?;
-    let path = current_path();
-    let home = home_env();
-    #[cfg(target_os = "macos")]
-    {
-        let plist = launchd_plist(&bin, &path, home.as_deref(), s);
-        let dir = dirs_home()?.join("Library/LaunchAgents");
-        std::fs::create_dir_all(&dir)?;
-        let p = dir.join("ai.coldtrail.run.plist");
-        std::fs::write(&p, plist)?;
-        let uid = users_uid();
-        let _ = std::process::Command::new("launchctl")
-            .args(["bootout", &format!("gui/{uid}"), p.to_str().unwrap_or("")])
-            .output();
-        std::process::Command::new("launchctl")
-            .args(["bootstrap", &format!("gui/{uid}"), p.to_str().unwrap_or("")])
-            .output()
-            .context("launchctl bootstrap")?;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let (svc, timer) = systemd_units(&bin, &path, home.as_deref(), s);
-        let dir = dirs_home()?.join(".config/systemd/user");
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join("coldtrail.service"), svc)?;
-        std::fs::write(dir.join("coldtrail.timer"), timer)?;
-        std::process::Command::new("systemctl")
-            .args(["--user", "daemon-reload"])
-            .output()
-            .ok();
-        std::process::Command::new("systemctl")
-            .args(["--user", "enable", "--now", "coldtrail.timer"])
-            .output()
-            .context("systemctl enable")?;
-    }
-    Ok(())
-}
-
-/// Remove the OS timer (idempotent — safe to call even if nothing is installed).
-#[allow(dead_code)] // wired into the setup/CLI flow by a later task
-pub fn uninstall() -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let uid = users_uid();
-        let p = dirs_home()?.join("Library/LaunchAgents/ai.coldtrail.run.plist");
-        let _ = std::process::Command::new("launchctl")
-            .args(["bootout", &format!("gui/{uid}"), p.to_str().unwrap_or("")])
-            .output();
-        let _ = std::fs::remove_file(&p);
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let _ = std::process::Command::new("systemctl")
-            .args(["--user", "disable", "--now", "coldtrail.timer"])
-            .output();
-        let dir = dirs_home()?.join(".config/systemd/user");
-        let _ = std::fs::remove_file(dir.join("coldtrail.timer"));
-        let _ = std::fs::remove_file(dir.join("coldtrail.service"));
-    }
-    Ok(())
-}
-
 /// Install (or remove, if `s.enabled` is false) the OS timer for a single schedule row, keyed by
-/// `s.id`. Unlike [`apply`] (the singular `ai.coldtrail.run` timer), each schedule gets its own
-/// launchd label / systemd unit pair so multiple schedules can run independently.
-#[allow(dead_code)] // wired into the setup/CLI flow by a later task
+/// `s.id`. Each schedule gets its own launchd label / systemd unit pair so multiple schedules can
+/// run independently.
+#[allow(dead_code)] // macos/linux cfg-gated bodies; each half is dead on the other OS
 pub fn apply_one(s: &DbSchedule) -> Result<()> {
     if !s.enabled {
         return remove_one(&s.id);
@@ -309,8 +203,8 @@ pub fn apply_one(s: &DbSchedule) -> Result<()> {
 }
 
 /// Remove the per-schedule OS timer for `id` (idempotent — safe to call even if nothing is
-/// installed). Mirrors [`uninstall`] but targets `ai.coldtrail.run.<id>` / `coldtrail-<id>.*`.
-#[allow(dead_code)] // wired into the setup/CLI flow by a later task
+/// installed). Targets `ai.coldtrail.run.<id>` / `coldtrail-<id>.*`.
+#[allow(dead_code)] // macos/linux cfg-gated bodies; each half is dead on the other OS
 pub fn remove_one(id: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -343,8 +237,9 @@ pub fn remove_one(id: &str) -> Result<()> {
 /// units whose schedule row was deleted out-of-band — deletion goes through remove_one via the
 /// API, so a row dropped directly from the DB (or a unit installed by a since-removed build)
 /// would linger on disk. Enumerate-and-prune is a future nicety, not implemented here.
-#[allow(dead_code)] // wired into the setup/CLI flow by a later task
+#[allow(dead_code)] // exercised via `coldtrail schedule sync`; allow kept for platforms where apply_one/remove_one bodies are cfg'd out
 pub fn sync() -> Result<()> {
+    crate::db::init()?; // matches every other DB-touching CLI entrypoint; needed on a fresh COLDTRAIL_HOME
     for s in crate::db::list_schedules()? {
         apply_one(&s)?;
     }
@@ -372,61 +267,6 @@ fn users_uid() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Schedule;
-
-    #[test]
-    fn plist_daily_has_calendar_and_path() {
-        let s = Schedule {
-            enabled: true,
-            freq: "daily".into(),
-            time: "09:30".into(),
-            weekday: None,
-        };
-        let p = launchd_plist(
-            "/usr/local/bin/coldtrail",
-            "/opt/homebrew/bin:/usr/bin",
-            None,
-            &s,
-        );
-        assert!(p.contains("<string>run</string>"));
-        assert!(p.contains("<key>Hour</key>") && p.contains("<integer>9</integer>"));
-        assert!(p.contains("<key>Minute</key>") && p.contains("<integer>30</integer>"));
-        assert!(!p.contains("<key>Weekday</key>")); // daily => no weekday
-        assert!(p.contains("/opt/homebrew/bin")); // PATH baked in
-        assert!(p.contains("/usr/local/bin/coldtrail"));
-    }
-
-    #[test]
-    fn plist_weekly_includes_weekday() {
-        let s = Schedule {
-            enabled: true,
-            freq: "weekly".into(),
-            time: "08:00".into(),
-            weekday: Some(1),
-        };
-        let p = launchd_plist("/x/coldtrail", "/usr/bin", None, &s);
-        assert!(p.contains("<key>Weekday</key>") && p.contains("<integer>1</integer>"));
-    }
-
-    #[test]
-    fn systemd_timer_oncalendar_daily_and_weekly() {
-        let daily = Schedule {
-            enabled: true,
-            freq: "daily".into(),
-            time: "09:30".into(),
-            weekday: None,
-        };
-        let (_svc, t) = systemd_units("/x/coldtrail", "/usr/bin", None, &daily);
-        assert!(t.contains("OnCalendar=*-*-* 09:30:00"));
-        let weekly = Schedule {
-            enabled: true,
-            freq: "weekly".into(),
-            time: "08:00".into(),
-            weekday: Some(1),
-        };
-        let (_s2, t2) = systemd_units("/x/coldtrail", "/usr/bin", None, &weekly);
-        assert!(t2.contains("OnCalendar=Mon 08:00:00"));
-    }
 
     #[test]
     fn plist_per_schedule_labels_and_targets_the_id() {
