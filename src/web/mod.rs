@@ -8,6 +8,7 @@ pub mod company;
 pub mod followups;
 pub mod onboarding;
 pub mod pipeline;
+pub mod schedule;
 pub mod send;
 
 use axum::{
@@ -122,6 +123,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/contacts", get(pipeline::contacts))
         .route("/api/drafts", get(pipeline::drafts))
         .route("/api/overview", get(pipeline::overview))
+        .route("/api/schedule", get(schedule::get).post(schedule::post))
         .route("/api/followups", get(pipeline::followups))
         .route("/api/followups/check", post(followups::check))
         .route("/api/followups/:domain/mark", post(pipeline::mark_touch))
