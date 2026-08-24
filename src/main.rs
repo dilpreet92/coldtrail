@@ -1,4 +1,5 @@
 mod agents;
+mod chat_store;
 mod cli;
 mod config;
 mod contact;
