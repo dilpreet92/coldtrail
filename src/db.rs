@@ -18,6 +18,17 @@ pub fn open() -> Result<Connection> {
 pub fn init() -> Result<()> {
     let c = open()?;
     c.execute_batch(SCHEMA)?;
+    // scheduled_runs predates this feature; add the attribution columns if missing (idempotent).
+    for (col, decl) in [("schedule_id", "TEXT"), ("trigger", "TEXT")] {
+        let exists: bool = c
+            .prepare("SELECT 1 FROM pragma_table_info('scheduled_runs') WHERE name=?1")?
+            .exists([col])?;
+        if !exists {
+            c.execute_batch(&format!(
+                "ALTER TABLE scheduled_runs ADD COLUMN {col} {decl};"
+            ))?;
+        }
+    }
     Ok(())
 }
 
@@ -113,6 +124,9 @@ pub struct RunRow {
     pub sent: i64,
     pub chat_id: Option<String>,
     pub note: Option<String>,
+    pub schedule_id: Option<String>,
+    pub trigger: Option<String>,
+    pub schedule_name: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -120,7 +134,8 @@ pub fn last_run() -> Result<Option<RunRow>> {
     let c = open()?;
     let row = c
         .query_row(
-            "SELECT started_at, status, sourced, enriched, drafted, sent, chat_id, note \
+            "SELECT started_at, status, sourced, enriched, drafted, sent, chat_id, note, \
+                    schedule_id, trigger \
              FROM scheduled_runs ORDER BY id DESC LIMIT 1",
             [],
             |r| {
@@ -133,11 +148,127 @@ pub fn last_run() -> Result<Option<RunRow>> {
                     sent: r.get(5)?,
                     chat_id: r.get(6)?,
                     note: r.get(7)?,
+                    schedule_id: r.get(8)?,
+                    trigger: r.get(9)?,
+                    schedule_name: None,
                 })
             },
         )
         .optional()?;
     Ok(row)
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct Schedule {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub freq: String,
+    pub time: String,
+    pub weekday: Option<u8>,
+    pub task_mode: String,
+    pub prompt: Option<String>,
+}
+
+fn row_to_schedule(r: &rusqlite::Row) -> rusqlite::Result<Schedule> {
+    Ok(Schedule {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        enabled: r.get::<_, i64>(2)? != 0,
+        freq: r.get(3)?,
+        time: r.get(4)?,
+        weekday: r.get::<_, Option<i64>>(5)?.map(|v| v as u8),
+        task_mode: r.get(6)?,
+        prompt: r.get(7)?,
+    })
+}
+
+/// List all schedules, oldest first. Not yet wired into a command (later task).
+#[allow(dead_code)]
+pub fn list_schedules() -> Result<Vec<Schedule>> {
+    let c = open()?;
+    let mut st = c.prepare(
+        "SELECT id,name,enabled,freq,time,weekday,task_mode,prompt FROM schedules ORDER BY created_at",
+    )?;
+    let out = st
+        .query_map([], row_to_schedule)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(out)
+}
+
+/// Fetch a single schedule by id. Not yet wired into a command (later task).
+#[allow(dead_code)]
+pub fn get_schedule(id: &str) -> Result<Option<Schedule>> {
+    let c = open()?;
+    let s = c
+        .query_row(
+            "SELECT id,name,enabled,freq,time,weekday,task_mode,prompt FROM schedules WHERE id=?1",
+            [id],
+            row_to_schedule,
+        )
+        .optional()?;
+    Ok(s)
+}
+
+/// Insert or update a schedule by id. Not yet wired into a command (later task).
+#[allow(dead_code)]
+pub fn upsert_schedule(s: &Schedule) -> Result<()> {
+    let c = open()?;
+    c.execute(
+        "INSERT INTO schedules (id,name,enabled,freq,time,weekday,task_mode,prompt,updated_at) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,datetime('now')) \
+         ON CONFLICT(id) DO UPDATE SET name=?2,enabled=?3,freq=?4,time=?5,weekday=?6,task_mode=?7,prompt=?8,updated_at=datetime('now')",
+        params![
+            s.id,
+            s.name,
+            s.enabled as i64,
+            s.freq,
+            s.time,
+            s.weekday.map(|w| w as i64),
+            s.task_mode,
+            s.prompt
+        ],
+    )?;
+    Ok(())
+}
+
+/// Delete a schedule by id. Not yet wired into a command (later task).
+#[allow(dead_code)]
+pub fn delete_schedule(id: &str) -> Result<()> {
+    open()?.execute("DELETE FROM schedules WHERE id=?1", [id])?;
+    Ok(())
+}
+
+/// List recent scheduled runs, newest first, with the triggering schedule's name joined in.
+/// Not yet wired into a command (later task).
+#[allow(dead_code)]
+pub fn list_runs(limit: i64) -> Result<Vec<RunRow>> {
+    let c = open()?;
+    let mut st = c.prepare(
+        "SELECT r.started_at,r.status,r.sourced,r.enriched,r.drafted,r.sent,r.chat_id,r.note,\
+                r.schedule_id,r.trigger,s.name \
+         FROM scheduled_runs r LEFT JOIN schedules s ON s.id=r.schedule_id \
+         ORDER BY r.id DESC LIMIT ?1",
+    )?;
+    let out = st
+        .query_map([limit], |r| {
+            Ok(RunRow {
+                started_at: r.get(0)?,
+                status: r.get(1)?,
+                sourced: r.get(2)?,
+                enriched: r.get(3)?,
+                drafted: r.get(4)?,
+                sent: r.get(5)?,
+                chat_id: r.get(6)?,
+                note: r.get(7)?,
+                schedule_id: r.get(8)?,
+                trigger: r.get(9)?,
+                schedule_name: r.get(10)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -202,6 +333,51 @@ mod tests {
             assert_eq!(r.drafted, 3);
             assert_eq!(r.sent, 1);
             assert_eq!(r.chat_id.as_deref(), Some("chat-1"));
+        });
+    }
+
+    #[test]
+    fn schedules_crud_and_runs_join() {
+        crate::testutil::with_home("ct-db-schedules", |_| {
+            crate::db::init().unwrap();
+            let s = Schedule {
+                id: "s1".into(),
+                name: "Fintech".into(),
+                enabled: true,
+                freq: "weekly".into(),
+                time: "09:00".into(),
+                weekday: Some(1),
+                task_mode: "custom".into(),
+                prompt: Some("web-search fintech founders".into()),
+            };
+            upsert_schedule(&s).unwrap();
+            let got = get_schedule("s1").unwrap().unwrap();
+            assert_eq!(got.name, "Fintech");
+            assert_eq!(got.task_mode, "custom");
+            assert_eq!(got.weekday, Some(1));
+            // update
+            let mut s2 = got.clone();
+            s2.enabled = false;
+            s2.name = "FT".into();
+            upsert_schedule(&s2).unwrap();
+            assert_eq!(list_schedules().unwrap().len(), 1);
+            assert_eq!(get_schedule("s1").unwrap().unwrap().name, "FT");
+            // a run attributed to the schedule shows up in list_runs with the joined name
+            let z = Counts {
+                companies: 0,
+                contacts: 0,
+                outreach: 0,
+                sent_today: 0,
+            };
+            record_run("ok", z, z, Some("chat1"), None).unwrap(); // 5-arg still; schedule_id NULL here
+            let runs = list_runs(10).unwrap();
+            assert_eq!(runs.len(), 1);
+            // idempotent init: second call must not error and columns persist
+            crate::db::init().unwrap();
+            assert!(get_schedule("s1").unwrap().is_some());
+            // delete
+            delete_schedule("s1").unwrap();
+            assert!(get_schedule("s1").unwrap().is_none());
         });
     }
 }
