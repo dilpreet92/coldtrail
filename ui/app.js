@@ -49,6 +49,31 @@ async function postJSON(path, body) {
   if (!r.ok) throw new Error(data.message || raw || r.statusText);
   return data;
 }
+// PATCH/DELETE have no existing helper (only GET/POST did) — mirror the same 401 + error-body
+// handling as postJSON so callers get the same "stale session" / real-error surfacing.
+async function patchJSON(path, body) {
+  const r = await fetch(path, {
+    method: "PATCH",
+    credentials: "same-origin",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  if (r.status === 401) throw new Error(SESSION_EXPIRED);
+  const raw = await r.text();
+  let data = {};
+  try { data = raw ? JSON.parse(raw) : {}; } catch (_) {}
+  if (!r.ok) throw new Error(data.message || raw || r.statusText);
+  return data;
+}
+async function deleteJSON(path) {
+  const r = await fetch(path, { method: "DELETE", credentials: "same-origin" });
+  if (r.status === 401) throw new Error(SESSION_EXPIRED);
+  const raw = await r.text();
+  let data = {};
+  try { data = raw ? JSON.parse(raw) : {}; } catch (_) {}
+  if (!r.ok) throw new Error(data.message || raw || r.statusText);
+  return data;
+}
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 
@@ -350,41 +375,213 @@ function wireAutoSend() {
   if (cap) cap.addEventListener("change", () => { if (t.checked) save(); });
 }
 
-// Scheduled runs (Settings). #schedule-panel is static markup in index.html (not re-rendered
-// via innerHTML like the auto-send block), so its listeners are wired once here at load time.
-async function loadSchedule() {
-  let s; try { s = await getJSON("/api/schedule"); } catch (_) { return; }
-  $("#sched-enabled").checked = !!s.enabled;
-  $("#sched-freq").value = s.freq || "daily";
-  $("#sched-time").value = s.time || "09:00";
-  if (s.weekday != null) $("#sched-weekday").value = String(s.weekday);
-  $("#sched-weekday").hidden = s.freq !== "weekly";
-  renderSchedStatus(s.last_run);
+// --- cron (multi-schedule) ---------------------------------------------------
+// #cron-list / #cron-runs are re-rendered via innerHTML on every loadCron(), so their action
+// listeners are (re)wired after each render — same pattern as loaders.pipeline / loaders.drafts.
+loaders.cron = loadCron;
+let cronStatus = {}; // last /api/status snapshot — feeds the auto_send "Run now" guard
+let cronSchedules = []; // last-loaded schedules — feeds Edit (populate the form) and Delete (name in the confirm)
+
+async function loadCron() {
+  let data, runs, status;
+  try { [data, runs, status] = await Promise.all([
+    getJSON("/api/schedules"), getJSON("/api/runs"), getJSON("/api/status").catch(()=>({})) ]); }
+  catch (_) { return; }
+  cronStatus = status || {};
+  // The live API returns a plain array; tolerate a {schedules:[...]} wrapper too.
+  cronSchedules = data.schedules || data || [];
+  renderScheduleCards(cronSchedules, cronStatus);
+  renderRunHistory(runs.runs || runs || []);
 }
-function renderSchedStatus(lr) {
-  const el = $("#sched-status"); if (!el) return;
-  if (!lr) { el.textContent = "No scheduled run yet."; el.className = "sched-status"; return; }
-  if (lr.status === "auth_failed") {
-    el.innerHTML = "⚠ Sign in again — your last scheduled run couldn't authenticate.";
-    el.className = "sched-status warn"; return;
+
+// next-run computed client-side from cadence
+function nextRun(freq, time, weekday) {
+  const [h, m] = (time||"09:00").split(":").map(Number);
+  const now = new Date(); const d = new Date(now); d.setHours(h, m, 0, 0);
+  if (freq === "weekly") {
+    const target = (weekday==null?1:weekday); // 0=Sun..6=Sat
+    let add = (target - d.getDay() + 7) % 7;
+    if (add === 0 && d <= now) add = 7;
+    d.setDate(d.getDate() + add);
+  } else if (d <= now) { d.setDate(d.getDate() + 1); }
+  return d;
+}
+
+const CRON_DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+function cadenceLabel(sc) {
+  return sc.freq === "weekly"
+    ? `Weekly · ${CRON_DAYS[sc.weekday == null ? 1 : sc.weekday]} ${sc.time}`
+    : `Daily · ${sc.time}`;
+}
+function taskBadge(sc) {
+  if (sc.task_mode === "custom") {
+    const p = sc.prompt || "";
+    return `Custom: "${esc(p.slice(0, 40))}${p.length > 40 ? "…" : ""}"`;
   }
-  el.textContent = `Last run ${lr.started_at} · ${lr.status} · sourced ${lr.sourced}, drafts ${lr.drafted}, sent ${lr.sent}`;
-  el.className = "sched-status";
+  return "Agent decides";
 }
-$("#sched-freq").addEventListener("change", (e) => { $("#sched-weekday").hidden = e.target.value !== "weekly"; });
-$("#sched-save").addEventListener("click", async () => {
-  const body = {
-    enabled: $("#sched-enabled").checked,
-    freq: $("#sched-freq").value,
-    time: $("#sched-time").value,
-    weekday: $("#sched-freq").value === "weekly" ? Number($("#sched-weekday").value) : null,
-  };
-  try { const s = await postJSON("/api/schedule", body); renderSchedStatus(s.last_run); toast("Schedule saved.", "ok"); }
-  catch (e) { toast(e.message, "err"); }
+function lastRunLine(lr) {
+  if (!lr) return `<span class="cron-lastrun muted">No runs yet.</span>`;
+  const view = lr.chat_id ? ` <a href="#" class="cron-view-run" data-chat="${escAttr(lr.chat_id)}">view</a>` : "";
+  if (lr.status === "auth_failed") return `<span class="cron-lastrun warn">⚠ last run couldn't authenticate — sign in again</span>${view}`;
+  return `<span class="cron-lastrun">last: ${esc((lr.started_at || "").replace("T", " ").slice(0, 16))} · ${esc(lr.status)} · sourced ${lr.sourced}, enriched ${lr.enriched}, drafted ${lr.drafted}, sent ${lr.sent}</span>${view}`;
+}
+
+function renderScheduleCards(schedules, status) {
+  const host = $("#cron-list");
+  if (!host) return;
+  if (!schedules.length) {
+    host.innerHTML = `<div class="empty">No schedules yet — add one to run coldtrail while you're away.</div>`;
+    return;
+  }
+  host.innerHTML = schedules
+    .map(
+      (sc) => `<div class="cron-card" data-id="${escAttr(sc.id)}">
+        <div class="cron-card-head">
+          <label class="switch"><input type="checkbox" class="cron-enabled" ${sc.enabled ? "checked" : ""}> <strong>${esc(sc.name) || "(untitled)"}</strong></label>
+          <span class="cron-badge">${esc(cadenceLabel(sc))}</span>
+          <span class="cron-badge task">${taskBadge(sc)}</span>
+        </div>
+        <div class="cron-meta">
+          <span class="cron-next">next: ${esc(nextRun(sc.freq, sc.time, sc.weekday).toLocaleString())}</span>
+          ${lastRunLine(sc.last_run)}
+        </div>
+        <div class="cron-actions">
+          <button class="btn mini cron-dry" type="button">Dry run</button>
+          <button class="btn mini primary cron-run" type="button">Run now</button>
+          <button class="btn mini cron-edit" type="button">Edit</button>
+          <button class="btn mini cron-delete" type="button">Delete</button>
+        </div>
+      </div>`
+    )
+    .join("");
+
+  $$("#cron-list .cron-enabled").forEach((cb) =>
+    cb.addEventListener("change", async () => {
+      const id = cb.closest(".cron-card").dataset.id;
+      const enabled = cb.checked;
+      try { await patchJSON(`/api/schedules/${encodeURIComponent(id)}`, { enabled }); toast(enabled ? "Schedule enabled." : "Schedule paused.", "ok"); }
+      catch (e) { cb.checked = !enabled; toast(e.message, "err"); }
+    })
+  );
+  $$("#cron-list .cron-view-run").forEach((a) =>
+    a.addEventListener("click", (e) => { e.preventDefault(); openChat(a.dataset.chat); show("chat"); })
+  );
+  $$("#cron-list .cron-dry").forEach((b) =>
+    b.addEventListener("click", async () => {
+      const id = b.closest(".cron-card").dataset.id;
+      b.disabled = true; b.textContent = "running…";
+      try {
+        await postJSON(`/api/schedules/${encodeURIComponent(id)}/run`, { draft_only: true });
+        toast("Dry run started — drafts only, nothing sent. Check history shortly.", "ok");
+      } catch (e) { toast(e.message, "err"); }
+      finally { b.disabled = false; b.textContent = "Dry run"; setTimeout(loadCron, 1500); }
+    })
+  );
+  $$("#cron-list .cron-run").forEach((b) =>
+    b.addEventListener("click", async () => {
+      if (status.auto_send) {
+        const cap = status.daily_send_cap || 20;
+        if (!confirm("Auto-send is ON — this may send up to " + cap + " real emails. Run live?")) return;
+      }
+      const id = b.closest(".cron-card").dataset.id;
+      b.disabled = true; b.textContent = "running…";
+      try {
+        await postJSON(`/api/schedules/${encodeURIComponent(id)}/run`, { draft_only: false });
+        toast("Run started. Check history shortly.", "ok");
+      } catch (e) { toast(e.message, "err"); }
+      finally { b.disabled = false; b.textContent = "Run now"; setTimeout(loadCron, 1500); }
+    })
+  );
+  $$("#cron-list .cron-edit").forEach((b) =>
+    b.addEventListener("click", () => {
+      const id = b.closest(".cron-card").dataset.id;
+      const sc = schedules.find((s) => s.id === id);
+      if (sc) openCronForm(sc);
+    })
+  );
+  $$("#cron-list .cron-delete").forEach((b) =>
+    b.addEventListener("click", async () => {
+      const id = b.closest(".cron-card").dataset.id;
+      const sc = schedules.find((s) => s.id === id);
+      if (!confirm(`Delete schedule "${sc ? sc.name : id}"? This can't be undone.`)) return;
+      try { await deleteJSON(`/api/schedules/${encodeURIComponent(id)}`); toast("Schedule deleted.", "ok"); await loadCron(); }
+      catch (e) { toast(e.message, "err"); }
+    })
+  );
+}
+
+function renderRunHistory(runs) {
+  const host = $("#cron-runs");
+  if (!host) return;
+  if (!runs.length) { host.innerHTML = `<div class="empty">No runs yet.</div>`; return; }
+  host.innerHTML = runs
+    .map((r) => {
+      const view = r.chat_id ? `<a href="#" class="cron-view-run" data-chat="${escAttr(r.chat_id)}">view</a>` : "";
+      const cls = r.status === "auth_failed" || r.status === "error" ? "bad" : r.status === "ok" ? "ok" : "warn";
+      return `<div class="cron-run-row">
+          <span class="cr-when">${esc((r.started_at || "").replace("T", " ").slice(0, 16))}</span>
+          <span class="cr-name">${esc(r.schedule_name || "manual")}</span>
+          <span class="cr-status ${cls}">${esc(r.status)}</span>
+          <span class="cr-trigger">${esc(r.trigger || "")}</span>
+          <span class="cr-counts">sourced ${r.sourced} · enriched ${r.enriched} · drafted ${r.drafted} · sent ${r.sent}</span>
+          ${view}
+        </div>`;
+    })
+    .join("");
+  $$("#cron-runs .cron-view-run").forEach((a) =>
+    a.addEventListener("click", (e) => { e.preventDefault(); openChat(a.dataset.chat); show("chat"); })
+  );
+}
+
+// New/Edit form. `sc` is the schedule to edit, or null/undefined for a new one.
+function openCronForm(sc) {
+  const form = $("#cron-form");
+  $("#cf-id").value = sc ? sc.id : "";
+  $("#cf-name").value = sc ? sc.name : "";
+  $("#cf-freq").value = sc ? sc.freq : "daily";
+  $("#cf-time").value = sc ? sc.time : "09:00";
+  $("#cf-weekday").value = sc && sc.weekday != null ? String(sc.weekday) : "1";
+  $("#cf-weekday").hidden = $("#cf-freq").value !== "weekly";
+  const mode = sc ? sc.task_mode : "agent";
+  $$('input[name="cf-task-mode"]').forEach((r) => { r.checked = r.value === mode; });
+  $("#cf-prompt").value = sc ? sc.prompt || "" : "";
+  $("#cf-prompt").hidden = mode !== "custom";
+  $("#cron-form-title").textContent = sc ? "Edit schedule" : "New schedule";
+  msg("#cf-msg", "", true);
+  form.hidden = false;
+  form.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+$("#cron-new").addEventListener("click", () => openCronForm(null));
+$("#cf-cancel").addEventListener("click", () => { $("#cron-form").hidden = true; });
+$("#cf-freq").addEventListener("change", (e) => { $("#cf-weekday").hidden = e.target.value !== "weekly"; });
+$$('input[name="cf-task-mode"]').forEach((r) =>
+  r.addEventListener("change", (e) => { $("#cf-prompt").hidden = e.target.value !== "custom"; })
+);
+$("#cron-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const id = $("#cf-id").value;
+  const name = $("#cf-name").value.trim();
+  const freq = $("#cf-freq").value;
+  const time = $("#cf-time").value;
+  const weekday = freq === "weekly" ? Number($("#cf-weekday").value) : null;
+  const taskModeEl = $$('input[name="cf-task-mode"]').find((r) => r.checked);
+  const task_mode = taskModeEl ? taskModeEl.value : "agent";
+  const prompt = $("#cf-prompt").value.trim();
+  if (!name) { msg("#cf-msg", "give it a name", false); return; }
+  if (task_mode === "custom" && !prompt) { msg("#cf-msg", "a custom task needs an instruction", false); return; }
+  const body = { name, freq, time, weekday, task_mode, prompt: task_mode === "custom" ? prompt : null };
+  const btn = $("#cf-save");
+  btn.disabled = true;
+  try {
+    if (id) await patchJSON(`/api/schedules/${encodeURIComponent(id)}`, body);
+    else await postJSON("/api/schedules", { ...body, enabled: true });
+    $("#cron-form").hidden = true;
+    toast(id ? "Schedule updated." : "Schedule created.", "ok");
+    await loadCron();
+  } catch (err) { msg("#cf-msg", err.message, false); }
+  btn.disabled = false;
 });
-// The Settings view reuses the "onboarding" nav slot — loaders.onboarding mirrors every other
-// view's per-nav loader (loaders.company, loaders.pipeline, ...) so opening Settings refreshes it.
-loaders.onboarding = loadSchedule;
 
 // Enrichment (OSINT) setup panel: one row per tool — detected, one-click install, or why not.
 function renderOsint(o) {
