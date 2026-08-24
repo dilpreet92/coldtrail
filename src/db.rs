@@ -94,12 +94,14 @@ pub fn record_run(
     after: Counts,
     chat_id: Option<&str>,
     note: Option<&str>,
+    schedule_id: Option<&str>,
+    trigger: &str,
 ) -> Result<()> {
     let c = open()?;
     c.execute(
         "INSERT INTO scheduled_runs \
-         (finished_at, status, sourced, enriched, drafted, sent, chat_id, note) \
-         VALUES (datetime('now'), ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+         (finished_at, status, sourced, enriched, drafted, sent, chat_id, note, schedule_id, trigger) \
+         VALUES (datetime('now'), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             status,
             (after.companies - before.companies).max(0),
@@ -108,6 +110,8 @@ pub fn record_run(
             (after.sent_today - before.sent_today).max(0),
             chat_id,
             note,
+            schedule_id,
+            trigger,
         ],
     )?;
     Ok(())
@@ -325,7 +329,7 @@ mod tests {
                 outreach: 3,
                 sent_today: 1,
             };
-            record_run("ok", before, after, Some("chat-1"), None).unwrap();
+            record_run("ok", before, after, Some("chat-1"), None, None, "manual").unwrap();
             let r = last_run().unwrap().unwrap();
             assert_eq!(r.status, "ok");
             assert_eq!(r.sourced, 5);
@@ -369,7 +373,7 @@ mod tests {
                 outreach: 0,
                 sent_today: 0,
             };
-            record_run("ok", z, z, Some("chat1"), None).unwrap(); // 5-arg still; schedule_id NULL here
+            record_run("ok", z, z, Some("chat1"), None, None, "manual").unwrap();
             let runs = list_runs(10).unwrap();
             assert_eq!(runs.len(), 1);
             // idempotent init: second call must not error and columns persist

@@ -5,8 +5,7 @@ use crate::provider::cli::Tools;
 use crate::provider::{resolve, run_turn, AgentEvent, GMAIL_TOOL};
 use anyhow::Result;
 
-#[allow(dead_code)] // wired into `coldtrail run` / the scheduler by the next task
-pub fn brief() -> String {
+pub fn agent_brief() -> String {
     "This is an automated scheduled run — no human is watching, so don't ask questions; act. \
      Read product.md and the workspace history. Plan 3–5 fresh, genuinely diverse angles that \
      AVOID companies already sourced or contacted. Run the full loop: source → enrich (prefer your \
@@ -16,13 +15,39 @@ pub fn brief() -> String {
         .to_string()
 }
 
-#[allow(dead_code)] // wired into `coldtrail run` / the scheduler by the next task
+pub fn custom_brief(instruction: &str) -> String {
+    format!(
+        "This is an automated scheduled run — no human is watching, so don't ask questions; act. \
+         Your task for this run: {instruction}\n\n\
+         Work within coldtrail's loop: source (`coldtrail source`) → enrich (prefer your own web \
+         tools) → draft (`coldtrail draft`). Never re-contact a known domain. If config.toml has \
+         auto_send = true, you may send with `coldtrail send <domain>` up to the remaining daily \
+         cap; otherwise leave drafts for review. Report what you did."
+    )
+}
+
+/// Kept as a thin wrapper so `main.rs`'s `coldtrail run` still compiles until a later task
+/// wires it directly to `run(schedule_id, trigger)`.
 pub async fn run_once() -> Result<()> {
+    run(None, "manual").await
+}
+
+/// One unattended cycle, optionally attributed to a schedule and tagged with the trigger that
+/// started it ("manual", "cron", "dry", ...). Always returns Ok after recording an outcome so
+/// the OS timer never loops on failure.
+pub async fn run(schedule_id: Option<&str>, trigger: &str) -> Result<()> {
+    let draft_only = trigger == "dry";
+    if draft_only {
+        std::env::set_var("COLDTRAIL_NO_SEND", "1");
+    }
     // Every fallible step below is best-effort: the doc comment above promises this function
     // ALWAYS resolves to Ok, because Task 7 wires it directly to the OS timer — an `Err` here
     // would make the timer loop on a run that otherwise completed fine.
     if let Err(e) = crate::db::init() {
         crate::logf::log(&format!("scheduled run aborted: {e}"));
+        if draft_only {
+            std::env::remove_var("COLDTRAIL_NO_SEND");
+        }
         return Ok(());
     }
     let backend = resolve();
@@ -40,7 +65,11 @@ pub async fn run_once() -> Result<()> {
                 outreach: 0,
                 sent_today: 0,
             };
-            let _ = crate::db::record_run("auth_failed", z, z, None, Some(&m));
+            let _ =
+                crate::db::record_run("auth_failed", z, z, None, Some(&m), schedule_id, trigger);
+            if draft_only {
+                std::env::remove_var("COLDTRAIL_NO_SEND");
+            }
             return Ok(());
         }
         crate::probe::Outcome::TimedOut => {
@@ -51,7 +80,18 @@ pub async fn run_once() -> Result<()> {
                 outreach: 0,
                 sent_today: 0,
             };
-            let _ = crate::db::record_run("auth_failed", z, z, None, Some("auth probe timed out"));
+            let _ = crate::db::record_run(
+                "auth_failed",
+                z,
+                z,
+                None,
+                Some("auth probe timed out"),
+                schedule_id,
+                trigger,
+            );
+            if draft_only {
+                std::env::remove_var("COLDTRAIL_NO_SEND");
+            }
             return Ok(());
         }
     }
@@ -60,6 +100,9 @@ pub async fn run_once() -> Result<()> {
         Ok(h) => h,
         Err(e) => {
             crate::logf::log(&format!("scheduled run aborted: {e}"));
+            if draft_only {
+                std::env::remove_var("COLDTRAIL_NO_SEND");
+            }
             return Ok(());
         }
     };
@@ -79,16 +122,28 @@ pub async fn run_once() -> Result<()> {
             zero
         }
     };
-    // Title is just "Scheduled run" — the chat list already shows each row's timestamp
-    // (updated_at), so no date crate is needed here.
-    let (chat_id, agent_sid) = match crate::chat_store::create_session("Scheduled run") {
+    let (title, mut msg) =
+        match schedule_id.and_then(|id| crate::db::get_schedule(id).ok().flatten()) {
+            Some(s) if s.task_mode == "custom" => (
+                format!("Scheduled run — {}", s.name),
+                custom_brief(s.prompt.as_deref().unwrap_or("")),
+            ),
+            Some(s) => (format!("Scheduled run — {}", s.name), agent_brief()),
+            None => ("Manual run".to_string(), agent_brief()),
+        };
+    if draft_only {
+        msg = format!("DRY RUN — do NOT send anything; produce drafts only.\n\n{msg}");
+    }
+    let (chat_id, agent_sid) = match crate::chat_store::create_session(&title) {
         Ok(v) => v,
         Err(e) => {
             crate::logf::log(&format!("scheduled run aborted: {e}"));
+            if draft_only {
+                std::env::remove_var("COLDTRAIL_NO_SEND");
+            }
             return Ok(());
         }
     };
-    let msg = brief();
     crate::chat_store::insert_message(&chat_id, "user", &msg);
     crate::logf::log(&format!("scheduled run started (chat {chat_id})"));
 
@@ -128,7 +183,15 @@ pub async fn run_once() -> Result<()> {
         }
     };
     let status = if ok { "ok" } else { "error" };
-    if let Err(e) = crate::db::record_run(status, before, after, Some(&chat_id), None) {
+    if let Err(e) = crate::db::record_run(
+        status,
+        before,
+        after,
+        Some(&chat_id),
+        None,
+        schedule_id,
+        trigger,
+    ) {
         crate::logf::log(&format!("scheduled run: failed to record outcome: {e}"));
     }
     crate::logf::log(&format!(
@@ -138,6 +201,9 @@ pub async fn run_once() -> Result<()> {
         (after.outreach - before.outreach).max(0),
         (after.sent_today - before.sent_today).max(0),
     ));
+    if draft_only {
+        std::env::remove_var("COLDTRAIL_NO_SEND");
+    }
     Ok(())
 }
 
@@ -147,10 +213,20 @@ mod tests {
 
     #[test]
     fn brief_mentions_history_and_the_send_gate() {
-        let b = brief();
+        let b = agent_brief();
         assert!(b.contains("automated scheduled run"));
         assert!(b.to_lowercase().contains("avoid")); // history-aware
         assert!(b.contains("auto_send")); // the gate
+    }
+
+    #[test]
+    fn briefs_carry_guardrails_and_instruction() {
+        assert!(agent_brief().contains("automated"));
+        assert!(agent_brief().to_lowercase().contains("avoid"));
+        let c = custom_brief("web-search fintech founders in London");
+        assert!(c.contains("web-search fintech founders in London")); // the instruction is embedded
+        assert!(c.to_lowercase().contains("auto_send") || c.to_lowercase().contains("send only"));
+        assert!(c.to_lowercase().contains("don't ask") || c.to_lowercase().contains("do not ask"));
     }
 
     // Happy path against a mock OpenAI backend: run_once writes a scheduled_runs row + a chat.
@@ -200,6 +276,64 @@ mod tests {
             .unwrap();
         assert_eq!(chats, 1);
 
+        std::env::remove_var("COLDTRAIL_HOME");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn run_custom_schedule_uses_the_prompt_and_records_trigger() {
+        use axum::{routing::post, Json, Router};
+        use serde_json::json;
+        let _g = crate::testutil::env_guard();
+        let home = std::env::temp_dir().join("ct-run-custom");
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("COLDTRAIL_HOME", &home);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|_b: String| async {
+                Json(json!({"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}))
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        crate::config::save(&crate::config::Config {
+            agent: Some("openai".into()),
+            provider: Some(crate::config::Provider {
+                base_url: Some(format!("http://{addr}")),
+                model: Some("m".into()),
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        crate::db::init().unwrap();
+        crate::db::upsert_schedule(&crate::db::Schedule {
+            id: "s1".into(),
+            name: "FT".into(),
+            enabled: true,
+            freq: "daily".into(),
+            time: "09:00".into(),
+            weekday: None,
+            task_mode: "custom".into(),
+            prompt: Some("XYZZY-marker instruction".into()),
+        })
+        .unwrap();
+
+        run(Some("s1"), "manual").await.unwrap();
+
+        let runs = crate::db::list_runs(10).unwrap();
+        assert_eq!(runs[0].trigger.as_deref(), Some("manual"));
+        assert_eq!(runs[0].schedule_id.as_deref(), Some("s1"));
+        // the custom instruction reached the chat as the user message
+        let c = crate::db::open().unwrap();
+        let msg: String = c
+            .query_row(
+                "SELECT content FROM chat_messages WHERE role='user' ORDER BY id LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(msg.contains("XYZZY-marker instruction"));
         std::env::remove_var("COLDTRAIL_HOME");
     }
 }
