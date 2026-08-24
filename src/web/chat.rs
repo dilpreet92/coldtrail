@@ -22,29 +22,6 @@ use crate::provider::{resolve, run_turn, AgentEvent, GMAIL_TOOL};
 /// How long an unclaimed run (POSTed but never streamed) lingers before eviction.
 const RUN_TTL: Duration = Duration::from_secs(45);
 
-fn title_from(msg: &str) -> String {
-    let t = msg.trim().replace('\n', " ");
-    if t.chars().count() > 60 {
-        format!("{}…", t.chars().take(60).collect::<String>())
-    } else {
-        t
-    }
-}
-
-/// Persist a chat message (best-effort; never blocks the turn on a DB hiccup).
-fn insert_message(chat_id: &str, role: &str, content: &str) {
-    if let Ok(c) = crate::db::open() {
-        let _ = c.execute(
-            "INSERT INTO chat_messages (session_id, role, content) VALUES (?1, ?2, ?3)",
-            params![chat_id, role, content],
-        );
-        let _ = c.execute(
-            "UPDATE chat_sessions SET updated_at=datetime('now') WHERE id=?1",
-            [chat_id],
-        );
-    }
-}
-
 pub async fn start(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatReq>,
@@ -82,10 +59,10 @@ pub async fn start(
             let _ = c.execute(
                 "INSERT INTO chat_sessions (id, agent_session_id, title) VALUES (?1, ?2, ?3) \
                  ON CONFLICT(id) DO NOTHING",
-                params![chat_id, agent_sid, title_from(&msg)],
+                params![chat_id, agent_sid, crate::chat_store::title_from(&msg)],
             );
         }
-        insert_message(&chat_id, "user", &msg);
+        crate::chat_store::insert_message(&chat_id, "user", &msg);
 
         // Run the turn on an inner channel so we can both persist and forward its events.
         let (tx_a, mut rx_a) = mpsc::channel::<AgentEvent>(128);
@@ -130,7 +107,7 @@ pub async fn start(
             }
         }
         if !assistant.trim().is_empty() {
-            insert_message(&chat_id, "assistant", assistant.trim());
+            crate::chat_store::insert_message(&chat_id, "assistant", assistant.trim());
         }
         let mut s = st.chat.lock().await;
         if let Some(sid) = new_session {

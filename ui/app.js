@@ -328,7 +328,7 @@ function renderDestination(s) {
 function autoSendBlock(s) {
   return `<div class="autosend">
     <label class="switch"><input type="checkbox" id="as-toggle"${s.auto_send ? " checked" : ""} /> <span>Auto-send (skip the manual Gmail step)</span></label>
-    <p class="hint">When on, <strong>Send</strong> on the Drafts screen sends the email for real instead of saving a draft. Turn this on only once you trust the drafts. There's no undo on a sent email.</p>
+    <p class="hint">When on, <strong>Send</strong> on the Drafts screen sends the email for real instead of saving a draft. Turn this on only once you trust the drafts. There's no undo on a sent email — also lets scheduled runs send unattended.</p>
     <label class="cap-row">Daily send cap <input type="number" id="as-cap" min="1" max="500" value="${s.daily_send_cap}" /></label>
     <span class="form-msg" id="as-msg"></span>
   </div>`;
@@ -349,6 +349,42 @@ function wireAutoSend() {
   const cap = $("#as-cap");
   if (cap) cap.addEventListener("change", () => { if (t.checked) save(); });
 }
+
+// Scheduled runs (Settings). #schedule-panel is static markup in index.html (not re-rendered
+// via innerHTML like the auto-send block), so its listeners are wired once here at load time.
+async function loadSchedule() {
+  let s; try { s = await getJSON("/api/schedule"); } catch (_) { return; }
+  $("#sched-enabled").checked = !!s.enabled;
+  $("#sched-freq").value = s.freq || "daily";
+  $("#sched-time").value = s.time || "09:00";
+  if (s.weekday != null) $("#sched-weekday").value = String(s.weekday);
+  $("#sched-weekday").hidden = s.freq !== "weekly";
+  renderSchedStatus(s.last_run);
+}
+function renderSchedStatus(lr) {
+  const el = $("#sched-status"); if (!el) return;
+  if (!lr) { el.textContent = "No scheduled run yet."; el.className = "sched-status"; return; }
+  if (lr.status === "auth_failed") {
+    el.innerHTML = "⚠ Sign in again — your last scheduled run couldn't authenticate.";
+    el.className = "sched-status warn"; return;
+  }
+  el.textContent = `Last run ${lr.started_at} · ${lr.status} · sourced ${lr.sourced}, drafts ${lr.drafted}, sent ${lr.sent}`;
+  el.className = "sched-status";
+}
+$("#sched-freq").addEventListener("change", (e) => { $("#sched-weekday").hidden = e.target.value !== "weekly"; });
+$("#sched-save").addEventListener("click", async () => {
+  const body = {
+    enabled: $("#sched-enabled").checked,
+    freq: $("#sched-freq").value,
+    time: $("#sched-time").value,
+    weekday: $("#sched-freq").value === "weekly" ? Number($("#sched-weekday").value) : null,
+  };
+  try { const s = await postJSON("/api/schedule", body); renderSchedStatus(s.last_run); toast("Schedule saved.", "ok"); }
+  catch (e) { toast(e.message, "err"); }
+});
+// The Settings view reuses the "onboarding" nav slot — loaders.onboarding mirrors every other
+// view's per-nav loader (loaders.company, loaders.pipeline, ...) so opening Settings refreshes it.
+loaders.onboarding = loadSchedule;
 
 // Enrichment (OSINT) setup panel: one row per tool — detected, one-click install, or why not.
 function renderOsint(o) {

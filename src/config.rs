@@ -4,6 +4,17 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Schedule {
+    pub enabled: bool,
+    /// "daily" | "weekly"
+    pub freq: String,
+    /// "HH:MM" local 24h
+    pub time: String,
+    /// 0=Sun..6=Sat, weekly only
+    pub weekday: Option<u8>,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
     /// "claude" | "codex" | "openai"
@@ -15,6 +26,8 @@ pub struct Config {
     pub auto_send: bool,
     /// Safety cap on auto-sends per calendar day (deliverability / warmup). Defaults to 20.
     pub daily_send_cap: Option<u32>,
+    #[serde(default)]
+    pub schedule: Option<Schedule>,
 }
 
 /// The effective daily auto-send cap (config value or the default).
@@ -77,6 +90,32 @@ mod tests {
             let got = load();
             assert!(got.auto_send);
             assert_eq!(got.daily_send_cap, Some(7));
+        });
+    }
+
+    #[test]
+    fn schedule_roundtrips_and_defaults_absent() {
+        crate::testutil::with_home("ct-config-sched", |_| {
+            crate::home::workspace().unwrap();
+            // absent in old config -> None, no error
+            save(&Config::default()).unwrap();
+            assert!(load().schedule.is_none());
+            // roundtrip
+            let c = Config {
+                schedule: Some(Schedule {
+                    enabled: true,
+                    freq: "weekly".into(),
+                    time: "09:00".into(),
+                    weekday: Some(1),
+                }),
+                ..Default::default()
+            };
+            save(&c).unwrap();
+            let got = load().schedule.unwrap();
+            assert_eq!(got.freq, "weekly");
+            assert_eq!(got.time, "09:00");
+            assert_eq!(got.weekday, Some(1));
+            assert!(got.enabled);
         });
     }
 }

@@ -57,3 +57,16 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     content     TEXT,
     created_at  TEXT DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS scheduled_runs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    finished_at TEXT,
+    status      TEXT NOT NULL,
+    sourced     INTEGER NOT NULL DEFAULT 0,
+    enriched    INTEGER NOT NULL DEFAULT 0,
+    drafted     INTEGER NOT NULL DEFAULT 0,
+    sent        INTEGER NOT NULL DEFAULT 0,
+    chat_id     TEXT,
+    note        TEXT
+);

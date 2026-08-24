@@ -105,4 +105,24 @@ pub enum Commands {
     Seed,
     /// Re-download the latest release binary in place
     Update,
+    /// Run one scheduled cycle now (source → enrich → draft; send if auto_send). What the timer calls.
+    Run,
+    /// Install/update or remove the OS timer for scheduled runs.
+    Schedule {
+        /// Run every day
+        #[arg(long, conflicts_with_all = ["weekly", "off"])]
+        daily: bool,
+        /// Run once a week
+        #[arg(long, conflicts_with_all = ["daily", "off"])]
+        weekly: bool,
+        /// Time of day, HH:MM (default 09:00)
+        #[arg(long, default_value = "09:00")]
+        time: String,
+        /// Weekday for --weekly: 0=Sun..6=Sat (default 1=Mon)
+        #[arg(long)]
+        weekday: Option<u8>,
+        /// Turn the schedule off and remove the timer
+        #[arg(long)]
+        off: bool,
+    },
 }
