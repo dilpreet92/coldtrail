@@ -1023,6 +1023,11 @@ let teardownStream = null;
 // Live-poll handle for a scheduled run's chat opened via openChat() — cleared whenever the
 // user switches chats or starts a new one, mirroring teardownStream's cancel-on-switch discipline.
 let cronPoll = null;
+// Generation counter for openChat(): each call captures the value at its start (`myGen`) and
+// re-checks it after every await. A newer openChat() bumps this, so a superseded call (and its
+// poll, which re-checks per tick) bails instead of racing to overwrite `cronPoll` with an
+// orphaned interval that would poll the wrong chat forever.
+let openSeq = 0;
 // The page (window) is the scroll container — #chat-log has no height of its own — so follow
 // new chat output by scrolling the window, not the log element (log.scrollTop was a no-op).
 // Guarded to the chat view so a stray event can't yank another screen.
@@ -1118,23 +1123,32 @@ function renderMessages(list, running) {
 }
 
 async function openChat(id) {
+  // Captured synchronously before any await, so a later openChat() call (e.g. the user clicking
+  // a different chat before this one's fetches resolve) can be detected below and this call can
+  // bail instead of racing to render/poll the wrong chat.
+  const myGen = ++openSeq;
   if (teardownStream) teardownStream(); // stop the previous chat's live stream leaking in here
   if (cronPoll) { clearInterval(cronPoll); cronPoll = null; } // cancel any prior run's live poll
   try {
     const d = await getJSON(`/api/chats/${encodeURIComponent(id)}`);
+    if (myGen !== openSeq) return; // superseded while awaiting — a newer openChat() owns the screen now
     await postJSON(`/api/chats/${encodeURIComponent(id)}/activate`, {});
+    if (myGen !== openSeq) return;
     renderMessages(d.messages, d.running);
     scrollChatToBottom();
     await loadChatList();
     if (d.running) {
-      cronPoll = setInterval(async () => {
+      const handle = setInterval(async () => {
+        if (myGen !== openSeq) { clearInterval(handle); return; } // this chat is no longer the one on screen
         try {
           const d2 = await getJSON(`/api/chats/${encodeURIComponent(id)}`);
+          if (myGen !== openSeq) { clearInterval(handle); return; }
           renderMessages(d2.messages, d2.running);
           scrollChatToBottom();
-          if (!d2.running) { clearInterval(cronPoll); cronPoll = null; }
-        } catch (_) { clearInterval(cronPoll); cronPoll = null; }
+          if (!d2.running) { clearInterval(handle); if (cronPoll === handle) cronPoll = null; }
+        } catch (_) { clearInterval(handle); if (cronPoll === handle) cronPoll = null; }
       }, 2000);
+      cronPoll = handle;
     }
   } catch (e) { toast(e.message, "err"); }
 }
