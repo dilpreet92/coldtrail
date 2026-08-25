@@ -29,6 +29,15 @@ pub fn init() -> Result<()> {
             ))?;
         }
     }
+    // chat_sessions predates this feature; add the live-progress flag if missing (idempotent).
+    let has_running: bool = c
+        .prepare("SELECT 1 FROM pragma_table_info('chat_sessions') WHERE name='running'")?
+        .exists([])?;
+    if !has_running {
+        c.execute_batch(
+            "ALTER TABLE chat_sessions ADD COLUMN running INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
     Ok(())
 }
 
@@ -244,6 +253,31 @@ pub fn delete_schedule(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Mark a chat session's live-progress flag. Not yet wired into a command (later task).
+#[allow(dead_code)]
+pub fn set_chat_running(chat_id: &str, running: bool) -> Result<()> {
+    open()?.execute(
+        "UPDATE chat_sessions SET running=?1 WHERE id=?2",
+        params![running as i64, chat_id],
+    )?;
+    Ok(())
+}
+
+/// Whether a chat session currently has a live run in progress. Not yet wired into a
+/// command (later task).
+#[allow(dead_code)]
+pub fn chat_running(chat_id: &str) -> Result<bool> {
+    let c = open()?;
+    let v: Option<i64> = c
+        .query_row(
+            "SELECT running FROM chat_sessions WHERE id=?1",
+            [chat_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(v.unwrap_or(0) != 0)
+}
+
 /// List recent scheduled runs, newest first, with the triggering schedule's name joined in.
 /// Not yet wired into a command (later task).
 #[allow(dead_code)]
@@ -382,6 +416,26 @@ mod tests {
             // delete
             delete_schedule("s1").unwrap();
             assert!(get_schedule("s1").unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn chat_running_flag_roundtrips() {
+        crate::testutil::with_home("ct-db-running", |_| {
+            crate::db::init().unwrap();
+            let c = crate::db::open().unwrap();
+            c.execute(
+                "INSERT INTO chat_sessions (id, agent_session_id, title) VALUES ('c1','a1','t')",
+                [],
+            )
+            .unwrap();
+            assert!(!chat_running("c1").unwrap());
+            set_chat_running("c1", true).unwrap();
+            assert!(chat_running("c1").unwrap());
+            set_chat_running("c1", false).unwrap();
+            assert!(!chat_running("c1").unwrap());
+            crate::db::init().unwrap(); // idempotent ALTER
+            assert!(!chat_running("c1").unwrap());
         });
     }
 }
