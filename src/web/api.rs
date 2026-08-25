@@ -165,6 +165,8 @@ pub struct ChatDetail {
     pub id: String,
     pub title: Option<String>,
     pub messages: Vec<ChatMessageDto>,
+    /// True while a scheduled/CLI run is actively writing to this chat — lets the UI keep polling.
+    pub running: bool,
 }
 
 #[derive(Deserialize)]

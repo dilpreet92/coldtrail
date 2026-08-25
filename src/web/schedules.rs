@@ -232,28 +232,45 @@ pub async fn remove(
 /// requests. Setting that env var in-process would spuriously block legitimate concurrent sends
 /// during a dry run, or (with overlapping dry runs and auto_send on) let a dry run actually send.
 /// A subprocess isolates the env gate to the child, exactly like the OS timer path
-/// (`schedule.rs::apply_one`). The HTTP handler returns immediately; a background task awaits the
-/// child so it's reaped, and the UI finds out by polling `/api/runs` rather than from this
-/// response.
+/// (`schedule.rs::apply_one`). The chat row is pre-created here (not by the child) so the
+/// response can hand its id straight back to the UI, which opens/polls that chat immediately;
+/// `running` is set true right away so the first poll already sees it live. The HTTP handler
+/// returns as soon as the subprocess is spawned; a background task awaits the child so it's
+/// reaped.
 pub async fn run_now(
     State(_s): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(req): Json<RunNowReq>,
 ) -> Result<Response, ApiErr> {
-    if crate::db::get_schedule(&id).map_err(ApiErr)?.is_none() {
+    let Some(sched) = crate::db::get_schedule(&id).map_err(ApiErr)? else {
         return Ok((StatusCode::NOT_FOUND, "schedule not found").into_response());
-    }
+    };
     let draft_only = req.draft_only;
+    // Pre-create the chat here (server-side) so we can hand its id back immediately: the UI
+    // opens/polls this chat right away rather than waiting on the subprocess to create it.
+    let (chat_id, _agent_sid) =
+        crate::chat_store::create_session(&format!("Scheduled run — {}", sched.name))
+            .map_err(ApiErr)?;
+    let _ = crate::db::set_chat_running(&chat_id, true);
     let exe = std::env::current_exe().map_err(|e| ApiErr(anyhow::anyhow!(e)))?;
     let trigger = if draft_only { "dry" } else { "manual" };
+    let cid = chat_id.clone();
     // Detached: a background task awaits the child so it's reaped, but the HTTP handler returns now.
     tokio::spawn(async move {
         let _ = tokio::process::Command::new(exe)
-            .args(["run", "--schedule", &id, "--trigger", trigger])
+            .args([
+                "run",
+                "--schedule",
+                &id,
+                "--trigger",
+                trigger,
+                "--chat",
+                &cid,
+            ])
             .status()
             .await;
     });
-    Ok(Json(serde_json::json!({ "ok": true })).into_response())
+    Ok(Json(serde_json::json!({ "chat_id": chat_id })).into_response())
 }
 
 pub async fn runs(State(_s): State<Arc<AppState>>) -> Result<Json<Vec<RunDto>>, ApiErr> {
