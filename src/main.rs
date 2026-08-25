@@ -87,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
             schedule,
             draft_only,
             trigger,
+            chat,
         }) => {
             let derived = if draft_only {
                 "dry"
@@ -96,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
                 "manual"
             };
             let effective_trigger = trigger.as_deref().unwrap_or(derived);
-            scheduled::run(schedule.as_deref(), effective_trigger).await
+            scheduled::run(schedule.as_deref(), effective_trigger, chat.as_deref()).await
         }
         Some(Commands::Schedule { cmd }) => match cmd {
             cli::ScheduleCmd::Sync => schedule::sync(),

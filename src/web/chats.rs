@@ -31,7 +31,8 @@ pub async fn list(State(state): State<Arc<AppState>>) -> Result<Json<Vec<ChatSum
     Ok(Json(rows))
 }
 
-/// One conversation's transcript.
+/// One conversation's transcript (all roles, including `tool`), plus whether a run is
+/// currently live-writing to it (so the UI knows whether to keep polling).
 pub async fn detail(Path(id): Path<String>) -> Result<Json<ChatDetail>, ApiErr> {
     let c = crate::db::open()?;
     let title: Option<String> = c
@@ -40,6 +41,7 @@ pub async fn detail(Path(id): Path<String>) -> Result<Json<ChatDetail>, ApiErr> 
         })
         .optional()?
         .flatten();
+    let running = crate::db::chat_running(&id)?;
     let mut stmt = c.prepare(
         "SELECT role, content, COALESCE(created_at,'') FROM chat_messages \
          WHERE session_id=?1 ORDER BY id",
@@ -57,6 +59,7 @@ pub async fn detail(Path(id): Path<String>) -> Result<Json<ChatDetail>, ApiErr> 
         id,
         title,
         messages,
+        running,
     }))
 }
 

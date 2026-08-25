@@ -118,6 +118,10 @@ pub enum Commands {
         /// so the dry-run env gate stays isolated to the child.
         #[arg(long)]
         trigger: Option<String>,
+        /// Reuse a pre-created chat id (the web run-now endpoint pre-creates one so the UI
+        /// can open it immediately and watch progress land live).
+        #[arg(long)]
+        chat: Option<String>,
     },
     /// Reconcile OS timers to the saved schedules (after a reinstall).
     Schedule {

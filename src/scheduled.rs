@@ -27,9 +27,17 @@ pub fn custom_brief(instruction: &str) -> String {
 }
 
 /// One unattended cycle, optionally attributed to a schedule and tagged with the trigger that
-/// started it ("manual", "cron", "dry", ...). Always returns Ok after recording an outcome so
-/// the OS timer never loops on failure.
-pub async fn run(schedule_id: Option<&str>, trigger: &str) -> Result<()> {
+/// started it ("manual", "cron", "dry", ...). `chat_id`, when given, is a chat the caller
+/// (the web run-now endpoint) already pre-created so its UI can open it and watch progress land
+/// live; when absent a fresh chat is created here as before. Always returns Ok after recording
+/// an outcome so the OS timer never loops on failure.
+pub async fn run(schedule_id: Option<&str>, trigger: &str, chat_id: Option<&str>) -> Result<()> {
+    // The web run-now endpoint pre-creates the chat and marks it running=1 BEFORE spawning this
+    // subprocess, so its UI can open the chat and poll for live progress. If we abort below
+    // before reaching the point where `running` is normally cleared (the auth-gate / workspace
+    // checks all happen before that), we must clear it ourselves or the pre-created chat is
+    // stuck "running" forever with zero messages and the UI polls it indefinitely.
+    let precreated = chat_id;
     let draft_only = trigger == "dry";
     if draft_only {
         std::env::set_var("COLDTRAIL_NO_SEND", "1");
@@ -59,8 +67,18 @@ pub async fn run(schedule_id: Option<&str>, trigger: &str) -> Result<()> {
                 outreach: 0,
                 sent_today: 0,
             };
-            let _ =
-                crate::db::record_run("auth_failed", z, z, None, Some(&m), schedule_id, trigger);
+            let _ = crate::db::record_run(
+                "auth_failed",
+                z,
+                z,
+                precreated,
+                Some(&m),
+                schedule_id,
+                trigger,
+            );
+            if let Some(id) = precreated {
+                let _ = crate::db::set_chat_running(id, false);
+            }
             if draft_only {
                 std::env::remove_var("COLDTRAIL_NO_SEND");
             }
@@ -78,11 +96,14 @@ pub async fn run(schedule_id: Option<&str>, trigger: &str) -> Result<()> {
                 "auth_failed",
                 z,
                 z,
-                None,
+                precreated,
                 Some("auth probe timed out"),
                 schedule_id,
                 trigger,
             );
+            if let Some(id) = precreated {
+                let _ = crate::db::set_chat_running(id, false);
+            }
             if draft_only {
                 std::env::remove_var("COLDTRAIL_NO_SEND");
             }
@@ -94,6 +115,9 @@ pub async fn run(schedule_id: Option<&str>, trigger: &str) -> Result<()> {
         Ok(h) => h,
         Err(e) => {
             crate::logf::log(&format!("scheduled run aborted: {e}"));
+            if let Some(id) = precreated {
+                let _ = crate::db::set_chat_running(id, false);
+            }
             if draft_only {
                 std::env::remove_var("COLDTRAIL_NO_SEND");
             }
@@ -128,31 +152,63 @@ pub async fn run(schedule_id: Option<&str>, trigger: &str) -> Result<()> {
     if draft_only {
         msg = format!("DRY RUN — do NOT send anything; produce drafts only.\n\n{msg}");
     }
-    let (chat_id, agent_sid) = match crate::chat_store::create_session(&title) {
-        Ok(v) => v,
-        Err(e) => {
-            crate::logf::log(&format!("scheduled run aborted: {e}"));
-            if draft_only {
-                std::env::remove_var("COLDTRAIL_NO_SEND");
+    let (chat_id, agent_sid) = match chat_id {
+        Some(id) => {
+            let cid = id.to_string();
+            let asid = uuid::Uuid::new_v4().to_string();
+            // The web pre-creates this row; if it's somehow absent, create it now.
+            if let Ok(c) = crate::db::open() {
+                let _ = c.execute(
+                    "INSERT OR IGNORE INTO chat_sessions (id, agent_session_id, title) \
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![cid, asid, title],
+                );
             }
-            return Ok(());
+            (cid, asid)
         }
+        None => match crate::chat_store::create_session(&title) {
+            Ok(v) => v,
+            Err(e) => {
+                crate::logf::log(&format!("scheduled run aborted: {e}"));
+                if draft_only {
+                    std::env::remove_var("COLDTRAIL_NO_SEND");
+                }
+                return Ok(());
+            }
+        },
     };
     crate::chat_store::insert_message(&chat_id, "user", &msg);
+    let _ = crate::db::set_chat_running(&chat_id, true);
     crate::logf::log(&format!("scheduled run started (chat {chat_id})"));
 
-    // Drive one turn; accumulate the reply + capture a provider session id; log events.
+    // Drive one turn; accumulate the reply + capture a provider session id; log events. Text
+    // and tool events are persisted as they arrive so the chat UI can show live progress.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(128);
     let tools = Tools::Disallow(&[GMAIL_TOOL]);
     let turn = run_turn(&backend, &agent_sid, true, &msg, &home, &tools, tx);
     let mut assistant = String::new();
     let mut new_session: Option<String> = None;
+    let mut live_id: i64 = 0;
     let drain = async {
         while let Some(ev) = rx.recv().await {
             match &ev {
-                AgentEvent::Text { text } => assistant.push_str(text),
+                AgentEvent::Text { text } => {
+                    assistant.push_str(text);
+                    if live_id == 0 {
+                        live_id = crate::chat_store::insert_returning_id(
+                            &chat_id,
+                            "assistant",
+                            assistant.trim(),
+                        );
+                    } else {
+                        crate::chat_store::update_content(live_id, assistant.trim());
+                    }
+                }
                 AgentEvent::Session { id } => new_session = Some(id.clone()),
-                AgentEvent::ToolStart { name, .. } => crate::logf::log(&format!("  tool: {name}")),
+                AgentEvent::ToolStart { name, .. } => {
+                    crate::chat_store::insert_message(&chat_id, "tool", name);
+                    crate::logf::log(&format!("  tool: {name}"));
+                }
                 AgentEvent::Error { message } => crate::logf::log(&format!("  error: {message}")),
                 _ => {}
             }
@@ -164,7 +220,11 @@ pub async fn run(schedule_id: Option<&str>, trigger: &str) -> Result<()> {
         crate::chat_store::set_agent_session(&chat_id, sid);
     }
     if !assistant.trim().is_empty() {
-        crate::chat_store::insert_message(&chat_id, "assistant", assistant.trim());
+        if live_id == 0 {
+            crate::chat_store::insert_returning_id(&chat_id, "assistant", assistant.trim());
+        } else {
+            crate::chat_store::update_content(live_id, assistant.trim());
+        }
     }
 
     let after = match crate::db::open().and_then(|c| crate::db::counts(&c)) {
@@ -195,6 +255,7 @@ pub async fn run(schedule_id: Option<&str>, trigger: &str) -> Result<()> {
         (after.outreach - before.outreach).max(0),
         (after.sent_today - before.sent_today).max(0),
     ));
+    let _ = crate::db::set_chat_running(&chat_id, false);
     if draft_only {
         std::env::remove_var("COLDTRAIL_NO_SEND");
     }
@@ -259,7 +320,7 @@ mod tests {
         })
         .unwrap();
 
-        run(None, "manual").await.unwrap();
+        run(None, "manual", None).await.unwrap();
 
         let r = crate::db::last_run().unwrap().unwrap();
         assert_eq!(r.status, "ok");
@@ -313,7 +374,7 @@ mod tests {
         })
         .unwrap();
 
-        run(Some("s1"), "manual").await.unwrap();
+        run(Some("s1"), "manual", None).await.unwrap();
 
         let runs = crate::db::list_runs(10).unwrap();
         assert_eq!(runs[0].trigger.as_deref(), Some("manual"));
@@ -328,6 +389,155 @@ mod tests {
             )
             .unwrap();
         assert!(msg.contains("XYZZY-marker instruction"));
+        std::env::remove_var("COLDTRAIL_HOME");
+    }
+
+    // Drives a tool call then a finishing reply — mirrors
+    // src/provider/openai.rs::loop_runs_tool_then_finishes — so the run produces both a
+    // ToolStart (persisted as a role='tool' row) and Text (persisted as a live-updated
+    // role='assistant' row), and asserts `chat_sessions.running` ends at 0.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn run_persists_progress_and_clears_running() {
+        use axum::{routing::post, Json, Router};
+        use serde_json::json;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let _g = crate::testutil::env_guard();
+        let home = std::env::temp_dir().join("ct-scheduled-progress-test");
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("COLDTRAIL_HOME", &home);
+
+        // mock server. Call 0 is `scheduled::run`'s own auth probe (a throwaway "reply with
+        // ok" turn) — answer it directly so it doesn't eat the tool-call turn below. Call 1
+        // (the real turn's first request) -> a tool_call; call 2 -> content+stop. Same
+        // tool_call/content shape as provider::openai's loop_runs_tool_then_finishes.
+        let n = Arc::new(AtomicUsize::new(0));
+        let n2 = n.clone();
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |_b: String| {
+                let n = n2.clone();
+                async move {
+                    let i = n.fetch_add(1, Ordering::SeqCst);
+                    if i == 0 {
+                        Json(json!({"choices":[{"message":{"role":"assistant","content":"ok"},
+                            "finish_reason":"stop"}]}))
+                    } else if i == 1 {
+                        Json(json!({"choices":[{"message":{"role":"assistant","content":null,
+                            "tool_calls":[{"id":"c1","type":"function",
+                            "function":{"name":"list_companies","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}))
+                    } else {
+                        Json(json!({"choices":[{"message":{"role":"assistant","content":"All set."},
+                            "finish_reason":"stop"}]}))
+                    }
+                }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+
+        crate::config::save(&crate::config::Config {
+            agent: Some("openai".into()),
+            provider: Some(crate::config::Provider {
+                base_url: Some(format!("http://{addr}")),
+                model: Some("m".into()),
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        crate::db::init().unwrap();
+
+        run(None, "manual", None).await.unwrap();
+
+        let r = crate::db::last_run().unwrap().unwrap();
+        let chat_id = r.chat_id.expect("run recorded a chat");
+
+        let c = crate::db::open().unwrap();
+        let tool_rows: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM chat_messages WHERE session_id=?1 AND role='tool'",
+                [&chat_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(tool_rows >= 1, "expected a persisted tool row");
+        let assistant: String = c
+            .query_row(
+                "SELECT content FROM chat_messages WHERE session_id=?1 AND role='assistant' \
+                 ORDER BY id DESC LIMIT 1",
+                [&chat_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(assistant.contains("All set"));
+        let running: i64 = c
+            .query_row(
+                "SELECT running FROM chat_sessions WHERE id=?1",
+                [&chat_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(running, 0);
+
+        std::env::remove_var("COLDTRAIL_HOME");
+    }
+
+    // C1 regression: the web run-now endpoint pre-creates the chat and marks it running=1
+    // BEFORE spawning `coldtrail run`. The auth-gate probe check happens before `run` would
+    // otherwise clear `running`, so a probe failure must clear it on the precreated chat itself
+    // or the row is stuck running=1 forever with zero messages. Mirrors
+    // src/probe.rs::probe_failed_on_error's 500-response mock, which makes probe() return
+    // Outcome::Failed.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn probe_failure_clears_precreated_running_flag() {
+        use axum::{routing::post, Router};
+
+        let _g = crate::testutil::env_guard();
+        let home = std::env::temp_dir().join("ct-run-probefail");
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("COLDTRAIL_HOME", &home);
+
+        // mock backend whose /chat/completions 500s -> probe fails
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|_b: String| async { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom") }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+
+        crate::config::save(&crate::config::Config {
+            agent: Some("openai".into()),
+            provider: Some(crate::config::Provider {
+                base_url: Some(format!("http://{addr}")),
+                model: Some("m".into()),
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        crate::db::init().unwrap();
+
+        // pre-create a chat + mark running (as the web run-now endpoint does)
+        let c = crate::db::open().unwrap();
+        c.execute(
+            "INSERT INTO chat_sessions (id, agent_session_id, title) VALUES ('pc','a','Scheduled run')",
+            [],
+        )
+        .unwrap();
+        crate::db::set_chat_running("pc", true).unwrap();
+        assert!(crate::db::chat_running("pc").unwrap());
+
+        run(None, "dry", Some("pc")).await.unwrap(); // probe fails -> early return
+
+        assert!(
+            !crate::db::chat_running("pc").unwrap(),
+            "running must be cleared on probe-fail abort"
+        );
+
         std::env::remove_var("COLDTRAIL_HOME");
     }
 }

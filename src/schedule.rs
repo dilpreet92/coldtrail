@@ -232,6 +232,33 @@ pub fn remove_one(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// One-time upgrade cleanup: removes the v0.9.15 singular `ai.coldtrail.run` timer (macOS) /
+/// `coldtrail.{service,timer}` (Linux) that predated per-schedule units, so a user upgrading
+/// from v0.9.15 with a schedule already enabled doesn't keep an orphaned timer firing
+/// unattended alongside the new per-id ones. Best-effort: every step ignores its own errors.
+fn remove_legacy_singular() {
+    #[cfg(target_os = "macos")]
+    {
+        let uid = users_uid();
+        let _ = std::process::Command::new("launchctl")
+            .args(["bootout", &format!("gui/{uid}/ai.coldtrail.run")])
+            .output();
+        if let Ok(home) = dirs_home() {
+            let _ = std::fs::remove_file(home.join("Library/LaunchAgents/ai.coldtrail.run.plist"));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "disable", "--now", "coldtrail.timer"])
+            .output();
+        if let Ok(dir) = dirs_home().map(|h| h.join(".config/systemd/user")) {
+            let _ = std::fs::remove_file(dir.join("coldtrail.timer"));
+            let _ = std::fs::remove_file(dir.join("coldtrail.service"));
+        }
+    }
+}
+
 /// Reconcile installed per-schedule OS timers to the DB: apply_one every schedule row
 /// (apply_one itself removes the disabled ones). MVP scope: this does not garbage-collect
 /// units whose schedule row was deleted out-of-band — deletion goes through remove_one via the
@@ -239,6 +266,7 @@ pub fn remove_one(id: &str) -> Result<()> {
 /// would linger on disk. Enumerate-and-prune is a future nicety, not implemented here.
 #[allow(dead_code)] // exercised via `coldtrail schedule sync`; allow kept for platforms where apply_one/remove_one bodies are cfg'd out
 pub fn sync() -> Result<()> {
+    remove_legacy_singular(); // upgrade migration: drop the v0.9.15 singular timer, if present
     crate::db::init()?; // matches every other DB-touching CLI entrypoint; needed on a fresh COLDTRAIL_HOME
     for s in crate::db::list_schedules()? {
         apply_one(&s)?;

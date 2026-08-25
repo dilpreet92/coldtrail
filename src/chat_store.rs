@@ -49,6 +49,42 @@ pub fn set_agent_session(chat_id: &str, agent_sid: &str) {
     }
 }
 
+/// Insert a chat message and return its rowid (best-effort; returns 0 on any DB failure).
+/// Not yet wired into a command (later task: live-run-progress streaming).
+#[allow(dead_code)]
+pub fn insert_returning_id(chat_id: &str, role: &str, content: &str) -> i64 {
+    if let Ok(c) = crate::db::open() {
+        if c.execute(
+            "INSERT INTO chat_messages (session_id, role, content) VALUES (?1,?2,?3)",
+            params![chat_id, role, content],
+        )
+        .is_ok()
+        {
+            let _ = c.execute(
+                "UPDATE chat_sessions SET updated_at=datetime('now') WHERE id=?1",
+                [chat_id],
+            );
+            return c.last_insert_rowid();
+        }
+    }
+    0
+}
+
+/// Update an already-inserted message's content in place (best-effort; a no-op for id 0,
+/// which signals a prior insert failure). Not yet wired into a command (later task).
+#[allow(dead_code)]
+pub fn update_content(id: i64, content: &str) {
+    if id == 0 {
+        return;
+    }
+    if let Ok(c) = crate::db::open() {
+        let _ = c.execute(
+            "UPDATE chat_messages SET content=?1 WHERE id=?2",
+            params![content, id],
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
