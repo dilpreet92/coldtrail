@@ -65,11 +65,15 @@ pub enum Commands {
         /// A short label for this ICP / search
         label: String,
     },
-    /// Add an MX-verified founder contact by hand
+    /// Add an MX-verified founder contact (email and/or LinkedIn URL) by hand
     AddContact {
         domain: String,
         name: String,
-        email: String,
+        /// Founder email (optional if --linkedin is given)
+        email: Option<String>,
+        /// LinkedIn profile URL (optional if an email is given)
+        #[arg(long)]
+        linkedin: Option<String>,
         /// How you found it (default: "websearch")
         source: Option<String>,
     },

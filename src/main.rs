@@ -13,6 +13,7 @@ mod gmail;
 mod home;
 mod imap_draft;
 mod import;
+mod linkedin;
 mod logf;
 mod mark;
 mod mcp;
@@ -65,8 +66,18 @@ async fn main() -> anyhow::Result<()> {
             domain,
             name,
             email,
+            linkedin,
             source,
-        }) => contact::run(&domain, &name, &email, source.as_deref()).await,
+        }) => {
+            contact::run(
+                &domain,
+                &name,
+                email.as_deref(),
+                linkedin.as_deref(),
+                source.as_deref(),
+            )
+            .await
+        }
         Some(Commands::FindEmails { max }) => find::run(max.unwrap_or(20)).await,
         Some(Commands::DraftPrep { max }) => draft::run(max.unwrap_or(20)),
         Some(Commands::Draft {
