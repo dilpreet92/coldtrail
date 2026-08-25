@@ -32,6 +32,12 @@ pub fn custom_brief(instruction: &str) -> String {
 /// live; when absent a fresh chat is created here as before. Always returns Ok after recording
 /// an outcome so the OS timer never loops on failure.
 pub async fn run(schedule_id: Option<&str>, trigger: &str, chat_id: Option<&str>) -> Result<()> {
+    // The web run-now endpoint pre-creates the chat and marks it running=1 BEFORE spawning this
+    // subprocess, so its UI can open the chat and poll for live progress. If we abort below
+    // before reaching the point where `running` is normally cleared (the auth-gate / workspace
+    // checks all happen before that), we must clear it ourselves or the pre-created chat is
+    // stuck "running" forever with zero messages and the UI polls it indefinitely.
+    let precreated = chat_id;
     let draft_only = trigger == "dry";
     if draft_only {
         std::env::set_var("COLDTRAIL_NO_SEND", "1");
@@ -61,8 +67,18 @@ pub async fn run(schedule_id: Option<&str>, trigger: &str, chat_id: Option<&str>
                 outreach: 0,
                 sent_today: 0,
             };
-            let _ =
-                crate::db::record_run("auth_failed", z, z, None, Some(&m), schedule_id, trigger);
+            let _ = crate::db::record_run(
+                "auth_failed",
+                z,
+                z,
+                precreated,
+                Some(&m),
+                schedule_id,
+                trigger,
+            );
+            if let Some(id) = precreated {
+                let _ = crate::db::set_chat_running(id, false);
+            }
             if draft_only {
                 std::env::remove_var("COLDTRAIL_NO_SEND");
             }
@@ -80,11 +96,14 @@ pub async fn run(schedule_id: Option<&str>, trigger: &str, chat_id: Option<&str>
                 "auth_failed",
                 z,
                 z,
-                None,
+                precreated,
                 Some("auth probe timed out"),
                 schedule_id,
                 trigger,
             );
+            if let Some(id) = precreated {
+                let _ = crate::db::set_chat_running(id, false);
+            }
             if draft_only {
                 std::env::remove_var("COLDTRAIL_NO_SEND");
             }
@@ -96,6 +115,9 @@ pub async fn run(schedule_id: Option<&str>, trigger: &str, chat_id: Option<&str>
         Ok(h) => h,
         Err(e) => {
             crate::logf::log(&format!("scheduled run aborted: {e}"));
+            if let Some(id) = precreated {
+                let _ = crate::db::set_chat_running(id, false);
+            }
             if draft_only {
                 std::env::remove_var("COLDTRAIL_NO_SEND");
             }
@@ -459,6 +481,62 @@ mod tests {
             )
             .unwrap();
         assert_eq!(running, 0);
+
+        std::env::remove_var("COLDTRAIL_HOME");
+    }
+
+    // C1 regression: the web run-now endpoint pre-creates the chat and marks it running=1
+    // BEFORE spawning `coldtrail run`. The auth-gate probe check happens before `run` would
+    // otherwise clear `running`, so a probe failure must clear it on the precreated chat itself
+    // or the row is stuck running=1 forever with zero messages. Mirrors
+    // src/probe.rs::probe_failed_on_error's 500-response mock, which makes probe() return
+    // Outcome::Failed.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn probe_failure_clears_precreated_running_flag() {
+        use axum::{routing::post, Router};
+
+        let _g = crate::testutil::env_guard();
+        let home = std::env::temp_dir().join("ct-run-probefail");
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("COLDTRAIL_HOME", &home);
+
+        // mock backend whose /chat/completions 500s -> probe fails
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|_b: String| async { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom") }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+
+        crate::config::save(&crate::config::Config {
+            agent: Some("openai".into()),
+            provider: Some(crate::config::Provider {
+                base_url: Some(format!("http://{addr}")),
+                model: Some("m".into()),
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        crate::db::init().unwrap();
+
+        // pre-create a chat + mark running (as the web run-now endpoint does)
+        let c = crate::db::open().unwrap();
+        c.execute(
+            "INSERT INTO chat_sessions (id, agent_session_id, title) VALUES ('pc','a','Scheduled run')",
+            [],
+        )
+        .unwrap();
+        crate::db::set_chat_running("pc", true).unwrap();
+        assert!(crate::db::chat_running("pc").unwrap());
+
+        run(None, "dry", Some("pc")).await.unwrap(); // probe fails -> early return
+
+        assert!(
+            !crate::db::chat_running("pc").unwrap(),
+            "running must be cleared on probe-fail abort"
+        );
 
         std::env::remove_var("COLDTRAIL_HOME");
     }
