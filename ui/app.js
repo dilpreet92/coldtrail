@@ -472,8 +472,9 @@ function renderScheduleCards(schedules, status) {
       const id = b.closest(".cron-card").dataset.id;
       b.disabled = true; b.textContent = "running…";
       try {
-        await postJSON(`/api/schedules/${encodeURIComponent(id)}/run`, { draft_only: true });
-        toast("Dry run started — drafts only, nothing sent. Check history shortly.", "ok");
+        const res = await postJSON(`/api/schedules/${encodeURIComponent(id)}/run`, { draft_only: true });
+        openChat(res.chat_id);
+        show("chat");
       } catch (e) { toast(e.message, "err"); }
       finally { b.disabled = false; b.textContent = "Dry run"; setTimeout(loadCron, 1500); }
     })
@@ -487,8 +488,9 @@ function renderScheduleCards(schedules, status) {
       const id = b.closest(".cron-card").dataset.id;
       b.disabled = true; b.textContent = "running…";
       try {
-        await postJSON(`/api/schedules/${encodeURIComponent(id)}/run`, { draft_only: false });
-        toast("Run started. Check history shortly.", "ok");
+        const res = await postJSON(`/api/schedules/${encodeURIComponent(id)}/run`, { draft_only: false });
+        openChat(res.chat_id);
+        show("chat");
       } catch (e) { toast(e.message, "err"); }
       finally { b.disabled = false; b.textContent = "Run now"; setTimeout(loadCron, 1500); }
     })
@@ -1018,6 +1020,9 @@ const log = $("#chat-log");
 // UI teardown for an in-flight chat stream (set while streaming; see sendChat). Switching
 // chats calls this so a running turn's tool chips / dots don't bleed into the chat on screen.
 let teardownStream = null;
+// Live-poll handle for a scheduled run's chat opened via openChat() — cleared whenever the
+// user switches chats or starts a new one, mirroring teardownStream's cancel-on-switch discipline.
+let cronPoll = null;
 // The page (window) is the scroll container — #chat-log has no height of its own — so follow
 // new chat output by scrolling the window, not the log element (log.scrollTop was a no-op).
 // Guarded to the chat view so a stray event can't yank another screen.
@@ -1096,22 +1101,47 @@ async function loadChatList() {
   $$("#chat-list .chat-item").forEach((b) => b.addEventListener("click", () => openChat(b.dataset.id)));
 }
 
+// Render a chat's persisted message list into #chat-log. Shared by the initial openChat render
+// and each live-poll re-render, so both stay in lockstep with the same role handling.
+// `running` (true while a scheduled run is still in flight) leaves the very last tool row
+// pulsing instead of marked done, since the backend persists a tool row at start (not completion)
+// and has no separate "finished" signal for it.
+function renderMessages(list, running) {
+  log.innerHTML = "";
+  list.forEach((m, i) => {
+    if (m.role === "user") bubble("user", m.content);
+    else if (m.role === "tool") {
+      const chip = toolChip(m.content);
+      if (!(running && i === list.length - 1)) chip.classList.add("done");
+    } else { const el = bubble("agent", ""); el.innerHTML = mdInline(m.content); }
+  });
+}
+
 async function openChat(id) {
   if (teardownStream) teardownStream(); // stop the previous chat's live stream leaking in here
+  if (cronPoll) { clearInterval(cronPoll); cronPoll = null; } // cancel any prior run's live poll
   try {
     const d = await getJSON(`/api/chats/${encodeURIComponent(id)}`);
     await postJSON(`/api/chats/${encodeURIComponent(id)}/activate`, {});
-    log.innerHTML = "";
-    d.messages.forEach((m) => {
-      if (m.role === "user") bubble("user", m.content);
-      else { const el = bubble("agent", ""); el.innerHTML = mdInline(m.content); }
-    });
+    renderMessages(d.messages, d.running);
+    scrollChatToBottom();
     await loadChatList();
+    if (d.running) {
+      cronPoll = setInterval(async () => {
+        try {
+          const d2 = await getJSON(`/api/chats/${encodeURIComponent(id)}`);
+          renderMessages(d2.messages, d2.running);
+          scrollChatToBottom();
+          if (!d2.running) { clearInterval(cronPoll); cronPoll = null; }
+        } catch (_) { clearInterval(cronPoll); cronPoll = null; }
+      }, 2000);
+    }
   } catch (e) { toast(e.message, "err"); }
 }
 
 $("#chat-new").addEventListener("click", async () => {
   if (teardownStream) teardownStream(); // don't let a running turn stream into the fresh chat
+  if (cronPoll) { clearInterval(cronPoll); cronPoll = null; } // don't let a scheduled run's poll paint into the fresh chat
   try {
     await postJSON("/api/chats/new", {});
     log.innerHTML = "";
