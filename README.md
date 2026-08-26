@@ -66,7 +66,8 @@ runs the whole loop:
    real phrasings), searches them in parallel, and imports the **union deduped by domain** — so
    you cover the long tail without double-contacting anyone.
 2. **Enrich.** A founder contact per company, working down coldtrail's technique ladder (OSINT
-   tools, GitHub commit metadata, crt.sh, WHOIS, on-domain) — MX-verified, founder-addressed only.
+   tools, GitHub commit metadata, crt.sh, WHOIS, on-domain) — an MX-verified, founder-addressed
+   email, or a verified LinkedIn profile URL; either makes a company reachable.
 3. **Draft.** A tailored subject + body per company, composed fresh from your Company profile and
    what the company actually does. Nothing is sent verbatim.
 4. **Send — your call.** By default drafts wait for you in the **Drafts** tab. If you've turned on
@@ -80,7 +81,7 @@ Canonical (sourcing)      ← plain-English ICP → verified companies the big D
 local SQLite              ← deduped by domain, one status per company (no double-contact)
         │
         ▼
-enrichment                ← founder email per company (OSINT ladder · your key · by hand)
+enrichment                ← founder email or LinkedIn URL per company (OSINT ladder · your key · by hand)
         │
         ▼
 draft (your voice)        ← personalized from your Company profile; never verbatim

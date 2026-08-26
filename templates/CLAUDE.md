@@ -123,7 +123,7 @@ sourcing and wait — keep going through enrichment and drafting — unless the 
 | Command | Purpose |
 |---|---|
 | `coldtrail import <json> "<label>"` | dedupe-import Canonical results |
-| `coldtrail add-contact <domain> "<name>" [email] [src]` | MX-verified email contact |
+| `coldtrail add-contact <domain> "<name>" [email] [src]` | MX-verified email contact (email or `--linkedin` required) |
 | `coldtrail add-contact <domain> "<name>" [email] --linkedin <url> [src]` | contact with a LinkedIn URL (email optional) |
 | `coldtrail find-emails [max]` | best-effort OSINT founder-email finder |
 | `coldtrail draft <domain> --subject "…" --body "…"` | store a personalized draft (email contact) |
