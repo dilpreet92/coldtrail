@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Fake LinkedIn Profile (fixture)</title>
+    <style>
+      body { font-family: sans-serif; margin: 40px; }
+      button { font-size: 16px; padding: 10px 16px; margin: 6px 0; cursor: pointer; }
+      #modal { border: 1px solid #888; padding: 20px; margin-top: 20px; max-width: 480px; }
+      textarea { width: 100%; height: 120px; font-size: 14px; box-sizing: border-box; }
+      .hidden { display: none; }
+    </style>
+  </head>
+  <body>
+    <!--
+      Static fixture that mimics LinkedIn's Connect -> Add-a-note -> Send DOM. It uses the SAME
+      selectors as `src/linkedin/browser.rs::selectors`, so the real driving code is exercised
+      unchanged. It NEVER contacts linkedin.com. Flow:
+        Connect click  -> reveal the invite modal (Add-a-note + Send visible)
+        Add-a-note click -> reveal the note textarea
+        Send click     -> REMOVE the modal from the DOM, reveal the Pending marker
+      The Send path removes (not just hides) the modal so `find_element(textarea#custom-message)`
+      fails afterwards, matching LinkedIn where the modal is torn down on a successful invite.
+    -->
+    <h1>Jane Doe</h1>
+    <p>Fixture profile — no network, no LinkedIn.</p>
+
+    <!-- CONNECT_BTN: button[aria-label^='Invite'][aria-label*='connect'] -->
+    <button id="connect" aria-label="Invite Jane Doe to connect">Connect</button>
+
+    <!-- Overflow fallback (MORE_BTN); unused by the happy path but present for completeness. -->
+    <button id="more" aria-label="More actions">More</button>
+
+    <!-- PENDING_MARKER: button[aria-label^='Pending'] — the success confirmation. -->
+    <button id="pending" class="hidden" aria-label="Pending">Pending</button>
+
+    <div id="modal" class="hidden">
+      <p>Add a note to your invitation?</p>
+      <!-- ADD_NOTE_BTN: button[aria-label='Add a note'] -->
+      <button id="add-note" aria-label="Add a note">Add a note</button>
+
+      <!-- NOTE_TEXTAREA: textarea#custom-message -->
+      <textarea id="custom-message" class="hidden" placeholder="Your note"></textarea>
+
+      <!-- SEND_BTN: button[aria-label='Send invitation'] -->
+      <button id="send" aria-label="Send invitation">Send invitation</button>
+    </div>
+
+    <script>
+      const connect = document.getElementById("connect");
+      const more = document.getElementById("more");
+      const modal = document.getElementById("modal");
+      const addNote = document.getElementById("add-note");
+      const textarea = document.getElementById("custom-message");
+      const send = document.getElementById("send");
+      const pending = document.getElementById("pending");
+
+      function openModal() {
+        connect.classList.add("hidden");
+        modal.classList.remove("hidden");
+      }
+      connect.addEventListener("click", openModal);
+      // The overflow path also opens the same modal.
+      more.addEventListener("click", openModal);
+
+      addNote.addEventListener("click", () => {
+        textarea.classList.remove("hidden");
+        textarea.focus();
+      });
+
+      send.addEventListener("click", () => {
+        // Tear the modal down entirely, then surface the Pending confirmation.
+        modal.remove();
+        pending.classList.remove("hidden");
+      });
+    </script>
+  </body>
+</html>

@@ -38,6 +38,8 @@ webpki-roots = "0.26"
 async-trait = "0.1"
 fs2 = "0.4"
 time = { version = "0.3", features = ["local-offset"] }
+chromiumoxide = { version = "0.7", features = ["tokio-runtime"], default-features = false }
+futures-util = "0.3"
 
 [profile.release]
 strip = true
