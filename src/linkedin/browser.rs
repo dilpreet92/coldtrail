@@ -36,7 +36,7 @@ pub enum InviteOutcome {
 
 #[async_trait]
 #[allow(dead_code)]
-pub trait LinkedInBrowser: Send {
+pub trait LinkedInBrowser: Send + Sync {
     /// Launch headful at the login page and wait until login is detected or timeout.
     async fn connect_and_wait_for_login(&self, timeout_secs: u64) -> Result<LoginOutcome>;
     /// Drive Connect -> Add note -> fill; Auto also clicks Send and verifies.
@@ -83,5 +83,37 @@ impl LinkedInBrowser for FakeBrowser {
     }
     async fn is_session_valid(&self) -> Result<bool> {
         Ok(self.session_valid)
+    }
+}
+
+/// Real chromiumoxide-backed browser. STUB until Task 5 fills in the driving; returns Failed so
+/// no invite can be claimed sent before the real impl exists.
+#[allow(dead_code)]
+pub struct ChromeBrowser;
+
+#[allow(dead_code)]
+impl ChromeBrowser {
+    pub fn new() -> Result<Self> {
+        Ok(ChromeBrowser)
+    }
+}
+
+#[async_trait]
+impl LinkedInBrowser for ChromeBrowser {
+    async fn connect_and_wait_for_login(&self, _t: u64) -> Result<LoginOutcome> {
+        Ok(LoginOutcome::TimedOut)
+    }
+    async fn send_connection_request(
+        &self,
+        _u: &str,
+        _n: &str,
+        _m: SendMode,
+    ) -> Result<InviteOutcome> {
+        Ok(InviteOutcome::Failed(
+            "LinkedIn browser not yet implemented".into(),
+        ))
+    }
+    async fn is_session_valid(&self) -> Result<bool> {
+        Ok(false)
     }
 }

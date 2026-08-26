@@ -11,7 +11,6 @@ use rusqlite::OptionalExtension;
 #[derive(Debug)]
 pub struct Draft {
     /// "email" | "linkedin"
-    #[allow(dead_code)] // read by the LinkedIn send branch added in Task 4
     pub channel: String,
     /// recipient: an email address (email channel) or a LinkedIn profile URL (linkedin channel)
     pub to: String,
@@ -77,13 +76,11 @@ pub fn sent_today() -> u32 {
 }
 
 /// LinkedIn connection-invites sent today.
-#[allow(dead_code)] // consumed starting in Task 4 (LinkedIn send path)
 pub fn linkedin_sent_today() -> u32 {
     count_sent("status='sent' AND channel='linkedin' AND date(sent_at)=date('now')")
 }
 
 /// LinkedIn connection-invites sent in the trailing 7 days (rolling weekly cap).
-#[allow(dead_code)] // consumed starting in Task 4 (LinkedIn send path)
 pub fn linkedin_sent_last_7d() -> u32 {
     count_sent("status='sent' AND channel='linkedin' AND sent_at >= datetime('now','-7 days')")
 }
@@ -102,11 +99,26 @@ fn count_sent(where_clause: &str) -> u32 {
         .unwrap_or(0)
 }
 
+/// Local hour (0..24) for the LinkedIn daytime-window gate. The `time` crate refuses to read the
+/// local UTC offset on a multi-threaded process (returns Err) — `unwrap_or(12)` is deliberate:
+/// noon is safely inside the sending window, so a failed offset lookup never blocks a send.
+fn local_hour() -> u32 {
+    time::OffsetDateTime::now_local()
+        .map(|t| t.hour() as u32)
+        .unwrap_or(12)
+}
+
 /// SEND for real. Refuses unless the human enabled `auto_send`; enforces the per-day cap; sends
 /// via SMTP (app-password) or the Gmail API (OAuth); marks the row `sent`. Returns a status line.
 pub async fn send(domain: &str, d: &Draft) -> Result<String> {
     if std::env::var("COLDTRAIL_NO_SEND").is_ok() {
         return Err(anyhow!("dry run: sending is disabled for this run"));
+    }
+    if d.channel == "linkedin" {
+        let cfg = crate::config::load();
+        let hour = local_hour();
+        let browser = crate::linkedin::browser::ChromeBrowser::new()?;
+        return crate::linkedin::send::deliver(domain, d, &browser, &cfg, hour).await;
     }
     let cfg = crate::config::load();
     if !cfg.auto_send {

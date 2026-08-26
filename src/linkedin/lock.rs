@@ -11,7 +11,6 @@ pub struct ProfileLock {
 }
 
 /// Try to acquire the profile lock without blocking. Returns None if another process holds it.
-#[allow(dead_code)]
 pub fn try_acquire() -> Result<Option<ProfileLock>> {
     let path = crate::linkedin::profile_dir()?.join(".lock");
     let file = File::create(path)?;

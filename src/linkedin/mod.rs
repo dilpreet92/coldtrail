@@ -4,6 +4,7 @@
 pub mod browser;
 pub mod lock;
 pub mod note;
+pub mod send;
 pub mod url;
 
 use anyhow::{anyhow, Result};

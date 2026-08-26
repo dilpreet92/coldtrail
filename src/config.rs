@@ -26,10 +26,7 @@ pub struct Config {
 
 /// The effective daily auto-send cap (config value or the default).
 pub const DEFAULT_DAILY_SEND_CAP: u32 = 20;
-/// Consumed by the LinkedIn send-gate (Task 4+); unused for now.
-#[allow(dead_code)]
 pub const DEFAULT_LINKEDIN_WEEKLY_CAP: u32 = 80;
-#[allow(dead_code)]
 pub const DEFAULT_LINKEDIN_DAILY_CAP: u32 = 15;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
