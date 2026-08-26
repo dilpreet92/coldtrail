@@ -65,7 +65,7 @@ pub enum Commands {
         /// A short label for this ICP / search
         label: String,
     },
-    /// Add an MX-verified founder contact (email and/or LinkedIn URL) by hand
+    /// Add a founder contact by hand — an email (MX-verified), a LinkedIn URL, or both
     AddContact {
         domain: String,
         name: String,
@@ -138,10 +138,24 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: ScheduleCmd,
     },
+    /// Manage the LinkedIn destination's connected Chrome session
+    Linkedin {
+        #[command(subcommand)]
+        cmd: LinkedinCmd,
+    },
 }
 
 #[derive(Subcommand)]
 pub enum ScheduleCmd {
     /// Reinstall timers for all enabled schedules
     Sync,
+}
+
+#[derive(Subcommand)]
+pub enum LinkedinCmd {
+    /// Open a human-visible Chrome window at the LinkedIn login page and wait up to 3 minutes
+    /// for you to finish logging in
+    Connect,
+    /// Print the persisted connect state (connected / reconnect_needed)
+    Status,
 }

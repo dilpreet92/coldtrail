@@ -114,7 +114,46 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Schedule { cmd }) => match cmd {
             cli::ScheduleCmd::Sync => schedule::sync(),
         },
+        Some(Commands::Linkedin { cmd }) => match cmd {
+            cli::LinkedinCmd::Connect => linkedin_connect().await,
+            cli::LinkedinCmd::Status => {
+                let s = linkedin::LinkedinState::load();
+                println!(
+                    "connected={} reconnect_needed={}",
+                    s.connected, s.reconnect_needed
+                );
+                Ok(())
+            }
+        },
     }
+}
+
+/// Thin CLI mirror of the web connect flow (`src/web/linkedin.rs::connect`): launch a real,
+/// human-visible Chrome window at the LinkedIn login page and wait (up to 3 minutes) for the
+/// human to finish logging in. Unlike the web path — which spawns off the request and can't
+/// surface a launch error to the caller — this awaits inline, so a `ChromeBrowser::new()` or
+/// launch failure (e.g. no Chrome installed) prints directly instead of being swallowed.
+async fn linkedin_connect() -> anyhow::Result<()> {
+    use linkedin::browser::{ChromeBrowser, LinkedInBrowser, LoginOutcome};
+
+    let browser = ChromeBrowser::new()?;
+    match browser.connect_and_wait_for_login(180).await? {
+        LoginOutcome::LoggedIn => {
+            linkedin::LinkedinState {
+                connected: true,
+                reconnect_needed: false,
+            }
+            .save()?;
+            println!("LinkedIn connected.");
+        }
+        LoginOutcome::TimedOut => {
+            println!("Not logged in (timed out after 3 minutes) — run `coldtrail linkedin connect` again.");
+        }
+        LoginOutcome::WindowClosed => {
+            println!("Not logged in (the Chrome window was closed) — run `coldtrail linkedin connect` again.");
+        }
+    }
+    Ok(())
 }
 
 /// Test-only helpers. `COLDTRAIL_HOME` is process-global, so any test that sets it

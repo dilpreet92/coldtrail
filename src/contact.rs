@@ -1,5 +1,7 @@
-//! Add a founder email (from the agent, WebSearch, or by hand) into the pipeline,
-//! MX-verified. Rejects generic/placeholder locals.
+//! Add a founder contact (from the agent, WebSearch, or by hand) into the pipeline: an
+//! email, a LinkedIn URL, or both — at least one is required. An email is MX-verified and
+//! rejects generic/placeholder locals; a LinkedIn-only contact is not MX-verified (there's
+//! no email to verify) but still makes the company reachable.
 
 use anyhow::{anyhow, Result};
 use rusqlite::{params, OptionalExtension};
