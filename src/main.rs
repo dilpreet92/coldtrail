@@ -91,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
             body,
         }) => draft::followup_add(&domain, &subject, &body),
         Some(Commands::Mark { domain, value }) => mark::run(&domain, &value),
+        Some(Commands::LinkedinNote { domain, note }) => linkedin::note::add(&domain, &note),
         Some(Commands::Send { domain }) => deliver::run(&domain).await,
         Some(Commands::Seed) => seed::run(),
         Some(Commands::Update) => update::run().await,

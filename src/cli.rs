@@ -105,6 +105,12 @@ pub enum Commands {
     },
     /// Record a Gmail draft id, or mark sent / bounced
     Mark { domain: String, value: String },
+    /// Store a LinkedIn connection-request note for a company (never sends; requires a LinkedIn contact)
+    LinkedinNote {
+        domain: String,
+        #[arg(long)]
+        note: String,
+    },
     /// Load already-contacted domains from contacted.toml (dedupe guard)
     Seed,
     /// Re-download the latest release binary in place
