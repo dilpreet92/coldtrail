@@ -43,6 +43,11 @@ pub async fn connect(
             Ok(browser) => browser.connect_and_wait_for_login(180).await,
             Err(e) => Err(e),
         };
+        // Off-request task, so a launch/login failure (e.g. no Chrome installed) can't surface to
+        // the caller — log it so it's at least visible in the server log instead of vanishing.
+        if let Err(e) = &outcome {
+            eprintln!("linkedin connect: launch/login failed: {e}");
+        }
         if matches!(outcome, Ok(LoginOutcome::LoggedIn)) {
             let _ = LinkedinState {
                 connected: true,
