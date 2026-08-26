@@ -6,6 +6,7 @@ pub mod chat;
 pub mod chats;
 pub mod company;
 pub mod followups;
+pub mod linkedin;
 pub mod onboarding;
 pub mod pipeline;
 pub mod schedules;
@@ -21,6 +22,7 @@ use axum::{
     Router,
 };
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
@@ -31,6 +33,7 @@ use crate::provider::AgentEvent;
 struct Assets;
 
 /// Wraps any error into a 500 JSON-ish response for handlers.
+#[derive(Debug)]
 pub struct ApiErr(pub anyhow::Error);
 
 impl<E: Into<anyhow::Error>> From<E> for ApiErr {
@@ -64,6 +67,9 @@ pub struct AppState {
     pub chat: Mutex<ChatSession>,
     /// Held for the duration of an agent turn so turns never overlap.
     pub turn_lock: Mutex<()>,
+    /// True while a `linkedin::connect` task is running (launched Chrome, waiting on login).
+    /// `GET /api/destination/linkedin/status` reads this for its `waiting` field.
+    pub linkedin_connecting: AtomicBool,
 }
 
 fn loopback_hosts(port: u16) -> [String; 2] {
@@ -114,6 +120,24 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/destination/auto-send",
             post(onboarding::set_auto_send),
+        )
+        .route("/api/destination/linkedin/connect", post(linkedin::connect))
+        .route("/api/destination/linkedin/status", get(linkedin::status))
+        .route(
+            "/api/destination/linkedin/disconnect",
+            post(linkedin::disconnect),
+        )
+        .route(
+            "/api/destination/linkedin/auto-send",
+            post(linkedin::set_auto_send),
+        )
+        .route(
+            "/api/drafts/:domain/linkedin/assist",
+            post(linkedin::assist),
+        )
+        .route(
+            "/api/drafts/:domain/linkedin/confirm",
+            post(linkedin::confirm),
         )
         .route("/api/companies", get(pipeline::companies))
         .route(
@@ -243,6 +267,7 @@ mod tests {
             runs: Mutex::new(HashMap::new()),
             chat: Mutex::new(ChatSession::default()),
             turn_lock: Mutex::new(()),
+            linkedin_connecting: AtomicBool::new(false),
         })
     }
 

@@ -16,7 +16,6 @@ use futures_util::StreamExt;
 use crate::linkedin::{chrome_binary, profile_dir};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum SendMode {
     /// Drive up to the filled note, stop before Send (human clicks).
     Assist,
@@ -25,7 +24,6 @@ pub enum SendMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum LoginOutcome {
     LoggedIn,
     TimedOut,
@@ -45,9 +43,14 @@ pub enum InviteOutcome {
 }
 
 #[async_trait]
-#[allow(dead_code)]
 pub trait LinkedInBrowser: Send + Sync {
     /// Launch headful at the login page and wait until login is detected or timeout.
+    ///
+    /// `allow(dead_code)`: `tests/linkedin_browser_fixture.rs` pulls this file in via `#[path]`
+    /// as its own separate crate and only exercises `send_connection_request` there, so this
+    /// method is unreachable in THAT compilation unit even though the main binary calls it
+    /// (`web::linkedin::connect`).
+    #[allow(dead_code)]
     async fn connect_and_wait_for_login(&self, timeout_secs: u64) -> Result<LoginOutcome>;
     /// Drive Connect -> Add note -> fill; Auto also clicks Send and verifies.
     async fn send_connection_request(
@@ -57,6 +60,7 @@ pub trait LinkedInBrowser: Send + Sync {
         mode: SendMode,
     ) -> Result<InviteOutcome>;
     /// Best-effort: is the persisted session still valid?
+    #[allow(dead_code)]
     async fn is_session_valid(&self) -> Result<bool>;
 }
 

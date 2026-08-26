@@ -52,6 +52,7 @@ pub async fn status() -> Result<Json<StatusDto>, ApiErr> {
         crate::secrets::gmail_app_password().is_some() || crate::secrets::has_token("gmail");
     let _ = (canonical_wired, gmail_wired, message_customized);
     let onboarded = product_set && provider_ready && discovery_connected;
+    let li = crate::linkedin::LinkedinState::load();
 
     Ok(Json(StatusDto {
         provider,
@@ -74,6 +75,15 @@ pub async fn status() -> Result<Json<StatusDto>, ApiErr> {
         osint: crate::osint::status(),
         gmail_client_configured: crate::oauth::google_client().is_some(),
         gcloud_available: crate::gcloud::available(),
+        linkedin_connected: li.connected,
+        linkedin_reconnect_needed: li.reconnect_needed,
+        linkedin_auto_send: cfg.linkedin_auto_send,
+        linkedin_weekly_cap: cfg
+            .linkedin_weekly_cap
+            .unwrap_or(crate::config::DEFAULT_LINKEDIN_WEEKLY_CAP),
+        linkedin_daily_cap: cfg
+            .linkedin_daily_cap
+            .unwrap_or(crate::config::DEFAULT_LINKEDIN_DAILY_CAP),
     }))
 }
 

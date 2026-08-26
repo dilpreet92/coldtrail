@@ -38,6 +38,16 @@ pub struct StatusDto {
     pub gmail_client_configured: bool,
     /// gcloud Application Default Credentials are present (keyless Gmail path).
     pub gcloud_available: bool,
+    /// A LinkedIn session is connected (`linkedin::LinkedinState`).
+    pub linkedin_connected: bool,
+    /// The persisted session is no longer valid — the human needs to reconnect.
+    pub linkedin_reconnect_needed: bool,
+    /// Opt-in: coldtrail may click Send on LinkedIn connection requests.
+    pub linkedin_auto_send: bool,
+    /// The rolling-7-day LinkedIn invite cap in effect.
+    pub linkedin_weekly_cap: u32,
+    /// The per-day LinkedIn invite cap in effect.
+    pub linkedin_daily_cap: u32,
 }
 
 #[derive(Deserialize, Default)]

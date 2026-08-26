@@ -45,7 +45,6 @@ pub struct LinkedinState {
     pub reconnect_needed: bool,
 }
 
-#[allow(dead_code)]
 impl LinkedinState {
     pub fn load() -> Self {
         state_path()
