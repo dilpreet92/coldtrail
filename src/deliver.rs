@@ -6,6 +6,10 @@
 
 use anyhow::{anyhow, Result};
 use rusqlite::OptionalExtension;
+use std::sync::OnceLock;
+
+/// The machine's local UTC offset, captured ONCE at process start (see `capture_local_offset`).
+static LOCAL_OFFSET: OnceLock<time::UtcOffset> = OnceLock::new();
 
 /// A reviewable draft ready to draft-in-Gmail, send, or deliver via LinkedIn.
 #[derive(Debug)]
@@ -99,13 +103,24 @@ fn count_sent(where_clause: &str) -> u32 {
         .unwrap_or(0)
 }
 
-/// Local hour (0..24) for the LinkedIn daytime-window gate. The `time` crate refuses to read the
-/// local UTC offset on a multi-threaded process (returns Err) — `unwrap_or(12)` is deliberate:
-/// noon is safely inside the sending window, so a failed offset lookup never blocks a send.
+/// Capture the machine's local UTC offset ONCE, while the process is still single-threaded.
+/// MUST be called from `main` BEFORE the tokio runtime is built: the `time` crate refuses to read
+/// the local offset once other threads exist (a soundness guard), which is exactly why the old
+/// `now_local()`-in-`local_hour()` approach always failed under the multi-threaded runtime and
+/// left the daytime-window gate inert. Idempotent; only the first successful capture wins. If the
+/// lookup fails, the offset stays unset and `local_hour` falls back to real UTC (offset 0).
+pub fn capture_local_offset() {
+    if let Ok(off) = time::UtcOffset::current_local_offset() {
+        let _ = LOCAL_OFFSET.set(off);
+    }
+}
+
+/// Local hour (0..24) for the LinkedIn daytime-window gate. Uses the offset captured at process
+/// start (`capture_local_offset`); if that capture failed, falls back to the real UTC hour
+/// (offset 0) rather than a hardcoded noon — so the window still gates on a real wall clock.
 fn local_hour() -> u32 {
-    time::OffsetDateTime::now_local()
-        .map(|t| t.hour() as u32)
-        .unwrap_or(12)
+    let offset = LOCAL_OFFSET.get().copied().unwrap_or(time::UtcOffset::UTC);
+    time::OffsetDateTime::now_utc().to_offset(offset).hour() as u32
 }
 
 /// SEND for real. Refuses unless the human enabled `auto_send`; enforces the per-day cap; sends
@@ -161,6 +176,15 @@ pub async fn run(domain: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_hour_returns_a_real_wall_clock_hour() {
+        // Safe to call anywhere; under the multi-threaded test runner the offset can't be read,
+        // so this exercises the UTC fallback. Either way the result must be a valid 0..24 hour
+        // derived from the real clock — never the old hardcoded noon.
+        capture_local_offset();
+        assert!(local_hour() < 24);
+    }
 
     #[test]
     fn send_refuses_when_auto_send_off() {

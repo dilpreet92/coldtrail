@@ -39,8 +39,20 @@ mod web;
 use clap::Parser;
 use cli::{Cli, Commands};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Capture the local UTC offset while the process is still single-threaded. The `time` crate
+    // refuses to read the local offset once worker threads exist, so this MUST happen before the
+    // multi-threaded tokio runtime is built — hence the manual runtime instead of `#[tokio::main]`
+    // (which would run this on a runtime worker thread, where the lookup always fails). Without it
+    // the LinkedIn daytime-window gate is inert. `enable_all()` matches `#[tokio::main]`'s config.
+    deliver::capture_local_offset();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         None => {
