@@ -8,6 +8,7 @@ use anyhow::{anyhow, Result};
 use rusqlite::OptionalExtension;
 
 /// A reviewable draft ready to draft-in-Gmail, send, or deliver via LinkedIn.
+#[derive(Debug)]
 pub struct Draft {
     /// "email" | "linkedin"
     #[allow(dead_code)] // read by the LinkedIn send branch added in Task 4
@@ -186,5 +187,132 @@ mod tests {
         std::env::remove_var("COLDTRAIL_NO_SEND");
         let err = res.unwrap_err().to_string();
         assert!(err.contains("dry run"), "got: {err}");
+    }
+
+    #[test]
+    fn reviewable_linkedin_channel_returns_linkedin_url_as_to() {
+        crate::testutil::with_home("ct-deliver-reviewable-li-ok", |_| {
+            crate::db::init().unwrap();
+            let c = crate::db::open().unwrap();
+            c.execute(
+                "INSERT INTO companies (domain, source_query) VALUES ('acme.com','q')",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO contacts (domain, founder_name, linkedin_url) \
+                 VALUES ('acme.com','Jane','https://www.linkedin.com/in/janedoe')",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO outreach (domain, contact_id, channel, subject, body, status) \
+                 VALUES ('acme.com', (SELECT id FROM contacts WHERE domain='acme.com'), \
+                 'linkedin', '', 'Hi Jane', 'draft_pending')",
+                [],
+            )
+            .unwrap();
+            let d = reviewable("acme.com").unwrap();
+            assert_eq!(d.channel, "linkedin");
+            assert_eq!(d.to, "https://www.linkedin.com/in/janedoe");
+            assert_eq!(d.body, "Hi Jane");
+        });
+    }
+
+    #[test]
+    fn reviewable_linkedin_channel_without_linkedin_url_errors() {
+        crate::testutil::with_home("ct-deliver-reviewable-li-missing", |_| {
+            crate::db::init().unwrap();
+            let c = crate::db::open().unwrap();
+            c.execute(
+                "INSERT INTO companies (domain, source_query) VALUES ('acme.com','q')",
+                [],
+            )
+            .unwrap();
+            // Contact exists but has no linkedin_url (email-only).
+            c.execute(
+                "INSERT INTO contacts (domain, founder_name, email) \
+                 VALUES ('acme.com','Jane','jane@acme.com')",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO outreach (domain, contact_id, channel, subject, body, status) \
+                 VALUES ('acme.com', (SELECT id FROM contacts WHERE domain='acme.com'), \
+                 'linkedin', '', 'Hi Jane', 'draft_pending')",
+                [],
+            )
+            .unwrap();
+            let err = reviewable("acme.com").unwrap_err().to_string();
+            assert!(err.contains("no LinkedIn URL"), "got: {err}");
+        });
+    }
+
+    #[test]
+    fn linkedin_sent_today_counts_only_linkedin_today_and_sent_today_stays_email_only() {
+        crate::testutil::with_home("ct-deliver-li-sent-today", |_| {
+            crate::db::init().unwrap();
+            let c = crate::db::open().unwrap();
+            c.execute(
+                "INSERT INTO companies (domain, source_query) VALUES ('a.com','q')",
+                [],
+            )
+            .unwrap();
+            // A linkedin send today, a linkedin send 10 days ago, and an email send today.
+            c.execute(
+                "INSERT INTO outreach (domain, channel, status, sent_at) \
+                 VALUES ('a.com','linkedin','sent', datetime('now'))",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO outreach (domain, channel, status, sent_at) \
+                 VALUES ('a.com','linkedin','sent', datetime('now','-10 days'))",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO outreach (domain, channel, status, sent_at) \
+                 VALUES ('a.com','email','sent', datetime('now'))",
+                [],
+            )
+            .unwrap();
+            assert_eq!(linkedin_sent_today(), 1);
+            // Email-only counter must not pick up the linkedin row sent today.
+            assert_eq!(sent_today(), 1);
+        });
+    }
+
+    #[test]
+    fn linkedin_sent_last_7d_counts_trailing_week_only() {
+        crate::testutil::with_home("ct-deliver-li-sent-7d", |_| {
+            crate::db::init().unwrap();
+            let c = crate::db::open().unwrap();
+            c.execute(
+                "INSERT INTO companies (domain, source_query) VALUES ('a.com','q')",
+                [],
+            )
+            .unwrap();
+            // Inside the trailing 7 days: today and 3 days ago. Outside: 10 days ago.
+            c.execute(
+                "INSERT INTO outreach (domain, channel, status, sent_at) \
+                 VALUES ('a.com','linkedin','sent', datetime('now'))",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO outreach (domain, channel, status, sent_at) \
+                 VALUES ('a.com','linkedin','sent', datetime('now','-3 days'))",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO outreach (domain, channel, status, sent_at) \
+                 VALUES ('a.com','linkedin','sent', datetime('now','-10 days'))",
+                [],
+            )
+            .unwrap();
+            assert_eq!(linkedin_sent_last_7d(), 2);
+        });
     }
 }
