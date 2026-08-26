@@ -10,14 +10,36 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::{ApiErr, AppState};
 use crate::linkedin::browser::{
-    ChromeBrowser, InviteOutcome, LinkedInBrowser, LoginOutcome, SendMode,
+    AssistError, AssistSession, ChromeBrowser, LinkedInBrowser, LoginOutcome,
 };
 use crate::linkedin::{lock, LinkedinState};
+
+/// One live assist window plus everything it owns for its lifetime: the pre-Send Chrome session
+/// and the profile lock (held so no other connect/assist/auto op can launch on the profile until
+/// this window closes). Parked in `AppState::assist` between `assist` and `confirm`/timeout.
+pub struct AssistHandle {
+    session: AssistSession,
+    /// Profile lock, released when this handle is dropped/closed. Held for effect, never read.
+    #[allow(dead_code)]
+    _lock: lock::ProfileLock,
+    /// The draft domain this window is staging, so `confirm` closes the right one.
+    domain: String,
+    /// Monotonic identity so the timeout task only closes the window it itself opened — not a
+    /// newer one that replaced it in the slot.
+    id: u64,
+}
+
+/// Hands out the monotonic `AssistHandle::id`.
+static ASSIST_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// How long a staged assist window stays open waiting for the human before it is auto-closed.
+const ASSIST_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// `POST /api/destination/linkedin/connect` — launch a fresh, human-visible Chrome window at the
 /// LinkedIn login page and wait (off the request) for the human to finish logging in. Returns
@@ -116,16 +138,26 @@ pub async fn set_auto_send(
 }
 
 /// `POST /api/drafts/:domain/linkedin/assist` — drive Connect -> Add note -> fill the note in a
-/// real (human-visible) Chrome window, then stop with the modal open for the human to click Send
-/// themselves. The channel check runs BEFORE the lock/browser are touched at all, so calling this
-/// on an email draft — or a domain with no reviewable draft at all — never launches Chrome.
-pub async fn assist(Path(domain): Path<String>) -> Result<Response, ApiErr> {
+/// real (human-visible) Chrome window, then LEAVE it open with the modal staged for the human to
+/// review and click Send themselves. The channel check runs BEFORE the lock/browser are touched
+/// at all, so calling this on an email draft — or a domain with no reviewable draft — never
+/// launches Chrome.
+///
+/// Unlike the old behavior, the window is NOT closed when this returns: the live session (plus the
+/// profile lock) is parked in `AppState::assist` and stays alive until `confirm` marks the result
+/// or a timeout fires — which is what makes the human-review-then-Send flow actually work. The
+/// profile lock is therefore held for the window's whole lifetime, so no other connect/assist/auto
+/// op can launch on the profile in the meantime.
+pub async fn assist(
+    State(state): State<Arc<AppState>>,
+    Path(domain): Path<String>,
+) -> Result<Response, ApiErr> {
     let domain = domain.to_lowercase();
     let d = crate::deliver::reviewable(&domain)?;
     if d.channel != "linkedin" {
         return Ok((StatusCode::BAD_REQUEST, "not a LinkedIn draft").into_response());
     }
-    let Some(_lock) = lock::try_acquire()? else {
+    let Some(lock) = lock::try_acquire()? else {
         return Ok((
             StatusCode::CONFLICT,
             "LinkedIn browser is busy — try again in a moment",
@@ -133,35 +165,62 @@ pub async fn assist(Path(domain): Path<String>) -> Result<Response, ApiErr> {
             .into_response());
     };
     let browser = ChromeBrowser::new()?;
-    let outcome = browser
-        .send_connection_request(&d.to, &d.body, SendMode::Assist)
-        .await?;
-    // `_lock` releases right here, when the function returns: assist only holds Chrome for the
-    // drive itself. The human then acts in the window it left open, and the result comes back
-    // via `confirm` (below), not by holding the browser lock across an unbounded human pause.
-    Ok(match outcome {
-        InviteOutcome::Staged => Json(serde_json::json!({ "staged": true })).into_response(),
-        InviteOutcome::LoggedOut => {
+    match browser.assist_open(&d.to, &d.body).await {
+        Ok(session) => {
+            // Move the live window + the profile lock into the shared slot. `lock` is consumed
+            // here, so it now lives exactly as long as the window (until confirm/timeout closes).
+            let id = ASSIST_SEQ.fetch_add(1, Ordering::SeqCst);
+            let handle = AssistHandle {
+                session,
+                _lock: lock,
+                domain: domain.clone(),
+                id,
+            };
+            {
+                let mut slot = state.assist.lock().await;
+                // Only one window at a time: close any previous occupant before parking this one.
+                if let Some(prev) = slot.take() {
+                    prev.session.close().await;
+                }
+                *slot = Some(handle);
+            }
+            // Timeout guard: close + clear the slot after ASSIST_TIMEOUT if it is STILL this same
+            // window (identity check via `id`), so a human who never clicks Send can't leak a
+            // Chrome process or pin the profile lock forever. Racing `confirm` is safe — whichever
+            // takes the slot first wins; the loser sees it empty or holding a different id.
+            let assist_slot = state.assist.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(ASSIST_TIMEOUT).await;
+                let taken = {
+                    let mut slot = assist_slot.lock().await;
+                    if slot.as_ref().map(|h| h.id) == Some(id) {
+                        slot.take()
+                    } else {
+                        None
+                    }
+                };
+                if let Some(h) = taken {
+                    h.session.close().await;
+                }
+            });
+            Ok(Json(serde_json::json!({ "staged": true })).into_response())
+        }
+        // assist_open already closed the window on every error path; `lock` drops when this
+        // function returns, releasing the profile lock.
+        Err(AssistError::LoggedOut) => {
             let mut s = LinkedinState::load();
             s.reconnect_needed = true;
             let _ = s.save();
-            (
+            Ok((
                 StatusCode::CONFLICT,
                 "LinkedIn session expired — reconnect from Destination settings",
             )
-                .into_response()
+                .into_response())
         }
-        InviteOutcome::Failed(reason) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, reason).into_response()
+        Err(AssistError::Failed(reason)) => {
+            Ok((StatusCode::INTERNAL_SERVER_ERROR, reason).into_response())
         }
-        // Assist never clicks Send, so a real driver should never report this — treat it as a
-        // hard failure rather than silently claiming success.
-        InviteOutcome::Sent => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "unexpected: an Assist drive reported Sent".to_string(),
-        )
-            .into_response(),
-    })
+    }
 }
 
 /// `sent:true` — the human clicked Send in the staged window. `sent:false` — they closed it
@@ -173,6 +232,7 @@ pub struct ConfirmReq {
 
 /// `POST /api/drafts/:domain/linkedin/confirm`.
 pub async fn confirm(
+    State(state): State<Arc<AppState>>,
     Path(domain): Path<String>,
     Json(req): Json<ConfirmReq>,
 ) -> Result<Json<serde_json::Value>, ApiErr> {
@@ -181,6 +241,20 @@ pub async fn confirm(
         // Channel-scoped mark (same helper the auto path uses): a domain can carry a separate
         // email row (e.g. a follow-up), so a domain-wide UPDATE would false-mark it.
         crate::linkedin::send::mark_linkedin_sent(&domain)?;
+    }
+    // Close the live assist window this domain left open, dropping the profile lock with it.
+    // Idempotent: the timeout may have already cleared the slot, or there may be none — in which
+    // case we just recorded the mark and return. The identity check is by domain so we never
+    // close a window a later assist opened for a different draft.
+    let taken = {
+        let mut slot = state.assist.lock().await;
+        match slot.as_ref() {
+            Some(h) if h.domain == domain => slot.take(),
+            _ => None,
+        }
+    };
+    if let Some(h) = taken {
+        h.session.close().await;
     }
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -200,6 +274,7 @@ mod tests {
             chat: Mutex::new(super::super::ChatSession::default()),
             turn_lock: Mutex::new(()),
             linkedin_connecting: AtomicBool::new(false),
+            assist: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -284,11 +359,49 @@ mod tests {
             .unwrap();
             let resp = tokio::runtime::Runtime::new()
                 .unwrap()
-                .block_on(assist(Path("acme.com".to_string())))
+                .block_on(assist(State(state()), Path("acme.com".to_string())))
                 .unwrap();
             // BAD_REQUEST (not a 500/panic) proves the channel check ran, and it necessarily ran
             // before any lock::try_acquire/ChromeBrowser call, since those sit later in the fn.
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        });
+    }
+
+    #[test]
+    fn confirm_sent_marks_linkedin_and_is_idempotent_with_no_staged_window() {
+        crate::testutil::with_home("ct-web-li-confirm-mark", |_| {
+            crate::db::init().unwrap();
+            let c = crate::db::open().unwrap();
+            c.execute(
+                "INSERT INTO companies (domain, source_query) VALUES ('acme.com','q')",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO outreach (domain, channel, subject, body, status) \
+                 VALUES ('acme.com','linkedin','','Hi Jane','draft_pending')",
+                [],
+            )
+            .unwrap();
+            // The assist slot is empty (no live window) — confirm must still mark the row sent and
+            // return ok without touching a browser or deadlocking on the slot.
+            let resp = tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(confirm(
+                    State(state()),
+                    Path("acme.com".to_string()),
+                    Json(ConfirmReq { sent: true }),
+                ))
+                .unwrap();
+            assert_eq!(resp.0["ok"].as_bool(), Some(true));
+            let status: String = c
+                .query_row(
+                    "SELECT status FROM outreach WHERE domain='acme.com' AND channel='linkedin'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "sent");
         });
     }
 
@@ -298,7 +411,7 @@ mod tests {
             crate::db::init().unwrap();
             let res = tokio::runtime::Runtime::new()
                 .unwrap()
-                .block_on(assist(Path("nowhere.com".to_string())));
+                .block_on(assist(State(state()), Path("nowhere.com".to_string())));
             assert!(res.is_err());
         });
     }
