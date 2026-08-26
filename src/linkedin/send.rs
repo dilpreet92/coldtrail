@@ -3,6 +3,7 @@
 //! authorized and cap-free — see the web assist handler).
 
 use anyhow::{anyhow, Result};
+use std::time::Duration;
 
 use crate::config::{Config, DEFAULT_LINKEDIN_DAILY_CAP, DEFAULT_LINKEDIN_WEEKLY_CAP};
 use crate::deliver::Draft;
@@ -11,6 +12,51 @@ use crate::linkedin::browser::{InviteOutcome, LinkedInBrowser, SendMode};
 /// Daytime sending window (local hour, 24h). Bursts/off-hours are detection signals.
 pub fn within_window(hour: u32) -> bool {
     (8..20).contains(&hour)
+}
+
+/// Inter-invite pacing bounds (seconds): every auto send waits until at least a randomized
+/// target in this range has elapsed since the previous LinkedIn send, so a run trickles instead
+/// of bursting (bursts are a detection signal).
+const PACING_MIN_SECS: u64 = 45;
+const PACING_MAX_SECS: u64 = 120;
+
+/// Pure pacing math: how much longer to wait so that `target_secs` have elapsed since the last
+/// send. `secs_since_last` is `None` when there is no prior LinkedIn send (→ no wait). A gap that
+/// already meets/exceeds the target (or a negative/clock-skew value) also yields no wait.
+pub fn remaining_pacing_delay(secs_since_last: Option<i64>, target_secs: u64) -> Duration {
+    match secs_since_last {
+        Some(s) if s >= 0 && (s as u64) < target_secs => {
+            Duration::from_secs(target_secs - s as u64)
+        }
+        _ => Duration::ZERO,
+    }
+}
+
+/// A randomized pacing target in `PACING_MIN_SECS..=PACING_MAX_SECS`. Jitter is derived from the
+/// current time's sub-second nanos — good enough to de-correlate send timing without pulling in an
+/// RNG crate. Runtime-only (not unit-tested); the deterministic math lives in
+/// `remaining_pacing_delay`.
+fn random_pacing_target() -> u64 {
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    PACING_MIN_SECS + jitter % (PACING_MAX_SECS - PACING_MIN_SECS + 1)
+}
+
+/// Whole seconds since the most recent `channel='linkedin'` send, or `None` if there is none.
+/// Best-effort — a db error is treated as "no prior send" (no wait), never a hard failure.
+fn secs_since_last_linkedin_send() -> Option<i64> {
+    crate::db::open().ok().and_then(|c| {
+        c.query_row(
+            "SELECT CAST((julianday('now') - julianday(MAX(sent_at))) * 86400 AS INTEGER) \
+             FROM outreach WHERE channel='linkedin' AND status='sent' AND sent_at IS NOT NULL",
+            [],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .ok()
+        .flatten()
+    })
 }
 
 /// Mark this domain's LinkedIn invite as sent, scoped to the `linkedin` channel so a same-domain
@@ -66,6 +112,15 @@ pub async fn deliver(
             "outside the LinkedIn sending window (08:00–20:00 local) — deferring"
         ));
     }
+    // Pacing: trickle sends so a run doesn't burst. Sleep the remaining time until a randomized
+    // minimum gap since the last LinkedIn send has elapsed. Done BEFORE taking the profile lock so
+    // the (up-to-2-minute) sleep doesn't hold the lock. Auto-send runs in the run subprocess, so
+    // sleeping here is fine; the human-authorized assist path never reaches this function.
+    let wait = remaining_pacing_delay(secs_since_last_linkedin_send(), random_pacing_target());
+    if !wait.is_zero() {
+        tokio::time::sleep(wait).await;
+    }
+
     // Gate 6: one Chrome per profile.
     let _lock = crate::linkedin::lock::try_acquire()?
         .ok_or_else(|| anyhow!("LinkedIn browser is busy — try again in a moment"))?;
@@ -113,6 +168,23 @@ mod tests {
             linkedin_auto_send: true,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn pacing_delay_waits_only_the_remaining_gap() {
+        // 30s elapsed, 100s target → wait the remaining 70s.
+        assert_eq!(
+            remaining_pacing_delay(Some(30), 100),
+            Duration::from_secs(70)
+        );
+        // Gap already meets the target → no wait.
+        assert_eq!(remaining_pacing_delay(Some(100), 100), Duration::ZERO);
+        // Gap exceeds the target → no wait.
+        assert_eq!(remaining_pacing_delay(Some(500), 100), Duration::ZERO);
+        // No prior send → no wait.
+        assert_eq!(remaining_pacing_delay(None, 100), Duration::ZERO);
+        // Clock skew (negative) → no wait, never a panic/overflow.
+        assert_eq!(remaining_pacing_delay(Some(-5), 100), Duration::ZERO);
     }
 
     #[tokio::test]
