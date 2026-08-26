@@ -137,11 +137,15 @@ pub struct ContactDto {
 #[derive(Serialize)]
 pub struct DraftDto {
     pub domain: String,
+    /// Recipient: an email address for the email channel, or the contact's LinkedIn profile
+    /// URL for the linkedin channel (see `channel`).
     pub to: Option<String>,
     pub subject: Option<String>,
     pub body: Option<String>,
     pub status: String,
     pub gmail_draft_id: Option<String>,
+    /// "email" | "linkedin" — drives which action buttons the Drafts UI renders.
+    pub channel: String,
 }
 
 #[derive(Deserialize)]

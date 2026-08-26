@@ -273,6 +273,19 @@ ol.steps li{margin-bottom:4px}
 a.btn{display:inline-block; text-decoration:none}
 .gmail-note{padding:8px 16px 0; font-family:var(--mono); font-size:12px; color:var(--cyan)}
 
+/* LinkedIn destination card (Destination panel, second half — mirrors the Gmail half above it) */
+.li-sep{display:flex; align-items:center; gap:8px; margin-top:18px; padding-top:14px; border-top:1px solid var(--line); font-family:var(--mono); font-size:12.5px; letter-spacing:.02em}
+.li-label{color:var(--ink); font-weight:600}
+.li-warn-badge{color:var(--warn)}
+.li-warn{color:var(--warn)}
+
+/* LinkedIn draft rows */
+.s-linkedin{color:var(--cyan); border-color:var(--cyan-dim)}
+.li-charcount{font-family:var(--mono); font-size:11.5px; color:var(--faint); padding:0 16px 12px; text-align:right}
+.li-charcount.over{color:var(--bad)}
+.li-confirm{display:flex; align-items:center; gap:8px}
+.li-confirm-q{font-family:var(--mono); font-size:12px; color:var(--mut)}
+
 /* overview */
 .tiles{display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:14px; margin-bottom:22px}
 .tile{background:linear-gradient(180deg,var(--panel),var(--panel2)); border:1px solid var(--line); border-radius:12px; padding:18px 20px}

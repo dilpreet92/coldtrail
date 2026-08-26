@@ -1,0 +1,12 @@
+{
+  "name": "coldtrail-ui-tests",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Playwright specs for coldtrail's browser UI (ui/index.html + ui/app.js). Every spec route-intercepts backend calls that would otherwise touch real state or launch a real browser (e.g. the LinkedIn destination) — nothing here should ever reach a live server or LinkedIn.",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.47.0"
+  }
+}
