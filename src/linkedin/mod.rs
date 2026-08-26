@@ -31,12 +31,12 @@ fn state_path() -> Result<PathBuf> {
 }
 
 #[cfg(unix)]
-fn set_private(p: &std::path::Path) {
+pub(crate) fn set_private(p: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700));
 }
 #[cfg(not(unix))]
-fn set_private(_p: &std::path::Path) {}
+pub(crate) fn set_private(_p: &std::path::Path) {}
 
 /// Persisted connection state (the truth the UI status reads).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

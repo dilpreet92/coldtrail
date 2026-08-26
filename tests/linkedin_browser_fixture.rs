@@ -33,6 +33,10 @@ mod linkedin {
         Ok(dir)
     }
 
+    // Shim for `set_private` (0700 the profile/debug dirs in production). A no-op here — the
+    // fixture only needs `browser.rs` to compile and drive Chrome, not to lock down temp dirs.
+    pub fn set_private(_p: &std::path::Path) {}
+
     pub fn chrome_binary() -> Result<PathBuf> {
         let candidates: &[&str] = if cfg!(target_os = "macos") {
             &[

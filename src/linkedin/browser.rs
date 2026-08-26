@@ -392,6 +392,9 @@ async fn has_li_at(page: &Page) -> bool {
 async fn debug_screenshot(page: &Page) -> Option<PathBuf> {
     let dir = profile_dir().ok()?.parent()?.join("linkedin-debug");
     std::fs::create_dir_all(&dir).ok()?;
+    // Screenshots can capture PII from the profile — lock the dir down (0700 on unix), same
+    // treatment as the profile dir itself.
+    crate::linkedin::set_private(&dir);
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()?
