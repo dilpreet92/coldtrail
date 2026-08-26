@@ -173,9 +173,9 @@ pub async fn confirm(
 ) -> Result<Json<serde_json::Value>, ApiErr> {
     let domain = domain.to_lowercase();
     if req.sent {
-        // Same UPDATE the auto path uses (`linkedin::send::deliver`) — one outreach row per
-        // domain makes a domain-scoped mark safe for the linkedin channel too.
-        crate::mark::run(&domain, "sent")?;
+        // Channel-scoped mark (same helper the auto path uses): a domain can carry a separate
+        // email row (e.g. a follow-up), so a domain-wide UPDATE would false-mark it.
+        crate::linkedin::send::mark_linkedin_sent(&domain)?;
     }
     Ok(Json(serde_json::json!({ "ok": true })))
 }

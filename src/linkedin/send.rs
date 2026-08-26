@@ -13,6 +13,21 @@ pub fn within_window(hour: u32) -> bool {
     (8..20).contains(&hour)
 }
 
+/// Mark this domain's LinkedIn invite as sent, scoped to the `linkedin` channel so a same-domain
+/// row on another channel (e.g. an email follow-up created by `draft::followup_add`) is never
+/// false-marked. Mirrors the company-status bump the email path does via `mark::run`. Shared by
+/// the auto path (`deliver` below) and the web assist `confirm` route.
+pub fn mark_linkedin_sent(domain: &str) -> anyhow::Result<()> {
+    let conn = crate::db::open()?;
+    conn.execute(
+        "UPDATE outreach SET status='sent', sent_at=datetime('now') \
+         WHERE domain=?1 AND channel='linkedin' AND status IN ('draft_pending','drafted')",
+        [domain],
+    )?;
+    crate::db::set_status(&conn, domain, "sent")?;
+    Ok(())
+}
+
 /// Deliver one LinkedIn invite via the gated auto path. Browser + local hour injected for tests.
 pub async fn deliver(
     domain: &str,
@@ -60,7 +75,7 @@ pub async fn deliver(
         .await?
     {
         InviteOutcome::Sent => {
-            crate::mark::run(domain, "sent")?;
+            mark_linkedin_sent(domain)?;
             Ok(format!(
                 "invited {} on LinkedIn ({}/{daily} today)",
                 d.to,
@@ -146,6 +161,52 @@ mod tests {
         });
         // login field only matters for the connect flow; silence unused warnings deterministically
         let _ = LoginOutcome::LoggedIn;
+    }
+
+    #[test]
+    fn linkedin_mark_is_channel_scoped_and_spares_same_domain_email_row() {
+        crate::testutil::with_home("ct-lisend-mark-scope", |_| {
+            crate::db::init().unwrap();
+            let c = crate::db::open().unwrap();
+            c.execute(
+                "INSERT INTO companies (domain, source_query) VALUES ('acme.com','q')",
+                [],
+            )
+            .unwrap();
+            // Same domain, two channels: a LinkedIn invite draft AND an email follow-up draft.
+            c.execute(
+                "INSERT INTO outreach (domain, channel, subject, body, status) \
+                 VALUES ('acme.com','linkedin','','Hi Jane','draft_pending')",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO outreach (domain, channel, subject, body, status) \
+                 VALUES ('acme.com','email','Re: hi','following up','draft_pending')",
+                [],
+            )
+            .unwrap();
+
+            mark_linkedin_sent("acme.com").unwrap();
+
+            let li: String = c
+                .query_row(
+                    "SELECT status FROM outreach WHERE domain='acme.com' AND channel='linkedin'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let em: String = c
+                .query_row(
+                    "SELECT status FROM outreach WHERE domain='acme.com' AND channel='email'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            // The LinkedIn row is sent; the email follow-up row is left untouched.
+            assert_eq!(li, "sent");
+            assert_eq!(em, "draft_pending", "email row must NOT be false-marked");
+        });
     }
 
     #[test]
