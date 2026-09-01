@@ -128,10 +128,11 @@ observing LinkedIn's own confirmation. Assist mode has no cap because a human is
 actual clicking.
 
 **Where the session lives.** LinkedIn's cookies/session live in a coldtrail-owned Chrome
-profile directory outside the agent's workspace, next to your other secrets (OS config
-dir — e.g. `~/.config/coldtrail/linkedin-profile` on Linux), created with locked-down (0700)
-permissions. It holds only the browser session, never a password. The workspace agent that
-runs shell commands can't read it.
+profile directory outside the agent's workspace, next to your other secrets — in your OS
+config dir (`dirs::config_dir()`): `~/Library/Application Support/coldtrail/linkedin-profile`
+on macOS, `~/.config/coldtrail/linkedin-profile` on Linux, `%APPDATA%\coldtrail\linkedin-profile`
+on Windows — created with locked-down (0700) permissions. It holds only the browser session,
+never a password. The workspace agent that runs shell commands can't read it.
 
 ## Guardrails baked in
 

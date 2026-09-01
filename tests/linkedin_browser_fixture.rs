@@ -1,6 +1,9 @@
-//! Drives real Chrome (via ChromeBrowser's CDP path) against a LOCAL static page that mimics
-//! LinkedIn's Connect->note->Send DOM. Never touches linkedin.com. Ignored by default because it
-//! needs a Chrome binary (and a display, since the driver runs headful); run with:
+//! Drives real Chrome (via ChromeBrowser's CDP path) against a LOCAL static page that mimics the
+//! LinkedIn DOM that broke the first live run: a Follow / Message / "…" action bar with Connect
+//! hidden INSIDE the "…" (More) overflow menu. This exercises the driver's text/role location and
+//! the "…" -> in-menu Connect -> Add-a-note -> fill -> Send path. Never touches linkedin.com.
+//! Ignored by default because it needs a Chrome binary (and a display, since the driver runs
+//! headful); run with:
 //!
 //!   cargo test --test linkedin_browser_fixture -- --ignored
 //!
@@ -104,7 +107,7 @@ fn serve_fixture() -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs a real Chrome binary + display; run with --ignored"]
-async fn drives_connect_note_send_on_fixture() {
+async fn drives_connect_under_more_note_send_on_fixture() {
     let base = serve_fixture();
     // Point the driver at the local server via the strictly test-only override.
     std::env::set_var("COLDTRAIL_LINKEDIN_BASE", &base);
@@ -115,7 +118,8 @@ async fn drives_connect_note_send_on_fixture() {
     // typing would choke on it, so this guards against that regression.
     let note = "Hi Jane — enjoyed your post on cold outreach.";
 
-    // Assist: drive up to the filled note, stop before Send.
+    // Assist: there is NO top-level Connect, so the driver must open the "…" overflow, click the
+    // in-menu Connect, click Add-a-note, fill the note, and stop before Send.
     let staged = browser
         .send_connection_request(&profile_url, note, SendMode::Assist)
         .await
@@ -123,10 +127,11 @@ async fn drives_connect_note_send_on_fixture() {
     assert_eq!(
         staged,
         InviteOutcome::Staged,
-        "Assist should stage the invite"
+        "Assist should stage the invite via the Connect-under-More path"
     );
 
-    // Auto: drive through Send and verify the confirmation.
+    // Auto: same path, then drive through Send and verify the Pending marker the Send handler
+    // creates (never-false-Sent: confirmation is a real post-Send signal, not pre-placed).
     let sent = browser
         .send_connection_request(&profile_url, note, SendMode::Auto)
         .await
@@ -134,6 +139,6 @@ async fn drives_connect_note_send_on_fixture() {
     assert_eq!(
         sent,
         InviteOutcome::Sent,
-        "Auto should confirm Sent (got {sent:?})"
+        "Auto should confirm Sent via the Connect-under-More path (got {sent:?})"
     );
 }

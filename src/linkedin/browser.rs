@@ -112,30 +112,112 @@ impl LinkedInBrowser for FakeBrowser {
     }
 }
 
-/// Every LinkedIn selector lives here — LinkedIn changes these often, so this is the one place to
-/// patch when a live run reports "… not found". These are best-effort as of 2026-08; the contract
-/// this task guarantees is screenshot-on-failure + never-false-`Sent`, NOT selector perfection.
+/// The two elements we still locate by a stable CSS id/prefix. Everything else (Connect, the "…"
+/// overflow, its in-menu Connect item, Add-a-note, Send) is located by TEXT/ROLE in JS — see the
+/// `match_` predicates below — because LinkedIn's aria-labels drift but the human-visible text does
+/// not. The contract this task guarantees is screenshot-on-failure + never-false-`Sent`, NOT
+/// selector perfection.
 mod selectors {
-    /// Primary Connect button on a profile; fall back to the overflow menu when absent.
-    pub const CONNECT_BTN: &str = "button[aria-label^='Invite'][aria-label*='connect']";
-    /// The "More actions" overflow that hides Connect on some profiles.
-    pub const MORE_BTN: &str = "button[aria-label='More actions']";
-    /// "Add a note" inside the Connect modal.
-    pub const ADD_NOTE_BTN: &str = "button[aria-label='Add a note']";
-    /// The custom-note textarea.
+    /// The custom-note textarea. Real LinkedIn and the fixture both use this id; the note-fill path
+    /// falls back to any visible `<textarea>` inside the open dialog when the id ever changes.
     pub const NOTE_TEXTAREA: &str = "textarea#custom-message";
-    /// Send: "Send invitation" (current) or "Send now" (older) label.
-    pub const SEND_BTN: &str =
-        "button[aria-label='Send invitation'], button[aria-label='Send now']";
-    /// After a successful invite the profile shows a "Pending" button.
+    /// After a successful invite the profile shows a "Pending" button — the never-false-Sent gate.
     pub const PENDING_MARKER: &str = "button[aria-label^='Pending']";
 }
+
+/// The CSS candidate sets each text matcher scans. Kept broad on purpose — a matcher narrows by
+/// visible TEXT/aria (see `match_`), not by a brittle attribute, so a class/label rename can't hide
+/// the target as long as the human-readable text survives.
+mod candidates {
+    /// A top-level Connect: a real control anywhere in the document (main bar or sticky header).
+    pub const TOP: &str = "button, a, [role=button]";
+    /// A primary-action control: the "…" overflow, Add-a-note, and Send all live in this set.
+    pub const ACTION: &str = "button, [role=button]";
+    /// A Connect item inside the opened "…" dropdown — menus render items as varied tags.
+    pub const DROPDOWN: &str = "div[role=button], button, a, li, span";
+}
+
+/// JS boolean predicates run against each candidate, with `txt` = its lowercased trimmed text and
+/// `aria` = its lowercased `aria-label` in scope. Text/role, never a raw attribute — this is the
+/// one place to tweak when a live run reports a step "not found".
+mod match_ {
+    /// Connect (top-level or the in-menu item): exact visible text, or the invite-to-connect label.
+    pub const CONNECT: &str = "txt === 'connect' || /invite .* to connect/i.test(aria)";
+    /// The "…" overflow: an aria-label mentioning "more" (but not a see/show/read-more expander), or
+    /// the literal ellipsis as visible text. Deliberately looser than the old exact `More actions`.
+    pub const MORE: &str =
+        r"(/\bmore\b/i.test(aria) && !/(see|show|read) more/i.test(aria)) || txt === '…'";
+    /// "Add a note" inside the invite modal.
+    pub const ADD_NOTE: &str = "txt === 'add a note'";
+    /// Send: "Send", "Send invitation" (current) or "Send now" (older).
+    pub const SEND: &str = "/^send( invitation)?$/i.test(txt) || txt === 'send now'";
+}
+
+/// Template for the locate-and-tag matcher: scan `__CAND__` for the FIRST *visible* element whose
+/// text/aria satisfies `__PRED__`, tag it `data-ct='__TAG__'`, and return whether one was found. Run
+/// as a strict expression (an IIFE) via `evaluate_expression`, so chromiumoxide never mis-detects it
+/// as a function declaration. Visibility is a real client-rect check so a `position:fixed` sticky
+/// header still counts but a `display:none` dropdown item (before the menu opens) does not.
+const LOCATE_TEMPLATE: &str = r#"(() => {
+  const visible = (el) => {
+    const rects = el.getClientRects();
+    if (!rects.length) return false;
+    const b = el.getBoundingClientRect();
+    return b.width > 0 && b.height > 0;
+  };
+  const nodes = document.querySelectorAll('__CAND__');
+  for (const el of nodes) {
+    const txt = (el.innerText || el.textContent || '').trim().toLowerCase();
+    const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+    if ((__PRED__) && visible(el)) {
+      el.setAttribute('data-ct', '__TAG__');
+      return true;
+    }
+  }
+  return false;
+})()"#;
+
+/// Locate + tag the note textarea: prefer the stable id, else the first visible `<textarea>` inside
+/// an open dialog. Tags it `data-ct='note'` so the fill + verify steps have a stable handle.
+const LOCATE_TEXTAREA_JS: &str = r#"(() => {
+  const visible = (el) => {
+    const rects = el.getClientRects();
+    if (!rects.length) return false;
+    const b = el.getBoundingClientRect();
+    return b.width > 0 && b.height > 0;
+  };
+  let t = document.querySelector('textarea#custom-message');
+  if (!t || !visible(t)) {
+    const scopes = document.querySelectorAll('[role=dialog], .artdeco-modal, dialog');
+    const list = scopes.length ? Array.from(scopes) : [document];
+    t = null;
+    for (const s of list) {
+      for (const ta of s.querySelectorAll('textarea')) {
+        if (visible(ta)) { t = ta; break; }
+      }
+      if (t) break;
+    }
+  }
+  if (!t) return false;
+  t.setAttribute('data-ct', 'note');
+  return true;
+})()"#;
+
+/// Read the tagged note textarea's current value, for post-insert verification.
+const READ_NOTE_JS: &str = r#"(() => { const t = document.querySelector("[data-ct='note']"); return t ? t.value : ""; })()"#;
+
+/// Remove a `data-ct` tag so it can never leak into a later matcher pass.
+const UNTAG_TEMPLATE: &str = r#"(() => { const e = document.querySelector("[data-ct='__TAG__']"); if (e) e.removeAttribute('data-ct'); return true; })()"#;
 
 /// The origin production always targets. Never overridden outside the test-only constructor.
 const LINKEDIN_ORIGIN: &str = "https://www.linkedin.com";
 /// Element-wait budget: `WAIT_TRIES * WAIT_INTERVAL` per lookup (~6s).
 const WAIT_TRIES: u32 = 20;
 const WAIT_INTERVAL: Duration = Duration::from_millis(300);
+/// Shorter budget for the top-level Connect and the "…" overflow: enough to absorb late action-bar
+/// hydration (~3s), but on a Follow/Message/"…" profile the top-level probe is *expected* to miss,
+/// so we don't want to burn the full budget before trying the overflow.
+const CONNECT_TRIES: u32 = 10;
 /// Let navigation / redirects settle before reading the URL or cookies.
 const SETTLE: Duration = Duration::from_millis(1200);
 /// Cap graceful browser teardown so it can never hang the send path; force-kill past this.
@@ -257,52 +339,44 @@ impl ChromeBrowser {
             }
         }
 
-        // Connect: try the direct button, else the More overflow -> Connect.
-        let connect = match require(&page, selectors::CONNECT_BTN, "Connect button").await {
-            Ok(el) => el,
-            Err(_) => {
-                let Ok(more) = require(&page, selectors::MORE_BTN, "More actions button").await
-                else {
-                    return Ok(
-                        failed(&page, "Connect button not found (direct or via More)").await,
-                    );
-                };
-                if more.click().await.is_err() {
-                    return Ok(failed(&page, "failed to open the More actions menu").await);
-                }
-                match require(&page, selectors::CONNECT_BTN, "Connect button (More menu)").await {
-                    Ok(el) => el,
-                    Err(reason) => return Ok(failed(&page, &reason).await),
-                }
-            }
-        };
-        if connect.click().await.is_err() {
-            return Ok(failed(&page, "failed to click Connect").await);
+        // Connect: a top-level button (main bar or sticky header), else the "…" overflow -> the
+        // in-menu Connect item. Each target is located by TEXT/ROLE in JS, tagged, and clicked with
+        // a REAL (trusted CDP) gesture — LinkedIn may ignore an untrusted synthetic `.click()`.
+        if !locate_connect(&page).await {
+            return Ok(failed(
+                &page,
+                "could not find Connect (no top-level button and none in the More \"…\" overflow menu)",
+            )
+            .await);
         }
 
         // Add a note.
-        let add_note = match require(&page, selectors::ADD_NOTE_BTN, "Add a note button").await {
-            Ok(el) => el,
-            Err(reason) => return Ok(failed(&page, &reason).await),
-        };
-        if add_note.click().await.is_err() {
-            return Ok(failed(&page, "failed to click Add a note").await);
+        match locate_and_click_retry(
+            &page,
+            "addnote",
+            candidates::ACTION,
+            match_::ADD_NOTE,
+            WAIT_TRIES,
+        )
+        .await
+        {
+            Located::Clicked => {}
+            Located::ClickFailed => {
+                return Ok(failed(&page, "found \"Add a note\" but could not click it").await)
+            }
+            Located::NotFound => {
+                return Ok(failed(
+                    &page,
+                    "could not find \"Add a note\" (the invite modal did not open)",
+                )
+                .await)
+            }
         }
 
-        // Focus the note textarea, then insert the note.
-        let textarea = match require(&page, selectors::NOTE_TEXTAREA, "note textarea").await {
-            Ok(el) => el,
-            Err(reason) => return Ok(failed(&page, &reason).await),
-        };
-        if textarea.click().await.is_err() {
-            return Ok(failed(&page, "failed to focus the note textarea").await);
-        }
-        // Insert the note via CDP `Input.insertText` rather than per-key events: it handles
-        // arbitrary Unicode (em-dashes, smart quotes, accents, emoji — all common in real notes
-        // and names) and fires the input events a React textarea needs. `type_str` errors on any
-        // character outside its US-keyboard keymap, so it is unsafe for real note content.
-        if page.execute(InsertTextParams::new(note)).await.is_err() {
-            return Ok(failed(&page, "failed to type the note").await);
+        // Fill the note: focus the textarea, insert via CDP `Input.insertText`, and VERIFY the value
+        // stuck (so a silent fill-failure becomes Failed, not a blank note).
+        if let Err(reason) = fill_note(&page, note).await {
+            return Ok(failed(&page, &reason).await);
         }
 
         // Assist stops here with the modal open for the human to click Send.
@@ -311,12 +385,14 @@ impl ChromeBrowser {
         }
 
         // Auto: click Send, then VERIFY. Never return Sent without observing the confirmation.
-        let send = match require(&page, selectors::SEND_BTN, "Send button").await {
-            Ok(el) => el,
-            Err(reason) => return Ok(failed(&page, &reason).await),
-        };
-        if send.click().await.is_err() {
-            return Ok(failed(&page, "failed to click Send").await);
+        match locate_and_click_retry(&page, "send", candidates::ACTION, match_::SEND, WAIT_TRIES)
+            .await
+        {
+            Located::Clicked => {}
+            Located::ClickFailed => {
+                return Ok(failed(&page, "found the Send button but could not click it").await)
+            }
+            Located::NotFound => return Ok(failed(&page, "could not find the Send button").await),
         }
 
         // Confirmation = a Pending marker appeared AND the invite modal (its textarea) is gone.
@@ -461,6 +537,179 @@ async fn require(page: &Page, selector: &str, what: &str) -> std::result::Result
         tokio::time::sleep(WAIT_INTERVAL).await;
     }
     Err(format!("{what} not found (selector: {selector})"))
+}
+
+/// Outcome of a single locate-then-click attempt.
+enum Located {
+    /// Matched a visible element and completed a trusted CDP click on it.
+    Clicked,
+    /// Matched, but the trusted click failed (not clickable / detached mid-click).
+    ClickFailed,
+    /// No visible element matched the text/role predicate.
+    NotFound,
+}
+
+/// Build the locate-and-tag matcher expression for `candidates`/`predicate`/`tag`. Simple `replace`
+/// (not `format!`) so the JS braces don't need escaping and the inputs stay readable.
+fn locate_js(tag: &str, candidates: &str, predicate: &str) -> String {
+    LOCATE_TEMPLATE
+        .replace("__CAND__", candidates)
+        .replace("__PRED__", predicate)
+        .replace("__TAG__", tag)
+}
+
+/// Run a boolean matcher expression, mapping any error/non-bool result to `false`.
+async fn eval_bool(page: &Page, js: impl Into<String>) -> bool {
+    page.evaluate_expression(js.into())
+        .await
+        .ok()
+        .and_then(|r| r.into_value::<bool>().ok())
+        .unwrap_or(false)
+}
+
+/// Drop a `data-ct` tag (best-effort) so it can't be re-matched in a later pass.
+async fn untag(page: &Page, tag: &str) {
+    let _ = page
+        .evaluate_expression(UNTAG_TEMPLATE.replace("__TAG__", tag))
+        .await;
+}
+
+/// Locate a target by TEXT/ROLE (tag it `data-ct=<tag>`), then click the tagged node with a REAL
+/// (trusted CDP) gesture — `chromiumoxide`'s `Element::click` scrolls into view and dispatches a
+/// mouse event, which LinkedIn treats as a genuine user action (an untrusted JS `.click()` can be
+/// ignored/flagged). The tag is always removed afterward.
+async fn locate_and_click(page: &Page, tag: &str, candidates: &str, predicate: &str) -> Located {
+    if !eval_bool(page, locate_js(tag, candidates, predicate)).await {
+        return Located::NotFound;
+    }
+    let sel = format!("[data-ct='{tag}']");
+    let clicked = match page.find_element(&sel).await {
+        Ok(el) => el.click().await.is_ok(),
+        Err(_) => false,
+    };
+    untag(page, tag).await;
+    if clicked {
+        Located::Clicked
+    } else {
+        Located::ClickFailed
+    }
+}
+
+/// Retry [`locate_and_click`] up to `tries` times (≈`tries * WAIT_INTERVAL`) to absorb load/animation
+/// timing. Returns on the first `Clicked`; otherwise reports the last non-`Clicked` outcome.
+async fn locate_and_click_retry(
+    page: &Page,
+    tag: &str,
+    candidates: &str,
+    predicate: &str,
+    tries: u32,
+) -> Located {
+    let mut last = Located::NotFound;
+    for _ in 0..tries {
+        match locate_and_click(page, tag, candidates, predicate).await {
+            Located::Clicked => return Located::Clicked,
+            other => last = other,
+        }
+        tokio::time::sleep(WAIT_INTERVAL).await;
+    }
+    last
+}
+
+/// Click a Connect control: a visible top-level button (main bar or sticky header), else open the
+/// "…" overflow and click its in-menu Connect item. Returns true once a Connect has been clicked.
+async fn locate_connect(page: &Page) -> bool {
+    // (a) A top-level Connect (short poll — absent on Follow/Message/"…" profiles, by design).
+    if let Located::Clicked = locate_and_click_retry(
+        page,
+        "connect",
+        candidates::TOP,
+        match_::CONNECT,
+        CONNECT_TRIES,
+    )
+    .await
+    {
+        return true;
+    }
+    // (b) The "…" overflow, then the Connect item inside the dropdown it opens.
+    if let Located::Clicked = locate_and_click_retry(
+        page,
+        "more",
+        candidates::ACTION,
+        match_::MORE,
+        CONNECT_TRIES,
+    )
+    .await
+    {
+        if let Located::Clicked = locate_and_click_retry(
+            page,
+            "connect",
+            candidates::DROPDOWN,
+            match_::CONNECT,
+            WAIT_TRIES,
+        )
+        .await
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Focus the note textarea and insert `note` via CDP `Input.insertText`, then VERIFY the field holds
+/// exactly `note`. Insert (not per-key typing) handles arbitrary Unicode — em-dashes, smart quotes,
+/// accents, emoji, all common in real notes/names — and fires the input events a React textarea
+/// needs; `type_str` errors on any character outside its US-keyboard keymap. Returns a step reason on
+/// failure so a blank/short fill becomes a diagnostic `Failed`, never a silently empty note.
+async fn fill_note(page: &Page, note: &str) -> std::result::Result<(), String> {
+    // Locate + tag the textarea (poll for the modal to render).
+    let mut located = false;
+    for _ in 0..WAIT_TRIES {
+        if eval_bool(page, LOCATE_TEXTAREA_JS).await {
+            located = true;
+            break;
+        }
+        tokio::time::sleep(WAIT_INTERVAL).await;
+    }
+    if !located {
+        return Err("could not find the note textarea".to_string());
+    }
+
+    // Focus it with a trusted gesture (click), falling back to a plain focus().
+    let ta = page
+        .find_element("[data-ct='note']")
+        .await
+        .map_err(|_| "note textarea vanished after tagging".to_string())?;
+    let focused = ta.click().await.is_ok() || ta.focus().await.is_ok();
+    if !focused {
+        untag(page, "note").await;
+        return Err("could not focus the note textarea".to_string());
+    }
+
+    if page.execute(InsertTextParams::new(note)).await.is_err() {
+        untag(page, "note").await;
+        return Err("failed to insert the note text".to_string());
+    }
+
+    // Verify the value actually landed (React can swallow an insert). Poll a few ticks.
+    let mut ok = false;
+    for _ in 0..WAIT_TRIES {
+        let value = page
+            .evaluate_expression(READ_NOTE_JS)
+            .await
+            .ok()
+            .and_then(|r| r.into_value::<String>().ok());
+        if value.as_deref() == Some(note) {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(WAIT_INTERVAL).await;
+    }
+    untag(page, "note").await;
+    if ok {
+        Ok(())
+    } else {
+        Err("the note textarea did not accept the text (verification failed)".to_string())
+    }
 }
 
 /// True if the page carries a LinkedIn session cookie.

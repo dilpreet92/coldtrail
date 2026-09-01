@@ -5,7 +5,9 @@
     <title>Fake LinkedIn Profile (fixture)</title>
     <style>
       body { font-family: sans-serif; margin: 40px; }
-      button { font-size: 16px; padding: 10px 16px; margin: 6px 0; cursor: pointer; }
+      button { font-size: 16px; padding: 10px 16px; margin: 6px 6px 6px 0; cursor: pointer; }
+      #more-menu { border: 1px solid #888; padding: 8px; margin-top: 8px; max-width: 260px; }
+      #more-menu [role="button"] { display: block; padding: 10px 12px; cursor: pointer; }
       #modal { border: 1px solid #888; padding: 20px; margin-top: 20px; max-width: 480px; }
       textarea { width: 100%; height: 120px; font-size: 14px; box-sizing: border-box; }
       .hidden { display: none; }
@@ -13,55 +15,64 @@
   </head>
   <body>
     <!--
-      Static fixture that mimics LinkedIn's Connect -> Add-a-note -> Send DOM. It uses the SAME
-      selectors as `src/linkedin/browser.rs::selectors`, so the real driving code is exercised
-      unchanged. It NEVER contacts linkedin.com. Flow:
-        Connect click  -> reveal the invite modal (Add-a-note + Send visible)
-        Add-a-note click -> reveal the note textarea
-        Send click     -> REMOVE the modal from the DOM, reveal the Pending marker
-      The Send path removes (not just hides) the modal so `find_element(textarea#custom-message)`
-      fails afterwards, matching LinkedIn where the modal is torn down on a successful invite.
+      Static fixture that mimics the LinkedIn DOM that BROKE the first live run: the primary action
+      bar is Follow / Message / "…" with NO top-level Connect — Connect lives INSIDE the "…" (More)
+      overflow menu. It exercises the driver's text/role location (see src/linkedin/browser.rs
+      `match_`) + trusted-click path unchanged; it NEVER contacts linkedin.com. Flow:
+        "…" (More) click     -> open the dropdown menu (its Connect item becomes visible)
+        in-menu Connect click -> reveal the invite modal (Add-a-note + Send visible)
+        Add-a-note click      -> reveal the note textarea
+        Send click            -> REMOVE the modal, then CREATE the Pending marker
+
+      Two deliberate fidelity choices mirror real LinkedIn:
+        * Connect is only reachable via "…" (no top-level Connect button anywhere), and the menu
+          starts display:none so the driver's *visible*-element matcher can't see the Connect item
+          until the overflow is actually opened — forcing the More fallback path.
+        * The Pending marker is CREATED by the Send handler (not pre-placed hidden), so Auto->Sent is
+          gated on a real post-Send signal, exactly like the live confirmation.
     -->
     <h1>Jane Doe</h1>
     <p>Fixture profile — no network, no LinkedIn.</p>
 
-    <!-- CONNECT_BTN: button[aria-label^='Invite'][aria-label*='connect'] -->
-    <button id="connect" aria-label="Invite Jane Doe to connect">Connect</button>
+    <!-- Primary action bar: Follow / Message / "…". NO top-level Connect (matches the failing DOM). -->
+    <button id="follow" aria-label="Follow Jane Doe">Follow</button>
+    <button id="message" aria-label="Message Jane Doe">Message</button>
+    <button id="more" aria-label="More actions">…</button>
 
-    <!-- Overflow fallback (MORE_BTN); unused by the happy path but present for completeness. -->
-    <button id="more" aria-label="More actions">More</button>
+    <!-- The "…" overflow menu. display:none until opened, so Connect isn't a *visible* match before. -->
+    <div id="more-menu" class="hidden" role="menu">
+      <!-- The in-menu Connect: matched by trimmed text "Connect" AND the invite-to-connect aria. -->
+      <div id="connect" role="button" aria-label="Invite Jane Doe to connect">Connect</div>
+    </div>
 
-    <!-- PENDING_MARKER: button[aria-label^='Pending'] — the success confirmation. -->
-    <button id="pending" class="hidden" aria-label="Pending">Pending</button>
-
-    <div id="modal" class="hidden">
+    <div id="modal" class="hidden" role="dialog" aria-label="Invite Jane Doe to connect">
       <p>Add a note to your invitation?</p>
-      <!-- ADD_NOTE_BTN: button[aria-label='Add a note'] -->
       <button id="add-note" aria-label="Add a note">Add a note</button>
 
-      <!-- NOTE_TEXTAREA: textarea#custom-message -->
       <textarea id="custom-message" class="hidden" placeholder="Your note"></textarea>
 
-      <!-- SEND_BTN: button[aria-label='Send invitation'] -->
       <button id="send" aria-label="Send invitation">Send invitation</button>
     </div>
 
     <script>
-      const connect = document.getElementById("connect");
       const more = document.getElementById("more");
+      const moreMenu = document.getElementById("more-menu");
+      const connect = document.getElementById("connect");
       const modal = document.getElementById("modal");
       const addNote = document.getElementById("add-note");
       const textarea = document.getElementById("custom-message");
       const send = document.getElementById("send");
-      const pending = document.getElementById("pending");
 
-      function openModal() {
-        connect.classList.add("hidden");
+      // "…" opens the overflow menu — only now does the Connect item become visible.
+      more.addEventListener("click", () => {
+        moreMenu.classList.remove("hidden");
+      });
+
+      // In-menu Connect opens the invite modal (and closes the menu).
+      connect.addEventListener("click", () => {
+        moreMenu.classList.add("hidden");
         modal.classList.remove("hidden");
-      }
-      connect.addEventListener("click", openModal);
-      // The overflow path also opens the same modal.
-      more.addEventListener("click", openModal);
+      });
 
       addNote.addEventListener("click", () => {
         textarea.classList.remove("hidden");
@@ -69,9 +80,15 @@
       });
 
       send.addEventListener("click", () => {
-        // Tear the modal down entirely, then surface the Pending confirmation.
+        // Tear the modal down entirely, THEN create the Pending confirmation — so the driver's
+        // never-false-Sent gate (Pending present AND modal gone) is satisfied by a real post-Send
+        // signal, not something pre-placed on the page.
         modal.remove();
-        pending.classList.remove("hidden");
+        const pending = document.createElement("button");
+        pending.id = "pending";
+        pending.setAttribute("aria-label", "Pending");
+        pending.textContent = "Pending";
+        document.body.appendChild(pending);
       });
     </script>
   </body>
