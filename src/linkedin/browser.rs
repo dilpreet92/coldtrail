@@ -155,8 +155,18 @@ mod scopes {
         ".artdeco-dropdown__content--is-open",
         "[role='menu']",
     ];
-    /// The open invite dialog — Add-a-note, the note textarea, and Send all live here.
-    pub const DIALOG: &[&str] = &["[role='dialog']", ".artdeco-modal", "dialog"];
+    /// The open invite modal — Add-a-note and Send. LinkedIn's modal container class/role varies (the
+    /// action buttons can sit outside a `[role='dialog']` inner node, and a first/only-dialog scope
+    /// lands on the Messaging widget instead), so we search the dialog containers AND fall back to
+    /// `<main>`/`<body>`. The EXCLUDE list still keeps the scan off the messaging widget / nav /
+    /// sidebars, where "Add a note"/"Send" never appear anyway.
+    pub const DIALOG: &[&str] = &[
+        "[role='dialog']",
+        ".artdeco-modal",
+        "dialog",
+        "main",
+        "body",
+    ];
 }
 
 /// Regions a profile-action locate must NEVER match into, even when nested inside an allowed scope:
@@ -850,12 +860,41 @@ async fn debug_screenshot(page: &Page) -> Option<PathBuf> {
     Some(path)
 }
 
-/// Build a `Failed` outcome, embedding a debug screenshot path when one could be captured.
+/// Dump the current page's full HTML into `linkedin-debug/<ts>.html` for post-mortem when a step can't
+/// be located — lets us see the REAL DOM (container class/role, exact button text) instead of guessing
+/// against LinkedIn's shifting markup. Best-effort — never panics.
+async fn debug_html(page: &Page) -> Option<PathBuf> {
+    let dir = profile_dir().ok()?.parent()?.join("linkedin-debug");
+    std::fs::create_dir_all(&dir).ok()?;
+    crate::linkedin::set_private(&dir);
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    let path = dir.join(format!("{ts}.html"));
+    let html = page
+        .evaluate_expression("document.documentElement.outerHTML")
+        .await
+        .ok()?
+        .into_value::<String>()
+        .ok()?;
+    std::fs::write(&path, html).ok()?;
+    Some(path)
+}
+
+/// Build a `Failed` outcome, embedding the debug screenshot + HTML-dump paths when they could be
+/// captured (the HTML is the definitive post-mortem for a "step not found" against live LinkedIn).
 async fn failed(page: &Page, reason: &str) -> InviteOutcome {
-    match debug_screenshot(page).await {
-        Some(path) => InviteOutcome::Failed(format!("{reason} — screenshot: {}", path.display())),
-        None => InviteOutcome::Failed(reason.to_string()),
+    let shot = debug_screenshot(page).await;
+    let html = debug_html(page).await;
+    let mut msg = reason.to_string();
+    if let Some(p) = shot {
+        msg.push_str(&format!(" — screenshot: {}", p.display()));
     }
+    if let Some(p) = html {
+        msg.push_str(&format!(" — html: {}", p.display()));
+    }
+    InviteOutcome::Failed(msg)
 }
 
 #[async_trait]
