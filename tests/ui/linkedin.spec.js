@@ -1,12 +1,12 @@
 // @ts-check
 //
 // Playwright spec for the LinkedIn destination card (ui/index.html + ui/app.js) and the
-// LinkedIn rendering in the Drafts tab. Everything the LinkedIn feature can do to a real
-// browser/backend — connect (launches a real, human-visible Chrome window), assist (drives that
-// window), disconnect, and auto-send — is route-intercepted below. This spec must NEVER let a
-// real request reach `/api/destination/linkedin/connect` or `/api/drafts/:domain/linkedin/assist`
-// unmocked: if a route pattern here is wrong and one of those falls through, the coldtrail
-// backend really would try to launch Chrome.
+// LinkedIn rendering in the Drafts tab. LinkedIn runs in ASSIST mode: the destination card is a
+// static explanation (no Connect / auto-send controls), and on the Drafts screen "Open in LinkedIn"
+// asks the backend to open the prospect's profile in the user's own browser (returns {opened:true}),
+// "Copy note" copies the note to the clipboard, and a ✓/✗ pair confirms whether it sent. The assist
+// endpoint is still route-intercepted below: against a live server it calls `open::that`, which
+// would really pop a browser tab, so this spec must NEVER let a request reach it unmocked.
 //
 // How to run this against a live coldtrail server (there is no CI wiring for this yet — see the
 // task-7 report for why):
@@ -90,7 +90,7 @@ test.beforeEach(async ({ page }) => {
   await page.route("**/api/destination/linkedin/disconnect", (route) => route.fulfill({ json: { ok: true } }));
 
   // --- Drafts LinkedIn endpoints ---------------------------------------------------------
-  await page.route("**/api/drafts/*/linkedin/assist", (route) => route.fulfill({ json: { staged: true } }));
+  await page.route("**/api/drafts/*/linkedin/assist", (route) => route.fulfill({ json: { opened: true } }));
   await page.route("**/api/drafts/*/linkedin/confirm", (route) => route.fulfill({ json: { ok: true } }));
   // The bare per-domain save endpoint ("persist edits first") — one path segment after the
   // domain, so this does not shadow the two routes above (which have two extra segments).
@@ -105,36 +105,22 @@ test.beforeEach(async ({ page }) => {
   await page.goto(`/?t=${TOKEN}`);
 });
 
-test("LinkedIn destination card: Connect goes waiting -> connected, then caps POST", async ({ page }) => {
+test("LinkedIn destination card: assist-mode copy, no connect/auto-send controls", async ({ page }) => {
   await page.click('[data-nav="onboarding"]');
-  const connectBtn = page.locator("#li-connect");
-  await expect(connectBtn).toBeVisible();
-
-  await connectBtn.click();
-  await expect(page.locator("#li-body")).toContainText("waiting for login");
-
-  // The poll (every 2s) flips to connected on its 2nd call — allow real time for it.
-  await expect(page.locator("#li-conn-badge")).toContainText("connected", { timeout: 10_000 });
-  await expect(page.locator("#li-disconnect")).toBeVisible();
-  await expect(page.locator("#li-as-toggle")).toBeVisible();
-
-  // Turning the toggle on shows a confirm() — accept it — then it POSTs to auto-send.
-  page.once("dialog", (d) => d.accept());
-  const [req] = await Promise.all([
-    page.waitForRequest(
-      (r) => r.url().includes("/api/destination/linkedin/auto-send") && r.method() === "POST"
-    ),
-    page.locator("#li-as-toggle").check(),
-  ]);
-  const posted = req.postDataJSON();
-  expect(posted.enabled).toBe(true);
-  expect(typeof posted.weekly_cap).toBe("number");
-  expect(typeof posted.daily_cap).toBe("number");
+  // The card is now a static assist-mode explanation — the badge says so.
+  await expect(page.locator("#li-conn-badge")).toContainText("assist mode");
+  // The CDP-managed controls are gone: no Connect/Reconnect, Disconnect, or auto-send toggle/caps.
+  await expect(page.locator("#li-connect")).toHaveCount(0);
+  await expect(page.locator("#li-disconnect")).toHaveCount(0);
+  await expect(page.locator("#li-as-toggle")).toHaveCount(0);
+  await expect(page.locator("#li-as-weekly")).toHaveCount(0);
+  await expect(page.locator("#li-as-daily")).toHaveCount(0);
 });
 
-test("Drafts: a LinkedIn draft shows its badge + live char count + Open-in-LinkedIn, then stages", async ({
+test("Drafts: a LinkedIn draft shows its badge + char count + Copy note + Open-in-LinkedIn, then confirms", async ({
   page,
 }) => {
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
   await page.click('[data-nav="drafts"]');
   const card = page.locator('.draft[data-channel="linkedin"]');
   await expect(card).toBeVisible();
@@ -149,14 +135,23 @@ test("Drafts: a LinkedIn draft shows its badge + live char count + Open-in-Linke
   await expect(counter).toHaveText("310/300");
   await expect(counter).toHaveClass(/over/);
 
+  // Copy note: writes the note to the clipboard and flips its label to a "Copied" affordance.
+  await note.fill("Hi Jane, let's connect.");
+  const copyBtn = card.locator(".li-copy");
+  await expect(copyBtn).toBeVisible();
+  await copyBtn.click();
+  await expect(copyBtn).toContainText("Copied");
+  const clip = await page.evaluate(() => navigator.clipboard.readText());
+  expect(clip).toBe("Hi Jane, let's connect.");
+
+  // Open in LinkedIn: POSTs assist -> {opened:true}, then the row re-renders with the "Did it
+  // send?" ✓/✗ pair instead of the Copy note / Open buttons.
   const assistBtn = card.locator(".li-assist");
   await expect(assistBtn).toBeVisible();
   await assistBtn.click();
-
-  // After {staged:true}, the row re-renders with the "Did it send?" ✓/✗ pair instead of the
-  // assist button.
   await expect(card.locator(".li-confirm-q")).toBeVisible();
   await expect(card.locator(".li-yes")).toBeVisible();
   await expect(card.locator(".li-no")).toBeVisible();
   await expect(card.locator(".li-assist")).toHaveCount(0);
+  await expect(card.locator(".li-copy")).toHaveCount(0);
 });

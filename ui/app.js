@@ -399,32 +399,18 @@ function linkedinAutoSendBlock(s) {
   </div>`;
 }
 
+// Assist-only card: LinkedIn's current Web-Components/Shadow-DOM invite modal is unreachable to an
+// automated driver, so there is no coldtrail-managed session, Connect step, or auto-send toggle.
+// The whole flow lives on the Drafts screen (Open in LinkedIn / Copy note / ✓✗ confirm), so this
+// card is just an explanatory badge. The connect/disconnect/auto-send helpers below are kept (the
+// backend routes still exist) but are no longer wired to any control.
 function renderLinkedinCard() {
-  const s = liStatus;
-  const body = $("#li-body");
   const badge = $("#li-conn-badge");
-  if (!body || !badge) return; // Destination panel not on screen (e.g. before first load)
+  if (!badge) return; // Destination panel not on screen (e.g. before first load)
   badge.classList.remove("li-warn-badge");
-  if (liWaiting) {
-    badge.textContent = "· connecting…";
-    body.innerHTML = `<p class="hint">waiting for login… finish signing in in the Chrome window that opened — this updates automatically.</p>`;
-    return;
-  }
-  if (s.linkedin_reconnect_needed) {
-    badge.textContent = "· reconnect needed";
-    badge.classList.add("li-warn-badge");
-    body.innerHTML = `<p class="hint li-warn">⚠ LinkedIn session expired — reconnect to keep sending invites.</p>
-      <div class="row"><button class="btn primary" id="li-connect">Reconnect LinkedIn</button><span class="form-msg" id="li-msg"></span></div>`;
-  } else if (s.linkedin_connected) {
-    badge.textContent = "· connected";
-    body.innerHTML = `<p class="hint">✓ connected.</p>
-      <div class="row"><button class="btn" id="li-disconnect">Disconnect</button><span class="form-msg" id="li-msg"></span></div>
-      ${linkedinAutoSendBlock(s)}`;
-  } else {
-    badge.textContent = "";
-    body.innerHTML = `<div class="row"><button class="btn primary" id="li-connect">Connect LinkedIn</button><span class="form-msg" id="li-msg"></span></div>`;
-  }
-  wireLinkedinCard();
+  badge.textContent = "· assist mode";
+  const body = $("#li-body");
+  if (body) body.innerHTML = "";
 }
 
 function wireLinkedinCard() {
@@ -968,15 +954,16 @@ loaders.overview = async () => {
 // --- drafts -----------------------------------------------------------------
 const escAttr = (s) => esc(s).replace(/"/g, "&quot;");
 const DRAFT_LABEL = { draft_pending: "draft", drafted: "in Gmail" };
-// Domains whose LinkedIn assist drive just staged an invite (Chrome left the modal open for the
-// human to click Send) — ephemeral client-side state; it drives the "Did it send?" ✓/✗ prompt
-// until the human resolves it via confirm. Not persisted: a reload just shows "Open in LinkedIn" again.
+// Domains whose LinkedIn profile the human just opened in their browser via assist — ephemeral
+// client-side state; it drives the "Did it send?" ✓/✗ prompt until the human resolves it via
+// confirm. Not persisted: a reload just shows "Open in LinkedIn"/"Copy note" again.
 const liStagedDomains = new Set();
 
-// One LinkedIn draft row: the note (300-char LinkedIn invite limit) + a live char count, an
-// "Open in LinkedIn" assist button, and — once staged — the "Did it send?" ✓/✗ pair. Reuses the
-// same `.draft-body-edit`/`.save` wiring as the email rows below (see `edits()`), since the
-// backend's PATCH-style save endpoint is channel-agnostic.
+// One LinkedIn draft row: the note (300-char LinkedIn invite limit) + a live char count, a
+// "Copy note" + "Open in LinkedIn" pair (assist opens the profile in the user's own browser), and —
+// once opened — the "Did it send?" ✓/✗ pair. Reuses the same `.draft-body-edit`/`.save` wiring as
+// the email rows below (see `edits()`), since the backend's PATCH-style save endpoint is
+// channel-agnostic.
 function linkedinDraftRow(r) {
   const staged = liStagedDomains.has(r.domain);
   const note = r.body || "";
@@ -988,7 +975,7 @@ function linkedinDraftRow(r) {
       <span class="status s-${esc(r.status)}">${esc(DRAFT_LABEL[r.status] || r.status)}</span>
       ${staged
         ? `<span class="li-confirm"><span class="li-confirm-q">Did it send?</span><button class="btn mini primary li-yes">✓</button><button class="btn mini li-no">✗</button></span>`
-        : `<button class="btn save">Save</button><button class="btn primary li-assist">Open in LinkedIn</button>`}
+        : `<button class="btn save">Save</button><button class="btn li-copy">Copy note</button><button class="btn primary li-assist">Open in LinkedIn</button>`}
     </div>`;
   const bodyBlock = `<textarea class="draft-body-edit li-note" rows="6" spellcheck="false">${esc(note)}</textarea>
       <div class="li-charcount${len > 300 ? " over" : ""}">${len}/300</div>`;
@@ -1127,8 +1114,31 @@ loaders.drafts = async () => {
       if (counter) { counter.textContent = `${len}/300`; counter.classList.toggle("over", len > 300); }
     });
   });
-  // "Open in LinkedIn" — drives a real, human-visible Chrome window to Connect -> Add note ->
-  // fill the note, then leaves the Send click to the human (see web/linkedin.rs::assist).
+  // "Copy note" — put the invite note on the clipboard so the human can paste it into LinkedIn's
+  // "Add a note" box. Falls back to selecting the textarea + execCommand when the async Clipboard
+  // API is unavailable (e.g. a non-secure context).
+  $$("#drafts-list .li-copy").forEach((b) =>
+    b.addEventListener("click", async () => {
+      const card = b.closest(".draft");
+      const ta = card.querySelector(".li-note");
+      const note = ta ? ta.value : "";
+      const copied = () => { b.textContent = "Copied ✓"; setTimeout(() => { b.textContent = "Copy note"; }, 1400); };
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(note);
+          copied();
+        } else if (ta && document.execCommand) {
+          ta.focus(); ta.select(); document.execCommand("copy");
+          copied();
+        } else {
+          toast("clipboard unavailable — select the note and copy it manually", "err");
+        }
+      } catch (e) { toast("couldn't copy — select the note and copy it manually", "err"); }
+    })
+  );
+  // "Open in LinkedIn" — opens the prospect's profile in the user's own browser (see
+  // web/linkedin.rs::assist). LinkedIn's UI blocks automated sending, so the human Connects, pastes
+  // the note (Copy note), and clicks Send themselves; the ✓/✗ confirm records the result.
   $$("#drafts-list .li-assist").forEach((b) =>
     b.addEventListener("click", async () => {
       const card = b.closest(".draft");
@@ -1137,8 +1147,8 @@ loaders.drafts = async () => {
       try {
         await postJSON(`/api/drafts/${encodeURIComponent(dom)}`, edits(card)); // persist the edited note first
         const r = await postJSON(`/api/drafts/${encodeURIComponent(dom)}/linkedin/assist`, {});
-        if (r.staged) { liStagedDomains.add(dom); toast("Opened in LinkedIn — review and click Send there.", "ok"); await loaders.drafts(); }
-        else { b.disabled = false; b.textContent = "Open in LinkedIn"; toast("could not open LinkedIn", "err"); }
+        if (r.opened) { liStagedDomains.add(dom); toast("Opened in your browser — Connect, paste the note, and Send there.", "ok"); await loaders.drafts(); }
+        else { b.disabled = false; b.textContent = "Open in LinkedIn"; toast("could not open the profile", "err"); }
       } catch (e) { b.disabled = false; b.textContent = "Open in LinkedIn"; toast(e.message, "err"); }
     })
   );
