@@ -16,6 +16,9 @@ use futures_util::StreamExt;
 use crate::linkedin::{chrome_binary, profile_dir};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// `Assist` is constructed only in the fixture test crate (see the trait's dead_code note); the main
+// binary's send path only ever drives `Auto`, so `Assist` is matched-but-never-constructed there.
+#[allow(dead_code)]
 pub enum SendMode {
     /// Drive up to the filled note, stop before Send (human clicks).
     Assist,
@@ -39,18 +42,6 @@ pub enum InviteOutcome {
     /// The session is no longer logged in — caller must flip state to reconnect-needed.
     LoggedOut,
     /// A selector/step failed; carries a short reason (a screenshot path may be embedded).
-    Failed(String),
-}
-
-/// Why an `assist_open` drive did not reach the Staged (note-filled, pre-Send) state. Lets the
-/// web assist handler distinguish "reconnect needed" from a generic failure without threading an
-/// `InviteOutcome` back out (the success case now returns a live `AssistSession` instead).
-#[derive(Debug)]
-#[allow(dead_code)] // unused in the fixture test crate (see the trait's dead_code note)
-pub enum AssistError {
-    /// The session is no longer logged in — caller should flip state to reconnect-needed.
-    LoggedOut,
-    /// A step failed (selector/timeout/launch/etc.); carries a short human-readable reason.
     Failed(String),
 }
 
@@ -488,79 +479,7 @@ impl ChromeBrowser {
         }
         Ok(InviteOutcome::Sent)
     }
-
-    /// Assist keep-alive entry point. Launch a fresh headful Chrome, drive Connect -> Add note ->
-    /// fill the note, and — on success — RETURN the live window at the Staged state WITHOUT
-    /// closing it, so the human can review and click Send in the visible window. The caller owns
-    /// the returned `AssistSession` and MUST `close()` it (on confirm or a timeout) to end Chrome.
-    /// On any non-Staged outcome (logged out / step failure / launch error) the window is closed
-    /// here and an `AssistError` is returned. Concrete (non-trait) because it hands back a live
-    /// session; the trait's `send_connection_request` keeps its close-on-return behavior for the
-    /// Auto path and the fixture test.
-    #[allow(dead_code)] // unused in the fixture test crate (see the trait's dead_code note)
-    pub async fn assist_open(
-        &self,
-        profile_url: &str,
-        note: &str,
-    ) -> std::result::Result<AssistSession, AssistError> {
-        let session = self
-            .launch()
-            .await
-            .map_err(|e| AssistError::Failed(format!("launch chrome: {e}")))?;
-        match self
-            .drive_invite(&session.browser, profile_url, note, SendMode::Assist)
-            .await
-        {
-            Ok(InviteOutcome::Staged) => Ok(AssistSession { session }),
-            Ok(InviteOutcome::LoggedOut) => {
-                session.close().await;
-                Err(AssistError::LoggedOut)
-            }
-            Ok(InviteOutcome::Failed(reason)) => {
-                session.close().await;
-                Err(AssistError::Failed(reason))
-            }
-            // Assist never clicks Send, so a real driver should never report this.
-            Ok(InviteOutcome::Sent) => {
-                session.close().await;
-                Err(AssistError::Failed(
-                    "unexpected: an Assist drive reported Sent".to_string(),
-                ))
-            }
-            Err(e) => {
-                session.close().await;
-                Err(AssistError::Failed(e.to_string()))
-            }
-        }
-    }
 }
-
-/// A live, human-visible Chrome window left open at the Staged (note-filled, pre-Send) state by
-/// [`ChromeBrowser::assist_open`]. The web server parks it (with the profile lock) until the human
-/// clicks Send (confirm) or a timeout fires. chromiumoxide's `Browser` is `kill_on_drop`, so
-/// merely holding this keeps Chrome alive, and dropping/`close()`ing it kills Chrome — which is
-/// exactly what lets confirm/timeout tear the window down. `Send + Sync` (see the static assert
-/// below) so it can live in the axum-shared `AppState`.
-#[allow(dead_code)] // unused in the fixture test crate (see the trait's dead_code note)
-pub struct AssistSession {
-    session: Session,
-}
-
-impl AssistSession {
-    /// Bounded graceful close then force-kill — identical teardown to the internal send path.
-    #[allow(dead_code)] // unused in the fixture test crate (see the trait's dead_code note)
-    pub async fn close(self) {
-        self.session.close().await;
-    }
-}
-
-/// Compile-time proof the assist session (and the browser handle it owns) is `Send + Sync`, so it
-/// can be stored in the axum-shared `AppState` behind a tokio `Mutex`. If a future chromiumoxide
-/// bump makes `Browser` non-`Sync`, this fails to compile here rather than at the `AppState` use.
-const _: fn() = || {
-    fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<AssistSession>();
-};
 
 /// Owns a launched browser and its CDP handler task; tears both down on `close()`.
 struct Session {

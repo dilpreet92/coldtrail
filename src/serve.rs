@@ -31,7 +31,6 @@ pub async fn serve(port: Option<u16>, no_open: bool) -> Result<()> {
         chat: Mutex::new(web::ChatSession::default()),
         turn_lock: Mutex::new(()),
         linkedin_connecting: AtomicBool::new(false),
-        assist: Arc::new(Mutex::new(None)),
     });
     let app = web::router(state);
 
