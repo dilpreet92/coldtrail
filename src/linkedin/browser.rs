@@ -8,8 +8,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chromiumoxide::browser::{Browser, BrowserConfig};
-use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
-use chromiumoxide::element::Element;
+use chromiumoxide::cdp::browser_protocol::input::{
+    DispatchMouseEventParams, DispatchMouseEventType, InsertTextParams, MouseButton,
+};
 use chromiumoxide::page::{Page, ScreenshotParams};
 use futures_util::StreamExt;
 
@@ -192,77 +193,164 @@ mod match_ {
     pub const SEND: &str = "/^send( invitation)?$/i.test(txt) || txt === 'send now'";
 }
 
-/// Template for the locate-and-tag matcher: within ANY `__SCOPES__` container that matches (the
-/// union — falling back to `document` only when none match), scan `__CAND__` for the FIRST *visible*
-/// element whose text/aria satisfies `__PRED__` and which is NOT inside an `__EXCLUDE__` region, tag
-/// it `data-ct='__TAG__'`, and return whether one was found. Run as a strict expression (an IIFE)
-/// via `evaluate_expression`, so chromiumoxide never mis-detects it as a function declaration.
-/// Visibility is a real client-rect check so a `position:fixed` sticky header still counts but a
-/// `display:none` dropdown item (before the menu opens) does not. The scope + exclude are what keep
-/// the scan on the profile's own action bar instead of a nav/sidebar/messaging look-alike.
-const LOCATE_TEMPLATE: &str = r#"(() => {
+/// Shared JS injected (via `__HELPERS__`) into every DOM-reading snippet so it can SEE the modal
+/// LinkedIn now renders inside an OPEN shadow root on a top-level `<div>` (the live capture reached
+/// it at `document > div::shadow`). `querySelectorAll` / `Element.closest` / `Node.contains` do NOT
+/// cross shadow (or same-origin iframe) boundaries, so:
+///  * `walk` recursively descends `el.shadowRoot` (open) and same-origin `iframe.contentDocument`,
+///    yielding the flat element set the classic matchers used to get from one `querySelectorAll`.
+///  * `visible` is the same real client-rect test as before.
+///  * `composedTest` climbs the COMPOSED tree — parentNode, then ShadowRoot→host, then an iframe
+///    Document→its frame element — so scope-membership and EXCLUDE still work across the boundary a
+///    plain `.closest()` can't see. A shadow-nested candidate is still correctly kept in / out.
+const PIERCE_HELPERS: &str = r#"
   const visible = (el) => {
+    if (!el.getClientRects) return false;
     const rects = el.getClientRects();
     if (!rects.length) return false;
     const b = el.getBoundingClientRect();
     return b.width > 0 && b.height > 0;
   };
+  const walk = (root, out) => {
+    let els; try { els = root.querySelectorAll('*'); } catch (e) { return; }
+    for (const el of els) {
+      out.push(el);
+      if (el.shadowRoot) walk(el.shadowRoot, out);
+      if (el.tagName === 'IFRAME') { try { if (el.contentDocument) walk(el.contentDocument, out); } catch (e) {} }
+    }
+  };
+  const allElements = () => { const out = []; walk(document, out); return out; };
+  const composedTest = (el, test) => {
+    let n = el;
+    while (n) {
+      if (n.nodeType === 1 && test(n)) return true;
+      if (n.parentNode) n = n.parentNode;
+      else if (n.host) n = n.host;                                   // ShadowRoot -> host
+      else if (n.defaultView && n.defaultView.frameElement) n = n.defaultView.frameElement; // iframe Document -> frame
+      else n = null;
+    }
+    return false;
+  };
+"#;
+
+/// Template for the locate-and-tag matcher: over the SHADOW-PIERCING element set, find the FIRST
+/// *visible* element that matches `__CAND__`, satisfies the text/aria predicate `__PRED__`, sits
+/// (in the composed tree) inside a `__SCOPES__` container (falling back to document-wide when none
+/// match — which is how the DIALOG scope's `body` entry reaches a top-level shadow-hosted modal),
+/// and is NOT inside an `__EXCLUDE__` region. It scrolls the match into view, tags it
+/// `data-ct='__TAG__'`, and RETURNS its viewport-center `[x, y]` (or `null`). The coordinates let the
+/// caller dispatch a TRUSTED CDP mouse click, which — unlike `find_element` — resolves a shadow-
+/// nested node. Run as a strict expression (an IIFE) via `evaluate_expression`.
+const LOCATE_TEMPLATE: &str = r#"(() => {
+__HELPERS__
   const scopeSels = __SCOPES__;
   const excludeSel = "__EXCLUDE__";
-  // Search the UNION of every matching scope container, not just the first. On real LinkedIn the
-  // bottom-right Messaging widget is ALSO a [role='dialog'], so a first-match scope could land on it
-  // and miss the invite modal's Add-a-note / Send. Union + the exclude list keeps us correct.
-  let roots = [];
-  for (const s of scopeSels) {
-    document.querySelectorAll(s).forEach((el) => roots.push(el));
+  const all = allElements();
+  // Scope containers, matched anywhere in the pierced set. Empty => the whole document is in scope.
+  const scopeRoots = [];
+  for (const el of all) {
+    if (!el.matches) continue;
+    for (const s of scopeSels) {
+      try { if (el.matches(s)) { scopeRoots.push(el); break; } } catch (e) {}
+    }
   }
-  if (!roots.length) roots = [document];
-  for (const root of roots) {
-    const nodes = root.querySelectorAll('__CAND__');
-    for (const el of nodes) {
-      if (excludeSel && el.closest(excludeSel)) continue;
-      const txt = (el.innerText || el.textContent || '').trim().toLowerCase();
-      const aria = (el.getAttribute('aria-label') || '').toLowerCase();
-      if ((__PRED__) && visible(el)) {
-        el.setAttribute('data-ct', '__TAG__');
-        return true;
+  const inScope = (el) => !scopeRoots.length || composedTest(el, (n) => scopeRoots.indexOf(n) !== -1);
+  const excluded = (el) => !!excludeSel && composedTest(el, (n) => { try { return n.matches(excludeSel); } catch (e) { return false; } });
+  for (const el of all) {
+    if (!el.matches) continue;
+    let isCand = false; try { isCand = el.matches('__CAND__'); } catch (e) { isCand = false; }
+    if (!isCand) continue;
+    if (excluded(el)) continue;
+    if (!inScope(el)) continue;
+    const txt = (el.innerText || el.textContent || '').trim().toLowerCase();
+    const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+    if ((__PRED__) && visible(el)) {
+      el.setAttribute('data-ct', '__TAG__');
+      try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
+      const b = el.getBoundingClientRect();
+      return [b.left + b.width / 2, b.top + b.height / 2];
+    }
+  }
+  return null;
+})()"#;
+
+/// Locate + tag the note textarea across the shadow boundary: prefer the stable id, else the first
+/// visible `<textarea>` whose composed ancestry includes an open dialog/modal. Tags it
+/// `data-ct='note'`, scrolls it into view, and RETURNS its viewport-center `[x, y]` (or `null`).
+const LOCATE_TEXTAREA_JS: &str = r#"(() => {
+__HELPERS__
+  const all = allElements();
+  let t = null;
+  for (const el of all) {
+    if (el.matches && el.matches('textarea#custom-message') && visible(el)) { t = el; break; }
+  }
+  if (!t) {
+    for (const el of all) {
+      if (el.tagName === 'TEXTAREA' && visible(el) &&
+          composedTest(el, (n) => n.matches && (n.matches("[role='dialog']") || n.matches('.artdeco-modal') || n.tagName === 'DIALOG'))) {
+        t = el; break;
       }
     }
+  }
+  if (!t) return null;
+  t.setAttribute('data-ct', 'note');
+  try { t.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
+  const b = t.getBoundingClientRect();
+  return [b.left + b.width / 2, b.top + b.height / 2];
+})()"#;
+
+/// Read a tagged element's current `.value` (shadow-piercing), for post-insert verification.
+const READ_TAGGED_TEMPLATE: &str = r#"(() => {
+__HELPERS__
+  for (const el of allElements()) {
+    if (el.getAttribute && el.getAttribute('data-ct') === '__TAG__') return el.value != null ? el.value : "";
+  }
+  return "";
+})()"#;
+
+/// Click a tagged element (shadow-piercing) — the untrusted `.click()` fallback for when a trusted
+/// CDP coordinate click could not be dispatched.
+const CLICK_TAGGED_TEMPLATE: &str = r#"(() => {
+__HELPERS__
+  for (const el of allElements()) {
+    if (el.getAttribute && el.getAttribute('data-ct') === '__TAG__') { try { el.click(); return true; } catch (e) { return false; } }
   }
   return false;
 })()"#;
 
-/// Locate + tag the note textarea: prefer the stable id, else the first visible `<textarea>` inside
-/// an open dialog. Tags it `data-ct='note'` so the fill + verify steps have a stable handle.
-const LOCATE_TEXTAREA_JS: &str = r#"(() => {
-  const visible = (el) => {
-    const rects = el.getClientRects();
-    if (!rects.length) return false;
-    const b = el.getBoundingClientRect();
-    return b.width > 0 && b.height > 0;
-  };
-  let t = document.querySelector('textarea#custom-message');
-  if (!t || !visible(t)) {
-    const scopes = document.querySelectorAll('[role=dialog], .artdeco-modal, dialog');
-    const list = scopes.length ? Array.from(scopes) : [document];
-    t = null;
-    for (const s of list) {
-      for (const ta of s.querySelectorAll('textarea')) {
-        if (visible(ta)) { t = ta; break; }
-      }
-      if (t) break;
-    }
+/// Focus a tagged element (shadow-piercing). Plain `focus()` works inside an OPEN shadow root, so
+/// this is enough to arm the CDP `Input.insertText` that follows.
+const FOCUS_TAGGED_TEMPLATE: &str = r#"(() => {
+__HELPERS__
+  for (const el of allElements()) {
+    if (el.getAttribute && el.getAttribute('data-ct') === '__TAG__') { try { el.focus(); return true; } catch (e) { return false; } }
   }
-  if (!t) return false;
-  t.setAttribute('data-ct', 'note');
-  return true;
+  return false;
 })()"#;
 
-/// Read the tagged note textarea's current value, for post-insert verification.
-const READ_NOTE_JS: &str = r#"(() => { const t = document.querySelector("[data-ct='note']"); return t ? t.value : ""; })()"#;
+/// Does any element (shadow-piercing) match `__SEL__`? When `__VIS__` is true it must also have a
+/// real client rect. Backs the never-false-Sent Pending-marker and "note textarea gone" checks.
+const EXISTS_TEMPLATE: &str = r#"(() => {
+__HELPERS__
+  const needVisible = __VIS__;
+  for (const el of allElements()) {
+    if (!el.matches) continue;
+    let m = false; try { m = el.matches("__SEL__"); } catch (e) { m = false; }
+    if (!m) continue;
+    if (needVisible && !visible(el)) continue;
+    return true;
+  }
+  return false;
+})()"#;
 
-/// Remove a `data-ct` tag so it can never leak into a later matcher pass.
-const UNTAG_TEMPLATE: &str = r#"(() => { const e = document.querySelector("[data-ct='__TAG__']"); if (e) e.removeAttribute('data-ct'); return true; })()"#;
+/// Remove a `data-ct` tag (shadow-piercing) so it can never leak into a later matcher pass.
+const UNTAG_TEMPLATE: &str = r#"(() => {
+__HELPERS__
+  for (const el of allElements()) {
+    if (el.getAttribute && el.getAttribute('data-ct') === '__TAG__') { el.removeAttribute('data-ct'); return true; }
+  }
+  return true;
+})()"#;
 
 /// The origin production always targets. Never overridden outside the test-only constructor.
 const LINKEDIN_ORIGIN: &str = "https://www.linkedin.com";
@@ -479,11 +567,21 @@ impl ChromeBrowser {
         }
 
         // Confirmation = a Pending marker appeared AND the invite modal (its textarea) is gone.
-        if let Err(reason) = require(&page, selectors::PENDING_MARKER, "Pending confirmation").await
+        // BOTH checks pierce the shadow boundary — the modal (and its textarea) live in an open
+        // shadow root, so a light-DOM `find_element` would never see the textarea and would report
+        // it "gone" unconditionally, a never-false-Sent hole. The textarea check requires a *visible*
+        // match, so a stray hidden `#custom-message` elsewhere can't keep us from confirming.
+        if let Err(reason) = require_pierce(
+            &page,
+            selectors::PENDING_MARKER,
+            true,
+            "Pending confirmation",
+        )
+        .await
         {
             return Ok(failed(&page, &reason).await);
         }
-        if page.find_element(selectors::NOTE_TEXTAREA).await.is_ok() {
+        if pierce_exists(&page, selectors::NOTE_TEXTAREA, true).await {
             return Ok(failed(&page, "invite modal did not close after Send").await);
         }
         Ok(InviteOutcome::Sent)
@@ -611,17 +709,6 @@ async fn open(browser: &Browser, url: &str) -> Result<Page> {
     Err(anyhow!("navigate: {}", last.unwrap()))
 }
 
-/// Find an element, retrying briefly to absorb load/render timing. Maps absence to a clear reason.
-async fn require(page: &Page, selector: &str, what: &str) -> std::result::Result<Element, String> {
-    for _ in 0..WAIT_TRIES {
-        if let Ok(el) = page.find_element(selector).await {
-            return Ok(el);
-        }
-        tokio::time::sleep(WAIT_INTERVAL).await;
-    }
-    Err(format!("{what} not found (selector: {selector})"))
-}
-
 /// Outcome of a single locate-then-click attempt.
 enum Located {
     /// Matched a visible element and completed a trusted CDP click on it.
@@ -655,11 +742,39 @@ fn locate_js(
     exclude: &str,
 ) -> String {
     LOCATE_TEMPLATE
+        .replace("__HELPERS__", PIERCE_HELPERS)
         .replace("__CAND__", candidates)
         .replace("__PRED__", predicate)
         .replace("__TAG__", tag)
         .replace("__SCOPES__", &js_array(scopes))
         .replace("__EXCLUDE__", exclude)
+}
+
+/// Build a shadow-piercing snippet from `template` by injecting [`PIERCE_HELPERS`] at `__HELPERS__`.
+fn with_helpers(template: &str) -> String {
+    template.replace("__HELPERS__", PIERCE_HELPERS)
+}
+
+/// JS: click the `data-ct='<tag>'` node across the shadow boundary (the `.click()` fallback).
+fn click_tagged_js(tag: &str) -> String {
+    with_helpers(CLICK_TAGGED_TEMPLATE).replace("__TAG__", tag)
+}
+
+/// JS: focus the `data-ct='<tag>'` node across the shadow boundary.
+fn focus_tagged_js(tag: &str) -> String {
+    with_helpers(FOCUS_TAGGED_TEMPLATE).replace("__TAG__", tag)
+}
+
+/// JS: read the `data-ct='<tag>'` node's `.value` across the shadow boundary.
+fn read_tagged_js(tag: &str) -> String {
+    with_helpers(READ_TAGGED_TEMPLATE).replace("__TAG__", tag)
+}
+
+/// JS: does any element (shadow-piercing) match `sel`, optionally requiring it be visible?
+fn exists_js(sel: &str, need_visible: bool) -> String {
+    with_helpers(EXISTS_TEMPLATE)
+        .replace("__SEL__", sel)
+        .replace("__VIS__", if need_visible { "true" } else { "false" })
 }
 
 /// Run a boolean matcher expression, mapping any error/non-bool result to `false`.
@@ -671,17 +786,81 @@ async fn eval_bool(page: &Page, js: impl Into<String>) -> bool {
         .unwrap_or(false)
 }
 
-/// Drop a `data-ct` tag (best-effort) so it can't be re-matched in a later pass.
+/// Drop a `data-ct` tag (best-effort, shadow-piercing) so it can't be re-matched in a later pass.
 async fn untag(page: &Page, tag: &str) {
     let _ = page
-        .evaluate_expression(UNTAG_TEMPLATE.replace("__TAG__", tag))
+        .evaluate_expression(with_helpers(UNTAG_TEMPLATE).replace("__TAG__", tag))
         .await;
 }
 
-/// Locate a target by TEXT/ROLE (tag it `data-ct=<tag>`), then click the tagged node with a REAL
-/// (trusted CDP) gesture — `chromiumoxide`'s `Element::click` scrolls into view and dispatches a
-/// mouse event, which LinkedIn treats as a genuine user action (an untrusted JS `.click()` can be
-/// ignored/flagged). The tag is always removed afterward.
+/// Run a locate expression that returns a viewport-center `[x, y]` (found) or `null` (not found).
+async fn locate_coords(page: &Page, js: String) -> Option<(f64, f64)> {
+    page.evaluate_expression(js)
+        .await
+        .ok()
+        .and_then(|r| r.into_value::<(f64, f64)>().ok())
+}
+
+/// Dispatch a TRUSTED CDP left click at viewport coordinates `(x, y)` — a real `Input.dispatchMouse`
+/// press+release, which resolves a shadow-nested target that `find_element` (a light-DOM
+/// `DOM.querySelector`) cannot. A leading `mouseMoved` arms any hover-gated handler. Returns whether
+/// both CDP commands were accepted.
+async fn cdp_click(page: &Page, x: f64, y: f64) -> bool {
+    let build = |t: DispatchMouseEventType| {
+        DispatchMouseEventParams::builder()
+            .r#type(t)
+            .x(x)
+            .y(y)
+            .button(MouseButton::Left)
+            .click_count(1)
+            .build()
+    };
+    let (press, release) = match (
+        build(DispatchMouseEventType::MousePressed),
+        build(DispatchMouseEventType::MouseReleased),
+    ) {
+        (Ok(p), Ok(r)) => (p, r),
+        _ => return false,
+    };
+    if let Ok(moved) = DispatchMouseEventParams::builder()
+        .r#type(DispatchMouseEventType::MouseMoved)
+        .x(x)
+        .y(y)
+        .build()
+    {
+        let _ = page.execute(moved).await;
+    }
+    page.execute(press).await.is_ok() && page.execute(release).await.is_ok()
+}
+
+/// True if any element (shadow-piercing) matches `sel` (optionally requiring visibility).
+async fn pierce_exists(page: &Page, sel: &str, need_visible: bool) -> bool {
+    eval_bool(page, exists_js(sel, need_visible)).await
+}
+
+/// Poll (~`WAIT_TRIES * WAIT_INTERVAL`) for a shadow-piercing match of `sel`. Maps absence to a
+/// clear reason. Replaces the old `find_element`-based `require`, which could not see a shadow node.
+async fn require_pierce(
+    page: &Page,
+    sel: &str,
+    need_visible: bool,
+    what: &str,
+) -> std::result::Result<(), String> {
+    for _ in 0..WAIT_TRIES {
+        if pierce_exists(page, sel, need_visible).await {
+            return Ok(());
+        }
+        tokio::time::sleep(WAIT_INTERVAL).await;
+    }
+    Err(format!("{what} not found (selector: {sel})"))
+}
+
+/// Locate a target by TEXT/ROLE across the shadow boundary: the locate JS scrolls the match into
+/// view, tags it `data-ct=<tag>`, and returns its viewport-center coordinates. We then click it with
+/// a REAL (trusted CDP) mouse gesture at those coordinates — which resolves a shadow-nested node
+/// (`find_element` cannot) and reads as a genuine user action (an untrusted JS `.click()` can be
+/// ignored/flagged by LinkedIn). If coordinates are unusable or the CDP click is refused, fall back
+/// to a shadow-piercing JS `.click()` on the tagged node. The tag is always removed afterward.
 async fn locate_and_click(
     page: &Page,
     tag: &str,
@@ -690,14 +869,18 @@ async fn locate_and_click(
     scopes: &[&str],
     exclude: &str,
 ) -> Located {
-    if !eval_bool(page, locate_js(tag, candidates, predicate, scopes, exclude)).await {
+    let Some((x, y)) =
+        locate_coords(page, locate_js(tag, candidates, predicate, scopes, exclude)).await
+    else {
         return Located::NotFound;
-    }
-    let sel = format!("[data-ct='{tag}']");
-    let clicked = match page.find_element(&sel).await {
-        Ok(el) => el.click().await.is_ok(),
-        Err(_) => false,
     };
+    let mut clicked = false;
+    if x.is_finite() && y.is_finite() && x > 0.0 && y > 0.0 {
+        clicked = cdp_click(page, x, y).await;
+    }
+    if !clicked {
+        clicked = eval_bool(page, click_tagged_js(tag)).await;
+    }
     untag(page, tag).await;
     if clicked {
         Located::Clicked
@@ -782,25 +965,27 @@ async fn locate_connect(page: &Page) -> bool {
 /// needs; `type_str` errors on any character outside its US-keyboard keymap. Returns a step reason on
 /// failure so a blank/short fill becomes a diagnostic `Failed`, never a silently empty note.
 async fn fill_note(page: &Page, note: &str) -> std::result::Result<(), String> {
-    // Locate + tag the textarea (poll for the modal to render).
-    let mut located = false;
+    // Locate + tag the textarea (poll for the modal to render). The locate is shadow-piercing and
+    // returns the textarea's viewport-center coordinates.
+    let mut coords = None;
     for _ in 0..WAIT_TRIES {
-        if eval_bool(page, LOCATE_TEXTAREA_JS).await {
-            located = true;
+        coords = locate_coords(page, with_helpers(LOCATE_TEXTAREA_JS)).await;
+        if coords.is_some() {
             break;
         }
         tokio::time::sleep(WAIT_INTERVAL).await;
     }
-    if !located {
+    let Some((x, y)) = coords else {
         return Err("could not find the note textarea".to_string());
-    }
+    };
 
-    // Focus it with a trusted gesture (click), falling back to a plain focus().
-    let ta = page
-        .find_element("[data-ct='note']")
-        .await
-        .map_err(|_| "note textarea vanished after tagging".to_string())?;
-    let focused = ta.click().await.is_ok() || ta.focus().await.is_ok();
+    // Focus it: a trusted CDP click at its coordinates (works across the shadow boundary), then a
+    // shadow-piercing JS `focus()` as a belt-and-suspenders — plain `focus()` works in an OPEN
+    // shadow root and guarantees the field is the active element before we insert.
+    if x.is_finite() && y.is_finite() && x > 0.0 && y > 0.0 {
+        let _ = cdp_click(page, x, y).await;
+    }
+    let focused = eval_bool(page, focus_tagged_js("note")).await;
     if !focused {
         untag(page, "note").await;
         return Err("could not focus the note textarea".to_string());
@@ -811,11 +996,12 @@ async fn fill_note(page: &Page, note: &str) -> std::result::Result<(), String> {
         return Err("failed to insert the note text".to_string());
     }
 
-    // Verify the value actually landed (React can swallow an insert). Poll a few ticks.
+    // Verify the value actually landed (React can swallow an insert). Poll a few ticks, reading the
+    // tagged textarea's value across the shadow boundary.
     let mut ok = false;
     for _ in 0..WAIT_TRIES {
         let value = page
-            .evaluate_expression(READ_NOTE_JS)
+            .evaluate_expression(read_tagged_js("note"))
             .await
             .ok()
             .and_then(|r| r.into_value::<String>().ok());
@@ -873,7 +1059,7 @@ async fn debug_html(page: &Page) -> Option<PathBuf> {
         .as_millis();
     let path = dir.join(format!("{ts}.html"));
     let html = page
-        .evaluate_expression("document.documentElement.outerHTML")
+        .evaluate_expression(DUMP_HTML_JS)
         .await
         .ok()?
         .into_value::<String>()
@@ -881,6 +1067,36 @@ async fn debug_html(page: &Page) -> Option<PathBuf> {
     std::fs::write(&path, html).ok()?;
     Some(path)
 }
+
+/// Serialize the page SHADOW-AWARE: the top document's `outerHTML` (the light-DOM shell), then for
+/// every OPEN shadow host a marker + its `shadowRoot.innerHTML`, recursively, plus same-origin
+/// iframe documents. Without this a "step not found" dump on live LinkedIn shows only an empty
+/// light-DOM shell — the real invite modal lives inside an open shadow root and would be invisible.
+const DUMP_HTML_JS: &str = r#"(() => {
+  const out = ['<!-- === TOP DOCUMENT (light DOM) === -->'];
+  try { out.push(document.documentElement.outerHTML); } catch (e) {}
+  const walkHosts = (root) => {
+    let els; try { els = root.querySelectorAll('*'); } catch (e) { return; }
+    for (const el of els) {
+      if (el.shadowRoot) {
+        out.push('<!-- === OPEN SHADOW ROOT on <' + el.tagName.toLowerCase() + (el.id ? ' id="' + el.id + '"' : '') + '> === -->');
+        try { out.push(el.shadowRoot.innerHTML); } catch (e) {}
+        walkHosts(el.shadowRoot);
+      }
+      if (el.tagName === 'IFRAME') {
+        try {
+          if (el.contentDocument) {
+            out.push('<!-- === SAME-ORIGIN IFRAME ' + (el.id ? 'id="' + el.id + '"' : '') + ' === -->');
+            out.push(el.contentDocument.documentElement.outerHTML);
+            walkHosts(el.contentDocument);
+          }
+        } catch (e) {}
+      }
+    }
+  };
+  walkHosts(document);
+  return out.join('\n');
+})()"#;
 
 /// Build a `Failed` outcome, embedding the debug screenshot + HTML-dump paths when they could be
 /// captured (the HTML is the definitive post-mortem for a "step not found" against live LinkedIn).

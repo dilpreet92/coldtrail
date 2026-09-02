@@ -11,42 +11,48 @@
       aside { margin-top: 24px; margin-bottom: 0; }
       #more-menu { border: 1px solid #888; padding: 8px; margin-top: 8px; max-width: 260px; }
       #more-menu [role="button"] { display: block; padding: 10px 12px; cursor: pointer; }
-      #modal { border: 1px solid #888; padding: 20px; margin-top: 20px; max-width: 480px; }
-      textarea { width: 100%; height: 120px; font-size: 14px; box-sizing: border-box; }
       .hidden { display: none; }
     </style>
   </head>
   <body>
     <!--
-      Static fixture that mimics the LinkedIn DOM that BROKE the live run. Two things are modeled:
+      Static fixture that mimics the LinkedIn DOM that BROKE the live run, on TWO fronts:
 
-      1. The profile's primary action bar is Follow / Message / "…" with NO top-level Connect —
-         Connect lives INSIDE the "…" (More) overflow menu.
-      2. DECOYS the OLD (unscoped, whole-document) matchers would wrongly hit: a global <header>/<nav>
-         with a "Notifications" link and an app "More" ("…") button, and a right-rail <aside>
-         "People also viewed" carrying a "Connect" button for a DIFFERENT person. Each decoy, when
-         clicked, NAVIGATES AWAY (to /notifications or /feed — the fixture server serves this same
-         page for any path) — reproducing the live "clicked the wrong element and landed on the
-         feed/notifications page, then Chrome was force-closed" crash.
+      1. WEB-COMPONENTS / SHADOW DOM (the new break): the invite modal ("Add a note" / "Send without
+         a note", then the note textarea + final "Send") is rendered INSIDE an OPEN shadow root on a
+         TOP-LEVEL <div id="invite-modal-host"> — exactly where a live recursive .shadowRoot walk found
+         it (document > div::shadow). A non-piercing document.querySelectorAll (and chromiumoxide's
+         find_element / CSS) CANNOT see it, so the driver only reaches these controls because its
+         locate/verify JS descends el.shadowRoot, and only CLICKS them because it dispatches a trusted
+         CDP mouse click at the element's coordinates (find_element can't resolve a shadow-nested node).
+         Against the old non-piercing locator the driver never finds "Add a note" -> Failed, so this
+         test FAILS — which is the regression guard for the shadow fix.
 
-      The profile + action bar are wrapped in <main>, the decoys are OUTSIDE it. The driver now scopes
-      every locate to <main> / the open menu / the open dialog and excludes header/nav/aside/messaging
-      (see src/linkedin/browser.rs `mod scopes` + `EXCLUDE`), so it must click the PROFILE's own
-      Connect-under-"…". The OLD unscoped code matches the <aside> "Connect" first, navigates away, and
-      fails — which is exactly the regression this fixture guards against.
+      2. SCOPING (the earlier break, still guarded): the profile's primary action bar is Follow /
+         Message / "…" with NO top-level Connect — Connect lives INSIDE the "…" (More) overflow menu —
+         and there are out-of-scope DECOYS the old unscoped matchers wrongly hit: a global <header>/<nav>
+         "Notifications" link + app "More", a bottom-right Messaging overlay that is ALSO a
+         [role='dialog'], and a right-rail <aside> "People also viewed" carrying a "Connect" for a
+         DIFFERENT person. Each decoy NAVIGATES AWAY when clicked (the fixture server serves this same
+         page for any path), reproducing the live "clicked the wrong element and landed on the
+         feed/notifications page" crash. The driver scopes Connect/More to <main> and the invite modal
+         document-wide-minus-excludes (see src/linkedin/browser.rs `mod scopes` + `EXCLUDE`).
 
       Flow (profile path only):
         "…" (More) click      -> open the dropdown menu (its Connect item becomes visible)
-        in-menu Connect click -> reveal the invite modal (Add-a-note + Send visible)
-        Add-a-note click      -> reveal the note textarea
-        Send click            -> REMOVE the modal, then CREATE the Pending marker
+        in-menu Connect click -> reveal the invite modal INSIDE THE OPEN SHADOW ROOT
+        Add-a-note click      -> reveal the note textarea + the final Send button (in the shadow)
+        Send click            -> REMOVE the modal, then CREATE the Pending marker (light DOM)
 
-      Two deliberate fidelity choices mirror real LinkedIn:
-        * Connect is only reachable via "…" (no top-level Connect button anywhere in <main>), and the
-          menu starts display:none so the driver's *visible*-element matcher can't see the Connect
-          item until the overflow is actually opened — forcing the More fallback path.
-        * The Pending marker is CREATED by the Send handler (not pre-placed hidden), so Auto->Sent is
-          gated on a real post-Send signal, exactly like the live confirmation.
+      Deliberate fidelity choices that mirror real LinkedIn:
+        * The invite modal is inside an OPEN shadow root on a top-level div (not <main>, not light DOM).
+        * The actionbar carries a "Send without a note" button that stays visible through the Send step,
+          so the SEND matcher (/^send( invitation)?$/i, "send now") is PROVEN not to match it.
+        * Connect is only reachable via "…" (no top-level Connect in <main>), and the menu starts
+          display:none so the driver's *visible*-element matcher can't see Connect until "…" is opened.
+        * The Pending marker is CREATED by the Send handler (not pre-placed), so Auto->Sent is gated on
+          a real post-Send signal — and both the Pending check and the "note textarea gone" check are
+          shadow-piercing, exactly like the live confirmation.
     -->
 
     <!-- DECOY: global top-nav. The OLD unscoped "…"/More matcher could hit this app "More"; the
@@ -60,9 +66,8 @@
 
     <!-- DECOY: the bottom-right Messaging overlay. It is ALSO a [role='dialog'] and appears BEFORE the
          invite modal, so a FIRST-match dialog scope would search HERE (not the invite modal) and miss
-         "Add a note" / "Send" — reproducing the live "clicked Connect, modal opened, then crashed at
-         Add-a-note" failure. Scoped-out via .msg-overlay-list-bubble / [id^='msg-overlay']; the union
-         scope + exclude keep the driver on the real invite modal. -->
+         "Add a note" / "Send". Scoped-out via .msg-overlay-list-bubble / [id^='msg-overlay']; the
+         document-wide-minus-excludes scope keeps the driver on the real invite modal. -->
     <section id="msg-overlay-1" class="msg-overlay-list-bubble" role="dialog" aria-label="Messaging">
       <button aria-label="Open messaging">Messaging</button>
     </section>
@@ -81,15 +86,6 @@
         <!-- The in-menu Connect: matched by trimmed text "Connect" AND the invite-to-connect aria. -->
         <div id="connect" role="button" aria-label="Invite Jane Doe to connect">Connect</div>
       </div>
-
-      <div id="modal" class="hidden" role="dialog" aria-label="Invite Jane Doe to connect">
-        <p>Add a note to your invitation?</p>
-        <button id="add-note" aria-label="Add a note">Add a note</button>
-
-        <textarea id="custom-message" class="hidden" placeholder="Your note"></textarea>
-
-        <button id="send" aria-label="Send invitation">Send invitation</button>
-      </div>
     </main>
 
     <!-- DECOY: right-rail "People also viewed". The OLD unscoped top-level Connect matcher hits THIS
@@ -99,14 +95,42 @@
       <button id="aside-connect" aria-label="Invite John Smith to connect">Connect</button>
     </aside>
 
+    <!-- The invite modal is rendered INSIDE an OPEN shadow root attached to THIS top-level div (see
+         the script below). It is intentionally NOT in the light DOM — mirroring the live capture's
+         `document > div::shadow`. -->
+    <div id="invite-modal-host"></div>
+
     <script>
       const more = document.getElementById("more");
       const moreMenu = document.getElementById("more-menu");
       const connect = document.getElementById("connect");
-      const modal = document.getElementById("modal");
-      const addNote = document.getElementById("add-note");
-      const textarea = document.getElementById("custom-message");
-      const send = document.getElementById("send");
+
+      // Build the invite modal INSIDE an OPEN shadow root on the top-level host div — the classic
+      // artdeco `send-invite` DOM. A non-piercing querySelectorAll on the light DOM cannot see any of
+      // this; the driver reaches it only via its recursive el.shadowRoot walk.
+      const host = document.getElementById("invite-modal-host");
+      const shadow = host.attachShadow({ mode: "open" });
+      shadow.innerHTML = `
+        <style>
+          .hidden { display: none; }
+          button { font-size: 16px; padding: 10px 16px; margin: 6px 6px 6px 0; cursor: pointer; }
+          textarea { width: 100%; height: 120px; font-size: 14px; box-sizing: border-box; }
+          #modal { border: 1px solid #888; padding: 20px; margin-top: 20px; max-width: 480px; }
+        </style>
+        <div id="modal" class="hidden artdeco-modal artdeco-modal--layer-default send-invite"
+             data-test-modal role="dialog" aria-labelledby="send-invite-modal">
+          <h2 id="send-invite-modal">Add a note to your invitation?</h2>
+          <div class="artdeco-modal__actionbar">
+            <button id="add-note" aria-label="Add a note"><span class="artdeco-button__text">Add a note</span></button>
+            <button id="send-without" aria-label="Send without a note"><span class="artdeco-button__text">Send without a note</span></button>
+          </div>
+          <textarea id="custom-message" name="message" class="hidden" placeholder="Your note"></textarea>
+          <button id="send" class="hidden" aria-label="Send invitation"><span class="artdeco-button__text">Send invitation</span></button>
+        </div>`;
+      const modal = shadow.getElementById("modal");
+      const addNote = shadow.getElementById("add-note");
+      const textarea = shadow.getElementById("custom-message");
+      const send = shadow.getElementById("send");
 
       // DECOYS: clicking any of the out-of-scope look-alikes navigates AWAY from the profile — the
       // fixture server returns this same page for any path, so the URL changes to /notifications or
@@ -127,20 +151,24 @@
         moreMenu.classList.remove("hidden");
       });
 
-      // In-menu Connect opens the invite modal (and closes the menu).
+      // In-menu Connect opens the invite modal (in the shadow root) and closes the menu.
       connect.addEventListener("click", () => {
         moreMenu.classList.add("hidden");
         modal.classList.remove("hidden");
       });
 
+      // "Add a note" reveals the textarea + the final Send. "Send without a note" stays visible, so
+      // the driver's SEND matcher is proven to pick "Send invitation" and skip it.
       addNote.addEventListener("click", () => {
         textarea.classList.remove("hidden");
+        send.classList.remove("hidden");
         textarea.focus();
       });
 
       send.addEventListener("click", () => {
-        // Tear the modal down entirely, THEN create the Pending confirmation — so the driver's
-        // never-false-Sent gate (Pending present AND modal gone) is satisfied by a real post-Send
+        // Tear the modal down entirely (removing the shadow-nested textarea), THEN create the Pending
+        // confirmation in the LIGHT DOM — so the driver's never-false-Sent gate (a *visible*, pierced
+        // Pending present AND no *visible*, pierced note textarea) is satisfied by a real post-Send
         // signal, not something pre-placed on the page.
         modal.remove();
         const pending = document.createElement("button");
