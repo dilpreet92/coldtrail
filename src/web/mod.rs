@@ -70,6 +70,12 @@ pub struct AppState {
     /// True while a `linkedin::connect` task is running (launched Chrome, waiting on login).
     /// `GET /api/destination/linkedin/status` reads this for its `waiting` field.
     pub linkedin_connecting: AtomicBool,
+    /// At most one live LinkedIn *assist* window, parked here between `assist` (which opens Chrome
+    /// at the pre-Send state and leaves it visible) and `confirm`/timeout (which close it). The
+    /// handle owns the profile lock for the window's whole lifetime, so no other connect/assist/
+    /// auto op can launch on the profile until the human is done. tokio `Mutex` so the guard can
+    /// be held across the async `close()`.
+    pub assist: Arc<Mutex<Option<linkedin::AssistHandle>>>,
 }
 
 fn loopback_hosts(port: u16) -> [String; 2] {
@@ -268,6 +274,7 @@ mod tests {
             chat: Mutex::new(ChatSession::default()),
             turn_lock: Mutex::new(()),
             linkedin_connecting: AtomicBool::new(false),
+            assist: Arc::new(Mutex::new(None)),
         })
     }
 
