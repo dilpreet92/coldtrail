@@ -65,9 +65,24 @@ sourcing and wait — keep going through enrichment and drafting — unless the 
    short. **One touch per company — never both channels:**
    - Contact has an **email** → write a subject + body and store it:
      `coldtrail draft <domain> --subject "<subject>" --body "<body>"`
-   - Contact has **only a LinkedIn URL** (no email) → write a connection note, **≤300
-     characters** (LinkedIn's hard limit), and store it:
+   - Contact has **only a LinkedIn URL** (no email) → write a **short, lightly-structured**
+     connection note and store it:
      `coldtrail linkedin-note <domain> --note "<note>"`
+     A LinkedIn note is **not a compressed email** — keep it shorter and more casual than an
+     email draft. Give it real structure with **actual line breaks** (press-enter newlines
+     inside the quoted value — a real newline, not the two literal characters `\n`): a greeting
+     line, a blank line, one or two crisp body lines, then a sign-off on its own line. Never a
+     single dense run-on paragraph. Stay **≤300 characters INCLUDING the newlines** (LinkedIn's
+     hard limit — newlines count). For example:
+     ```
+     coldtrail linkedin-note acme.com --note "Hi Jane,
+
+     Loved what Acme is building for indie logistics — the live-ETA piece especially.
+
+     Would be glad to connect.
+
+     — Dilpreet"
+     ```
    Both write a DB row only — neither creates a Gmail draft, opens a browser, or sends anything.
 4. **Report coverage, then hand off or send.** Show what you did: the **contacts you found**
    (name · email · source) and the drafts you wrote. **Always state coverage explicitly and
@@ -127,7 +142,7 @@ sourcing and wait — keep going through enrichment and drafting — unless the 
 | `coldtrail add-contact <domain> "<name>" [email] --linkedin <url> [src]` | contact with a LinkedIn URL (email optional) |
 | `coldtrail find-emails [max]` | best-effort OSINT founder-email finder |
 | `coldtrail draft <domain> --subject "…" --body "…"` | store a personalized draft (email contact) |
-| `coldtrail linkedin-note <domain> --note "…"` | store a ≤300-char connection note (LinkedIn-only contact) |
+| `coldtrail linkedin-note <domain> --note "…"` | store a short, line-broken ≤300-char connection note (newlines included; LinkedIn-only contact) |
 | `coldtrail followup <domain> --subject "…" --body "…"` | store a follow-up touch (no reply yet) |
 | `coldtrail send <domain>` | send a reviewed draft for real, either channel (refuses unless that channel's auto-send is on) |
 | `coldtrail mark <domain> <id\|sent\|replied\|bounced>` | advance status |

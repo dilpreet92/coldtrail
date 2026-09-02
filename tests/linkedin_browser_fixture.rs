@@ -120,9 +120,16 @@ async fn drives_connect_under_more_note_send_on_fixture() {
 
     let browser = ChromeBrowser::for_fixture_from_env();
     let profile_url = format!("{base}/in/janedoe");
-    // A deliberately non-ASCII note (em-dash) — the driver must insert it verbatim; per-key
-    // typing would choke on it, so this guards against that regression.
-    let note = "Hi Jane — enjoyed your post on cold outreach.";
+    // A deliberately non-ASCII note (em-dash) with REAL NEWLINES (a greeting line, a blank line,
+    // a body line) — LinkedIn notes are short + line-broken (see templates/CLAUDE.md). This is
+    // the newline end-to-end guard: `fill_note` inserts the note via CDP `Input.insertText` and
+    // then reads the textarea's `.value` back and requires it to equal `note` EXACTLY (see
+    // browser.rs `fill_note`'s verify loop). So an outcome of Staged/Sent below is itself the
+    // read-back assertion — it can only be reached if the "\n"s survived `Input.insertText` and
+    // landed as real newlines in the textarea. If they were dropped/mangled, the verify would
+    // fail and `send_connection_request` would return `Failed`, failing these asserts. The
+    // em-dash additionally guards against a per-key-typing regression (it would choke on it).
+    let note = "Hi Jane —\n\nenjoyed your post on cold outreach.";
 
     // Assist: there is NO top-level Connect, so the driver must open the PROFILE's "…" overflow
     // (ignoring the global-nav "…" and the sidebar "Connect" decoys), click the in-menu Connect,
