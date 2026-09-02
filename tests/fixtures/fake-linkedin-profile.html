@@ -42,7 +42,7 @@
         "…" (More) click      -> open the dropdown menu (its Connect item becomes visible)
         in-menu Connect click -> reveal the invite modal INSIDE THE OPEN SHADOW ROOT
         Add-a-note click      -> reveal the note textarea + the final Send button (in the shadow)
-        Send click            -> REMOVE the modal, then CREATE the Pending marker (light DOM)
+        Send click            -> REMOVE the modal, then CREATE the Pending marker as an <a> (light DOM)
 
       Deliberate fidelity choices that mirror real LinkedIn:
         * The invite modal is inside an OPEN shadow root on a top-level div (not <main>, not light DOM).
@@ -50,9 +50,12 @@
           so the SEND matcher (/^send( invitation)?$/i, "send now") is PROVEN not to match it.
         * Connect is only reachable via "…" (no top-level Connect in <main>), and the menu starts
           display:none so the driver's *visible*-element matcher can't see Connect until "…" is opened.
-        * The Pending marker is CREATED by the Send handler (not pre-placed), so Auto->Sent is gated on
-          a real post-Send signal — and both the Pending check and the "note textarea gone" check are
-          shadow-piercing, exactly like the live confirmation.
+        * The Pending marker is CREATED by the Send handler (not pre-placed) and is an <a> (NOT a
+          <button>) carrying a componentkey + a "Pending, click to withdraw…" aria-label, exactly like
+          real LinkedIn — so Auto->Sent is gated on a real post-Send signal that the driver's
+          shadow-piercing Pending PREDICATE (aria-label / componentkey / <a>-text) must match. That
+          predicate is now the SOLE authoritative confirmation (the old secondary "note textarea gone"
+          check was dropped so a lingering modal can never turn a real send into a false negative).
     -->
 
     <!-- DECOY: global top-nav. The OLD unscoped "…"/More matcher could hit this app "More"; the
@@ -167,14 +170,29 @@
 
       send.addEventListener("click", () => {
         // Tear the modal down entirely (removing the shadow-nested textarea), THEN create the Pending
-        // confirmation in the LIGHT DOM — so the driver's never-false-Sent gate (a *visible*, pierced
-        // Pending present AND no *visible*, pierced note textarea) is satisfied by a real post-Send
-        // signal, not something pre-placed on the page.
+        // confirmation in the LIGHT DOM as an <a> (NOT a <button>) — matching REAL LinkedIn, whose
+        // Pending marker is an <a> carrying componentkey="...invitation...pending" and an aria-label
+        // beginning "Pending, click to withdraw invitation sent to <NAME>". This is the a-vs-button
+        // regression guard: the driver's shadow-piercing Pending PREDICATE must match this <a> (by
+        // its aria-label / componentkey / <a> text), NOT the old button[aria-label^='Pending'] CSS
+        // selector, which was both light-DOM-only AND tag-wrong and returned a false negative on a
+        // real, sent invite. The marker is CREATED by the Send handler (not pre-placed), so Auto->Sent
+        // stays gated on a real post-Send signal — the driver's SOLE, authoritative confirmation.
         modal.remove();
-        const pending = document.createElement("button");
+        const pending = document.createElement("a");
         pending.id = "pending";
-        pending.setAttribute("aria-label", "Pending");
-        pending.textContent = "Pending";
+        pending.setAttribute("href", "/in/janedoe/");
+        pending.setAttribute(
+          "componentkey",
+          "ConnectButtonstate:invitation:urn:li:member:1_pending"
+        );
+        pending.setAttribute(
+          "aria-label",
+          "Pending, click to withdraw invitation sent to Jane Doe"
+        );
+        const label = document.createElement("span");
+        label.textContent = "Pending";
+        pending.appendChild(label);
         document.body.appendChild(pending);
       });
     </script>

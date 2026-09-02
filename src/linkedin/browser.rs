@@ -113,17 +113,25 @@ impl LinkedInBrowser for FakeBrowser {
     }
 }
 
-/// The two elements we still locate by a stable CSS id/prefix. Everything else (Connect, the "…"
-/// overflow, its in-menu Connect item, Add-a-note, Send) is located by TEXT/ROLE in JS — see the
-/// `match_` predicates below — because LinkedIn's aria-labels drift but the human-visible text does
-/// not. The contract this task guarantees is screenshot-on-failure + never-false-`Sent`, NOT
-/// selector perfection.
+/// Everything actionable (Connect, the "…" overflow, its in-menu Connect item, Add-a-note, Send) is
+/// located by TEXT/ROLE in JS — see the `match_` predicates below — because LinkedIn's aria-labels
+/// drift but the human-visible text does not. The note textarea is located by its stable id inline
+/// in `LOCATE_TEXTAREA_JS`. The one remaining named marker is the post-invite "Pending" confirmation,
+/// matched by a shadow-piercing JS PREDICATE (not a CSS selector) — see `PENDING_EXISTS_JS`. The
+/// contract this task guarantees is screenshot-on-failure + never-false-`Sent`, NOT selector
+/// perfection.
 mod selectors {
-    /// The custom-note textarea. Real LinkedIn and the fixture both use this id; the note-fill path
-    /// falls back to any visible `<textarea>` inside the open dialog when the id ever changes.
-    pub const NOTE_TEXTAREA: &str = "textarea#custom-message";
-    /// After a successful invite the profile shows a "Pending" button — the never-false-Sent gate.
-    pub const PENDING_MARKER: &str = "button[aria-label^='Pending']";
+    /// After a successful invite the profile shows a "Pending" marker — the never-false-Sent gate.
+    /// On REAL LinkedIn this is an `<a>` (NOT a `<button>`) in the LIGHT DOM carrying a
+    /// `componentkey="...invitation...pending"` and an `aria-label` beginning "Pending, click to
+    /// withdraw invitation sent to <NAME>". It is matched by the shadow-piercing `PENDING_EXISTS_JS`
+    /// predicate (aria-label starts with "pending", OR componentkey contains "invitation"+"pending",
+    /// OR an `<a>`/`<button>` whose text is exactly "pending") — NOT a CSS selector, because the old
+    /// `button[aria-label^='Pending']` was both light-DOM-only AND tag-wrong and returned a FALSE
+    /// NEGATIVE on a real, sent invite. This value is the human-readable description used in the
+    /// "not found" diagnostic.
+    pub const PENDING_MARKER: &str =
+        "aria-label^='Pending' | componentkey~'invitation'+'pending' | <a>/<button> text='Pending'";
 }
 
 /// The CSS candidate sets each text matcher scans. Kept broad on purpose — a matcher narrows by
@@ -328,17 +336,35 @@ __HELPERS__
   return false;
 })()"#;
 
-/// Does any element (shadow-piercing) match `__SEL__`? When `__VIS__` is true it must also have a
-/// real client rect. Backs the never-false-Sent Pending-marker and "note textarea gone" checks.
-const EXISTS_TEMPLATE: &str = r#"(() => {
+/// Shadow-piercing existence check for the post-invite "Pending" marker — the AUTHORITATIVE
+/// "invite sent" signal. Real LinkedIn renders it in the LIGHT DOM as an `<a>` (NOT a `<button>`)
+/// with obfuscated classes, e.g.
+///   <a href="https://www.linkedin.com/in/<slug>/"
+///      componentkey="ConnectButtonstate:invitation:urn:li:member:<id>_pending"
+///      aria-label="Pending, click to withdraw invitation sent to <NAME>"><span>Pending</span></a>
+/// The old `button[aria-label^='Pending']` CSS selector missed it (light-DOM-only AND tag-wrong) and
+/// returned a FALSE NEGATIVE even though LinkedIn had recorded the invite. Over the SHADOW-PIERCING
+/// element set (the same recursive `walk` — open `shadowRoot`s + same-origin iframes — the locators
+/// use), match ANY VISIBLE element whose:
+///  * `aria-label` starts with "pending" (case-insensitive), OR
+///  * `componentkey` contains BOTH "invitation" and "pending", OR
+///  * it is an `<a>`/`<button>` whose trimmed text is exactly "pending".
+///
+/// Any one (on the marker itself or its container) is sufficient. Requiring a real client rect keeps
+/// a hidden/stale template marker from confirming. Run as an IIFE via `evaluate_expression`.
+const PENDING_EXISTS_JS: &str = r#"(() => {
 __HELPERS__
-  const needVisible = __VIS__;
   for (const el of allElements()) {
-    if (!el.matches) continue;
-    let m = false; try { m = el.matches("__SEL__"); } catch (e) { m = false; }
-    if (!m) continue;
-    if (needVisible && !visible(el)) continue;
-    return true;
+    if (!el.getAttribute) continue;
+    if (!visible(el)) continue;
+    const aria = (el.getAttribute('aria-label') || '').trim().toLowerCase();
+    if (aria.startsWith('pending')) return true;
+    const ck = (el.getAttribute('componentkey') || '').toLowerCase();
+    if (ck.indexOf('invitation') !== -1 && ck.indexOf('pending') !== -1) return true;
+    if (el.tagName === 'A' || el.tagName === 'BUTTON') {
+      const txt = (el.innerText || el.textContent || '').trim().toLowerCase();
+      if (txt === 'pending') return true;
+    }
   }
   return false;
 })()"#;
@@ -365,6 +391,22 @@ const CONNECT_TRIES: u32 = 10;
 const SETTLE: Duration = Duration::from_millis(1200);
 /// Cap graceful browser teardown so it can never hang the send path; force-kill past this.
 const TEARDOWN_BUDGET: Duration = Duration::from_secs(6);
+
+/// Human-like PACING between the major invite steps (this is pacing, NOT fingerprint evasion — the
+/// "controlled by automated test software" banner stays; no webdriver/stealth spoofing). Applied
+/// only against the real LinkedIn origin; collapsed to zero when the test-only base override points
+/// `base` at a local fixture server (see [`ChromeBrowser::paced`]) so the `#[ignore]` fixture test
+/// stays fast. A short randomized pause before Connect, between Connect and Add-a-note, and before
+/// typing the note; a slightly longer one after the note is filled and before Send.
+const PACE_STEP_MIN_MS: u64 = 600;
+const PACE_STEP_MAX_MS: u64 = 1600;
+const PACE_PRESEND_MIN_MS: u64 = 900;
+const PACE_PRESEND_MAX_MS: u64 = 2200;
+/// Note typing: when paced, insert the note in small char-chunks with short randomized gaps so it
+/// reads as typed rather than pasted (unpaced/fixture: a single insert, kept fast). See `fill_note`.
+const NOTE_CHUNK_CHARS: usize = 4;
+const NOTE_CHUNK_MIN_MS: u64 = 40;
+const NOTE_CHUNK_MAX_MS: u64 = 160;
 
 /// Real chromiumoxide-backed browser. Launches a FRESH headful Chrome per operation against the
 /// coldtrail-owned profile, drives the invite flow over CDP, and tears the browser down when the
@@ -403,6 +445,22 @@ impl ChromeBrowser {
     /// ONLY behavioral difference and it can only be reached via the test-only constructor.
     fn requires_login(&self) -> bool {
         self.base.starts_with(LINKEDIN_ORIGIN)
+    }
+
+    /// Human-like pacing (and human-like chunked note typing) run ONLY against the real LinkedIn
+    /// origin. When the test-only `COLDTRAIL_LINKEDIN_BASE` override points `base` at a local
+    /// fixture server, this is false, so pacing collapses to zero and the `#[ignore]` fixture test
+    /// completes fast. Production always targets `LINKEDIN_ORIGIN`, so production is always paced.
+    fn paced(&self) -> bool {
+        self.base.starts_with(LINKEDIN_ORIGIN)
+    }
+
+    /// Sleep a randomized human-like pause in `[min_ms, max_ms]` between drive steps — but only when
+    /// [`Self::paced`] is true (a no-op against a fixture base, keeping the fixture test fast).
+    async fn pace(&self, min_ms: u64, max_ms: u64) {
+        if self.paced() {
+            tokio::time::sleep(Duration::from_millis(jitter_ms(min_ms, max_ms))).await;
+        }
     }
 
     /// Launch a fresh headful Chrome and start pumping its CDP handler. The returned `Session`
@@ -466,6 +524,7 @@ impl ChromeBrowser {
         note: &str,
         mode: SendMode,
     ) -> Result<InviteOutcome> {
+        let paced = self.paced();
         let page = open(browser, url).await?;
         tokio::time::sleep(SETTLE).await;
 
@@ -481,6 +540,10 @@ impl ChromeBrowser {
                 return Ok(InviteOutcome::LoggedOut);
             }
         }
+
+        // Human-like pause before the first click, so the drive doesn't fire the instant the page
+        // settles (no-op against a fixture base).
+        self.pace(PACE_STEP_MIN_MS, PACE_STEP_MAX_MS).await;
 
         // Connect: a top-level button (main bar or sticky header), else the "…" overflow -> the
         // in-menu Connect item. Each target is located by TEXT/ROLE in JS, tagged, and clicked with
@@ -510,6 +573,9 @@ impl ChromeBrowser {
             .await);
         }
 
+        // Human-like pause between opening Connect and reaching for "Add a note".
+        self.pace(PACE_STEP_MIN_MS, PACE_STEP_MAX_MS).await;
+
         // Add a note (scoped to the open invite dialog).
         match locate_and_click_retry(
             &page,
@@ -535,9 +601,13 @@ impl ChromeBrowser {
             }
         }
 
+        // Human-like pause before typing the note.
+        self.pace(PACE_STEP_MIN_MS, PACE_STEP_MAX_MS).await;
+
         // Fill the note: focus the textarea, insert via CDP `Input.insertText`, and VERIFY the value
-        // stuck (so a silent fill-failure becomes Failed, not a blank note).
-        if let Err(reason) = fill_note(&page, note).await {
+        // stuck (so a silent fill-failure becomes Failed, not a blank note). When paced (real
+        // LinkedIn) the insert is chunked with short gaps so it reads as typed, not pasted.
+        if let Err(reason) = fill_note(&page, note, paced).await {
             return Ok(failed(&page, &reason).await);
         }
 
@@ -545,6 +615,10 @@ impl ChromeBrowser {
         if mode == SendMode::Assist {
             return Ok(InviteOutcome::Staged);
         }
+
+        // Human-like pause after the note is filled and before clicking Send (a beat longer — a
+        // person re-reads the note before sending).
+        self.pace(PACE_PRESEND_MIN_MS, PACE_PRESEND_MAX_MS).await;
 
         // Auto: click Send (scoped to the open invite dialog), then VERIFY. Never return Sent without
         // observing the confirmation.
@@ -566,23 +640,21 @@ impl ChromeBrowser {
             Located::NotFound => return Ok(failed(&page, "could not find the Send button").await),
         }
 
-        // Confirmation = a Pending marker appeared AND the invite modal (its textarea) is gone.
-        // BOTH checks pierce the shadow boundary — the modal (and its textarea) live in an open
-        // shadow root, so a light-DOM `find_element` would never see the textarea and would report
-        // it "gone" unconditionally, a never-false-Sent hole. The textarea check requires a *visible*
-        // match, so a stray hidden `#custom-message` elsewhere can't keep us from confirming.
-        if let Err(reason) = require_pierce(
-            &page,
-            selectors::PENDING_MARKER,
-            true,
-            "Pending confirmation",
-        )
-        .await
-        {
-            return Ok(failed(&page, &reason).await);
-        }
-        if pierce_exists(&page, selectors::NOTE_TEXTAREA, true).await {
-            return Ok(failed(&page, "invite modal did not close after Send").await);
+        // Confirmation: the shadow-piercing Pending marker appeared. Its presence is AUTHORITATIVE —
+        // LinkedIn recorded the invite — so it is the SOLE signal we gate `Sent` on (never-false-
+        // Sent preserved: no Pending => Failed). The old secondary "note textarea gone" check is
+        // DROPPED on purpose: a lingering modal must never turn a real, recorded send into a false
+        // negative — which, together with the marker being an `<a>` (not a `<button>`), was exactly
+        // the shape of the live FALSE-NEGATIVE bug (invite sent on screen, driver reported Failed).
+        if !confirm_pending(&page).await {
+            return Ok(failed(
+                &page,
+                &format!(
+                    "Pending confirmation not found (predicate: {})",
+                    selectors::PENDING_MARKER
+                ),
+            )
+            .await);
         }
         Ok(InviteOutcome::Sent)
     }
@@ -770,11 +842,24 @@ fn read_tagged_js(tag: &str) -> String {
     with_helpers(READ_TAGGED_TEMPLATE).replace("__TAG__", tag)
 }
 
-/// JS: does any element (shadow-piercing) match `sel`, optionally requiring it be visible?
-fn exists_js(sel: &str, need_visible: bool) -> String {
-    with_helpers(EXISTS_TEMPLATE)
-        .replace("__SEL__", sel)
-        .replace("__VIS__", if need_visible { "true" } else { "false" })
+/// Cheap time-seeded jitter in `[min_ms, max_ms]` (inclusive). NOT cryptographic — it exists only to
+/// make the pause BETWEEN drive steps read as human rather than instant. `rand` is not a dependency,
+/// so entropy is derived from the current time's seconds+nanoseconds mixed through a small
+/// splitmix64-style avalanche, which spreads even nanosecond-close consecutive calls across the span.
+fn jitter_ms(min_ms: u64, max_ms: u64) -> u64 {
+    if max_ms <= min_ms {
+        return min_ms;
+    }
+    let span = max_ms - min_ms + 1;
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() ^ ((d.subsec_nanos() as u64) << 20))
+        .unwrap_or(0);
+    let mut x = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    min_ms + (x % span)
 }
 
 /// Run a boolean matcher expression, mapping any error/non-bool result to `false`.
@@ -833,26 +918,17 @@ async fn cdp_click(page: &Page, x: f64, y: f64) -> bool {
     page.execute(press).await.is_ok() && page.execute(release).await.is_ok()
 }
 
-/// True if any element (shadow-piercing) matches `sel` (optionally requiring visibility).
-async fn pierce_exists(page: &Page, sel: &str, need_visible: bool) -> bool {
-    eval_bool(page, exists_js(sel, need_visible)).await
-}
-
-/// Poll (~`WAIT_TRIES * WAIT_INTERVAL`) for a shadow-piercing match of `sel`. Maps absence to a
-/// clear reason. Replaces the old `find_element`-based `require`, which could not see a shadow node.
-async fn require_pierce(
-    page: &Page,
-    sel: &str,
-    need_visible: bool,
-    what: &str,
-) -> std::result::Result<(), String> {
+/// Poll up to `WAIT_TRIES` (~`WAIT_TRIES * WAIT_INTERVAL`) for the shadow-piercing Pending marker
+/// (see `PENDING_EXISTS_JS`) — the AUTHORITATIVE "invite sent" signal. Returns true once observed.
+/// This is the sole never-false-Sent gate: the caller returns `Sent` only when this is true.
+async fn confirm_pending(page: &Page) -> bool {
     for _ in 0..WAIT_TRIES {
-        if pierce_exists(page, sel, need_visible).await {
-            return Ok(());
+        if eval_bool(page, with_helpers(PENDING_EXISTS_JS)).await {
+            return true;
         }
         tokio::time::sleep(WAIT_INTERVAL).await;
     }
-    Err(format!("{what} not found (selector: {sel})"))
+    false
 }
 
 /// Locate a target by TEXT/ROLE across the shadow boundary: the locate JS scrolls the match into
@@ -959,12 +1035,33 @@ async fn locate_connect(page: &Page) -> bool {
     false
 }
 
+/// Insert `note` via CDP `Input.insertText` in small char-chunks (see `NOTE_CHUNK_CHARS`) with short
+/// randomized gaps so it reads as typed, not pasted. Chunks are split on CHAR boundaries — an em-dash
+/// / smart quote / emoji and the "\n"s are never split — and concatenate to EXACTLY `note`, so
+/// `fill_note`'s read-back verify still asserts the full exact value. Returns false if any chunk
+/// insert is rejected. Only called on the paced (real-LinkedIn) path.
+async fn insert_note_chunked(page: &Page, note: &str) -> bool {
+    let chars: Vec<char> = note.chars().collect();
+    for chunk in chars.chunks(NOTE_CHUNK_CHARS) {
+        let piece: String = chunk.iter().collect();
+        if page.execute(InsertTextParams::new(piece)).await.is_err() {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(jitter_ms(
+            NOTE_CHUNK_MIN_MS,
+            NOTE_CHUNK_MAX_MS,
+        )))
+        .await;
+    }
+    true
+}
+
 /// Focus the note textarea and insert `note` via CDP `Input.insertText`, then VERIFY the field holds
 /// exactly `note`. Insert (not per-key typing) handles arbitrary Unicode — em-dashes, smart quotes,
 /// accents, emoji, all common in real notes/names — and fires the input events a React textarea
 /// needs; `type_str` errors on any character outside its US-keyboard keymap. Returns a step reason on
 /// failure so a blank/short fill becomes a diagnostic `Failed`, never a silently empty note.
-async fn fill_note(page: &Page, note: &str) -> std::result::Result<(), String> {
+async fn fill_note(page: &Page, note: &str, paced: bool) -> std::result::Result<(), String> {
     // Locate + tag the textarea (poll for the modal to render). The locate is shadow-piercing and
     // returns the textarea's viewport-center coordinates.
     let mut coords = None;
@@ -991,7 +1088,18 @@ async fn fill_note(page: &Page, note: &str) -> std::result::Result<(), String> {
         return Err("could not focus the note textarea".to_string());
     }
 
-    if page.execute(InsertTextParams::new(note)).await.is_err() {
+    // Insert the text. When paced (real LinkedIn) type it in small char-chunks with short randomized
+    // gaps so it reads as typed, not pasted; unpaced (fixture) a single insert keeps the test fast.
+    // Either way the inserted characters concatenate to EXACTLY `note` (chunks are split on CHAR
+    // boundaries, so a multi-byte em-dash / smart quote / emoji and the "\n"s are never broken) and
+    // the verify loop below still asserts the full exact value — so the newline end-to-end guard and
+    // exact-value check are preserved regardless of chunking.
+    let inserted = if paced {
+        insert_note_chunked(page, note).await
+    } else {
+        page.execute(InsertTextParams::new(note)).await.is_ok()
+    };
+    if !inserted {
         untag(page, "note").await;
         return Err("failed to insert the note text".to_string());
     }
