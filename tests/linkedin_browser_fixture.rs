@@ -145,7 +145,12 @@ async fn drives_connect_under_more_note_send_on_fixture() {
     );
 
     // Auto: same path, then drive through Send and verify the Pending marker the Send handler
-    // creates (never-false-Sent: confirmation is a real post-Send signal, not pre-placed).
+    // creates (never-false-Sent: confirmation is a real post-Send signal, not pre-placed). It also
+    // guards the slug-tied confirmation: the fixture carries a sidebar decoy "Pending" for a
+    // DIFFERENT person (/in/someone-else) present from the START, so this can only reach Sent because
+    // the driver confirms the marker whose href carries the TARGET's /in/janedoe slug — not the decoy.
+    // (The real marker is appended to <body>, outside <main>, so only the slug pass can confirm it;
+    // the no-href <main> fallback cannot — proving the slug match end-to-end.)
     let sent = browser
         .send_connection_request(&profile_url, note, SendMode::Auto)
         .await
@@ -153,6 +158,6 @@ async fn drives_connect_under_more_note_send_on_fixture() {
     assert_eq!(
         sent,
         InviteOutcome::Sent,
-        "Auto should confirm Sent via the Connect-under-More path (got {sent:?})"
+        "Auto should confirm Sent via the Connect-under-More path, matching the TARGET slug not the sidebar decoy (got {sent:?})"
     );
 }

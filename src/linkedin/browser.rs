@@ -122,16 +122,18 @@ impl LinkedInBrowser for FakeBrowser {
 /// perfection.
 mod selectors {
     /// After a successful invite the profile shows a "Pending" marker — the never-false-Sent gate.
-    /// On REAL LinkedIn this is an `<a>` (NOT a `<button>`) in the LIGHT DOM carrying a
-    /// `componentkey="...invitation...pending"` and an `aria-label` beginning "Pending, click to
+    /// On REAL LinkedIn this is an `<a>` (NOT a `<button>`) in the LIGHT DOM carrying an
+    /// `href="https://www.linkedin.com/in/<slug>/"` to the invited profile, a
+    /// `componentkey="...invitation...pending"`, and an `aria-label` beginning "Pending, click to
     /// withdraw invitation sent to <NAME>". It is matched by the shadow-piercing `PENDING_EXISTS_JS`
-    /// predicate (aria-label starts with "pending", OR componentkey contains "invitation"+"pending",
-    /// OR an `<a>`/`<button>` whose text is exactly "pending") — NOT a CSS selector, because the old
-    /// `button[aria-label^='Pending']` was both light-DOM-only AND tag-wrong and returned a FALSE
-    /// NEGATIVE on a real, sent invite. This value is the human-readable description used in the
-    /// "not found" diagnostic.
-    pub const PENDING_MARKER: &str =
-        "aria-label^='Pending' | componentkey~'invitation'+'pending' | <a>/<button> text='Pending'";
+    /// predicate — a pending SIGNAL (aria-label starts with "pending", OR componentkey contains
+    /// "invitation"+"pending", OR an `<a>`/`<button>` whose text is exactly "pending") that is ALSO
+    /// tied to THIS invite by the target's `/in/<slug>` in the marker's own (or nearest ancestor
+    /// `<a>`'s) href — NOT a CSS selector, and NOT an unscoped whole-page scan. The slug tie is what
+    /// stops a sidebar "Pending" for a DIFFERENT person (e.g. "People also viewed") from ever
+    /// confirming THIS send. This value is the human-readable description used in the "not found"
+    /// diagnostic.
+    pub const PENDING_MARKER: &str = "pending signal (aria-label^='Pending' | componentkey~'invitation'+'pending' | <a>/<button> text='Pending') tied to the target's /in/<slug> href";
 }
 
 /// The CSS candidate sets each text matcher scans. Kept broad on purpose — a matcher narrows by
@@ -337,26 +339,67 @@ __HELPERS__
 })()"#;
 
 /// Shadow-piercing existence check for the post-invite "Pending" marker — the AUTHORITATIVE
-/// "invite sent" signal. Real LinkedIn renders it in the LIGHT DOM as an `<a>` (NOT a `<button>`)
-/// with obfuscated classes, e.g.
+/// "invite sent" signal, tied to THIS invite's target so a stray "Pending" for a DIFFERENT person
+/// can never confirm. Real LinkedIn renders it in the LIGHT DOM as an `<a>` (NOT a `<button>`) with
+/// obfuscated classes, e.g.
 ///   <a href="https://www.linkedin.com/in/<slug>/"
 ///      componentkey="ConnectButtonstate:invitation:urn:li:member:<id>_pending"
 ///      aria-label="Pending, click to withdraw invitation sent to <NAME>"><span>Pending</span></a>
-/// The old `button[aria-label^='Pending']` CSS selector missed it (light-DOM-only AND tag-wrong) and
-/// returned a FALSE NEGATIVE even though LinkedIn had recorded the invite. Over the SHADOW-PIERCING
-/// element set (the same recursive `walk` — open `shadowRoot`s + same-origin iframes — the locators
-/// use), match ANY VISIBLE element whose:
+/// The href carries the invited profile's `/in/<slug>` — the same slug the driver navigated to.
+///
+/// The old check matched ANY visible pending signal ANYWHERE on the page with NO scope. That is the
+/// last way never-false-`Sent` could break: if the Send click is intercepted (e.g. a "confirm you
+/// know this person / enter their email" checkpoint) and the invite does NOT register, the right-rail
+/// "People also viewed" `<aside>` still shows the Pending state of OTHER people you invited earlier —
+/// and a stray sidebar Pending would satisfy confirmation and record a FALSE `Sent`. So the predicate
+/// now requires BOTH a pending signal AND that the marker belong to THIS target.
+///
+/// Over the SHADOW-PIERCING element set (the same recursive `walk` — open `shadowRoot`s + same-origin
+/// iframes — the locators use), and dropping anything inside an EXCLUDE region (nav / sidebars /
+/// messaging) as defense-in-depth, a VISIBLE element is a pending SIGNAL when its:
 ///  * `aria-label` starts with "pending" (case-insensitive), OR
 ///  * `componentkey` contains BOTH "invitation" and "pending", OR
 ///  * it is an `<a>`/`<button>` whose trimmed text is exactly "pending".
 ///
-/// Any one (on the marker itself or its container) is sufficient. Requiring a real client rect keeps
-/// a hidden/stale template marker from confirming. Run as an IIFE via `evaluate_expression`.
+/// Confirmation is then two passes:
+///  1. PREFERRED: a pending signal whose OWN href, or its nearest composed-ancestor `<a>`'s href,
+///     has a `/in/<slug>` segment EXACTLY equal to the target slug (`__SLUG__`). A DIFFERENT person's
+///     marker (different slug) fails this.
+///  2. FALLBACK (defensive, only if no slug match): a pending signal inside `<main>` that carries NO
+///     href at all — for a legitimate marker that lost its href. A marker with an href to a DIFFERENT
+///     slug is matched by NEITHER pass (slug mismatch above; has-an-href here), so it can't confirm.
+///
+/// Requiring a real client rect keeps a hidden/stale template marker from confirming. `__SLUG__` is
+/// substituted (lowercased) before injection; an empty slug disables pass 1 (fail-safe: only the
+/// no-href fallback remains). Run as an IIFE via `evaluate_expression`.
 const PENDING_EXISTS_JS: &str = r#"(() => {
 __HELPERS__
-  for (const el of allElements()) {
-    if (!el.getAttribute) continue;
-    if (!visible(el)) continue;
+  const slug = "__SLUG__";
+  const excludeSel = "__EXCLUDE__";
+  const excluded = (el) => !!excludeSel && composedTest(el, (n) => { try { return n.matches(excludeSel); } catch (e) { return false; } });
+  const inMain = (el) => composedTest(el, (n) => { try { return n.matches('main'); } catch (e) { return false; } });
+  // The href of `el` itself or of its nearest composed-ancestor <a> (lowercased; '' if none).
+  const hrefOf = (el) => {
+    let n = el;
+    while (n) {
+      if (n.nodeType === 1 && n.tagName === 'A' && n.getAttribute) {
+        const h = n.getAttribute('href');
+        if (h) return h.toLowerCase();
+      }
+      if (n.parentNode) n = n.parentNode;
+      else if (n.host) n = n.host;
+      else if (n.defaultView && n.defaultView.frameElement) n = n.defaultView.frameElement;
+      else n = null;
+    }
+    return '';
+  };
+  // The /in/<slug> segment inside an href (lowercased; '' if none).
+  const slugOf = (href) => {
+    const i = href.indexOf('/in/');
+    if (i === -1) return '';
+    return href.slice(i + 4).split('/')[0].split('?')[0].split('#')[0].trim();
+  };
+  const isPending = (el) => {
     const aria = (el.getAttribute('aria-label') || '').trim().toLowerCase();
     if (aria.startsWith('pending')) return true;
     const ck = (el.getAttribute('componentkey') || '').toLowerCase();
@@ -365,6 +408,21 @@ __HELPERS__
       const txt = (el.innerText || el.textContent || '').trim().toLowerCase();
       if (txt === 'pending') return true;
     }
+    return false;
+  };
+  const all = allElements();
+  // Pass 1 (PREFERRED): a pending signal tied to THIS target by its /in/<slug> href.
+  for (const el of all) {
+    if (!el.getAttribute || !visible(el) || excluded(el)) continue;
+    if (!isPending(el)) continue;
+    if (slug && slugOf(hrefOf(el)) === slug) return true;
+  }
+  // Pass 2 (FALLBACK): a pending signal in <main> with NO href — defensive, prefer the slug match.
+  for (const el of all) {
+    if (!el.getAttribute || !visible(el) || excluded(el)) continue;
+    if (!isPending(el)) continue;
+    if (hrefOf(el) !== '') continue;
+    if (inMain(el)) return true;
   }
   return false;
 })()"#;
@@ -383,6 +441,12 @@ const LINKEDIN_ORIGIN: &str = "https://www.linkedin.com";
 /// Element-wait budget: `WAIT_TRIES * WAIT_INTERVAL` per lookup (~6s).
 const WAIT_TRIES: u32 = 20;
 const WAIT_INTERVAL: Duration = Duration::from_millis(300);
+/// Post-Send Pending-confirmation budget: `CONFIRM_TRIES * WAIT_INTERVAL` (~18s), deliberately LONGER
+/// than the per-element locate budget. LinkedIn can render the Pending marker slowly after Send, and
+/// the old ~6s could false-NEGATIVE a real, recorded send — leaving a stuck `draft_pending` row. A
+/// longer wait carries NO double-send risk: a re-drive of an already-invited profile finds no Connect
+/// and fails safe. Poll interval is unchanged.
+const CONFIRM_TRIES: u32 = 60;
 /// Shorter budget for the top-level Connect and the "…" overflow: enough to absorb late action-bar
 /// hydration (~3s), but on a Follow/Message/"…" profile the top-level probe is *expected* to miss,
 /// so we don't want to burn the full budget before trying the overflow.
@@ -646,7 +710,10 @@ impl ChromeBrowser {
         // DROPPED on purpose: a lingering modal must never turn a real, recorded send into a false
         // negative — which, together with the marker being an `<a>` (not a `<button>`), was exactly
         // the shape of the live FALSE-NEGATIVE bug (invite sent on screen, driver reported Failed).
-        if !confirm_pending(&page).await {
+        // Confirmation is tied to THIS invite's target: the Pending marker's href must carry the
+        // profile's `/in/<slug>` (so a sidebar "Pending" for a DIFFERENT person cannot confirm).
+        let slug = profile_slug(url).unwrap_or_default();
+        if !confirm_pending(&page, &slug).await {
             return Ok(failed(
                 &page,
                 &format!(
@@ -918,12 +985,40 @@ async fn cdp_click(page: &Page, x: f64, y: f64) -> bool {
     page.execute(press).await.is_ok() && page.execute(release).await.is_ok()
 }
 
-/// Poll up to `WAIT_TRIES` (~`WAIT_TRIES * WAIT_INTERVAL`) for the shadow-piercing Pending marker
-/// (see `PENDING_EXISTS_JS`) — the AUTHORITATIVE "invite sent" signal. Returns true once observed.
-/// This is the sole never-false-Sent gate: the caller returns `Sent` only when this is true.
-async fn confirm_pending(page: &Page) -> bool {
-    for _ in 0..WAIT_TRIES {
-        if eval_bool(page, with_helpers(PENDING_EXISTS_JS)).await {
+/// Extract the LinkedIn profile slug from a profile URL: the path segment after the first `/in/`,
+/// with any trailing slash / query / fragment stripped and lowercased. Returns None when the URL
+/// carries no `/in/<slug>` segment (defensive — production always drives a canonical `/in/<slug>`
+/// URL). This is what ties the post-invite Pending confirmation to THIS target (see
+/// `PENDING_EXISTS_JS`), and mirrors the JS `slugOf` there so the Rust and JS sides agree.
+fn profile_slug(profile_url: &str) -> Option<String> {
+    let after = profile_url.split("/in/").nth(1)?;
+    let slug = after.split(['/', '?', '#']).next().unwrap_or("").trim();
+    if slug.is_empty() {
+        None
+    } else {
+        Some(slug.to_lowercase())
+    }
+}
+
+/// Build the Pending-confirmation IIFE for `slug` (the target `/in/<slug>` this invite belongs to),
+/// injecting the shadow-piercing helpers, the target slug, and the EXCLUDE regions. An empty slug
+/// (URL without an `/in/` segment) disables the slug pass — fail-safe, leaving only the no-href
+/// fallback so a stray/mismatched marker still can't confirm.
+fn pending_exists_js(slug: &str) -> String {
+    with_helpers(PENDING_EXISTS_JS)
+        .replace("__SLUG__", slug)
+        .replace("__EXCLUDE__", EXCLUDE)
+}
+
+/// Poll up to `CONFIRM_TRIES` (~`CONFIRM_TRIES * WAIT_INTERVAL`) for the shadow-piercing Pending
+/// marker (see `PENDING_EXISTS_JS`) that belongs to THIS target's `slug` — the AUTHORITATIVE "invite
+/// sent" signal. Returns true once observed. This is the sole never-false-Sent gate: the caller
+/// returns `Sent` only when this is true, and only for a marker tied to the target's slug (a stray
+/// sidebar "Pending" for a different person cannot satisfy it).
+async fn confirm_pending(page: &Page, slug: &str) -> bool {
+    let js = pending_exists_js(slug);
+    for _ in 0..CONFIRM_TRIES {
+        if eval_bool(page, js.clone()).await {
             return true;
         }
         tokio::time::sleep(WAIT_INTERVAL).await;
@@ -1249,5 +1344,46 @@ impl LinkedInBrowser for ChromeBrowser {
         let valid = self.check_session(&session.browser).await.unwrap_or(false);
         session.close().await;
         Ok(valid)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_slug_extracts_and_normalizes() {
+        // The canonical production form, plus trailing slash / query / fragment / mixed case, and the
+        // local fixture form — all yield the bare, lowercased slug the Pending confirmation matches on.
+        for (url, want) in [
+            (
+                "https://www.linkedin.com/in/ilyanovohatskyi",
+                "ilyanovohatskyi",
+            ),
+            (
+                "https://www.linkedin.com/in/ilyanovohatskyi/",
+                "ilyanovohatskyi",
+            ),
+            ("https://www.linkedin.com/in/janedoe?trk=abc", "janedoe"),
+            ("https://www.linkedin.com/in/janedoe#section", "janedoe"),
+            ("https://www.linkedin.com/in/JaneDoe", "janedoe"),
+            ("http://127.0.0.1:8080/in/janedoe", "janedoe"),
+        ] {
+            assert_eq!(profile_slug(url).as_deref(), Some(want), "url: {url}");
+        }
+    }
+
+    #[test]
+    fn profile_slug_none_without_in_segment() {
+        // No `/in/<slug>` => None, which disables the slug pass (fail-safe: only the no-href fallback
+        // remains, so a stray/mismatched Pending marker still can't confirm).
+        for bad in [
+            "https://www.linkedin.com/company/acme",
+            "https://www.linkedin.com/feed/",
+            "https://www.linkedin.com/in/",
+            "",
+        ] {
+            assert_eq!(profile_slug(bad), None, "should have no slug: {bad}");
+        }
     }
 }

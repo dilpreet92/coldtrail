@@ -51,11 +51,17 @@
         * Connect is only reachable via "…" (no top-level Connect in <main>), and the menu starts
           display:none so the driver's *visible*-element matcher can't see Connect until "…" is opened.
         * The Pending marker is CREATED by the Send handler (not pre-placed) and is an <a> (NOT a
-          <button>) carrying a componentkey + a "Pending, click to withdraw…" aria-label, exactly like
-          real LinkedIn — so Auto->Sent is gated on a real post-Send signal that the driver's
-          shadow-piercing Pending PREDICATE (aria-label / componentkey / <a>-text) must match. That
-          predicate is now the SOLE authoritative confirmation (the old secondary "note textarea gone"
-          check was dropped so a lingering modal can never turn a real send into a false negative).
+          <button>) carrying an href to the invited profile (/in/janedoe), a componentkey + a
+          "Pending, click to withdraw…" aria-label, exactly like real LinkedIn — so Auto->Sent is
+          gated on a real post-Send signal that the driver's shadow-piercing Pending PREDICATE
+          (aria-label / componentkey / <a>-text) must match. That predicate is now the SOLE
+          authoritative confirmation (the old secondary "note textarea gone" check was dropped so a
+          lingering modal can never turn a real send into a false negative).
+        * The right-rail <aside> also carries a "Pending" <a> for a DIFFERENT person (/in/someone-else)
+          from the START. This is the never-false-Sent slug guard: the driver confirms ONLY a Pending
+          marker tied to the TARGET's /in/<slug> href, so this decoy (wrong slug, and EXCLUDE-scoped
+          out of the aside besides) can NEVER confirm. With the old unscoped whole-page Pending check
+          it alone would have recorded a false Sent even if the real Send were intercepted.
     -->
 
     <!-- DECOY: global top-nav. The OLD unscoped "…"/More matcher could hit this app "More"; the
@@ -92,10 +98,25 @@
     </main>
 
     <!-- DECOY: right-rail "People also viewed". The OLD unscoped top-level Connect matcher hits THIS
-         "Connect" (a different person) before ever opening the profile's "…". Scoped-out via aside. -->
+         "Connect" (a different person) before ever opening the profile's "…". Scoped-out via aside.
+         It ALSO carries a "Pending" marker for a DIFFERENT person (someone-else), present from the
+         START — exactly the real-LinkedIn shape (an <a> with a /in/<slug> href, an invitation+pending
+         componentkey, and a "Pending, click to withdraw…" aria-label) that shows the Pending state of
+         OTHERS you previously invited. This is the guard for the never-false-Sent slug fix: with the
+         old unscoped whole-page Pending check this decoy alone would satisfy confirmation (recording a
+         FALSE Sent even if the real Send were intercepted); the fixed driver confirms ONLY a Pending
+         marker whose href carries the TARGET's /in/janedoe slug (and it is EXCLUDE-scoped out of the
+         aside besides), so this decoy can never confirm. -->
     <aside class="scaffold-layout__aside" aria-label="People also viewed">
       <h2>People also viewed</h2>
       <button id="aside-connect" aria-label="Invite John Smith to connect">Connect</button>
+      <a
+        id="aside-pending"
+        href="https://www.linkedin.com/in/someone-else"
+        componentkey="ConnectButtonstate:invitation:urn:li:member:999_pending"
+        aria-label="Pending, click to withdraw invitation sent to Someone Else"
+        ><span>Pending</span></a
+      >
     </aside>
 
     <!-- The invite modal is rendered INSIDE an OPEN shadow root attached to THIS top-level div (see
@@ -171,12 +192,18 @@
       send.addEventListener("click", () => {
         // Tear the modal down entirely (removing the shadow-nested textarea), THEN create the Pending
         // confirmation in the LIGHT DOM as an <a> (NOT a <button>) — matching REAL LinkedIn, whose
-        // Pending marker is an <a> carrying componentkey="...invitation...pending" and an aria-label
-        // beginning "Pending, click to withdraw invitation sent to <NAME>". This is the a-vs-button
-        // regression guard: the driver's shadow-piercing Pending PREDICATE must match this <a> (by
-        // its aria-label / componentkey / <a> text), NOT the old button[aria-label^='Pending'] CSS
-        // selector, which was both light-DOM-only AND tag-wrong and returned a false negative on a
-        // real, sent invite. The marker is CREATED by the Send handler (not pre-placed), so Auto->Sent
+        // Pending marker is an <a> carrying an href to the invited profile (/in/<slug>), a
+        // componentkey="...invitation...pending", and an aria-label beginning "Pending, click to
+        // withdraw invitation sent to <NAME>". This is the a-vs-button regression guard: the driver's
+        // shadow-piercing Pending PREDICATE must match this <a> (by its aria-label / componentkey /
+        // <a> text), NOT the old button[aria-label^='Pending'] CSS selector, which was both
+        // light-DOM-only AND tag-wrong and returned a false negative on a real, sent invite.
+        //
+        // The href is /in/janedoe/ — the TARGET slug the test drives — so this REAL marker satisfies
+        // the driver's slug-tied confirmation, while the sidebar decoy (/in/someone-else) does NOT.
+        // It is appended to <body> (NOT inside <main>), so it can only be confirmed by the PREFERRED
+        // slug pass, never the no-href <main> fallback — which is precisely what proves the slug
+        // match end-to-end. The marker is CREATED by the Send handler (not pre-placed), so Auto->Sent
         // stays gated on a real post-Send signal — the driver's SOLE, authoritative confirmation.
         modal.remove();
         const pending = document.createElement("a");
