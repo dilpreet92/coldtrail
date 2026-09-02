@@ -182,8 +182,8 @@ mod match_ {
     pub const SEND: &str = "/^send( invitation)?$/i.test(txt) || txt === 'send now'";
 }
 
-/// Template for the locate-and-tag matcher: within the FIRST `__SCOPES__` container that exists
-/// (falling back to `document` only when none match), scan `__CAND__` for the FIRST *visible*
+/// Template for the locate-and-tag matcher: within ANY `__SCOPES__` container that matches (the
+/// union — falling back to `document` only when none match), scan `__CAND__` for the FIRST *visible*
 /// element whose text/aria satisfies `__PRED__` and which is NOT inside an `__EXCLUDE__` region, tag
 /// it `data-ct='__TAG__'`, and return whether one was found. Run as a strict expression (an IIFE)
 /// via `evaluate_expression`, so chromiumoxide never mis-detects it as a function declaration.
@@ -199,20 +199,24 @@ const LOCATE_TEMPLATE: &str = r#"(() => {
   };
   const scopeSels = __SCOPES__;
   const excludeSel = "__EXCLUDE__";
-  let root = null;
+  // Search the UNION of every matching scope container, not just the first. On real LinkedIn the
+  // bottom-right Messaging widget is ALSO a [role='dialog'], so a first-match scope could land on it
+  // and miss the invite modal's Add-a-note / Send. Union + the exclude list keeps us correct.
+  let roots = [];
   for (const s of scopeSels) {
-    const found = document.querySelector(s);
-    if (found) { root = found; break; }
+    document.querySelectorAll(s).forEach((el) => roots.push(el));
   }
-  if (!root) root = document;
-  const nodes = root.querySelectorAll('__CAND__');
-  for (const el of nodes) {
-    if (excludeSel && el.closest(excludeSel)) continue;
-    const txt = (el.innerText || el.textContent || '').trim().toLowerCase();
-    const aria = (el.getAttribute('aria-label') || '').toLowerCase();
-    if ((__PRED__) && visible(el)) {
-      el.setAttribute('data-ct', '__TAG__');
-      return true;
+  if (!roots.length) roots = [document];
+  for (const root of roots) {
+    const nodes = root.querySelectorAll('__CAND__');
+    for (const el of nodes) {
+      if (excludeSel && el.closest(excludeSel)) continue;
+      const txt = (el.innerText || el.textContent || '').trim().toLowerCase();
+      const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+      if ((__PRED__) && visible(el)) {
+        el.setAttribute('data-ct', '__TAG__');
+        return true;
+      }
     }
   }
   return false;

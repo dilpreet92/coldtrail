@@ -58,6 +58,15 @@
       </nav>
     </header>
 
+    <!-- DECOY: the bottom-right Messaging overlay. It is ALSO a [role='dialog'] and appears BEFORE the
+         invite modal, so a FIRST-match dialog scope would search HERE (not the invite modal) and miss
+         "Add a note" / "Send" — reproducing the live "clicked Connect, modal opened, then crashed at
+         Add-a-note" failure. Scoped-out via .msg-overlay-list-bubble / [id^='msg-overlay']; the union
+         scope + exclude keep the driver on the real invite modal. -->
+    <section id="msg-overlay-1" class="msg-overlay-list-bubble" role="dialog" aria-label="Messaging">
+      <button aria-label="Open messaging">Messaging</button>
+    </section>
+
     <main>
       <h1>Jane Doe</h1>
       <p>Fixture profile — no network, no LinkedIn.</p>
