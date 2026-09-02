@@ -145,6 +145,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/drafts/:domain/linkedin/confirm",
             post(linkedin::confirm),
         )
+        .route("/api/drafts/:domain/linkedin/send", post(linkedin::send))
         .route("/api/companies", get(pipeline::companies))
         .route(
             "/api/companies/:domain/status",

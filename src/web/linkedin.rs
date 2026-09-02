@@ -259,6 +259,50 @@ pub async fn confirm(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+/// `POST /api/drafts/:domain/linkedin/send` — the AUTO counterpart to `assist`: when LinkedIn
+/// auto-send is ON, actually drive Connect -> Add note -> Send (and mark the row sent on success)
+/// rather than leaving the Send click to the human. The Drafts "Send" button on a LinkedIn row.
+///
+/// Like `schedules::run_now`, this SPAWNS A DETACHED `coldtrail send <domain>` subprocess instead
+/// of sending in-process. `coldtrail send` routes a linkedin-channel draft through `deliver::send`
+/// -> the gated `linkedin::send::deliver` auto path (opt-in + weekly/daily caps + daytime window +
+/// inter-invite pacing + the one-Chrome-per-profile lock), which drives a real headful browser and
+/// can sleep for up to two minutes pacing before it even launches Chrome — work that must not block
+/// the axum handler. A subprocess also keeps this off the server's process-global env (the same
+/// reason run_now uses one) and is reaped by a background task while the handler returns at once.
+/// The channel + opt-in checks run HERE first so we never spawn a send for an email draft, a domain
+/// with no reviewable draft, or when auto-send is off. This does NOT set `COLDTRAIL_NO_SEND`: it is
+/// a real send. `deliver::send`'s linkedin branch still enforces every gate, so this can't send
+/// outside the caps/window even though the button skips the human confirm.
+pub async fn send(
+    State(_state): State<Arc<AppState>>,
+    Path(domain): Path<String>,
+) -> Result<Response, ApiErr> {
+    let domain = domain.to_lowercase();
+    let d = crate::deliver::reviewable(&domain)?;
+    if d.channel != "linkedin" {
+        return Ok((StatusCode::BAD_REQUEST, "not a LinkedIn draft").into_response());
+    }
+    if !crate::config::load().linkedin_auto_send {
+        return Ok((
+            StatusCode::CONFLICT,
+            "LinkedIn auto-send is off — turn it on in Settings, or use Open in LinkedIn",
+        )
+            .into_response());
+    }
+    // Detached subprocess re-invoking this same binary (exactly the `schedules::run_now` idiom):
+    // find the current exe, spawn `coldtrail send <domain>`, don't wait. A background task awaits
+    // the child only so it's reaped; the HTTP handler returns immediately.
+    let exe = std::env::current_exe().map_err(|e| ApiErr(anyhow::anyhow!(e)))?;
+    tokio::spawn(async move {
+        let _ = tokio::process::Command::new(exe)
+            .args(["send", &domain])
+            .status()
+            .await;
+    });
+    Ok(Json(serde_json::json!({ "sending": true })).into_response())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,6 +457,72 @@ mod tests {
                 .unwrap()
                 .block_on(assist(State(state()), Path("nowhere.com".to_string())));
             assert!(res.is_err());
+        });
+    }
+
+    #[test]
+    fn send_rejects_non_linkedin_draft_without_spawning() {
+        crate::testutil::with_home("ct-web-li-send-email", |_| {
+            crate::db::init().unwrap();
+            let c = crate::db::open().unwrap();
+            c.execute(
+                "INSERT INTO companies (domain, source_query) VALUES ('acme.com','q')",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO contacts (domain, founder_name, email) \
+                 VALUES ('acme.com','Jane','jane@acme.com')",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO outreach (domain, contact_id, channel, subject, body, status) \
+                 VALUES ('acme.com', (SELECT id FROM contacts WHERE domain='acme.com'), \
+                 'email', 'hi', 'body', 'draft_pending')",
+                [],
+            )
+            .unwrap();
+            // BAD_REQUEST (not a spawned `coldtrail send` child) proves the channel check ran
+            // before the spawn, which sits later in the fn.
+            let resp = tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(send(State(state()), Path("acme.com".to_string())))
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        });
+    }
+
+    #[test]
+    fn send_rejects_when_linkedin_auto_send_off() {
+        crate::testutil::with_home("ct-web-li-send-autooff", |_| {
+            crate::db::init().unwrap();
+            let c = crate::db::open().unwrap();
+            c.execute(
+                "INSERT INTO companies (domain, source_query) VALUES ('acme.com','q')",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO contacts (domain, founder_name, linkedin_url) \
+                 VALUES ('acme.com','Jane','https://www.linkedin.com/in/janedoe')",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO outreach (domain, contact_id, channel, subject, body, status) \
+                 VALUES ('acme.com', (SELECT id FROM contacts WHERE domain='acme.com'), \
+                 'linkedin', '', 'Hi Jane', 'draft_pending')",
+                [],
+            )
+            .unwrap();
+            // Fresh config → linkedin_auto_send defaults off. CONFLICT (not a spawned child)
+            // proves the opt-in gate ran before any `coldtrail send` subprocess is launched.
+            let resp = tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(send(State(state()), Path("acme.com".to_string())))
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CONFLICT);
         });
     }
 }

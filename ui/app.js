@@ -972,23 +972,30 @@ const DRAFT_LABEL = { draft_pending: "draft", drafted: "in Gmail" };
 // human to click Send) — ephemeral client-side state; it drives the "Did it send?" ✓/✗ prompt
 // until the human resolves it via confirm. Not persisted: a reload just shows "Open in LinkedIn" again.
 const liStagedDomains = new Set();
+// Generation token for the LinkedIn auto-"Send" poll (see the .li-send wiring below) — the same
+// supersede-guard pattern as chat's `openSeq`, so a second Send (or a tab switch) can't leave an
+// orphaned interval polling the drafts list forever.
+let liSendSeq = 0;
 
 // One LinkedIn draft row: the note (300-char LinkedIn invite limit) + a live char count, an
 // "Open in LinkedIn" assist button, and — once staged — the "Did it send?" ✓/✗ pair. Reuses the
 // same `.draft-body-edit`/`.save` wiring as the email rows below (see `edits()`), since the
-// backend's PATCH-style save endpoint is channel-agnostic.
-function linkedinDraftRow(r) {
+// backend's PATCH-style save endpoint is channel-agnostic. When LinkedIn auto-send is ON
+// (`liAuto`), a "Send" button (drives Connect→note→Send itself, like the email "Send now") sits
+// alongside the assist button; with auto-send off, only "Open in LinkedIn" (assist) shows.
+function linkedinDraftRow(r, liAuto) {
   const staged = liStagedDomains.has(r.domain);
   const note = r.body || "";
   const len = note.length;
+  const actions = staged
+    ? `<span class="li-confirm"><span class="li-confirm-q">Did it send?</span><button class="btn mini primary li-yes">✓</button><button class="btn mini li-no">✗</button></span>`
+    : `<button class="btn save">Save</button>${liAuto ? `<button class="btn primary li-send">Send</button>` : ""}<button class="btn${liAuto ? "" : " primary"} li-assist">Open in LinkedIn</button>`;
   const head = `<div class="draft-head">
       <span class="to">${esc(r.to) || esc(r.domain)}</span>
       <span class="status s-linkedin">LinkedIn</span>
       <span class="spacer"></span>
       <span class="status s-${esc(r.status)}">${esc(DRAFT_LABEL[r.status] || r.status)}</span>
-      ${staged
-        ? `<span class="li-confirm"><span class="li-confirm-q">Did it send?</span><button class="btn mini primary li-yes">✓</button><button class="btn mini li-no">✗</button></span>`
-        : `<button class="btn save">Save</button><button class="btn primary li-assist">Open in LinkedIn</button>`}
+      ${actions}
     </div>`;
   const bodyBlock = `<textarea class="draft-body-edit li-note" rows="6" spellcheck="false">${esc(note)}</textarea>
       <div class="li-charcount${len > 300 ? " over" : ""}">${len}/300</div>`;
@@ -1016,7 +1023,7 @@ loaders.drafts = async () => {
   }
   list.innerHTML = rows
     .map((r) => {
-      if (r.channel === "linkedin") return linkedinDraftRow(r);
+      if (r.channel === "linkedin") return linkedinDraftRow(r, !!st.linkedin_auto_send);
       const draftable = r.status === "draft_pending"; // still editable, not yet in Gmail
       const inGmail = r.status === "drafted"; // pushed to Gmail, awaiting your send
       const head = `<div class="draft-head">
@@ -1140,6 +1147,47 @@ loaders.drafts = async () => {
         if (r.staged) { liStagedDomains.add(dom); toast("Opened in LinkedIn — review and click Send there.", "ok"); await loaders.drafts(); }
         else { b.disabled = false; b.textContent = "Open in LinkedIn"; toast("could not open LinkedIn", "err"); }
       } catch (e) { b.disabled = false; b.textContent = "Open in LinkedIn"; toast(e.message, "err"); }
+    })
+  );
+  // "Send" (auto) — only rendered when LinkedIn auto-send is ON. POSTs .../linkedin/send, which
+  // spawns a detached `coldtrail send <domain>` that drives Connect→note→Send itself and marks the
+  // row sent on success. The row leaves the drafts list once it's sent (drafts only lists
+  // draft_pending/drafted), so we poll `/api/drafts` every ~2s and, when this domain's LinkedIn row
+  // is gone, refetch to reflect it. After a generous timeout (pacing can add up to ~2 min before
+  // Chrome even launches) we stop and leave a gentle nudge — the button stays disabled so a re-click
+  // can't spawn a second send; the user can refresh to re-check.
+  $$("#drafts-list .li-send").forEach((b) =>
+    b.addEventListener("click", async () => {
+      const card = b.closest(".draft");
+      const dom = card.dataset.domain;
+      b.disabled = true; b.textContent = "Sending on LinkedIn…";
+      const gen = ++liSendSeq;
+      try {
+        await postJSON(`/api/drafts/${encodeURIComponent(dom)}`, edits(card)); // persist the edited note first
+        const r = await postJSON(`/api/drafts/${encodeURIComponent(dom)}/linkedin/send`, {});
+        if (!r.sending) { b.disabled = false; b.textContent = "Send"; toast("could not start the LinkedIn send", "err"); return; }
+        toast("Sending on LinkedIn — driving the browser…", "ok");
+        const started = Date.now();
+        const TIMEOUT_MS = 240000; // 4 min: covers up to ~2 min inter-invite pacing + the drive
+        const tick = async () => {
+          if (gen !== liSendSeq) return; // superseded by a newer send or a tab switch
+          let rows = null;
+          try { rows = await getJSON("/api/drafts"); } catch (_) { /* transient — try again next tick */ }
+          if (gen !== liSendSeq) return;
+          const stillPending = rows && rows.some((x) => x.domain === dom && x.channel === "linkedin");
+          if (rows && !stillPending) { // the LinkedIn row left the drafts list => marked sent
+            toast("Invite sent on LinkedIn.", "ok");
+            await loaders.drafts();
+            return;
+          }
+          if (Date.now() - started > TIMEOUT_MS) {
+            toast("Still working — watch the LinkedIn browser window, or check again in a moment.", "");
+            return; // leave the button disabled so a re-click can't double-send
+          }
+          setTimeout(tick, 2000);
+        };
+        setTimeout(tick, 2000);
+      } catch (e) { b.disabled = false; b.textContent = "Send"; toast(e.message, "err"); }
     })
   );
   $$("#drafts-list .li-yes").forEach((b) =>
