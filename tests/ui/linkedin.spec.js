@@ -68,6 +68,8 @@ const STATUS_STUB = {
   linkedin_auto_send: false,
   linkedin_weekly_cap: 40,
   linkedin_daily_cap: 10,
+  linkedin_sent_7d: 3,
+  linkedin_sent_today: 1,
 };
 
 test.beforeEach(async ({ page }) => {
@@ -130,6 +132,29 @@ test("LinkedIn destination card: Connect goes waiting -> connected, then caps PO
   expect(posted.enabled).toBe(true);
   expect(typeof posted.weekly_cap).toBe("number");
   expect(typeof posted.daily_cap).toBe("number");
+});
+
+test("Drafts: channel tabs default to All, and filter to the LinkedIn/Email rows", async ({ page }) => {
+  await page.click('[data-nav="drafts"]');
+
+  // Default tab is "All" — the stubbed LinkedIn draft shows without picking a tab.
+  await expect(page.locator("#drafts-tabs .chip[data-t='all']")).toHaveAttribute("aria-pressed", "true");
+  const card = page.locator('.draft[data-channel="linkedin"]');
+  await expect(card).toBeVisible();
+
+  // Email tab: no email drafts in this stub, so the list goes empty and there's no LinkedIn-only
+  // "Send all" bulk button (that only ever appears on the Email tab, and only for email drafts).
+  await page.click("#drafts-tabs .chip[data-t='email']");
+  await expect(page.locator("#drafts-tabs .chip[data-t='email']")).toHaveAttribute("aria-pressed", "true");
+  await expect(card).toHaveCount(0);
+  await expect(page.locator(".drafts .empty")).toBeVisible();
+  await expect(page.locator("#drafts-bulk #bulk-draft")).toHaveCount(0);
+
+  // LinkedIn tab: the stats line reflects the LinkedIn caps/counts from /api/status, not Gmail's.
+  await page.click("#drafts-tabs .chip[data-t='linkedin']");
+  await expect(card).toBeVisible();
+  await expect(page.locator("#warmup")).toContainText("1/10 today");
+  await expect(page.locator("#warmup")).toContainText("3/40 this week");
 });
 
 test("Drafts: a LinkedIn draft shows its badge + live char count + Open-in-LinkedIn, then stages", async ({

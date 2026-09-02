@@ -48,6 +48,10 @@ pub struct StatusDto {
     pub linkedin_weekly_cap: u32,
     /// The per-day LinkedIn invite cap in effect.
     pub linkedin_daily_cap: u32,
+    /// LinkedIn connection-invites sent in the trailing 7 days (Drafts LinkedIn stats line).
+    pub linkedin_sent_7d: u32,
+    /// LinkedIn connection-invites sent today (Drafts LinkedIn stats line).
+    pub linkedin_sent_today: u32,
 }
 
 #[derive(Deserialize, Default)]

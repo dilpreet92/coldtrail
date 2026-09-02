@@ -968,6 +968,68 @@ loaders.overview = async () => {
 // --- drafts -----------------------------------------------------------------
 const escAttr = (s) => esc(s).replace(/"/g, "&quot;");
 const DRAFT_LABEL = { draft_pending: "draft", drafted: "in Gmail" };
+// Channel filter tabs (All / Email / LinkedIn). Email and LinkedIn drafts have different copy,
+// different stats (email cap vs. LinkedIn weekly+daily caps), and different bulk actions — one
+// shared Gmail-worded header used to cover both, which was confusing. Remembered per-browser
+// (best-effort; falls back to "all" if storage is unavailable or holds junk).
+const DRAFTS_TABS = ["all", "email", "linkedin"];
+const DRAFTS_TAB_LABEL = { all: "All", email: "Email", linkedin: "LinkedIn" };
+let draftsTab = "all";
+try {
+  const saved = localStorage.getItem("ct-drafts-tab");
+  if (DRAFTS_TABS.includes(saved)) draftsTab = saved;
+} catch (_) {}
+
+function renderDraftsTabs() {
+  const host = $("#drafts-tabs");
+  if (!host) return;
+  host.innerHTML = DRAFTS_TABS
+    .map((t) => `<button class="chip" data-t="${t}" aria-pressed="${t === draftsTab}">${DRAFTS_TAB_LABEL[t]}</button>`)
+    .join("");
+  $$("#drafts-tabs .chip").forEach((c) =>
+    c.addEventListener("click", () => {
+      if (c.dataset.t === draftsTab) return;
+      draftsTab = c.dataset.t;
+      try { localStorage.setItem("ct-drafts-tab", draftsTab); } catch (_) {}
+      loaders.drafts();
+    })
+  );
+}
+
+const DRAFTS_SUB = {
+  email: `Review &amp; edit, then <strong>Create Gmail draft</strong> — it lands in your Gmail Drafts and you send it from there.`,
+  linkedin: `Open each prospect in LinkedIn (assist), or auto-send if enabled — connection requests with your note.`,
+  all: `Email + LinkedIn drafts — filter by channel above.`,
+};
+// The stats line next to the subtitle. Email's cap/warmup and LinkedIn's weekly+daily caps
+// aren't comparable, so this only ever reflects the single channel that's active — nothing shows
+// on "All".
+function draftsStatsLine(ov, st) {
+  if (draftsTab === "email") {
+    const auto = !!st.auto_send;
+    const cap = st.daily_send_cap || 20;
+    const sent = ov.sent || 0;
+    return auto
+      ? `${sent} sent · auto-send ON · cap ${cap}/day`
+      : (sent ? `${sent} sent · pace new mailboxes to ~5/day` : "pace new mailboxes to ~5/day");
+  }
+  if (draftsTab === "linkedin") {
+    const auto = !!st.linkedin_auto_send;
+    const weeklyCap = st.linkedin_weekly_cap || 80;
+    const dailyCap = st.linkedin_daily_cap || 15;
+    const weeklyUsed = st.linkedin_sent_7d || 0;
+    const dailyUsed = st.linkedin_sent_today || 0;
+    return `auto-send ${auto ? "ON" : "OFF"} · ${weeklyUsed}/${weeklyCap} this week · ${dailyUsed}/${dailyCap} today`;
+  }
+  return "";
+}
+function renderDraftsHeader(ov, st) {
+  const sub = $("#drafts-sub");
+  if (!sub) return;
+  sub.innerHTML = `${DRAFTS_SUB[draftsTab] || DRAFTS_SUB.all} <span id="warmup" class="warmup"></span>`;
+  const w = $("#warmup");
+  if (w) w.textContent = draftsStatsLine(ov, st);
+}
 // Domains whose LinkedIn assist drive just staged an invite (Chrome left the modal open for the
 // human to click Send) — ephemeral client-side state; it drives the "Did it send?" ✓/✗ prompt
 // until the human resolves it via confirm. Not persisted: a reload just shows "Open in LinkedIn" again.
@@ -1009,9 +1071,9 @@ loaders.drafts = async () => {
   const auto = !!st.auto_send;
   const cap = st.daily_send_cap || 20;
   const sent = ov.sent || 0;
-  $("#warmup").textContent = auto
-    ? `${sent} sent · auto-send ON · cap ${cap}/day`
-    : (sent ? `${sent} sent · pace new mailboxes to ~5/day` : "pace new mailboxes to ~5/day");
+  renderDraftsTabs();
+  renderDraftsHeader(ov, st);
+  const shown = rows.filter((r) => draftsTab === "all" || r.channel === draftsTab);
   const list = $("#drafts-list");
   const bulkHost = $("#drafts-bulk");
   if (!rows.length) {
@@ -1021,7 +1083,12 @@ loaders.drafts = async () => {
       : `<div class="empty">No drafts yet — ask the agent to draft outreach in Chat.</div>`;
     return;
   }
-  list.innerHTML = rows
+  if (!shown.length) {
+    if (bulkHost) bulkHost.innerHTML = "";
+    list.innerHTML = `<div class="empty">No ${DRAFTS_TAB_LABEL[draftsTab]} drafts waiting — try a different tab.</div>`;
+    return;
+  }
+  list.innerHTML = shown
     .map((r) => {
       if (r.channel === "linkedin") return linkedinDraftRow(r, !!st.linkedin_auto_send);
       const draftable = r.status === "draft_pending"; // still editable, not yet in Gmail
@@ -1052,10 +1119,12 @@ loaders.drafts = async () => {
   // Bulk: create a Gmail draft for every pending draft, one at a time (each is an agent turn).
   // LinkedIn drafts go through the assist/confirm flow (a real, human-visible browser window),
   // never the bulk "Create all Gmail drafts" button — so bulk only ever touches email drafts.
+  // Only shown on the Email tab: on "All" it'd be ambiguous which channel it sends, and
+  // LinkedIn's bulk equivalent is a scheduled run, not a browser-driving button here.
   const pending = rows.filter((r) => r.status === "draft_pending" && r.channel !== "linkedin");
   const bulk = $("#drafts-bulk");
   if (bulk) {
-    bulk.innerHTML = pending.length >= 2
+    bulk.innerHTML = draftsTab === "email" && pending.length >= 2
       ? `<button class="btn primary" id="bulk-draft">${auto ? `Send all (${pending.length})` : `Create all Gmail drafts (${pending.length})`}</button><span class="form-msg" id="bulk-msg"></span>`
       : "";
   }

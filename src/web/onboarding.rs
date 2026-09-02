@@ -84,6 +84,8 @@ pub async fn status() -> Result<Json<StatusDto>, ApiErr> {
         linkedin_daily_cap: cfg
             .linkedin_daily_cap
             .unwrap_or(crate::config::DEFAULT_LINKEDIN_DAILY_CAP),
+        linkedin_sent_7d: crate::deliver::linkedin_sent_last_7d(),
+        linkedin_sent_today: crate::deliver::linkedin_sent_today(),
     }))
 }
 
