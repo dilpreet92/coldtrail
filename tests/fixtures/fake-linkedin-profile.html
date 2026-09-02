@@ -5,7 +5,10 @@
     <title>Fake LinkedIn Profile (fixture)</title>
     <style>
       body { font-family: sans-serif; margin: 40px; }
-      button { font-size: 16px; padding: 10px 16px; margin: 6px 6px 6px 0; cursor: pointer; }
+      button, a { font-size: 16px; padding: 10px 16px; margin: 6px 6px 6px 0; cursor: pointer; }
+      a { display: inline-block; }
+      header, aside { border: 1px solid #ccc; padding: 8px; margin-bottom: 16px; color: #555; }
+      aside { margin-top: 24px; margin-bottom: 0; }
       #more-menu { border: 1px solid #888; padding: 8px; margin-top: 8px; max-width: 260px; }
       #more-menu [role="button"] { display: block; padding: 10px 12px; cursor: pointer; }
       #modal { border: 1px solid #888; padding: 20px; margin-top: 20px; max-width: 480px; }
@@ -15,44 +18,77 @@
   </head>
   <body>
     <!--
-      Static fixture that mimics the LinkedIn DOM that BROKE the first live run: the primary action
-      bar is Follow / Message / "…" with NO top-level Connect — Connect lives INSIDE the "…" (More)
-      overflow menu. It exercises the driver's text/role location (see src/linkedin/browser.rs
-      `match_`) + trusted-click path unchanged; it NEVER contacts linkedin.com. Flow:
-        "…" (More) click     -> open the dropdown menu (its Connect item becomes visible)
+      Static fixture that mimics the LinkedIn DOM that BROKE the live run. Two things are modeled:
+
+      1. The profile's primary action bar is Follow / Message / "…" with NO top-level Connect —
+         Connect lives INSIDE the "…" (More) overflow menu.
+      2. DECOYS the OLD (unscoped, whole-document) matchers would wrongly hit: a global <header>/<nav>
+         with a "Notifications" link and an app "More" ("…") button, and a right-rail <aside>
+         "People also viewed" carrying a "Connect" button for a DIFFERENT person. Each decoy, when
+         clicked, NAVIGATES AWAY (to /notifications or /feed — the fixture server serves this same
+         page for any path) — reproducing the live "clicked the wrong element and landed on the
+         feed/notifications page, then Chrome was force-closed" crash.
+
+      The profile + action bar are wrapped in <main>, the decoys are OUTSIDE it. The driver now scopes
+      every locate to <main> / the open menu / the open dialog and excludes header/nav/aside/messaging
+      (see src/linkedin/browser.rs `mod scopes` + `EXCLUDE`), so it must click the PROFILE's own
+      Connect-under-"…". The OLD unscoped code matches the <aside> "Connect" first, navigates away, and
+      fails — which is exactly the regression this fixture guards against.
+
+      Flow (profile path only):
+        "…" (More) click      -> open the dropdown menu (its Connect item becomes visible)
         in-menu Connect click -> reveal the invite modal (Add-a-note + Send visible)
         Add-a-note click      -> reveal the note textarea
         Send click            -> REMOVE the modal, then CREATE the Pending marker
 
       Two deliberate fidelity choices mirror real LinkedIn:
-        * Connect is only reachable via "…" (no top-level Connect button anywhere), and the menu
-          starts display:none so the driver's *visible*-element matcher can't see the Connect item
-          until the overflow is actually opened — forcing the More fallback path.
+        * Connect is only reachable via "…" (no top-level Connect button anywhere in <main>), and the
+          menu starts display:none so the driver's *visible*-element matcher can't see the Connect
+          item until the overflow is actually opened — forcing the More fallback path.
         * The Pending marker is CREATED by the Send handler (not pre-placed hidden), so Auto->Sent is
           gated on a real post-Send signal, exactly like the live confirmation.
     -->
-    <h1>Jane Doe</h1>
-    <p>Fixture profile — no network, no LinkedIn.</p>
 
-    <!-- Primary action bar: Follow / Message / "…". NO top-level Connect (matches the failing DOM). -->
-    <button id="follow" aria-label="Follow Jane Doe">Follow</button>
-    <button id="message" aria-label="Message Jane Doe">Message</button>
-    <button id="more" aria-label="More actions">…</button>
+    <!-- DECOY: global top-nav. The OLD unscoped "…"/More matcher could hit this app "More"; the
+         "Notifications" link is the classic wrong-navigation target. Scoped-out via header/nav. -->
+    <header class="global-nav">
+      <nav aria-label="Primary navigation">
+        <a id="nav-notifications" href="/notifications" aria-label="Notifications">Notifications</a>
+        <button id="nav-more" aria-label="More">…</button>
+      </nav>
+    </header>
 
-    <!-- The "…" overflow menu. display:none until opened, so Connect isn't a *visible* match before. -->
-    <div id="more-menu" class="hidden" role="menu">
-      <!-- The in-menu Connect: matched by trimmed text "Connect" AND the invite-to-connect aria. -->
-      <div id="connect" role="button" aria-label="Invite Jane Doe to connect">Connect</div>
-    </div>
+    <main>
+      <h1>Jane Doe</h1>
+      <p>Fixture profile — no network, no LinkedIn.</p>
 
-    <div id="modal" class="hidden" role="dialog" aria-label="Invite Jane Doe to connect">
-      <p>Add a note to your invitation?</p>
-      <button id="add-note" aria-label="Add a note">Add a note</button>
+      <!-- Primary action bar: Follow / Message / "…". NO top-level Connect (matches the failing DOM). -->
+      <button id="follow" aria-label="Follow Jane Doe">Follow</button>
+      <button id="message" aria-label="Message Jane Doe">Message</button>
+      <button id="more" aria-label="More actions">…</button>
 
-      <textarea id="custom-message" class="hidden" placeholder="Your note"></textarea>
+      <!-- The "…" overflow menu. display:none until opened, so Connect isn't a *visible* match before. -->
+      <div id="more-menu" class="hidden" role="menu">
+        <!-- The in-menu Connect: matched by trimmed text "Connect" AND the invite-to-connect aria. -->
+        <div id="connect" role="button" aria-label="Invite Jane Doe to connect">Connect</div>
+      </div>
 
-      <button id="send" aria-label="Send invitation">Send invitation</button>
-    </div>
+      <div id="modal" class="hidden" role="dialog" aria-label="Invite Jane Doe to connect">
+        <p>Add a note to your invitation?</p>
+        <button id="add-note" aria-label="Add a note">Add a note</button>
+
+        <textarea id="custom-message" class="hidden" placeholder="Your note"></textarea>
+
+        <button id="send" aria-label="Send invitation">Send invitation</button>
+      </div>
+    </main>
+
+    <!-- DECOY: right-rail "People also viewed". The OLD unscoped top-level Connect matcher hits THIS
+         "Connect" (a different person) before ever opening the profile's "…". Scoped-out via aside. -->
+    <aside class="scaffold-layout__aside" aria-label="People also viewed">
+      <h2>People also viewed</h2>
+      <button id="aside-connect" aria-label="Invite John Smith to connect">Connect</button>
+    </aside>
 
     <script>
       const more = document.getElementById("more");
@@ -62,6 +98,20 @@
       const addNote = document.getElementById("add-note");
       const textarea = document.getElementById("custom-message");
       const send = document.getElementById("send");
+
+      // DECOYS: clicking any of the out-of-scope look-alikes navigates AWAY from the profile — the
+      // fixture server returns this same page for any path, so the URL changes to /notifications or
+      // /feed and the driver's navigated-away guard would fire. The OLD unscoped code clicks one of
+      // these; the fixed, scoped driver never does.
+      document
+        .getElementById("nav-notifications")
+        .addEventListener("click", (e) => { e.preventDefault(); window.location.href = "/notifications"; });
+      document
+        .getElementById("nav-more")
+        .addEventListener("click", () => { window.location.href = "/notifications"; });
+      document
+        .getElementById("aside-connect")
+        .addEventListener("click", () => { window.location.href = "/feed"; });
 
       // "…" opens the overflow menu — only now does the Connect item become visible.
       more.addEventListener("click", () => {

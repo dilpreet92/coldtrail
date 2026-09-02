@@ -127,15 +127,44 @@ mod selectors {
 
 /// The CSS candidate sets each text matcher scans. Kept broad on purpose — a matcher narrows by
 /// visible TEXT/aria (see `match_`), not by a brittle attribute, so a class/label rename can't hide
-/// the target as long as the human-readable text survives.
+/// the target as long as the human-readable text survives. The candidate set is always intersected
+/// with a *scope* (see `mod scopes`) and an *exclude* (see `EXCLUDE`) so the scan can never wander
+/// into the global nav, a sidebar, or the messaging overlay.
 mod candidates {
-    /// A top-level Connect: a real control anywhere in the document (main bar or sticky header).
+    /// A top-level Connect: the primary action-bar control, scoped to `<main>` (see `scopes::MAIN`).
     pub const TOP: &str = "button, a, [role=button]";
     /// A primary-action control: the "…" overflow, Add-a-note, and Send all live in this set.
     pub const ACTION: &str = "button, [role=button]";
     /// A Connect item inside the opened "…" dropdown — menus render items as varied tags.
     pub const DROPDOWN: &str = "div[role=button], button, a, li, span";
 }
+
+/// The container a locate is confined to. A locate builds its candidate list from the FIRST of these
+/// selectors that matches an element on the page (falling back to the whole document only when NONE
+/// match — e.g. a stripped-down fixture without the expected wrapper). This is the real fix for the
+/// live "clicked the wrong element and navigated to the feed" bug: without a scope, a whole-document
+/// text/role scan on a Follow/Message/"…" profile matches a global-nav item, a "People also viewed"
+/// sidebar Connect, or the messaging overlay's "…" instead of the profile's own control.
+mod scopes {
+    /// The profile card + its primary action bar (top-level Connect and the "…" More) render inside
+    /// LinkedIn's `<main>`.
+    pub const MAIN: &[&str] = &["main"];
+    /// The open "…" overflow menu — the in-menu Connect item lives here.
+    pub const DROPDOWN: &[&str] = &[
+        ".artdeco-dropdown__content",
+        ".artdeco-dropdown__content--is-open",
+        "[role='menu']",
+    ];
+    /// The open invite dialog — Add-a-note, the note textarea, and Send all live here.
+    pub const DIALOG: &[&str] = &["[role='dialog']", ".artdeco-modal", "dialog"];
+}
+
+/// Regions a profile-action locate must NEVER match into, even when nested inside an allowed scope:
+/// the global top-nav (`header`/`nav`/`.global-nav`), either sidebar rail (`aside` /
+/// `.scaffold-layout__aside`, e.g. "People also viewed"), and the bottom-right messaging overlay
+/// (`.msg-overlay-*`, `[id^='msg-overlay']`). Any candidate whose `.closest()` hits one of these is
+/// dropped. Uses only single-quoted attribute selectors so it can be inlined as a JS string literal.
+const EXCLUDE: &str = "header, nav, .global-nav, aside, .scaffold-layout__aside, .msg-overlay-list-bubble, [id^='msg-overlay'], .msg-overlay-container";
 
 /// JS boolean predicates run against each candidate, with `txt` = its lowercased trimmed text and
 /// `aria` = its lowercased `aria-label` in scope. Text/role, never a raw attribute — this is the
@@ -153,11 +182,14 @@ mod match_ {
     pub const SEND: &str = "/^send( invitation)?$/i.test(txt) || txt === 'send now'";
 }
 
-/// Template for the locate-and-tag matcher: scan `__CAND__` for the FIRST *visible* element whose
-/// text/aria satisfies `__PRED__`, tag it `data-ct='__TAG__'`, and return whether one was found. Run
-/// as a strict expression (an IIFE) via `evaluate_expression`, so chromiumoxide never mis-detects it
-/// as a function declaration. Visibility is a real client-rect check so a `position:fixed` sticky
-/// header still counts but a `display:none` dropdown item (before the menu opens) does not.
+/// Template for the locate-and-tag matcher: within the FIRST `__SCOPES__` container that exists
+/// (falling back to `document` only when none match), scan `__CAND__` for the FIRST *visible*
+/// element whose text/aria satisfies `__PRED__` and which is NOT inside an `__EXCLUDE__` region, tag
+/// it `data-ct='__TAG__'`, and return whether one was found. Run as a strict expression (an IIFE)
+/// via `evaluate_expression`, so chromiumoxide never mis-detects it as a function declaration.
+/// Visibility is a real client-rect check so a `position:fixed` sticky header still counts but a
+/// `display:none` dropdown item (before the menu opens) does not. The scope + exclude are what keep
+/// the scan on the profile's own action bar instead of a nav/sidebar/messaging look-alike.
 const LOCATE_TEMPLATE: &str = r#"(() => {
   const visible = (el) => {
     const rects = el.getClientRects();
@@ -165,8 +197,17 @@ const LOCATE_TEMPLATE: &str = r#"(() => {
     const b = el.getBoundingClientRect();
     return b.width > 0 && b.height > 0;
   };
-  const nodes = document.querySelectorAll('__CAND__');
+  const scopeSels = __SCOPES__;
+  const excludeSel = "__EXCLUDE__";
+  let root = null;
+  for (const s of scopeSels) {
+    const found = document.querySelector(s);
+    if (found) { root = found; break; }
+  }
+  if (!root) root = document;
+  const nodes = root.querySelectorAll('__CAND__');
   for (const el of nodes) {
+    if (excludeSel && el.closest(excludeSel)) continue;
     const txt = (el.innerText || el.textContent || '').trim().toLowerCase();
     const aria = (el.getAttribute('aria-label') || '').toLowerCase();
     if ((__PRED__) && visible(el)) {
@@ -350,12 +391,31 @@ impl ChromeBrowser {
             .await);
         }
 
-        // Add a note.
+        // Defensive guard: if the Connect/More click navigated us AWAY from the member profile, we
+        // must have clicked a mis-scoped control (a nav/sidebar/messaging look-alike) — which is the
+        // exact live failure this scoping fix targets. Turn the resulting "crash" (teardown force-
+        // closing the wrong page) into a diagnostic Failed + screenshot rather than driving on.
+        let after_connect = page.url().await.ok().flatten().unwrap_or_default();
+        if after_connect.contains("/notifications")
+            || after_connect.contains("/feed")
+            || after_connect.contains("/mynetwork")
+            || !after_connect.contains("/in/")
+        {
+            return Ok(failed(
+                &page,
+                "clicked a control that navigated away from the profile: the profile action bar wasn't found where expected",
+            )
+            .await);
+        }
+
+        // Add a note (scoped to the open invite dialog).
         match locate_and_click_retry(
             &page,
             "addnote",
             candidates::ACTION,
             match_::ADD_NOTE,
+            scopes::DIALOG,
+            EXCLUDE,
             WAIT_TRIES,
         )
         .await
@@ -384,9 +444,18 @@ impl ChromeBrowser {
             return Ok(InviteOutcome::Staged);
         }
 
-        // Auto: click Send, then VERIFY. Never return Sent without observing the confirmation.
-        match locate_and_click_retry(&page, "send", candidates::ACTION, match_::SEND, WAIT_TRIES)
-            .await
+        // Auto: click Send (scoped to the open invite dialog), then VERIFY. Never return Sent without
+        // observing the confirmation.
+        match locate_and_click_retry(
+            &page,
+            "send",
+            candidates::ACTION,
+            match_::SEND,
+            scopes::DIALOG,
+            EXCLUDE,
+            WAIT_TRIES,
+        )
+        .await
         {
             Located::Clicked => {}
             Located::ClickFailed => {
@@ -549,13 +618,34 @@ enum Located {
     NotFound,
 }
 
-/// Build the locate-and-tag matcher expression for `candidates`/`predicate`/`tag`. Simple `replace`
-/// (not `format!`) so the JS braces don't need escaping and the inputs stay readable.
-fn locate_js(tag: &str, candidates: &str, predicate: &str) -> String {
+/// Render a list of CSS selectors as a JS array literal (`["a","b"]`). The selectors are our own
+/// constants and never contain a double quote, so double-quoting each is a safe, allocation-light
+/// serialization.
+fn js_array(items: &[&str]) -> String {
+    let inner = items
+        .iter()
+        .map(|s| format!("\"{s}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{inner}]")
+}
+
+/// Build the locate-and-tag matcher expression for `candidates`/`predicate`/`tag`, confined to the
+/// first present of `scopes` and excluding anything inside `exclude`. Simple `replace` (not
+/// `format!`) so the JS braces don't need escaping and the inputs stay readable.
+fn locate_js(
+    tag: &str,
+    candidates: &str,
+    predicate: &str,
+    scopes: &[&str],
+    exclude: &str,
+) -> String {
     LOCATE_TEMPLATE
         .replace("__CAND__", candidates)
         .replace("__PRED__", predicate)
         .replace("__TAG__", tag)
+        .replace("__SCOPES__", &js_array(scopes))
+        .replace("__EXCLUDE__", exclude)
 }
 
 /// Run a boolean matcher expression, mapping any error/non-bool result to `false`.
@@ -578,8 +668,15 @@ async fn untag(page: &Page, tag: &str) {
 /// (trusted CDP) gesture — `chromiumoxide`'s `Element::click` scrolls into view and dispatches a
 /// mouse event, which LinkedIn treats as a genuine user action (an untrusted JS `.click()` can be
 /// ignored/flagged). The tag is always removed afterward.
-async fn locate_and_click(page: &Page, tag: &str, candidates: &str, predicate: &str) -> Located {
-    if !eval_bool(page, locate_js(tag, candidates, predicate)).await {
+async fn locate_and_click(
+    page: &Page,
+    tag: &str,
+    candidates: &str,
+    predicate: &str,
+    scopes: &[&str],
+    exclude: &str,
+) -> Located {
+    if !eval_bool(page, locate_js(tag, candidates, predicate, scopes, exclude)).await {
         return Located::NotFound;
     }
     let sel = format!("[data-ct='{tag}']");
@@ -602,11 +699,13 @@ async fn locate_and_click_retry(
     tag: &str,
     candidates: &str,
     predicate: &str,
+    scopes: &[&str],
+    exclude: &str,
     tries: u32,
 ) -> Located {
     let mut last = Located::NotFound;
     for _ in 0..tries {
-        match locate_and_click(page, tag, candidates, predicate).await {
+        match locate_and_click(page, tag, candidates, predicate, scopes, exclude).await {
             Located::Clicked => return Located::Clicked,
             other => last = other,
         }
@@ -618,24 +717,30 @@ async fn locate_and_click_retry(
 /// Click a Connect control: a visible top-level button (main bar or sticky header), else open the
 /// "…" overflow and click its in-menu Connect item. Returns true once a Connect has been clicked.
 async fn locate_connect(page: &Page) -> bool {
-    // (a) A top-level Connect (short poll — absent on Follow/Message/"…" profiles, by design).
+    // (a) A top-level Connect in the profile action bar (short poll — absent on Follow/Message/"…"
+    // profiles, by design). Scoped to `<main>` so a sidebar/nav "Connect" can't be mistaken for it.
     if let Located::Clicked = locate_and_click_retry(
         page,
         "connect",
         candidates::TOP,
         match_::CONNECT,
+        scopes::MAIN,
+        EXCLUDE,
         CONNECT_TRIES,
     )
     .await
     {
         return true;
     }
-    // (b) The "…" overflow, then the Connect item inside the dropdown it opens.
+    // (b) The "…" overflow (also scoped to `<main>`, excluding the global-nav/messaging "…"), then
+    // the Connect item inside the dropdown it opens (scoped to that open menu, not the whole page).
     if let Located::Clicked = locate_and_click_retry(
         page,
         "more",
         candidates::ACTION,
         match_::MORE,
+        scopes::MAIN,
+        EXCLUDE,
         CONNECT_TRIES,
     )
     .await
@@ -645,6 +750,8 @@ async fn locate_connect(page: &Page) -> bool {
             "connect",
             candidates::DROPDOWN,
             match_::CONNECT,
+            scopes::DROPDOWN,
+            EXCLUDE,
             WAIT_TRIES,
         )
         .await

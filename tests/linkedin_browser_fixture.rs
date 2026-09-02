@@ -1,7 +1,13 @@
 //! Drives real Chrome (via ChromeBrowser's CDP path) against a LOCAL static page that mimics the
-//! LinkedIn DOM that broke the first live run: a Follow / Message / "…" action bar with Connect
-//! hidden INSIDE the "…" (More) overflow menu. This exercises the driver's text/role location and
-//! the "…" -> in-menu Connect -> Add-a-note -> fill -> Send path. Never touches linkedin.com.
+//! LinkedIn DOM that broke the live run: a Follow / Message / "…" action bar with Connect hidden
+//! INSIDE the "…" (More) overflow menu, PLUS out-of-scope decoys the old whole-document matchers
+//! wrongly clicked (a global-nav "Notifications"/"More" and a "People also viewed" sidebar "Connect"
+//! for a different person — each navigates away when clicked). This exercises the driver's scoped
+//! text/role location and the "…" -> in-menu Connect -> Add-a-note -> fill -> Send path, and is a
+//! regression guard for the scoping fix: it PASSES only because every locate is confined to
+//! <main> / the open menu / the open dialog (see browser.rs `mod scopes` + `EXCLUDE`). Against the
+//! old unscoped code the driver clicks the sidebar "Connect", navigates away, and this FAILS. Never
+//! touches linkedin.com.
 //! Ignored by default because it needs a Chrome binary (and a display, since the driver runs
 //! headful); run with:
 //!
@@ -118,8 +124,9 @@ async fn drives_connect_under_more_note_send_on_fixture() {
     // typing would choke on it, so this guards against that regression.
     let note = "Hi Jane — enjoyed your post on cold outreach.";
 
-    // Assist: there is NO top-level Connect, so the driver must open the "…" overflow, click the
-    // in-menu Connect, click Add-a-note, fill the note, and stop before Send.
+    // Assist: there is NO top-level Connect, so the driver must open the PROFILE's "…" overflow
+    // (ignoring the global-nav "…" and the sidebar "Connect" decoys), click the in-menu Connect,
+    // click Add-a-note, fill the note, and stop before Send.
     let staged = browser
         .send_connection_request(&profile_url, note, SendMode::Assist)
         .await
