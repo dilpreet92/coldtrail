@@ -65,11 +65,15 @@ pub enum Commands {
         /// A short label for this ICP / search
         label: String,
     },
-    /// Add an MX-verified founder contact by hand
+    /// Add a founder contact by hand — an email (MX-verified), a LinkedIn URL, or both
     AddContact {
         domain: String,
         name: String,
-        email: String,
+        /// Founder email (optional if --linkedin is given)
+        email: Option<String>,
+        /// LinkedIn profile URL (optional if an email is given)
+        #[arg(long)]
+        linkedin: Option<String>,
         /// How you found it (default: "websearch")
         source: Option<String>,
     },
@@ -101,6 +105,12 @@ pub enum Commands {
     },
     /// Record a Gmail draft id, or mark sent / bounced
     Mark { domain: String, value: String },
+    /// Store a LinkedIn connection-request note for a company (never sends; requires a LinkedIn contact)
+    LinkedinNote {
+        domain: String,
+        #[arg(long)]
+        note: String,
+    },
     /// Load already-contacted domains from contacted.toml (dedupe guard)
     Seed,
     /// Re-download the latest release binary in place
@@ -128,10 +138,24 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: ScheduleCmd,
     },
+    /// Manage the LinkedIn destination's connected Chrome session
+    Linkedin {
+        #[command(subcommand)]
+        cmd: LinkedinCmd,
+    },
 }
 
 #[derive(Subcommand)]
 pub enum ScheduleCmd {
     /// Reinstall timers for all enabled schedules
     Sync,
+}
+
+#[derive(Subcommand)]
+pub enum LinkedinCmd {
+    /// Open a human-visible Chrome window at the LinkedIn login page and wait up to 3 minutes
+    /// for you to finish logging in
+    Connect,
+    /// Print the persisted connect state (connected / reconnect_needed)
+    Status,
 }

@@ -13,6 +13,7 @@ mod gmail;
 mod home;
 mod imap_draft;
 mod import;
+mod linkedin;
 mod logf;
 mod mark;
 mod mcp;
@@ -38,8 +39,20 @@ mod web;
 use clap::Parser;
 use cli::{Cli, Commands};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Capture the local UTC offset while the process is still single-threaded. The `time` crate
+    // refuses to read the local offset once worker threads exist, so this MUST happen before the
+    // multi-threaded tokio runtime is built — hence the manual runtime instead of `#[tokio::main]`
+    // (which would run this on a runtime worker thread, where the lookup always fails). Without it
+    // the LinkedIn daytime-window gate is inert. `enable_all()` matches `#[tokio::main]`'s config.
+    deliver::capture_local_offset();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         None => {
@@ -65,8 +78,18 @@ async fn main() -> anyhow::Result<()> {
             domain,
             name,
             email,
+            linkedin,
             source,
-        }) => contact::run(&domain, &name, &email, source.as_deref()).await,
+        }) => {
+            contact::run(
+                &domain,
+                &name,
+                email.as_deref(),
+                linkedin.as_deref(),
+                source.as_deref(),
+            )
+            .await
+        }
         Some(Commands::FindEmails { max }) => find::run(max.unwrap_or(20)).await,
         Some(Commands::DraftPrep { max }) => draft::run(max.unwrap_or(20)),
         Some(Commands::Draft {
@@ -80,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
             body,
         }) => draft::followup_add(&domain, &subject, &body),
         Some(Commands::Mark { domain, value }) => mark::run(&domain, &value),
+        Some(Commands::LinkedinNote { domain, note }) => linkedin::note::add(&domain, &note),
         Some(Commands::Send { domain }) => deliver::run(&domain).await,
         Some(Commands::Seed) => seed::run(),
         Some(Commands::Update) => update::run().await,
@@ -102,7 +126,46 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Schedule { cmd }) => match cmd {
             cli::ScheduleCmd::Sync => schedule::sync(),
         },
+        Some(Commands::Linkedin { cmd }) => match cmd {
+            cli::LinkedinCmd::Connect => linkedin_connect().await,
+            cli::LinkedinCmd::Status => {
+                let s = linkedin::LinkedinState::load();
+                println!(
+                    "connected={} reconnect_needed={}",
+                    s.connected, s.reconnect_needed
+                );
+                Ok(())
+            }
+        },
     }
+}
+
+/// Thin CLI mirror of the web connect flow (`src/web/linkedin.rs::connect`): launch a real,
+/// human-visible Chrome window at the LinkedIn login page and wait (up to 3 minutes) for the
+/// human to finish logging in. Unlike the web path — which spawns off the request and can't
+/// surface a launch error to the caller — this awaits inline, so a `ChromeBrowser::new()` or
+/// launch failure (e.g. no Chrome installed) prints directly instead of being swallowed.
+async fn linkedin_connect() -> anyhow::Result<()> {
+    use linkedin::browser::{ChromeBrowser, LinkedInBrowser, LoginOutcome};
+
+    let browser = ChromeBrowser::new()?;
+    match browser.connect_and_wait_for_login(180).await? {
+        LoginOutcome::LoggedIn => {
+            linkedin::LinkedinState {
+                connected: true,
+                reconnect_needed: false,
+            }
+            .save()?;
+            println!("LinkedIn connected.");
+        }
+        LoginOutcome::TimedOut => {
+            println!("Not logged in (timed out after 3 minutes) — run `coldtrail linkedin connect` again.");
+        }
+        LoginOutcome::WindowClosed => {
+            println!("Not logged in (the Chrome window was closed) — run `coldtrail linkedin connect` again.");
+        }
+    }
+    Ok(())
 }
 
 /// Test-only helpers. `COLDTRAIL_HOME` is process-global, so any test that sets it

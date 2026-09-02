@@ -15,10 +15,19 @@ pub struct Config {
     pub auto_send: bool,
     /// Safety cap on auto-sends per calendar day (deliverability / warmup). Defaults to 20.
     pub daily_send_cap: Option<u32>,
+    /// Opt-in: let coldtrail click Send on LinkedIn connection requests (separate from email auto_send).
+    #[serde(default)]
+    pub linkedin_auto_send: bool,
+    /// Rolling-7-day LinkedIn invite cap. Defaults to DEFAULT_LINKEDIN_WEEKLY_CAP.
+    pub linkedin_weekly_cap: Option<u32>,
+    /// Per-day LinkedIn invite sub-cap. Defaults to DEFAULT_LINKEDIN_DAILY_CAP.
+    pub linkedin_daily_cap: Option<u32>,
 }
 
 /// The effective daily auto-send cap (config value or the default).
 pub const DEFAULT_DAILY_SEND_CAP: u32 = 20;
+pub const DEFAULT_LINKEDIN_WEEKLY_CAP: u32 = 80;
+pub const DEFAULT_LINKEDIN_DAILY_CAP: u32 = 15;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Provider {
@@ -77,6 +86,29 @@ mod tests {
             let got = load();
             assert!(got.auto_send);
             assert_eq!(got.daily_send_cap, Some(7));
+        });
+    }
+
+    #[test]
+    fn linkedin_caps_roundtrip() {
+        crate::testutil::with_home("ct-config-linkedin", |_| {
+            crate::home::workspace().unwrap();
+            let defaults = Config::default();
+            assert!(
+                !defaults.linkedin_auto_send,
+                "linkedin_auto_send defaults false"
+            );
+            let c = Config {
+                linkedin_auto_send: true,
+                linkedin_weekly_cap: Some(40),
+                linkedin_daily_cap: Some(10),
+                ..Default::default()
+            };
+            save(&c).unwrap();
+            let got = load();
+            assert!(got.linkedin_auto_send);
+            assert_eq!(got.linkedin_weekly_cap, Some(40));
+            assert_eq!(got.linkedin_daily_cap, Some(10));
         });
     }
 }

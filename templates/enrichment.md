@@ -1,15 +1,29 @@
-# Enrichment playbook — finding a founder's email (free, honest)
+# Enrichment playbook — finding a founder's email or LinkedIn (free, honest)
 
-coldtrail's provider-agnostic guide for step 2 of the loop. Goal: **one real, MX-verified
-founder / decision-maker email per company, with provenance.** Prefer an *observed* address
-(seen in a real artifact) over a *guessed* pattern. Never fabricate. If nothing verifies,
-store nothing and say so — a missing contact is fine; an invented one is not.
+coldtrail's provider-agnostic guide for step 2 of the loop. Goal: **one real founder /
+decision-maker contact per company, with provenance** — an MX-verified email, a LinkedIn
+profile URL, or both. Prefer an *observed* email address (seen in a real artifact) over a
+*guessed* pattern. Never fabricate. If nothing verifies, store nothing and say so — a
+missing contact is fine; an invented one is not.
+
+**A LinkedIn URL alone is enough to make a company reachable** — it doesn't need an email
+too. Capture it wherever you find one: Canonical's company details often carry the founder's
+LinkedIn already (check there first), and a web search (`site:linkedin.com/in <name>
+<company>`) is the fallback. Work the email ladder below regardless — email still wins when
+both exist (the one-touch rule prefers it) — but don't skip a company just because the email
+rungs come up empty if you have a LinkedIn URL for them.
 
 Work down this ladder and stop as soon as you have a verified address. Use whatever tools
 your runtime actually has (shell/web on the CLI backends; coldtrail's own commands
 everywhere) — skip a rung you can't run rather than stalling.
 
 ## The ladder
+
+0. **Capture the LinkedIn URL first — it's usually already sitting there.** Check Canonical's
+   company details for the founder's `linkedin_url` before searching anything; when it's absent,
+   a web search `site:linkedin.com/in <name> <company>` almost always finds it. Do this
+   regardless of how the email rungs below turn out — a LinkedIn URL is its own reachable
+   contact, not a fallback for a failed email search.
 
 1. **OSINT tools, if installed** (check PATH first — they may not be present):
    - `theHarvester -d <domain> -b all` — emails / names / subdomains across many sources.
@@ -45,10 +59,13 @@ everywhere) — skip a rung you can't run rather than stalling.
 - Trust an address that appears in ≥2 independent places, or one observed artifact that
   matches a reported pattern (that match is what makes it "observed, not guessed").
 - Store with provenance:
-  `coldtrail add-contact <domain> "<Full Name>" <email> <source>`
-  — source e.g. `github-commit-metadata`, `crt.sh`, `whois`, `site-team-page`, `theHarvester`.
-- `add-contact` MX-verifies and rejects generic (`info@`, `sales@`, …) and placeholder
-  addresses. Don't work around it.
+  `coldtrail add-contact <domain> "<Full Name>" [email] --linkedin <url> <source>`
+  — source e.g. `github-commit-metadata`, `crt.sh`, `whois`, `site-team-page`, `theHarvester`,
+  `canonical`, `websearch`. Email and `--linkedin` are each optional but at least one is
+  required; pass whichever (or both) you found.
+- `add-contact` MX-verifies any email supplied and rejects generic (`info@`, `sales@`, …) and
+  placeholder addresses — don't work around it. A LinkedIn URL is recorded as-is (no email
+  verification applies to it).
 
 ## Honesty rules (non-negotiable)
 

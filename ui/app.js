@@ -129,6 +129,8 @@ async function loadStatus() {
   const dt = $("#dest-state");
   if (dt) dt.textContent = s.destination_connected ? "· connected" : "";
   renderDestination(s);
+  liStatus = s;
+  renderLinkedinCard();
 
   // wizard (first run) vs settings (once onboarded)
   renderSetup(s);
@@ -373,6 +375,132 @@ function wireAutoSend() {
   t.addEventListener("change", save);
   const cap = $("#as-cap");
   if (cap) cap.addEventListener("change", () => { if (t.checked) save(); });
+}
+
+// --- LinkedIn destination (Destination panel, second half) ------------------
+// `waiting` is client-side (this tab just clicked Connect and is polling); the poll is guarded
+// by `liPollSeq` — the same generation-token pattern as chat's `openSeq` — so a second Connect
+// click can't leave two pollers both racing to render the card.
+let liWaiting = false;
+let liPollSeq = 0;
+// The LinkedIn-relevant slice of the last-loaded /api/status, kept in sync by loadStatus().
+// Connect/auto-send/disconnect patch this locally from their own response and re-render from
+// it directly rather than round-tripping through a full /api/status reload — so the card updates
+// the instant its own action resolves, without depending on any other endpoint being in sync.
+let liStatus = {};
+
+function linkedinAutoSendBlock(s) {
+  return `<div class="autosend">
+    <label class="switch"><input type="checkbox" id="li-as-toggle"${s.linkedin_auto_send ? " checked" : ""} /> <span>LinkedIn auto-send (coldtrail clicks Send on invites)</span></label>
+    <p class="hint li-warn">coldtrail will click Send on invites — keep caps low; LinkedIn can restrict accounts.</p>
+    <label class="cap-row">Weekly cap <input type="number" id="li-as-weekly" min="1" max="500" value="${s.linkedin_weekly_cap}" /></label>
+    <label class="cap-row">Daily cap <input type="number" id="li-as-daily" min="1" max="500" value="${s.linkedin_daily_cap}" /></label>
+    <span class="form-msg" id="li-as-msg"></span>
+  </div>`;
+}
+
+function renderLinkedinCard() {
+  const s = liStatus;
+  const body = $("#li-body");
+  const badge = $("#li-conn-badge");
+  if (!body || !badge) return; // Destination panel not on screen (e.g. before first load)
+  badge.classList.remove("li-warn-badge");
+  if (liWaiting) {
+    badge.textContent = "· connecting…";
+    body.innerHTML = `<p class="hint">waiting for login… finish signing in in the Chrome window that opened — this updates automatically.</p>`;
+    return;
+  }
+  if (s.linkedin_reconnect_needed) {
+    badge.textContent = "· reconnect needed";
+    badge.classList.add("li-warn-badge");
+    body.innerHTML = `<p class="hint li-warn">⚠ LinkedIn session expired — reconnect to keep sending invites.</p>
+      <div class="row"><button class="btn primary" id="li-connect">Reconnect LinkedIn</button><span class="form-msg" id="li-msg"></span></div>`;
+  } else if (s.linkedin_connected) {
+    badge.textContent = "· connected";
+    body.innerHTML = `<p class="hint">✓ connected.</p>
+      <div class="row"><button class="btn" id="li-disconnect">Disconnect</button><span class="form-msg" id="li-msg"></span></div>
+      ${linkedinAutoSendBlock(s)}`;
+  } else {
+    badge.textContent = "";
+    body.innerHTML = `<div class="row"><button class="btn primary" id="li-connect">Connect LinkedIn</button><span class="form-msg" id="li-msg"></span></div>`;
+  }
+  wireLinkedinCard();
+}
+
+function wireLinkedinCard() {
+  const connectBtn = $("#li-connect");
+  if (connectBtn) connectBtn.addEventListener("click", liConnect);
+  const disconnectBtn = $("#li-disconnect");
+  if (disconnectBtn) disconnectBtn.addEventListener("click", liDisconnect);
+  const toggle = $("#li-as-toggle");
+  if (toggle) {
+    toggle.addEventListener("change", liSaveAutoSend);
+    $$("#li-as-weekly, #li-as-daily").forEach((inp) => inp.addEventListener("change", liSaveAutoSend));
+  }
+}
+
+async function liConnect() {
+  const btn = $("#li-connect");
+  if (btn) btn.disabled = true;
+  msg("#li-msg", "connecting…", true);
+  try {
+    const r = await postJSON("/api/destination/linkedin/connect", {});
+    if (r.status === "busy") {
+      msg("#li-msg", "browser busy — try again in a moment", false);
+      if (btn) btn.disabled = false;
+      return;
+    }
+    liWaiting = true;
+    renderLinkedinCard(); // "waiting for login…" — no network round trip needed for this state
+    liPollStatus();
+  } catch (e) {
+    msg("#li-msg", e.message, false);
+    if (btn) btn.disabled = false;
+  }
+}
+
+function liPollStatus() {
+  // Bump the generation token before starting: a superseded poller (from an earlier Connect
+  // click) sees its captured value no longer match and stops instead of racing this one.
+  const myGen = ++liPollSeq;
+  const handle = setInterval(async () => {
+    if (myGen !== liPollSeq) { clearInterval(handle); return; }
+    let s;
+    try { s = await getJSON("/api/destination/linkedin/status"); }
+    catch (_) { return; } // transient hiccup — try again next tick
+    if (myGen !== liPollSeq) { clearInterval(handle); return; }
+    if (s.connected) {
+      clearInterval(handle);
+      liWaiting = false;
+      liStatus = { ...liStatus, linkedin_connected: true, linkedin_reconnect_needed: !!s.reconnect_needed };
+      renderLinkedinCard();
+    }
+  }, 2000);
+}
+
+async function liDisconnect() {
+  if (!confirm("Disconnect LinkedIn? You'll need to log in again to send invites.")) return;
+  try {
+    await postJSON("/api/destination/linkedin/disconnect", {});
+    liStatus = { ...liStatus, linkedin_connected: false, linkedin_reconnect_needed: false };
+    renderLinkedinCard();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function liSaveAutoSend() {
+  const enabled = $("#li-as-toggle").checked;
+  const weekly = Math.max(1, parseInt($("#li-as-weekly").value, 10) || 1);
+  const daily = Math.max(1, parseInt($("#li-as-daily").value, 10) || 1);
+  if (enabled && !confirm(`Turn ON LinkedIn auto-send? coldtrail will click Send on invites (up to ${daily}/day, ${weekly}/week). LinkedIn can restrict accounts that send too many invites.`)) {
+    $("#li-as-toggle").checked = false;
+    return;
+  }
+  try {
+    await postJSON("/api/destination/linkedin/auto-send", { enabled, weekly_cap: weekly, daily_cap: daily });
+    liStatus = { ...liStatus, linkedin_auto_send: enabled, linkedin_weekly_cap: weekly, linkedin_daily_cap: daily };
+    renderLinkedinCard();
+    msg("#li-as-msg", enabled ? `auto-send on · ${daily}/day · ${weekly}/week` : "auto-send off", true);
+  } catch (e) { msg("#li-as-msg", e.message, false); }
 }
 
 // --- cron (multi-schedule) ---------------------------------------------------
@@ -840,6 +968,102 @@ loaders.overview = async () => {
 // --- drafts -----------------------------------------------------------------
 const escAttr = (s) => esc(s).replace(/"/g, "&quot;");
 const DRAFT_LABEL = { draft_pending: "draft", drafted: "in Gmail" };
+// Channel filter tabs (All / Email / LinkedIn). Email and LinkedIn drafts have different copy,
+// different stats (email cap vs. LinkedIn weekly+daily caps), and different bulk actions — one
+// shared Gmail-worded header used to cover both, which was confusing. Remembered per-browser
+// (best-effort; falls back to "all" if storage is unavailable or holds junk).
+const DRAFTS_TABS = ["all", "email", "linkedin"];
+const DRAFTS_TAB_LABEL = { all: "All", email: "Email", linkedin: "LinkedIn" };
+let draftsTab = "all";
+try {
+  const saved = localStorage.getItem("ct-drafts-tab");
+  if (DRAFTS_TABS.includes(saved)) draftsTab = saved;
+} catch (_) {}
+
+function renderDraftsTabs() {
+  const host = $("#drafts-tabs");
+  if (!host) return;
+  host.innerHTML = DRAFTS_TABS
+    .map((t) => `<button class="chip" data-t="${t}" aria-pressed="${t === draftsTab}">${DRAFTS_TAB_LABEL[t]}</button>`)
+    .join("");
+  $$("#drafts-tabs .chip").forEach((c) =>
+    c.addEventListener("click", () => {
+      if (c.dataset.t === draftsTab) return;
+      draftsTab = c.dataset.t;
+      try { localStorage.setItem("ct-drafts-tab", draftsTab); } catch (_) {}
+      loaders.drafts();
+    })
+  );
+}
+
+const DRAFTS_SUB = {
+  email: `Review &amp; edit, then <strong>Create Gmail draft</strong> — it lands in your Gmail Drafts and you send it from there.`,
+  linkedin: `Open each prospect in LinkedIn (assist), or auto-send if enabled — connection requests with your note.`,
+  all: `Email + LinkedIn drafts — filter by channel above.`,
+};
+// The stats line next to the subtitle. Email's cap/warmup and LinkedIn's weekly+daily caps
+// aren't comparable, so this only ever reflects the single channel that's active — nothing shows
+// on "All".
+function draftsStatsLine(ov, st) {
+  if (draftsTab === "email") {
+    const auto = !!st.auto_send;
+    const cap = st.daily_send_cap || 20;
+    const sent = ov.sent || 0;
+    return auto
+      ? `${sent} sent · auto-send ON · cap ${cap}/day`
+      : (sent ? `${sent} sent · pace new mailboxes to ~5/day` : "pace new mailboxes to ~5/day");
+  }
+  if (draftsTab === "linkedin") {
+    const auto = !!st.linkedin_auto_send;
+    const weeklyCap = st.linkedin_weekly_cap || 80;
+    const dailyCap = st.linkedin_daily_cap || 15;
+    const weeklyUsed = st.linkedin_sent_7d || 0;
+    const dailyUsed = st.linkedin_sent_today || 0;
+    return `auto-send ${auto ? "ON" : "OFF"} · ${weeklyUsed}/${weeklyCap} this week · ${dailyUsed}/${dailyCap} today`;
+  }
+  return "";
+}
+function renderDraftsHeader(ov, st) {
+  const sub = $("#drafts-sub");
+  if (!sub) return;
+  sub.innerHTML = `${DRAFTS_SUB[draftsTab] || DRAFTS_SUB.all} <span id="warmup" class="warmup"></span>`;
+  const w = $("#warmup");
+  if (w) w.textContent = draftsStatsLine(ov, st);
+}
+// Domains whose LinkedIn assist drive just staged an invite (Chrome left the modal open for the
+// human to click Send) — ephemeral client-side state; it drives the "Did it send?" ✓/✗ prompt
+// until the human resolves it via confirm. Not persisted: a reload just shows "Open in LinkedIn" again.
+const liStagedDomains = new Set();
+// Generation token for the LinkedIn auto-"Send" poll (see the .li-send wiring below) — the same
+// supersede-guard pattern as chat's `openSeq`, so a second Send (or a tab switch) can't leave an
+// orphaned interval polling the drafts list forever.
+let liSendSeq = 0;
+
+// One LinkedIn draft row: the note (300-char LinkedIn invite limit) + a live char count, an
+// "Open in LinkedIn" assist button, and — once staged — the "Did it send?" ✓/✗ pair. Reuses the
+// same `.draft-body-edit`/`.save` wiring as the email rows below (see `edits()`), since the
+// backend's PATCH-style save endpoint is channel-agnostic. When LinkedIn auto-send is ON
+// (`liAuto`), a "Send" button (drives Connect→note→Send itself, like the email "Send now") sits
+// alongside the assist button; with auto-send off, only "Open in LinkedIn" (assist) shows.
+function linkedinDraftRow(r, liAuto) {
+  const staged = liStagedDomains.has(r.domain);
+  const note = r.body || "";
+  const len = note.length;
+  const actions = staged
+    ? `<span class="li-confirm"><span class="li-confirm-q">Did it send?</span><button class="btn mini primary li-yes">✓</button><button class="btn mini li-no">✗</button></span>`
+    : `<button class="btn save">Save</button>${liAuto ? `<button class="btn primary li-send">Send</button>` : ""}<button class="btn${liAuto ? "" : " primary"} li-assist">Open in LinkedIn</button>`;
+  const head = `<div class="draft-head">
+      <span class="to">${esc(r.to) || esc(r.domain)}</span>
+      <span class="status s-linkedin">LinkedIn</span>
+      <span class="spacer"></span>
+      <span class="status s-${esc(r.status)}">${esc(DRAFT_LABEL[r.status] || r.status)}</span>
+      ${actions}
+    </div>`;
+  const bodyBlock = `<textarea class="draft-body-edit li-note" rows="6" spellcheck="false">${esc(note)}</textarea>
+      <div class="li-charcount${len > 300 ? " over" : ""}">${len}/300</div>`;
+  return `<div class="draft" data-domain="${escAttr(r.domain)}" data-channel="linkedin">${head}${bodyBlock}</div>`;
+}
+
 loaders.drafts = async () => {
   let rows, ov, st;
   try { [rows, ov, st] = await Promise.all([getJSON("/api/drafts"), getJSON("/api/overview").catch(() => ({ sent: 0 })), getJSON("/api/status").catch(() => ({}))]); }
@@ -847,9 +1071,9 @@ loaders.drafts = async () => {
   const auto = !!st.auto_send;
   const cap = st.daily_send_cap || 20;
   const sent = ov.sent || 0;
-  $("#warmup").textContent = auto
-    ? `${sent} sent · auto-send ON · cap ${cap}/day`
-    : (sent ? `${sent} sent · pace new mailboxes to ~5/day` : "pace new mailboxes to ~5/day");
+  renderDraftsTabs();
+  renderDraftsHeader(ov, st);
+  const shown = rows.filter((r) => draftsTab === "all" || r.channel === draftsTab);
   const list = $("#drafts-list");
   const bulkHost = $("#drafts-bulk");
   if (!rows.length) {
@@ -859,8 +1083,14 @@ loaders.drafts = async () => {
       : `<div class="empty">No drafts yet — ask the agent to draft outreach in Chat.</div>`;
     return;
   }
-  list.innerHTML = rows
+  if (!shown.length) {
+    if (bulkHost) bulkHost.innerHTML = "";
+    list.innerHTML = `<div class="empty">No ${DRAFTS_TAB_LABEL[draftsTab]} drafts waiting — try a different tab.</div>`;
+    return;
+  }
+  list.innerHTML = shown
     .map((r) => {
+      if (r.channel === "linkedin") return linkedinDraftRow(r, !!st.linkedin_auto_send);
       const draftable = r.status === "draft_pending"; // still editable, not yet in Gmail
       const inGmail = r.status === "drafted"; // pushed to Gmail, awaiting your send
       const head = `<div class="draft-head">
@@ -887,10 +1117,14 @@ loaders.drafts = async () => {
   });
 
   // Bulk: create a Gmail draft for every pending draft, one at a time (each is an agent turn).
-  const pending = rows.filter((r) => r.status === "draft_pending");
+  // LinkedIn drafts go through the assist/confirm flow (a real, human-visible browser window),
+  // never the bulk "Create all Gmail drafts" button — so bulk only ever touches email drafts.
+  // Only shown on the Email tab: on "All" it'd be ambiguous which channel it sends, and
+  // LinkedIn's bulk equivalent is a scheduled run, not a browser-driving button here.
+  const pending = rows.filter((r) => r.status === "draft_pending" && r.channel !== "linkedin");
   const bulk = $("#drafts-bulk");
   if (bulk) {
-    bulk.innerHTML = pending.length >= 2
+    bulk.innerHTML = draftsTab === "email" && pending.length >= 2
       ? `<button class="btn primary" id="bulk-draft">${auto ? `Send all (${pending.length})` : `Create all Gmail drafts (${pending.length})`}</button><span class="form-msg" id="bulk-msg"></span>`
       : "";
   }
@@ -958,6 +1192,93 @@ loaders.drafts = async () => {
       const dom = b.closest(".draft").dataset.domain;
       try { await postJSON(`/api/followups/${encodeURIComponent(dom)}/mark`, { value: "sent" }); toast(`Marked ${dom} as sent.`, "ok"); await loaders.drafts(); }
       catch (e) { toast(e.message, "err"); }
+    })
+  );
+
+  // LinkedIn: live char count against the 300-char invite-note limit.
+  $$("#drafts-list .li-note").forEach((ta) => {
+    const counter = ta.closest(".draft").querySelector(".li-charcount");
+    ta.addEventListener("input", () => {
+      const len = ta.value.length;
+      if (counter) { counter.textContent = `${len}/300`; counter.classList.toggle("over", len > 300); }
+    });
+  });
+  // "Open in LinkedIn" — drives a real, human-visible Chrome window to Connect -> Add note ->
+  // fill the note, then leaves the Send click to the human (see web/linkedin.rs::assist).
+  $$("#drafts-list .li-assist").forEach((b) =>
+    b.addEventListener("click", async () => {
+      const card = b.closest(".draft");
+      const dom = card.dataset.domain;
+      b.disabled = true; b.textContent = "opening…";
+      try {
+        await postJSON(`/api/drafts/${encodeURIComponent(dom)}`, edits(card)); // persist the edited note first
+        const r = await postJSON(`/api/drafts/${encodeURIComponent(dom)}/linkedin/assist`, {});
+        if (r.staged) { liStagedDomains.add(dom); toast("Opened in LinkedIn — review and click Send there.", "ok"); await loaders.drafts(); }
+        else { b.disabled = false; b.textContent = "Open in LinkedIn"; toast("could not open LinkedIn", "err"); }
+      } catch (e) { b.disabled = false; b.textContent = "Open in LinkedIn"; toast(e.message, "err"); }
+    })
+  );
+  // "Send" (auto) — only rendered when LinkedIn auto-send is ON. POSTs .../linkedin/send, which
+  // spawns a detached `coldtrail send <domain>` that drives Connect→note→Send itself and marks the
+  // row sent on success. The row leaves the drafts list once it's sent (drafts only lists
+  // draft_pending/drafted), so we poll `/api/drafts` every ~2s and, when this domain's LinkedIn row
+  // is gone, refetch to reflect it. After a generous timeout (pacing can add up to ~2 min before
+  // Chrome even launches) we stop and leave a gentle nudge — the button stays disabled so a re-click
+  // can't spawn a second send; the user can refresh to re-check.
+  $$("#drafts-list .li-send").forEach((b) =>
+    b.addEventListener("click", async () => {
+      const card = b.closest(".draft");
+      const dom = card.dataset.domain;
+      b.disabled = true; b.textContent = "Sending on LinkedIn…";
+      const gen = ++liSendSeq;
+      try {
+        await postJSON(`/api/drafts/${encodeURIComponent(dom)}`, edits(card)); // persist the edited note first
+        const r = await postJSON(`/api/drafts/${encodeURIComponent(dom)}/linkedin/send`, {});
+        if (!r.sending) { b.disabled = false; b.textContent = "Send"; toast("could not start the LinkedIn send", "err"); return; }
+        toast("Sending on LinkedIn — driving the browser…", "ok");
+        const started = Date.now();
+        const TIMEOUT_MS = 240000; // 4 min: covers up to ~2 min inter-invite pacing + the drive
+        const tick = async () => {
+          if (gen !== liSendSeq) return; // superseded by a newer send or a tab switch
+          let rows = null;
+          try { rows = await getJSON("/api/drafts"); } catch (_) { /* transient — try again next tick */ }
+          if (gen !== liSendSeq) return;
+          const stillPending = rows && rows.some((x) => x.domain === dom && x.channel === "linkedin");
+          if (rows && !stillPending) { // the LinkedIn row left the drafts list => marked sent
+            toast("Invite sent on LinkedIn.", "ok");
+            await loaders.drafts();
+            return;
+          }
+          if (Date.now() - started > TIMEOUT_MS) {
+            toast("Still working — watch the LinkedIn browser window, or check again in a moment.", "");
+            return; // leave the button disabled so a re-click can't double-send
+          }
+          setTimeout(tick, 2000);
+        };
+        setTimeout(tick, 2000);
+      } catch (e) { b.disabled = false; b.textContent = "Send"; toast(e.message, "err"); }
+    })
+  );
+  $$("#drafts-list .li-yes").forEach((b) =>
+    b.addEventListener("click", async () => {
+      const dom = b.closest(".draft").dataset.domain;
+      try {
+        await postJSON(`/api/drafts/${encodeURIComponent(dom)}/linkedin/confirm`, { sent: true });
+        liStagedDomains.delete(dom);
+        toast("Marked sent.", "ok");
+        await loaders.drafts();
+      } catch (e) { toast(e.message, "err"); }
+    })
+  );
+  $$("#drafts-list .li-no").forEach((b) =>
+    b.addEventListener("click", async () => {
+      const dom = b.closest(".draft").dataset.domain;
+      try {
+        await postJSON(`/api/drafts/${encodeURIComponent(dom)}/linkedin/confirm`, { sent: false });
+        liStagedDomains.delete(dom);
+        toast("Not sent — you can try again.", "ok");
+        await loaders.drafts();
+      } catch (e) { toast(e.message, "err"); }
     })
   );
 };

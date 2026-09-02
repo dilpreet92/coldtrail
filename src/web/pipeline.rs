@@ -213,7 +213,11 @@ pub async fn drafts() -> Result<Json<Vec<DraftDto>>, ApiErr> {
     let mut stmt = c.prepare(
         // Drafts is a work queue — only rows still awaiting action. Once a draft is
         // sent/replied/bounced it leaves this list (it lives on in Overview / Follow-ups).
-        "SELECT o.domain, k.email, o.subject, o.body, o.status, o.gmail_draft_id \
+        // `to` is the contact email for the email channel, or the contact's linkedin_url for
+        // the linkedin channel — same recipient rule as `deliver::reviewable`.
+        "SELECT o.domain, COALESCE(o.channel,'email'), \
+                CASE WHEN COALESCE(o.channel,'email')='linkedin' THEN k.linkedin_url ELSE k.email END, \
+                o.subject, o.body, o.status, o.gmail_draft_id \
          FROM outreach o LEFT JOIN contacts k ON k.id = o.contact_id \
          WHERE o.status IN ('draft_pending','drafted') \
          ORDER BY o.created_at DESC",
@@ -222,13 +226,77 @@ pub async fn drafts() -> Result<Json<Vec<DraftDto>>, ApiErr> {
         .query_map([], |r| {
             Ok(DraftDto {
                 domain: r.get(0)?,
-                to: r.get(1)?,
-                subject: r.get(2)?,
-                body: r.get(3)?,
-                status: r.get(4)?,
-                gmail_draft_id: r.get(5)?,
+                channel: r.get(1)?,
+                to: r.get(2)?,
+                subject: r.get(3)?,
+                body: r.get(4)?,
+                status: r.get(5)?,
+                gmail_draft_id: r.get(6)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(Json(rows))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A linkedin-channel row surfaces its contact's `linkedin_url` as `to` and `channel` as
+    /// "linkedin"; a plain (legacy, channel=NULL) email row keeps `to` = email and defaults to
+    /// "email" — the two branches the Drafts UI switches its rendering on.
+    #[test]
+    fn drafts_reports_channel_and_picks_recipient_by_channel() {
+        crate::testutil::with_home("ct-web-pipeline-drafts-channel", |_| {
+            crate::db::init().unwrap();
+            let c = crate::db::open().unwrap();
+            c.execute(
+                "INSERT INTO companies (domain, source_query) VALUES ('acme.com','q'), ('beta.com','q')",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO contacts (domain, founder_name, linkedin_url) \
+                 VALUES ('acme.com','Jane','https://www.linkedin.com/in/janedoe')",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO contacts (domain, founder_name, email) VALUES ('beta.com','Bob','bob@beta.com')",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO outreach (domain, contact_id, channel, subject, body, status) \
+                 VALUES ('acme.com', (SELECT id FROM contacts WHERE domain='acme.com'), \
+                 'linkedin', '', 'Hi Jane', 'draft_pending')",
+                [],
+            )
+            .unwrap();
+            // Legacy row: channel left NULL, as pre-dates the linkedin feature.
+            c.execute(
+                "INSERT INTO outreach (domain, contact_id, subject, body, status) \
+                 VALUES ('beta.com', (SELECT id FROM contacts WHERE domain='beta.com'), \
+                 'hi', 'Hi Bob', 'draft_pending')",
+                [],
+            )
+            .unwrap();
+
+            let rows = tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(drafts())
+                .unwrap()
+                .0;
+            assert_eq!(rows.len(), 2);
+            let li = rows.iter().find(|r| r.domain == "acme.com").unwrap();
+            assert_eq!(li.channel, "linkedin");
+            assert_eq!(
+                li.to.as_deref(),
+                Some("https://www.linkedin.com/in/janedoe")
+            );
+            let email = rows.iter().find(|r| r.domain == "beta.com").unwrap();
+            assert_eq!(email.channel, "email");
+            assert_eq!(email.to.as_deref(), Some("bob@beta.com"));
+        });
+    }
 }

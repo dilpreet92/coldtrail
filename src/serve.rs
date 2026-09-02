@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -29,6 +30,8 @@ pub async fn serve(port: Option<u16>, no_open: bool) -> Result<()> {
         runs: Mutex::new(HashMap::new()),
         chat: Mutex::new(web::ChatSession::default()),
         turn_lock: Mutex::new(()),
+        linkedin_connecting: AtomicBool::new(false),
+        assist: Arc::new(Mutex::new(None)),
     });
     let app = web::router(state);
 

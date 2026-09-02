@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Fake LinkedIn Profile (fixture)</title>
+    <style>
+      body { font-family: sans-serif; margin: 40px; }
+      button, a { font-size: 16px; padding: 10px 16px; margin: 6px 6px 6px 0; cursor: pointer; }
+      a { display: inline-block; }
+      header, aside { border: 1px solid #ccc; padding: 8px; margin-bottom: 16px; color: #555; }
+      aside { margin-top: 24px; margin-bottom: 0; }
+      #more-menu { border: 1px solid #888; padding: 8px; margin-top: 8px; max-width: 260px; }
+      #more-menu [role="button"] { display: block; padding: 10px 12px; cursor: pointer; }
+      .hidden { display: none; }
+    </style>
+  </head>
+  <body>
+    <!--
+      Static fixture that mimics the LinkedIn DOM that BROKE the live run, on TWO fronts:
+
+      1. WEB-COMPONENTS / SHADOW DOM (the new break): the invite modal ("Add a note" / "Send without
+         a note", then the note textarea + final "Send") is rendered INSIDE an OPEN shadow root on a
+         TOP-LEVEL <div id="invite-modal-host"> — exactly where a live recursive .shadowRoot walk found
+         it (document > div::shadow). A non-piercing document.querySelectorAll (and chromiumoxide's
+         find_element / CSS) CANNOT see it, so the driver only reaches these controls because its
+         locate/verify JS descends el.shadowRoot, and only CLICKS them because it dispatches a trusted
+         CDP mouse click at the element's coordinates (find_element can't resolve a shadow-nested node).
+         Against the old non-piercing locator the driver never finds "Add a note" -> Failed, so this
+         test FAILS — which is the regression guard for the shadow fix.
+
+      2. SCOPING (the earlier break, still guarded): the profile's primary action bar is Follow /
+         Message / "…" with NO top-level Connect — Connect lives INSIDE the "…" (More) overflow menu —
+         and there are out-of-scope DECOYS the old unscoped matchers wrongly hit: a global <header>/<nav>
+         "Notifications" link + app "More", a bottom-right Messaging overlay that is ALSO a
+         [role='dialog'], and a right-rail <aside> "People also viewed" carrying a "Connect" for a
+         DIFFERENT person. Each decoy NAVIGATES AWAY when clicked (the fixture server serves this same
+         page for any path), reproducing the live "clicked the wrong element and landed on the
+         feed/notifications page" crash. The driver scopes Connect/More to <main> and the invite modal
+         document-wide-minus-excludes (see src/linkedin/browser.rs `mod scopes` + `EXCLUDE`).
+
+      Flow (profile path only):
+        "…" (More) click      -> open the dropdown menu (its Connect item becomes visible)
+        in-menu Connect click -> reveal the invite modal INSIDE THE OPEN SHADOW ROOT
+        Add-a-note click      -> reveal the note textarea + the final Send button (in the shadow)
+        Send click            -> REMOVE the modal, then CREATE the Pending marker as an <a> (light DOM)
+
+      Deliberate fidelity choices that mirror real LinkedIn:
+        * The invite modal is inside an OPEN shadow root on a top-level div (not <main>, not light DOM).
+        * The actionbar carries a "Send without a note" button that stays visible through the Send step,
+          so the SEND matcher (/^send( invitation)?$/i, "send now") is PROVEN not to match it.
+        * Connect is only reachable via "…" (no top-level Connect in <main>), and the menu starts
+          display:none so the driver's *visible*-element matcher can't see Connect until "…" is opened.
+        * The Pending marker is CREATED by the Send handler (not pre-placed) and is an <a> (NOT a
+          <button>) carrying an href to the invited profile (/in/janedoe), a componentkey + a
+          "Pending, click to withdraw…" aria-label, exactly like real LinkedIn — so Auto->Sent is
+          gated on a real post-Send signal that the driver's shadow-piercing Pending PREDICATE
+          (aria-label / componentkey / <a>-text) must match. That predicate is now the SOLE
+          authoritative confirmation (the old secondary "note textarea gone" check was dropped so a
+          lingering modal can never turn a real send into a false negative).
+        * The right-rail <aside> also carries a "Pending" <a> for a DIFFERENT person (/in/someone-else)
+          from the START. This is the never-false-Sent slug guard: the driver confirms ONLY a Pending
+          marker tied to the TARGET's /in/<slug> href, so this decoy (wrong slug, and EXCLUDE-scoped
+          out of the aside besides) can NEVER confirm. With the old unscoped whole-page Pending check
+          it alone would have recorded a false Sent even if the real Send were intercepted.
+    -->
+
+    <!-- DECOY: global top-nav. The OLD unscoped "…"/More matcher could hit this app "More"; the
+         "Notifications" link is the classic wrong-navigation target. Scoped-out via header/nav. -->
+    <header class="global-nav">
+      <nav aria-label="Primary navigation">
+        <a id="nav-notifications" href="/notifications" aria-label="Notifications">Notifications</a>
+        <button id="nav-more" aria-label="More">…</button>
+      </nav>
+    </header>
+
+    <!-- DECOY: the bottom-right Messaging overlay. It is ALSO a [role='dialog'] and appears BEFORE the
+         invite modal, so a FIRST-match dialog scope would search HERE (not the invite modal) and miss
+         "Add a note" / "Send". Scoped-out via .msg-overlay-list-bubble / [id^='msg-overlay']; the
+         document-wide-minus-excludes scope keeps the driver on the real invite modal. -->
+    <section id="msg-overlay-1" class="msg-overlay-list-bubble" role="dialog" aria-label="Messaging">
+      <button aria-label="Open messaging">Messaging</button>
+    </section>
+
+    <main>
+      <h1>Jane Doe</h1>
+      <p>Fixture profile — no network, no LinkedIn.</p>
+
+      <!-- Primary action bar: Follow / Message / "…". NO top-level Connect (matches the failing DOM). -->
+      <button id="follow" aria-label="Follow Jane Doe">Follow</button>
+      <button id="message" aria-label="Message Jane Doe">Message</button>
+      <button id="more" aria-label="More actions">…</button>
+
+      <!-- The "…" overflow menu. display:none until opened, so Connect isn't a *visible* match before. -->
+      <div id="more-menu" class="hidden" role="menu">
+        <!-- The in-menu Connect: matched by trimmed text "Connect" AND the invite-to-connect aria. -->
+        <div id="connect" role="button" aria-label="Invite Jane Doe to connect">Connect</div>
+      </div>
+    </main>
+
+    <!-- DECOY: right-rail "People also viewed". The OLD unscoped top-level Connect matcher hits THIS
+         "Connect" (a different person) before ever opening the profile's "…". Scoped-out via aside.
+         It ALSO carries a "Pending" marker for a DIFFERENT person (someone-else), present from the
+         START — exactly the real-LinkedIn shape (an <a> with a /in/<slug> href, an invitation+pending
+         componentkey, and a "Pending, click to withdraw…" aria-label) that shows the Pending state of
+         OTHERS you previously invited. This is the guard for the never-false-Sent slug fix: with the
+         old unscoped whole-page Pending check this decoy alone would satisfy confirmation (recording a
+         FALSE Sent even if the real Send were intercepted); the fixed driver confirms ONLY a Pending
+         marker whose href carries the TARGET's /in/janedoe slug (and it is EXCLUDE-scoped out of the
+         aside besides), so this decoy can never confirm. -->
+    <aside class="scaffold-layout__aside" aria-label="People also viewed">
+      <h2>People also viewed</h2>
+      <button id="aside-connect" aria-label="Invite John Smith to connect">Connect</button>
+      <a
+        id="aside-pending"
+        href="https://www.linkedin.com/in/someone-else"
+        componentkey="ConnectButtonstate:invitation:urn:li:member:999_pending"
+        aria-label="Pending, click to withdraw invitation sent to Someone Else"
+        ><span>Pending</span></a
+      >
+    </aside>
+
+    <!-- The invite modal is rendered INSIDE an OPEN shadow root attached to THIS top-level div (see
+         the script below). It is intentionally NOT in the light DOM — mirroring the live capture's
+         `document > div::shadow`. -->
+    <div id="invite-modal-host"></div>
+
+    <script>
+      const more = document.getElementById("more");
+      const moreMenu = document.getElementById("more-menu");
+      const connect = document.getElementById("connect");
+
+      // Build the invite modal INSIDE an OPEN shadow root on the top-level host div — the classic
+      // artdeco `send-invite` DOM. A non-piercing querySelectorAll on the light DOM cannot see any of
+      // this; the driver reaches it only via its recursive el.shadowRoot walk.
+      const host = document.getElementById("invite-modal-host");
+      const shadow = host.attachShadow({ mode: "open" });
+      shadow.innerHTML = `
+        <style>
+          .hidden { display: none; }
+          button { font-size: 16px; padding: 10px 16px; margin: 6px 6px 6px 0; cursor: pointer; }
+          textarea { width: 100%; height: 120px; font-size: 14px; box-sizing: border-box; }
+          #modal { border: 1px solid #888; padding: 20px; margin-top: 20px; max-width: 480px; }
+        </style>
+        <div id="modal" class="hidden artdeco-modal artdeco-modal--layer-default send-invite"
+             data-test-modal role="dialog" aria-labelledby="send-invite-modal">
+          <h2 id="send-invite-modal">Add a note to your invitation?</h2>
+          <div class="artdeco-modal__actionbar">
+            <button id="add-note" aria-label="Add a note"><span class="artdeco-button__text">Add a note</span></button>
+            <button id="send-without" aria-label="Send without a note"><span class="artdeco-button__text">Send without a note</span></button>
+          </div>
+          <textarea id="custom-message" name="message" class="hidden" placeholder="Your note"></textarea>
+          <button id="send" class="hidden" aria-label="Send invitation"><span class="artdeco-button__text">Send invitation</span></button>
+        </div>`;
+      const modal = shadow.getElementById("modal");
+      const addNote = shadow.getElementById("add-note");
+      const textarea = shadow.getElementById("custom-message");
+      const send = shadow.getElementById("send");
+
+      // DECOYS: clicking any of the out-of-scope look-alikes navigates AWAY from the profile — the
+      // fixture server returns this same page for any path, so the URL changes to /notifications or
+      // /feed and the driver's navigated-away guard would fire. The OLD unscoped code clicks one of
+      // these; the fixed, scoped driver never does.
+      document
+        .getElementById("nav-notifications")
+        .addEventListener("click", (e) => { e.preventDefault(); window.location.href = "/notifications"; });
+      document
+        .getElementById("nav-more")
+        .addEventListener("click", () => { window.location.href = "/notifications"; });
+      document
+        .getElementById("aside-connect")
+        .addEventListener("click", () => { window.location.href = "/feed"; });
+
+      // "…" opens the overflow menu — only now does the Connect item become visible.
+      more.addEventListener("click", () => {
+        moreMenu.classList.remove("hidden");
+      });
+
+      // In-menu Connect opens the invite modal (in the shadow root) and closes the menu.
+      connect.addEventListener("click", () => {
+        moreMenu.classList.add("hidden");
+        modal.classList.remove("hidden");
+      });
+
+      // "Add a note" reveals the textarea + the final Send. "Send without a note" stays visible, so
+      // the driver's SEND matcher is proven to pick "Send invitation" and skip it.
+      addNote.addEventListener("click", () => {
+        textarea.classList.remove("hidden");
+        send.classList.remove("hidden");
+        textarea.focus();
+      });
+
+      send.addEventListener("click", () => {
+        // Tear the modal down entirely (removing the shadow-nested textarea), THEN create the Pending
+        // confirmation in the LIGHT DOM as an <a> (NOT a <button>) — matching REAL LinkedIn, whose
+        // Pending marker is an <a> carrying an href to the invited profile (/in/<slug>), a
+        // componentkey="...invitation...pending", and an aria-label beginning "Pending, click to
+        // withdraw invitation sent to <NAME>". This is the a-vs-button regression guard: the driver's
+        // shadow-piercing Pending PREDICATE must match this <a> (by its aria-label / componentkey /
+        // <a> text), NOT the old button[aria-label^='Pending'] CSS selector, which was both
+        // light-DOM-only AND tag-wrong and returned a false negative on a real, sent invite.
+        //
+        // The href is /in/janedoe/ — the TARGET slug the test drives — so this REAL marker satisfies
+        // the driver's slug-tied confirmation, while the sidebar decoy (/in/someone-else) does NOT.
+        // It is appended to <body> (NOT inside <main>), so it can only be confirmed by the PREFERRED
+        // slug pass, never the no-href <main> fallback — which is precisely what proves the slug
+        // match end-to-end. The marker is CREATED by the Send handler (not pre-placed), so Auto->Sent
+        // stays gated on a real post-Send signal — the driver's SOLE, authoritative confirmation.
+        modal.remove();
+        const pending = document.createElement("a");
+        pending.id = "pending";
+        pending.setAttribute("href", "/in/janedoe/");
+        pending.setAttribute(
+          "componentkey",
+          "ConnectButtonstate:invitation:urn:li:member:1_pending"
+        );
+        pending.setAttribute(
+          "aria-label",
+          "Pending, click to withdraw invitation sent to Jane Doe"
+        );
+        const label = document.createElement("span");
+        label.textContent = "Pending";
+        pending.appendChild(label);
+        document.body.appendChild(pending);
+      });
+    </script>
+  </body>
+</html>

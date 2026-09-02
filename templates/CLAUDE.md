@@ -33,31 +33,57 @@ sourcing and wait — keep going through enrichment and drafting — unless the 
    and don't hand-write the JSON — `coldtrail source` owns discovery. For a quick, unambiguous
    ICP a single angle is fine.
 2. **Enrich the freshly-sourced companies (be generous).** Work through this run's new companies —
-   aim for a solid batch (~40, or all of a small run), newest first — and get a founder contact for
-   each. Enrichment and drafting are cheap and safe; **only *sending* needs warmup pacing**, so
-   don't ration enrichment to ~5. Many companies legitimately have no MX-verifiable founder email —
-   skip those (never guess), but keep going through the batch so you surface as many real contacts
-   as you can. **Read `enrichment.md` in this workspace first** — it's
-   coldtrail's technique ladder (OSINT tools, GitHub commit metadata, crt.sh, WHOIS, on-domain/web,
-   and pattern-only-if-confirmed) plus the honesty rules. Work down it, store with provenance via
-   `coldtrail add-contact <domain> "<Full Name>" <email> <source>` (MX-verified;
-   generic/placeholder rejected), and skip any rung your tools can't run.
+   aim for a solid batch (~40, or all of a small run), newest first — and get, for each, an
+   **email or a LinkedIn URL** (a company with either is reachable). **Prefer email — it wins**
+   when both exist, per the one-touch rule in step 3. Enrichment and drafting are cheap and safe;
+   **only *sending* needs warmup pacing**, so don't ration enrichment to ~5. Many companies
+   legitimately have no MX-verifiable founder email — for those, fall back to a LinkedIn URL
+   rather than skipping the company outright — but never guess an email, and keep going through
+   the batch so you surface as many real contacts as you can. **Read `enrichment.md` in this
+   workspace first** — it's coldtrail's technique ladder (OSINT tools, GitHub commit metadata,
+   crt.sh, WHOIS, on-domain/web, and pattern-only-if-confirmed) plus the honesty rules. Work down
+   it, and separately: capture the founder's **LinkedIn URL** from Canonical's company details
+   when present, else via a web search (`site:linkedin.com/in <name> <company>`). Store whatever
+   you found, with provenance:
+   `coldtrail add-contact <domain> "<Full Name>" [email] --linkedin <url> [source]`
+   — email is MX-verified and generic/placeholder addresses are rejected; `--linkedin` is optional
+   when an email is given, and email is optional when `--linkedin` is given (at least one is
+   required). Skip any email rung your tools can't run.
    **Prefer your own web tools for the web rung.** If you have `WebSearch`/`WebFetch` (Claude Code)
-   or `web_search` (Codex), use them to hunt founder emails — ranked, real results, far higher
-   signal than scraping. `coldtrail find-emails [max]` is the **fallback** for backends without a
-   web tool (BYOK / local models): it automates the DuckDuckGo + on-domain rung, runs ~6 companies
-   in parallel (so a bigger `max` is cheap), and prints coverage —
+   or `web_search` (Codex), use them to hunt founder emails **and** LinkedIn URLs — ranked, real
+   results, far higher signal than scraping. `coldtrail find-emails [max]` is the **fallback**
+   for backends without a web tool (BYOK / local models): it automates the DuckDuckGo + on-domain
+   rung, runs ~6 companies in parallel (so a bigger `max` is cheap), and prints coverage —
    `hunting emails for N of M un-enriched companies` and a closing
    `enriched K new · Z still un-enriched` — **note that `Z` and carry it to the hand-off.**
-3. **Compose a personalized pitch — per company.** Read `product.md` as your **product
-   brief**: it carries what the product is + who it helps, the pain/value, proof, the offer,
-   the call-to-action link (keep its `{slug}` UTM), the sender's voice, and any constraints.
-   (`message.toml` is a structural fallback for the CLI batch path — you don't need it.)
-   **Do not send anything verbatim.** For each company, write a genuinely tailored subject +
-   body — reference what the company actually does and why it's a fit — in the user's voice,
-   honest, short. Then store it:
-   `coldtrail draft <domain> --subject "<subject>" --body "<body>"`
-   This writes a DB row only. It does not create a Gmail draft and does not send.
+3. **Compose a personalized pitch — per company, one touch, channel-aware.** Read `product.md`
+   as your **product brief**: it carries what the product is + who it helps, the pain/value,
+   proof, the offer, the call-to-action link (keep its `{slug}` UTM), the sender's voice, and any
+   constraints. (`message.toml` is a structural fallback for the CLI batch path — you don't need
+   it.) **Do not send anything verbatim.** For each company, write genuinely tailored copy —
+   reference what the company actually does and why it's a fit — in the user's voice, honest,
+   short. **One touch per company — never both channels:**
+   - Contact has an **email** → write a subject + body and store it:
+     `coldtrail draft <domain> --subject "<subject>" --body "<body>"`
+   - Contact has **only a LinkedIn URL** (no email) → write a **short, lightly-structured**
+     connection note and store it:
+     `coldtrail linkedin-note <domain> --note "<note>"`
+     A LinkedIn note is **not a compressed email** — keep it shorter and more casual than an
+     email draft. Give it real structure with **actual line breaks** (press-enter newlines
+     inside the quoted value — a real newline, not the two literal characters `\n`): a greeting
+     line, a blank line, one or two crisp body lines, then a sign-off on its own line. Never a
+     single dense run-on paragraph. Stay **≤300 characters INCLUDING the newlines** (LinkedIn's
+     hard limit — newlines count). For example:
+     ```
+     coldtrail linkedin-note acme.com --note "Hi Jane,
+
+     Loved what Acme is building for indie logistics — the live-ETA piece especially.
+
+     Would be glad to connect.
+
+     — Dilpreet"
+     ```
+   Both write a DB row only — neither creates a Gmail draft, opens a browser, or sends anything.
 4. **Report coverage, then hand off or send.** Show what you did: the **contacts you found**
    (name · email · source) and the drafts you wrote. **Always state coverage explicitly and
    honestly** — never present a partial run as if it were the whole job. Say, in one line:
@@ -67,13 +93,20 @@ sourcing and wait — keep going through enrichment and drafting — unless the 
    "I worked 22 of 228; want me to enrich the next batch, or source more?" — instead of stopping
    at a summary that reads as done. Then decide the ending by the human's send setting — read
    `config.toml`:
-   - **`auto_send = true`** → they've turned on real sending. Offer it: "Auto-send is on — want me
-     to send these <N> now?" On an explicit **yes**, send each with `coldtrail send <domain>`
-     (it enforces the daily cap; when it says the cap's reached, stop for today).
-   - **otherwise** → the drafts are review-only. Tell them the <N> drafts are in the **Drafts**
+   - **Email drafts, `auto_send = true`** → they've turned on real email sending. Offer it:
+     "Auto-send is on — want me to send these <N> now?" On an explicit **yes**, send each with
+     `coldtrail send <domain>` (it enforces the daily cap; when it says the cap's reached, stop
+     for today).
+   - **Email drafts, otherwise** → review-only. Tell them the <N> drafts are in the **Drafts**
      tab to review and send (they can also flip on auto-send in Settings → Destination).
-   `coldtrail send` refuses unless auto-send is on, so you can't send by accident. Always get an
-   explicit yes before sending — this is the one place you stop and ask.
+   - **LinkedIn notes** → the default hand-off is the **Drafts** tab's **Open in LinkedIn**
+     button — it drives Connect → Add note → fills your text, and the human clicks Send
+     (assist). Only if the human separately enabled **LinkedIn auto-send** in Settings →
+     Destination does `coldtrail send <domain>` drive it all the way through Send itself — it's
+     the same command as email, it just routes by the contact's channel; LinkedIn has its own
+     weekly/daily caps and is gated independently from email `auto_send`.
+   `coldtrail send` refuses unless that channel's auto-send is on, so you can't send by accident.
+   Always get an explicit yes before sending — this is the one place you stop and ask.
 
 ## Guardrails — non-negotiable
 
@@ -86,9 +119,11 @@ sourcing and wait — keep going through enrichment and drafting — unless the 
   stored draft and a hand-off to the Drafts tab.
 - **Dedupe by domain.** Never contact a company twice. Import and seeding enforce this;
   trust the "already-known (deduped)" counts.
-- **Founder-addressed, MX-verified only.** Generic (`info@`, `sales@`, …) and
-  placeholder/example addresses are rejected by `add-contact`/`find-emails`. Don't work
-  around it.
+- **Founder-addressed, verified.** An email contact is MX-verified — generic (`info@`,
+  `sales@`, …) and placeholder/example addresses are rejected by `add-contact`/`find-emails`.
+  A LinkedIn-only contact has no email to MX-check; it's verified instead by being a real
+  `/in/` profile URL (`add-contact` normalizes and rejects anything else). Don't work around
+  either check.
 - **No fabrication.** Personalize from real, verifiable facts about the company. If you
   don't know something, don't invent it.
 - **Pace warmup — sends only.** ~5 *sends*/day on a new mailbox. Enrich and draft as many as you
@@ -103,11 +138,13 @@ sourcing and wait — keep going through enrichment and drafting — unless the 
 | Command | Purpose |
 |---|---|
 | `coldtrail import <json> "<label>"` | dedupe-import Canonical results |
-| `coldtrail add-contact <domain> "<name>" <email> [src]` | MX-verified contact |
+| `coldtrail add-contact <domain> "<name>" [email] [src]` | MX-verified email contact (email or `--linkedin` required) |
+| `coldtrail add-contact <domain> "<name>" [email] --linkedin <url> [src]` | contact with a LinkedIn URL (email optional) |
 | `coldtrail find-emails [max]` | best-effort OSINT founder-email finder |
-| `coldtrail draft <domain> --subject "…" --body "…"` | store a personalized draft |
+| `coldtrail draft <domain> --subject "…" --body "…"` | store a personalized draft (email contact) |
+| `coldtrail linkedin-note <domain> --note "…"` | store a short, line-broken ≤300-char connection note (newlines included; LinkedIn-only contact) |
 | `coldtrail followup <domain> --subject "…" --body "…"` | store a follow-up touch (no reply yet) |
-| `coldtrail send <domain>` | send a reviewed draft for real (refuses unless auto-send is on) |
+| `coldtrail send <domain>` | send a reviewed draft for real, either channel (refuses unless that channel's auto-send is on) |
 | `coldtrail mark <domain> <id\|sent\|replied\|bounced>` | advance status |
 | `coldtrail seed` | load already-contacted domains (dedupe guard) |
 

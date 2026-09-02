@@ -66,7 +66,8 @@ runs the whole loop:
    real phrasings), searches them in parallel, and imports the **union deduped by domain** — so
    you cover the long tail without double-contacting anyone.
 2. **Enrich.** A founder contact per company, working down coldtrail's technique ladder (OSINT
-   tools, GitHub commit metadata, crt.sh, WHOIS, on-domain) — MX-verified, founder-addressed only.
+   tools, GitHub commit metadata, crt.sh, WHOIS, on-domain) — an MX-verified, founder-addressed
+   email, or a verified LinkedIn profile URL; either makes a company reachable.
 3. **Draft.** A tailored subject + body per company, composed fresh from your Company profile and
    what the company actually does. Nothing is sent verbatim.
 4. **Send — your call.** By default drafts wait for you in the **Drafts** tab. If you've turned on
@@ -80,7 +81,7 @@ Canonical (sourcing)      ← plain-English ICP → verified companies the big D
 local SQLite              ← deduped by domain, one status per company (no double-contact)
         │
         ▼
-enrichment                ← founder email per company (OSINT ladder · your key · by hand)
+enrichment                ← founder email or LinkedIn URL per company (OSINT ladder · your key · by hand)
         │
         ▼
 draft (your voice)        ← personalized from your Company profile; never verbatim
@@ -97,11 +98,48 @@ Then the Drafts screen sends for real on your click, and the agent can send with
 confirm. Sending is gated two ways — it won't fire unless *both* auto-send is on *and* you say yes
 — so nothing goes out by accident.
 
+## LinkedIn destination
+
+Contacts don't always have a findable email — coldtrail can also reach a founder on
+LinkedIn. When enrichment finds only a LinkedIn profile URL (no MX-verified email), the agent
+writes a short connection note instead of an email draft. One touch per company either way —
+never both channels.
+
+**Connect.** In Settings → Destination, click **Connect LinkedIn** (or run
+`coldtrail linkedin connect`): coldtrail opens a real, human-visible Chrome window at
+LinkedIn's login page and waits up to three minutes for you to log in yourself — coldtrail
+never sees or stores your password. Once you're in, it saves the connection state and reuses
+that Chrome profile for every LinkedIn action after.
+
+**Assist by default, gated auto-send.** Every LinkedIn note lands in the **Drafts** tab first.
+The default hand-off is **Open in LinkedIn** — coldtrail drives the browser through Connect →
+Add a note → fill your text, then stops and lets you click **Send** yourself. If you flip on
+**LinkedIn auto-send** in Settings → Destination (a separate toggle from email auto-send), the
+agent can drive all the way through Send after you say yes in chat — same two-part gate as
+email (opt-in + explicit yes), just tracked per channel.
+
+**Caps, pacing, and account safety.** LinkedIn's terms restrict automated activity, and
+aggressive, bursty, or off-hours connection requests are what gets accounts restricted — so
+auto-send is deliberately conservative and opt-in: a rolling weekly cap (80 by default) and a
+daily sub-cap (15 by default), both configurable; sends only inside a daytime local-hours
+window (08:00–20:00); only one Chrome session driving your profile at a time; and every send
+is verified on-screen before it's recorded — coldtrail never marks an invite "sent" without
+observing LinkedIn's own confirmation. Assist mode has no cap because a human is doing the
+actual clicking.
+
+**Where the session lives.** LinkedIn's cookies/session live in a coldtrail-owned Chrome
+profile directory outside the agent's workspace, next to your other secrets — in your OS
+config dir (`dirs::config_dir()`): `~/Library/Application Support/coldtrail/linkedin-profile`
+on macOS, `~/.config/coldtrail/linkedin-profile` on Linux, `%APPDATA%\coldtrail\linkedin-profile`
+on Windows — created with locked-down (0700) permissions. It holds only the browser session,
+never a password. The workspace agent that runs shell commands can't read it.
+
 ## Guardrails baked in
 
 - **Dedupe by domain** — you can't double-contact a company.
-- **MX-verified, founder-addressed only** — generic (`info@`/`sales@`) and placeholder addresses
-  are rejected, so guessed addresses don't bounce.
+- **Founder-addressed, verified.** An email contact is MX-verified — generic (`info@`/`sales@`)
+  and placeholder addresses are rejected, so guessed addresses don't bounce. A LinkedIn-only
+  contact is verified by being a real profile URL instead.
 - **No fabrication** — emails are written from your profile and real facts about the company.
 - **Draft-first, gated send** — sending is off until you enable it, capped for warmup, and the
   agent can only trigger `coldtrail send` (it never touches your credentials or mail APIs directly).
@@ -122,15 +160,18 @@ Bare `coldtrail` serves the app; every step also runs headless for power users /
 coldtrail serve --port 9000 --no-open    # serve without opening a browser
 coldtrail setup                          # terminal setup wizard (idempotent)
 coldtrail agent                          # raw terminal agent in the workspace
+coldtrail linkedin connect               # open Chrome, log into LinkedIn, save the session
+coldtrail linkedin status                # print the persisted LinkedIn connect state
 ```
 
 | Command | What it does |
 |---|---|
 | `coldtrail source "<angle>" ["<angle>" …]` | source from Canonical across angles, deduped by domain |
-| `coldtrail add-contact <domain> "<Name>" <email> [source]` | add a founder contact (MX-verified) |
+| `coldtrail add-contact <domain> "<Name>" [email] [--linkedin <url>] [source]` | add a founder contact — email (MX-verified), LinkedIn URL, or both |
 | `coldtrail find-emails [max]` | best-effort OSINT founder-email finder |
 | `coldtrail draft <domain> --subject "…" --body "…"` | store a personalized draft (never sends) |
-| `coldtrail send <domain>` | send a reviewed draft (refuses unless auto-send is on) |
+| `coldtrail linkedin-note <domain> --note "…"` | store a ≤300-char LinkedIn connection note (never sends) |
+| `coldtrail send <domain>` | send a reviewed draft for real, either channel (refuses unless that channel's auto-send is on) |
 | `coldtrail followup <domain> --subject "…" --body "…"` | store a follow-up touch |
 | `coldtrail mark <domain> <sent\|replied\|bounced>` | advance status |
 | `coldtrail seed` | load already-contacted domains from `contacted.toml` |

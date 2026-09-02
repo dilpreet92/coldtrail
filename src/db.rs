@@ -38,6 +38,20 @@ pub fn init() -> Result<()> {
             "ALTER TABLE chat_sessions ADD COLUMN running INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
+    // channel/linkedin_url exist in the schema template but predate this feature on old DBs.
+    for (table, col, decl) in [
+        ("outreach", "channel", "TEXT DEFAULT 'email'"),
+        ("contacts", "linkedin_url", "TEXT"),
+    ] {
+        let exists: bool = c
+            .prepare(&format!(
+                "SELECT 1 FROM pragma_table_info('{table}') WHERE name=?1"
+            ))?
+            .exists([col])?;
+        if !exists {
+            c.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {col} {decl};"))?;
+        }
+    }
     Ok(())
 }
 

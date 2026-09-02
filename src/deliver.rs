@@ -6,36 +6,54 @@
 
 use anyhow::{anyhow, Result};
 use rusqlite::OptionalExtension;
+use std::sync::OnceLock;
 
-/// A reviewable draft ready to draft-in-Gmail or send.
+/// The machine's local UTC offset, captured ONCE at process start (see `capture_local_offset`).
+static LOCAL_OFFSET: OnceLock<time::UtcOffset> = OnceLock::new();
+
+/// A reviewable draft ready to draft-in-Gmail, send, or deliver via LinkedIn.
+#[derive(Debug)]
 pub struct Draft {
+    /// "email" | "linkedin"
+    pub channel: String,
+    /// recipient: an email address (email channel) or a LinkedIn profile URL (linkedin channel)
     pub to: String,
     pub subject: String,
     pub body: String,
 }
 
 /// The latest reviewable (`draft_pending`|`drafted`) outreach for a domain, with its recipient.
+/// Recipient is the contact email for the email channel, or the contact's linkedin_url for the
+/// linkedin channel.
 pub fn reviewable(domain: &str) -> Result<Draft> {
     let c = crate::db::open()?;
     let row = c
         .query_row(
-            "SELECT o.subject, o.body, k.email FROM outreach o \
-             LEFT JOIN contacts k ON k.id = o.contact_id \
+            "SELECT COALESCE(o.channel,'email'), o.subject, o.body, k.email, k.linkedin_url \
+             FROM outreach o LEFT JOIN contacts k ON k.id = o.contact_id \
              WHERE o.domain=?1 AND o.status IN ('draft_pending','drafted') \
              ORDER BY o.created_at DESC LIMIT 1",
             [domain],
             |r| {
                 Ok((
-                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, String>(0)?,
                     r.get::<_, Option<String>>(1)?,
                     r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
                 ))
             },
         )
         .optional()?;
-    let (subject, body, to) = row.ok_or_else(|| anyhow!("no reviewable draft for {domain}"))?;
-    let to = to.ok_or_else(|| anyhow!("no recipient email on file for {domain}"))?;
+    let (channel, subject, body, email, linkedin) =
+        row.ok_or_else(|| anyhow!("no reviewable draft for {domain}"))?;
+    let to = if channel == "linkedin" {
+        linkedin.ok_or_else(|| anyhow!("no LinkedIn URL on file for {domain}"))?
+    } else {
+        email.ok_or_else(|| anyhow!("no recipient email on file for {domain}"))?
+    };
     Ok(Draft {
+        channel,
         to,
         subject: subject.unwrap_or_default(),
         body: body.unwrap_or_default(),
@@ -56,13 +74,27 @@ pub async fn draft(domain: &str, d: &Draft) -> Result<()> {
     Ok(())
 }
 
-/// How many real sends have gone out today (for the warmup cap).
+/// Email sends today (email channel or legacy NULL), for the email warmup cap.
 pub fn sent_today() -> u32 {
+    count_sent("status='sent' AND date(sent_at)=date('now') AND COALESCE(channel,'email')='email'")
+}
+
+/// LinkedIn connection-invites sent today.
+pub fn linkedin_sent_today() -> u32 {
+    count_sent("status='sent' AND channel='linkedin' AND date(sent_at)=date('now')")
+}
+
+/// LinkedIn connection-invites sent in the trailing 7 days (rolling weekly cap).
+pub fn linkedin_sent_last_7d() -> u32 {
+    count_sent("status='sent' AND channel='linkedin' AND sent_at >= datetime('now','-7 days')")
+}
+
+fn count_sent(where_clause: &str) -> u32 {
     crate::db::open()
         .ok()
         .and_then(|c| {
             c.query_row(
-                "SELECT COUNT(*) FROM outreach WHERE status='sent' AND date(sent_at)=date('now')",
+                &format!("SELECT COUNT(*) FROM outreach WHERE {where_clause}"),
                 [],
                 |r| r.get(0),
             )
@@ -71,11 +103,37 @@ pub fn sent_today() -> u32 {
         .unwrap_or(0)
 }
 
+/// Capture the machine's local UTC offset ONCE, while the process is still single-threaded.
+/// MUST be called from `main` BEFORE the tokio runtime is built: the `time` crate refuses to read
+/// the local offset once other threads exist (a soundness guard), which is exactly why the old
+/// `now_local()`-in-`local_hour()` approach always failed under the multi-threaded runtime and
+/// left the daytime-window gate inert. Idempotent; only the first successful capture wins. If the
+/// lookup fails, the offset stays unset and `local_hour` falls back to real UTC (offset 0).
+pub fn capture_local_offset() {
+    if let Ok(off) = time::UtcOffset::current_local_offset() {
+        let _ = LOCAL_OFFSET.set(off);
+    }
+}
+
+/// Local hour (0..24) for the LinkedIn daytime-window gate. Uses the offset captured at process
+/// start (`capture_local_offset`); if that capture failed, falls back to the real UTC hour
+/// (offset 0) rather than a hardcoded noon — so the window still gates on a real wall clock.
+fn local_hour() -> u32 {
+    let offset = LOCAL_OFFSET.get().copied().unwrap_or(time::UtcOffset::UTC);
+    time::OffsetDateTime::now_utc().to_offset(offset).hour() as u32
+}
+
 /// SEND for real. Refuses unless the human enabled `auto_send`; enforces the per-day cap; sends
 /// via SMTP (app-password) or the Gmail API (OAuth); marks the row `sent`. Returns a status line.
 pub async fn send(domain: &str, d: &Draft) -> Result<String> {
     if std::env::var("COLDTRAIL_NO_SEND").is_ok() {
         return Err(anyhow!("dry run: sending is disabled for this run"));
+    }
+    if d.channel == "linkedin" {
+        let cfg = crate::config::load();
+        let hour = local_hour();
+        let browser = crate::linkedin::browser::ChromeBrowser::new()?;
+        return crate::linkedin::send::deliver(domain, d, &browser, &cfg, hour).await;
     }
     let cfg = crate::config::load();
     if !cfg.auto_send {
@@ -120,11 +178,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn local_hour_returns_a_real_wall_clock_hour() {
+        // Safe to call anywhere; under the multi-threaded test runner the offset can't be read,
+        // so this exercises the UTC fallback. Either way the result must be a valid 0..24 hour
+        // derived from the real clock — never the old hardcoded noon.
+        capture_local_offset();
+        assert!(local_hour() < 24);
+    }
+
+    #[test]
     fn send_refuses_when_auto_send_off() {
         crate::testutil::with_home("ct-deliver-gate", |_| {
             crate::home::workspace().unwrap();
             // Fresh config → auto_send defaults off.
             let d = Draft {
+                channel: "email".into(),
                 to: "a@b.com".into(),
                 subject: "hi".into(),
                 body: "hello".into(),
@@ -146,6 +214,7 @@ mod tests {
         let _g = crate::testutil::env_guard();
         std::env::set_var("COLDTRAIL_NO_SEND", "1");
         let d = Draft {
+            channel: "email".into(),
             to: "a@example.com".into(),
             subject: "s".into(),
             body: "b".into(),
@@ -154,5 +223,132 @@ mod tests {
         std::env::remove_var("COLDTRAIL_NO_SEND");
         let err = res.unwrap_err().to_string();
         assert!(err.contains("dry run"), "got: {err}");
+    }
+
+    #[test]
+    fn reviewable_linkedin_channel_returns_linkedin_url_as_to() {
+        crate::testutil::with_home("ct-deliver-reviewable-li-ok", |_| {
+            crate::db::init().unwrap();
+            let c = crate::db::open().unwrap();
+            c.execute(
+                "INSERT INTO companies (domain, source_query) VALUES ('acme.com','q')",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO contacts (domain, founder_name, linkedin_url) \
+                 VALUES ('acme.com','Jane','https://www.linkedin.com/in/janedoe')",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO outreach (domain, contact_id, channel, subject, body, status) \
+                 VALUES ('acme.com', (SELECT id FROM contacts WHERE domain='acme.com'), \
+                 'linkedin', '', 'Hi Jane', 'draft_pending')",
+                [],
+            )
+            .unwrap();
+            let d = reviewable("acme.com").unwrap();
+            assert_eq!(d.channel, "linkedin");
+            assert_eq!(d.to, "https://www.linkedin.com/in/janedoe");
+            assert_eq!(d.body, "Hi Jane");
+        });
+    }
+
+    #[test]
+    fn reviewable_linkedin_channel_without_linkedin_url_errors() {
+        crate::testutil::with_home("ct-deliver-reviewable-li-missing", |_| {
+            crate::db::init().unwrap();
+            let c = crate::db::open().unwrap();
+            c.execute(
+                "INSERT INTO companies (domain, source_query) VALUES ('acme.com','q')",
+                [],
+            )
+            .unwrap();
+            // Contact exists but has no linkedin_url (email-only).
+            c.execute(
+                "INSERT INTO contacts (domain, founder_name, email) \
+                 VALUES ('acme.com','Jane','jane@acme.com')",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO outreach (domain, contact_id, channel, subject, body, status) \
+                 VALUES ('acme.com', (SELECT id FROM contacts WHERE domain='acme.com'), \
+                 'linkedin', '', 'Hi Jane', 'draft_pending')",
+                [],
+            )
+            .unwrap();
+            let err = reviewable("acme.com").unwrap_err().to_string();
+            assert!(err.contains("no LinkedIn URL"), "got: {err}");
+        });
+    }
+
+    #[test]
+    fn linkedin_sent_today_counts_only_linkedin_today_and_sent_today_stays_email_only() {
+        crate::testutil::with_home("ct-deliver-li-sent-today", |_| {
+            crate::db::init().unwrap();
+            let c = crate::db::open().unwrap();
+            c.execute(
+                "INSERT INTO companies (domain, source_query) VALUES ('a.com','q')",
+                [],
+            )
+            .unwrap();
+            // A linkedin send today, a linkedin send 10 days ago, and an email send today.
+            c.execute(
+                "INSERT INTO outreach (domain, channel, status, sent_at) \
+                 VALUES ('a.com','linkedin','sent', datetime('now'))",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO outreach (domain, channel, status, sent_at) \
+                 VALUES ('a.com','linkedin','sent', datetime('now','-10 days'))",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO outreach (domain, channel, status, sent_at) \
+                 VALUES ('a.com','email','sent', datetime('now'))",
+                [],
+            )
+            .unwrap();
+            assert_eq!(linkedin_sent_today(), 1);
+            // Email-only counter must not pick up the linkedin row sent today.
+            assert_eq!(sent_today(), 1);
+        });
+    }
+
+    #[test]
+    fn linkedin_sent_last_7d_counts_trailing_week_only() {
+        crate::testutil::with_home("ct-deliver-li-sent-7d", |_| {
+            crate::db::init().unwrap();
+            let c = crate::db::open().unwrap();
+            c.execute(
+                "INSERT INTO companies (domain, source_query) VALUES ('a.com','q')",
+                [],
+            )
+            .unwrap();
+            // Inside the trailing 7 days: today and 3 days ago. Outside: 10 days ago.
+            c.execute(
+                "INSERT INTO outreach (domain, channel, status, sent_at) \
+                 VALUES ('a.com','linkedin','sent', datetime('now'))",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO outreach (domain, channel, status, sent_at) \
+                 VALUES ('a.com','linkedin','sent', datetime('now','-3 days'))",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO outreach (domain, channel, status, sent_at) \
+                 VALUES ('a.com','linkedin','sent', datetime('now','-10 days'))",
+                [],
+            )
+            .unwrap();
+            assert_eq!(linkedin_sent_last_7d(), 2);
+        });
     }
 }

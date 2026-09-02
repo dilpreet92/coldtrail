@@ -24,10 +24,12 @@ pub fn defs(canonical_connected: bool) -> Value {
                 "required":["results_json","label"]}}}),
         json!({"type":"function","function":{
             "name":"add_contact",
-            "description":"Add an MX-verified founder contact. Generic/placeholder addresses are rejected.",
+            "description":"Add an MX-verified founder contact — an email, a LinkedIn profile URL, or both. Generic/placeholder addresses and non-profile LinkedIn URLs are rejected.",
             "parameters":{"type":"object","properties":{
-                "domain":{"type":"string"},"name":{"type":"string"},"email":{"type":"string"},
-                "source":{"type":"string"}},"required":["domain","name","email"]}}}),
+                "domain":{"type":"string"},"name":{"type":"string"},
+                "email":{"type":"string","description":"Founder email (optional if linkedin is given)"},
+                "linkedin":{"type":"string","description":"LinkedIn profile URL (optional if email is given)"},
+                "source":{"type":"string"}},"required":["domain","name"]}}}),
         json!({"type":"function","function":{
             "name":"find_emails",
             "description":"Best-effort OSINT founder-email finder for known companies lacking a verified email.",
@@ -84,7 +86,15 @@ pub async fn exec(name: &str, args: &Value) -> String {
         }
         "add_contact" => {
             let src = args.get("source").and_then(|v| v.as_str());
-            match crate::contact::add(&s(args, "domain"), &s(args, "name"), &s(args, "email"), src)
+            let email = args
+                .get("email")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            let linkedin = args
+                .get("linkedin")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            match crate::contact::add(&s(args, "domain"), &s(args, "name"), email, linkedin, src)
                 .await
             {
                 Ok(m) => m,

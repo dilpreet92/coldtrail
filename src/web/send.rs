@@ -17,6 +17,19 @@ pub async fn send(
     let domain = domain.to_lowercase();
     let draft = crate::deliver::reviewable(&domain)?;
 
+    // This button is the EMAIL send/draft path. A LinkedIn-channel draft has its own flow (the
+    // Drafts "Open in LinkedIn" assist button -> `web::linkedin::assist`/`confirm`) — never fall
+    // through to Gmail draft-creation or the email transport for it.
+    if draft.channel == "linkedin" {
+        return Ok(Json(MsgResp {
+            ok: false,
+            message: Some(
+                "This is a LinkedIn draft — use \"Open in LinkedIn\" to send it.".to_string(),
+            ),
+            wired: None,
+        }));
+    }
+
     let auto = crate::config::load().auto_send;
     let outcome = if auto {
         crate::deliver::send(&domain, &draft).await

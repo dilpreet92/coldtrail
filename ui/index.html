@@ -78,7 +78,10 @@
         <p class="hint" id="dest-hint">Where outreach goes. <strong>Gmail</strong> — coldtrail creates the draft; you review and hit Send. It never auto-sends.</p>
         <div id="dest-gcloud"></div>
         <div class="row"><button class="btn primary" id="connect-gmail">Connect Gmail</button><span class="form-msg" id="dest-msg"></span></div>
-        <p class="hint" style="margin-top:12px;opacity:.55">also a destination: <span class="status s-sourced">LinkedIn — coming</span></p>
+
+        <div class="li-sep"><span class="li-label">LinkedIn</span><span class="conn-state" id="li-conn-badge"></span></div>
+        <p class="hint">Also a destination — coldtrail opens a connection request in a real LinkedIn window for you to review, or (opt-in) clicks Send itself within your caps.</p>
+        <div id="li-body"></div>
       </div>
 
       <div class="panel" data-step="brief" id="panel-message">
@@ -176,7 +179,11 @@
 
   <!-- DRAFTS -->
   <section class="view" id="view-drafts">
-    <header class="view-head"><h1>Drafts</h1><p class="sub">Review &amp; edit, then <strong>Create Gmail draft</strong> — it lands in your Gmail Drafts and you send it from there. <span id="warmup" class="warmup"></span></p></header>
+    <header class="view-head">
+      <h1>Drafts</h1>
+      <p class="sub" id="drafts-sub"></p>
+      <div class="filters" id="drafts-tabs"></div>
+    </header>
     <div class="drafts-bulk" id="drafts-bulk"></div>
     <div class="drafts" id="drafts-list"></div>
   </section>
