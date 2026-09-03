@@ -1038,6 +1038,49 @@ const liStagedDomains = new Set();
 // supersede-guard pattern as chat's `openSeq`, so a second Send (or a tab switch) can't leave an
 // orphaned interval polling the drafts list forever.
 let liSendSeq = 0;
+// Generation token for the LinkedIn BULK-send poll ("Send all" on the LinkedIn/All tab) — same
+// supersede-guard pattern as `liSendSeq`'s per-row poll, so a second bulk click can't leave two
+// pollers both refetching drafts and racing to report "done".
+let liBulkSeq = 0;
+// The LinkedIn tab's current pending-draft count, refreshed by loaders.drafts() on every render —
+// the bulk poller below reads this instead of re-deriving it, since loaders.drafts() already did.
+let liLastPendingCount = 0;
+// True from the moment a bulk send is kicked off until its poll concludes (done or timed out).
+// Read by loaders.drafts() so the LinkedIn/All "Send all" button stays disabled — and reads
+// "Sending…" — across every re-render in between, not just for the one click that started it;
+// otherwise the very first poll tick's re-render would swap in a fresh, un-disabled button and a
+// second click could spawn a second `send-pending linkedin` process.
+let liBulkInFlight = false;
+const LI_BULK_POLL_MS = 3000;
+const LI_BULK_TIMEOUT_MS = 30 * 60 * 1000; // 30 min: covers a full day's cap worth of pacing
+
+// Poll the drafts list until every LinkedIn draft the bulk sender can reach is gone (or we time
+// out) — the "Send all" counterpart to the per-row `.li-send` poller above. `loaders.drafts()`
+// re-renders as it goes, so LinkedIn rows visibly drop off the list (and the pending count in the
+// tab's own button) as the detached `coldtrail send-pending linkedin` process marks them sent.
+function liBulkStart() {
+  const gen = ++liBulkSeq;
+  liBulkInFlight = true;
+  const startedAt = Date.now();
+  const tick = async () => {
+    if (gen !== liBulkSeq) return; // superseded by a newer bulk send or a tab switch away
+    await loaders.drafts();
+    if (gen !== liBulkSeq) return;
+    if (liLastPendingCount === 0) {
+      liBulkInFlight = false;
+      toast("LinkedIn bulk send finished.", "ok");
+      return;
+    }
+    if (Date.now() - startedAt > LI_BULK_TIMEOUT_MS) {
+      liBulkInFlight = false;
+      await loaders.drafts(); // one more render so the button re-enables instead of staying stuck
+      toast("Still working through LinkedIn invites — check back in a bit.", "");
+      return;
+    }
+    setTimeout(tick, LI_BULK_POLL_MS);
+  };
+  setTimeout(tick, LI_BULK_POLL_MS);
+}
 
 // One LinkedIn draft row: the note (300-char LinkedIn invite limit) + a live char count, an
 // "Open in LinkedIn" assist button, and — once staged — the "Did it send?" ✓/✗ pair. Reuses the
@@ -1116,49 +1159,151 @@ loaders.drafts = async () => {
     body: card.querySelector(".draft-body-edit")?.value,
   });
 
-  // Bulk: create a Gmail draft for every pending draft, one at a time (each is an agent turn).
-  // LinkedIn drafts go through the assist/confirm flow (a real, human-visible browser window),
-  // never the bulk "Create all Gmail drafts" button — so bulk only ever touches email drafts.
-  // Only shown on the Email tab: on "All" it'd be ambiguous which channel it sends, and
-  // LinkedIn's bulk equivalent is a scheduled run, not a browser-driving button here.
-  const pending = rows.filter((r) => r.status === "draft_pending" && r.channel !== "linkedin");
+  // Bulk "Send all": one button per active tab, with its own count + confirm + behavior.
+  //
+  // Email bulk creates a Gmail draft (or sends, if auto_send) for every pending EMAIL draft, one
+  // quick HTTP call at a time — unchanged from before channel tabs existed.
+  //
+  // LinkedIn bulk is fundamentally different: it drives a real, human-visible browser per invite,
+  // so it can never fire concurrently like email does. Instead it kicks ONE detached, sequential,
+  // paced, cap-aware `coldtrail send-pending linkedin` process (see web/linkedin.rs::send_all) and
+  // polls the drafts list (`liBulkStart`) so rows drop off as they're actually sent. It requires
+  // LinkedIn auto-send to be on to do anything unattended; the button always renders on the
+  // LinkedIn tab (so "Send all" is always present there) but is disabled with a hint when
+  // auto-send is off, rather than disappearing.
+  //
+  // The All tab's button does both at once: the email batch always runs, and — only if LinkedIn
+  // auto-send is on — the LinkedIn bulk sender is also kicked. With auto-send off, All's
+  // Send-all only touches the email drafts (the confirm says so).
+  const pendingEmail = rows.filter((r) => r.status === "draft_pending" && r.channel !== "linkedin");
+  const pendingLinkedin = rows.filter(
+    (r) => r.channel === "linkedin" && (r.status === "draft_pending" || r.status === "drafted")
+  );
+  liLastPendingCount = pendingLinkedin.length; // read by liBulkStart's poller
+  const liAutoOn = !!st.linkedin_auto_send;
+  const liDailyCap = st.linkedin_daily_cap || 15;
+  const liWeeklyCap = st.linkedin_weekly_cap || 80;
+
+  // Shared by the Email tab's button and the All tab's button: push every pending email draft
+  // through the per-domain send/draft endpoint, one at a time, persisting any in-progress edit
+  // first. Returns how many succeeded and the per-domain failure messages.
+  const runEmailBulk = async (msgEl) => {
+    $$("#drafts-list .push, #drafts-list .save").forEach((b) => (b.disabled = true));
+    const cardByDom = {};
+    $$("#drafts-list .draft").forEach((c) => { cardByDom[c.dataset.domain] = c; });
+    const doms = pendingEmail.map((r) => r.domain);
+    let ok = 0;
+    const fails = [];
+    for (let i = 0; i < doms.length; i++) {
+      const dom = doms[i];
+      if (msgEl) msgEl.textContent = `creating ${i + 1}/${doms.length}…`;
+      try {
+        const card = cardByDom[dom];
+        if (card) await postJSON(`/api/drafts/${encodeURIComponent(dom)}`, edits(card)); // persist edits first
+        const r = await postJSON(`/api/drafts/${encodeURIComponent(dom)}/send`, {}); // creates a Gmail draft
+        if (r.ok) ok++; else fails.push(`${dom}: ${r.message || "failed"}`);
+      } catch (e) { fails.push(`${dom}: ${e.message}`); }
+    }
+    return { ok, fails };
+  };
+
+  // Kick the detached LinkedIn bulk sender; starts the poll on success. Returns a short status
+  // string for the caller's summary line.
+  const kickLinkedinBulk = async () => {
+    try {
+      const r = await postJSON("/api/drafts/linkedin/send-all", {});
+      if (!r.sending) return "could not start the LinkedIn bulk send";
+      liBulkStart();
+      return "sending on LinkedIn…";
+    } catch (e) { return `LinkedIn bulk send failed to start: ${e.message}`; }
+  };
+
   const bulk = $("#drafts-bulk");
   if (bulk) {
-    bulk.innerHTML = draftsTab === "email" && pending.length >= 2
-      ? `<button class="btn primary" id="bulk-draft">${auto ? `Send all (${pending.length})` : `Create all Gmail drafts (${pending.length})`}</button><span class="form-msg" id="bulk-msg"></span>`
-      : "";
+    if (draftsTab === "email") {
+      bulk.innerHTML = pendingEmail.length >= 2
+        ? `<button class="btn primary" id="bulk-draft">${auto ? `Send all (${pendingEmail.length})` : `Create all Gmail drafts (${pendingEmail.length})`}</button><span class="form-msg" id="bulk-msg"></span>`
+        : "";
+    } else if (draftsTab === "linkedin") {
+      const liDisabled = !liAutoOn || liBulkInFlight;
+      const liLabel = liBulkInFlight ? "Sending on LinkedIn…" : `Send all (${pendingLinkedin.length})`;
+      bulk.innerHTML = pendingLinkedin.length
+        ? `<button class="btn primary" id="bulk-li-send"${liDisabled ? " disabled" : ""}>${liLabel}</button>` +
+          (liAutoOn || liBulkInFlight ? "" : `<span class="hint">Enable LinkedIn auto-send to bulk-send.</span>`) +
+          `<span class="form-msg" id="bulk-li-msg"></span>`
+        : "";
+    } else {
+      const total = pendingEmail.length + pendingLinkedin.length;
+      const allLabel = liBulkInFlight ? "Sending on LinkedIn…" : `Send all (${total})`;
+      bulk.innerHTML = total
+        ? `<button class="btn primary" id="bulk-all-send"${liBulkInFlight ? " disabled" : ""}>${allLabel}</button><span class="form-msg" id="bulk-all-msg"></span>`
+        : "";
+    }
   }
+
   const bulkBtn = $("#bulk-draft");
   if (bulkBtn)
     bulkBtn.addEventListener("click", async () => {
       const confirmMsg = auto
-        ? `Send all ${pending.length} pending emails FOR REAL now (cap ${cap}/day)? There's no undo.`
-        : `Create Gmail drafts for all ${pending.length} pending? Each is created as a draft — nothing is sent.`;
+        ? `Send all ${pendingEmail.length} pending emails FOR REAL now (cap ${cap}/day)? There's no undo.`
+        : `Create Gmail drafts for all ${pendingEmail.length} pending? Each is created as a draft — nothing is sent.`;
       if (!confirm(confirmMsg)) return;
-      const msg = $("#bulk-msg");
-      $$("#drafts-list .push, #drafts-list .save").forEach((b) => (b.disabled = true));
       bulkBtn.disabled = true;
-      const cardByDom = {};
-      $$("#drafts-list .draft").forEach((c) => { cardByDom[c.dataset.domain] = c; });
-      const doms = pending.map((r) => r.domain);
-      let ok = 0;
-      const fails = [];
-      for (let i = 0; i < doms.length; i++) {
-        const dom = doms[i];
-        if (msg) msg.textContent = `creating ${i + 1}/${doms.length}…`;
-        try {
-          const card = cardByDom[dom];
-          if (card) await postJSON(`/api/drafts/${encodeURIComponent(dom)}`, edits(card)); // persist edits first
-          const r = await postJSON(`/api/drafts/${encodeURIComponent(dom)}/send`, {}); // creates a Gmail draft
-          if (r.ok) ok++; else fails.push(`${dom}: ${r.message || "failed"}`);
-        } catch (e) { fails.push(`${dom}: ${e.message}`); }
-      }
+      const { ok, fails } = await runEmailBulk($("#bulk-msg"));
       let summary = auto
         ? `Sent ${ok} email${ok === 1 ? "" : "s"}.`
         : `Created ${ok} Gmail draft${ok === 1 ? "" : "s"}.`;
       if (fails.length) summary += ` ${fails.length} failed — see below.`;
       toast(summary, fails.length ? "err" : "ok");
       if (fails.length) toast(`Not created:\n${fails.join("\n")}`, "err");
+      await loaders.drafts();
+    });
+
+  const bulkLiBtn = $("#bulk-li-send");
+  if (bulkLiBtn)
+    bulkLiBtn.addEventListener("click", async () => {
+      const n = pendingLinkedin.length;
+      const confirmMsg = `Send up to ${n} LinkedIn invite${n === 1 ? "" : "s"} now? Driven one at a time, paced, and it stops at the ${liDailyCap}/day cap (or ${liWeeklyCap}/week). No undo.`;
+      if (!confirm(confirmMsg)) return;
+      bulkLiBtn.disabled = true;
+      const msgEl = $("#bulk-li-msg");
+      const status = await kickLinkedinBulk();
+      if (!status.startsWith("sending")) {
+        bulkLiBtn.disabled = false;
+        if (msgEl) msgEl.textContent = status;
+        toast(status, "err");
+        return;
+      }
+      if (msgEl) msgEl.textContent = "Sending on LinkedIn… (one at a time — this takes a while)";
+      toast("Sending on LinkedIn — driving the browser, one invite at a time…", "ok");
+    });
+
+  const bulkAllBtn = $("#bulk-all-send");
+  if (bulkAllBtn)
+    bulkAllBtn.addEventListener("click", async () => {
+      const nEmail = pendingEmail.length;
+      const nLi = pendingLinkedin.length;
+      const emailPart = auto
+        ? `send ${nEmail} email${nEmail === 1 ? "" : "s"} FOR REAL (cap ${cap}/day)`
+        : `create ${nEmail} Gmail draft${nEmail === 1 ? "" : "s"}`;
+      const liPart = !nLi
+        ? ""
+        : liAutoOn
+          ? ` and send up to ${nLi} LinkedIn invite${nLi === 1 ? "" : "s"} (driven one at a time, paced, stops at the day/week cap)`
+          : ` (${nLi} LinkedIn draft${nLi === 1 ? "" : "s"} will be skipped — enable LinkedIn auto-send to bulk-send those)`;
+      if (!confirm(`Send all pending now? This will ${emailPart}${liPart}. No undo.`)) return;
+      bulkAllBtn.disabled = true;
+      const msgEl = $("#bulk-all-msg");
+      const parts = [];
+      if (nEmail) {
+        const { ok, fails } = await runEmailBulk(msgEl);
+        parts.push(auto ? `sent ${ok} email${ok === 1 ? "" : "s"}` : `created ${ok} Gmail draft${ok === 1 ? "" : "s"}`);
+        if (fails.length) { parts.push(`${fails.length} email failure${fails.length === 1 ? "" : "s"}`); toast(`Not created:\n${fails.join("\n")}`, "err"); }
+      }
+      if (liAutoOn && nLi) parts.push(await kickLinkedinBulk());
+      const summary = parts.join("; ") || "nothing to send";
+      if (msgEl) msgEl.textContent = summary;
+      toast(summary, "ok");
       await loaders.drafts();
     });
 

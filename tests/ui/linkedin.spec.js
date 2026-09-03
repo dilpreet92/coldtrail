@@ -94,6 +94,10 @@ test.beforeEach(async ({ page }) => {
   // --- Drafts LinkedIn endpoints ---------------------------------------------------------
   await page.route("**/api/drafts/*/linkedin/assist", (route) => route.fulfill({ json: { staged: true } }));
   await page.route("**/api/drafts/*/linkedin/confirm", (route) => route.fulfill({ json: { ok: true } }));
+  // The LinkedIn bulk "Send all" endpoint — never a real send, just the {sending:true} ack. This
+  // route pattern has no wildcard path segment after "linkedin/", so it does NOT shadow (and is
+  // not shadowed by) the per-domain `/api/drafts/*/linkedin/send` route below.
+  await page.route("**/api/drafts/linkedin/send-all", (route) => route.fulfill({ json: { sending: true } }));
   // The bare per-domain save endpoint ("persist edits first") — one path segment after the
   // domain, so this does not shadow the two routes above (which have two extra segments).
   await page.route("**/api/drafts/*", (route, request) => {
@@ -137,13 +141,15 @@ test("LinkedIn destination card: Connect goes waiting -> connected, then caps PO
 test("Drafts: channel tabs default to All, and filter to the LinkedIn/Email rows", async ({ page }) => {
   await page.click('[data-nav="drafts"]');
 
-  // Default tab is "All" — the stubbed LinkedIn draft shows without picking a tab.
+  // Default tab is "All" — the stubbed LinkedIn draft shows without picking a tab, and its
+  // "Send all" button counts the one pending LinkedIn draft (no email drafts in this stub).
   await expect(page.locator("#drafts-tabs .chip[data-t='all']")).toHaveAttribute("aria-pressed", "true");
   const card = page.locator('.draft[data-channel="linkedin"]');
   await expect(card).toBeVisible();
+  await expect(page.locator("#bulk-all-send")).toHaveText("Send all (1)");
 
-  // Email tab: no email drafts in this stub, so the list goes empty and there's no LinkedIn-only
-  // "Send all" bulk button (that only ever appears on the Email tab, and only for email drafts).
+  // Email tab: no email drafts in this stub, so the list goes empty and there's no email
+  // "Send all" bulk button (email's requires >=2 pending, same threshold as before tabs existed).
   await page.click("#drafts-tabs .chip[data-t='email']");
   await expect(page.locator("#drafts-tabs .chip[data-t='email']")).toHaveAttribute("aria-pressed", "true");
   await expect(card).toHaveCount(0);
@@ -151,10 +157,53 @@ test("Drafts: channel tabs default to All, and filter to the LinkedIn/Email rows
   await expect(page.locator("#drafts-bulk #bulk-draft")).toHaveCount(0);
 
   // LinkedIn tab: the stats line reflects the LinkedIn caps/counts from /api/status, not Gmail's.
+  // Its own "Send all" button is present (count = 1) but DISABLED, since the stub has
+  // linkedin_auto_send:false — the button stays on the tab with a hint rather than disappearing.
   await page.click("#drafts-tabs .chip[data-t='linkedin']");
   await expect(card).toBeVisible();
   await expect(page.locator("#warmup")).toContainText("1/10 today");
   await expect(page.locator("#warmup")).toContainText("3/40 this week");
+  const liBulkBtn = page.locator("#bulk-li-send");
+  await expect(liBulkBtn).toHaveText("Send all (1)");
+  await expect(liBulkBtn).toBeDisabled();
+  await expect(page.locator("#drafts-bulk .hint")).toContainText("Enable LinkedIn auto-send");
+});
+
+test("Drafts: LinkedIn tab Send-all is enabled and posts to send-all when auto-send is on", async ({ page }) => {
+  await page.route("**/api/status", (route) =>
+    route.fulfill({ json: { ...STATUS_STUB, linkedin_auto_send: true } })
+  );
+  await page.click('[data-nav="drafts"]');
+  await page.click("#drafts-tabs .chip[data-t='linkedin']");
+
+  const liBulkBtn = page.locator("#bulk-li-send");
+  await expect(liBulkBtn).toBeEnabled();
+  await expect(page.locator("#drafts-bulk .hint")).toHaveCount(0);
+
+  page.once("dialog", (d) => d.accept());
+  const [req] = await Promise.all([
+    page.waitForRequest(
+      (r) => r.url().includes("/api/drafts/linkedin/send-all") && r.method() === "POST"
+    ),
+    liBulkBtn.click(),
+  ]);
+  expect(req.method()).toBe("POST");
+  // The button reports it's working and stays disabled so a re-click can't spawn a second
+  // `send-pending linkedin` process while one is already in flight.
+  await expect(page.locator("#bulk-li-msg")).toContainText("Sending on LinkedIn");
+  await expect(liBulkBtn).toBeDisabled();
+});
+
+test("Drafts: All tab Send-all sends only email when LinkedIn auto-send is off (confirm says so)", async ({
+  page,
+}) => {
+  await page.click('[data-nav="drafts"]');
+  // Default tab is "all"; the confirm dialog text is the only way to see the intended plan
+  // (LinkedIn is skipped) without actually dispatching any request — capture it and dismiss.
+  let dialogMessage = "";
+  page.once("dialog", (d) => { dialogMessage = d.message(); d.dismiss(); });
+  await page.locator("#bulk-all-send").click();
+  expect(dialogMessage).toContain("enable LinkedIn auto-send");
 });
 
 test("Drafts: a LinkedIn draft shows its badge + live char count + Open-in-LinkedIn, then stages", async ({

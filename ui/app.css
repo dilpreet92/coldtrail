@@ -256,6 +256,7 @@ ol.steps li{margin-bottom:4px}
 /* drafts */
 .drafts-bulk{display:flex; align-items:center; gap:12px; margin-bottom:14px}
 .drafts-bulk:empty{display:none}
+.drafts-bulk .hint{margin:0}
 .drafts{display:flex; flex-direction:column; gap:14px}
 .draft{border:1px solid var(--line); border-radius:12px; background:var(--panel); overflow:hidden}
 .draft-head{display:flex; align-items:center; gap:12px; padding:13px 16px; border-bottom:1px solid var(--line); background:var(--bg2)}
