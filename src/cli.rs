@@ -121,6 +121,10 @@ pub enum Commands {
         #[arg(long)]
         note: String,
     },
+    /// Backfill the Canonical CTA link onto existing pending/drafted LinkedIn notes that
+    /// don't have one yet (retrofits drafts written before this feature, or while no CTA
+    /// link was configured). Never sends.
+    LinkedinRelink,
     /// Load already-contacted domains from contacted.toml (dedupe guard)
     Seed,
     /// Re-download the latest release binary in place

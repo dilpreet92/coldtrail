@@ -72,8 +72,10 @@ sourcing and wait — keep going through enrichment and drafting — unless the 
      email draft. Give it real structure with **actual line breaks** (press-enter newlines
      inside the quoted value — a real newline, not the two literal characters `\n`): a greeting
      line, a blank line, one or two crisp body lines, then a sign-off on its own line. Never a
-     single dense run-on paragraph. Stay **≤300 characters INCLUDING the newlines** (LinkedIn's
-     hard limit — newlines count). For example:
+     single dense run-on paragraph. The Canonical CTA link is **automatically appended** as the
+     note's final line — write **≤ ~240 characters INCLUDING the newlines**, leaving room for
+     it, and **do not paste the link yourself** (LinkedIn's hard limit is 300 chars total,
+     newlines count, and the link is added after your text). For example:
      ```
      coldtrail linkedin-note acme.com --note "Hi Jane,
 
@@ -142,7 +144,7 @@ sourcing and wait — keep going through enrichment and drafting — unless the 
 | `coldtrail add-contact <domain> "<name>" [email] --linkedin <url> [src]` | contact with a LinkedIn URL (email optional) |
 | `coldtrail find-emails [max]` | best-effort OSINT founder-email finder |
 | `coldtrail draft <domain> --subject "…" --body "…"` | store a personalized draft (email contact) |
-| `coldtrail linkedin-note <domain> --note "…"` | store a short, line-broken ≤300-char connection note (newlines included; LinkedIn-only contact) |
+| `coldtrail linkedin-note <domain> --note "…"` | store a short, line-broken ≤240-char connection note (newlines included; LinkedIn-only contact) — the CTA link is appended automatically, up to LinkedIn's 300-char hard limit |
 | `coldtrail followup <domain> --subject "…" --body "…"` | store a follow-up touch (no reply yet) |
 | `coldtrail send <domain>` | send a reviewed draft for real, either channel (refuses unless that channel's auto-send is on) |
 | `coldtrail mark <domain> <id\|sent\|replied\|bounced>` | advance status |
