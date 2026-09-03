@@ -58,6 +58,16 @@ pub enum Commands {
         /// The company domain whose draft to send
         domain: String,
     },
+    /// Sequentially send every pending draft on a channel — paced and cap-aware; a real send,
+    /// same gates as `send` (currently only the `linkedin` channel is supported: it drives a real
+    /// browser per invite, so drafts are sent one at a time, never concurrently). Behind the
+    /// Drafts "Send all" button on the LinkedIn/All tab.
+    SendPending {
+        /// Channel to bulk-send (only "linkedin" is currently supported)
+        channel: String,
+        /// Max drafts to attempt this run (default: all pending)
+        max: Option<usize>,
+    },
     /// Import Canonical search results (JSON), deduped by domain
     Import {
         /// Path to the saved Canonical results JSON

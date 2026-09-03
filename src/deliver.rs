@@ -173,6 +173,111 @@ pub async fn run(domain: &str) -> Result<()> {
     Ok(())
 }
 
+/// Pending LinkedIn drafts eligible for the sequential bulk sender (`send_pending`): outreach rows
+/// still `draft_pending`/`drafted` on the `linkedin` channel whose company has a contact with a
+/// `linkedin_url` on file — the same recipient rule `reviewable` enforces, checked up front here so
+/// the bulk loop never queues a domain it can't actually send. Oldest-drafted first, so a bulk run
+/// works the queue in the order the drafts were created. `limit` bounds how many domains are
+/// fetched (`None` = no bound); it is the same knob as the CLI's `max` argument, so passing it
+/// through to the query (rather than the loop) keeps "how many to attempt" and "how many exist" in
+/// one place.
+pub fn pending_linkedin_domains(limit: Option<usize>) -> Result<Vec<String>> {
+    let c = crate::db::open()?;
+    let lim = limit.map(|n| n as i64).unwrap_or(i64::MAX);
+    let mut stmt = c.prepare(
+        "SELECT o.domain FROM outreach o JOIN contacts k ON k.id = o.contact_id \
+         WHERE COALESCE(o.channel,'email')='linkedin' AND o.status IN ('draft_pending','drafted') \
+           AND k.linkedin_url IS NOT NULL \
+         GROUP BY o.domain ORDER BY MIN(o.created_at) ASC LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map([lim], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Whether a `send` error on the `linkedin` channel is a GLOBAL gate — one that every remaining
+/// domain in the queue would hit identically (auto-send off, a cap reached, outside the daytime
+/// window, the profile lock busy, or the session needing reconnect) — as opposed to a
+/// domain-specific failure (e.g. the invite itself failing on that one profile) that's worth
+/// skipping past so one bad row can't wedge the whole run. Matched against the exact wording
+/// `linkedin::send::deliver` uses for each gate.
+fn is_linkedin_stopping_error(msg: &str) -> bool {
+    msg.contains("cap reached")
+        || msg.contains("auto-send is off")
+        || msg.contains("sending window")
+        || msg.contains("browser is busy")
+        || msg.contains("reconnect")
+}
+
+/// CLI entry: `coldtrail send-pending linkedin [max]` — the sequential, paced, cap-aware bulk
+/// LinkedIn sender behind the Drafts "Send all" button on the LinkedIn/All tab
+/// (`web::linkedin::send_all` spawns exactly one detached instance of this). Unlike email (which
+/// the UI bulk-sends with one quick HTTP call per domain), LinkedIn drives a real browser per
+/// invite and must never fire concurrently, so this loops `send` ONE AT A TIME — every gate in
+/// `linkedin::send::deliver` (opt-in, weekly/daily caps, the daytime window, inter-invite pacing,
+/// the one-Chrome-profile lock) still applies exactly as it does to a single `coldtrail send
+/// <domain>`.
+///
+/// Stops the loop when: a global gate fails (a cap is reached, auto-send is off, outside the
+/// sending window, the browser is busy, or the session needs reconnecting) — every domain still
+/// queued would fail the same way, so there's nothing to gain by continuing; or the queue (bounded
+/// by `max`, if given) is exhausted. A domain-specific failure is logged and skipped — its draft
+/// stays `draft_pending` for a later attempt — so one bad row can't wedge the whole run. ALWAYS
+/// returns `Ok`: every stop condition here (including a cap reached) is a normal outcome for an
+/// unattended bulk send, never a process failure.
+pub async fn send_pending(channel: &str, max: Option<usize>) -> Result<()> {
+    crate::db::init()?;
+    if channel != "linkedin" {
+        println!("send-pending: unsupported channel '{channel}' (only 'linkedin' is supported)");
+        return Ok(());
+    }
+    let domains = pending_linkedin_domains(max)?;
+    if domains.is_empty() {
+        println!("send-pending linkedin: nothing pending.");
+        return Ok(());
+    }
+    println!(
+        "send-pending linkedin: {} pending draft(s) queued.",
+        domains.len()
+    );
+    let mut sent = 0usize;
+    let mut skipped = 0usize;
+    let mut stop_reason: Option<String> = None;
+    for domain in &domains {
+        let d = match reviewable(domain) {
+            Ok(d) => d,
+            Err(e) => {
+                println!("{domain}: skip (no longer reviewable: {e})");
+                skipped += 1;
+                continue;
+            }
+        };
+        match send(domain, &d).await {
+            Ok(msg) => {
+                sent += 1;
+                println!("{domain}: {msg}");
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if is_linkedin_stopping_error(&msg) {
+                    println!("{domain}: {msg} — stopping.");
+                    stop_reason = Some(msg);
+                    break;
+                }
+                skipped += 1;
+                println!("{domain}: failed, skipping ({msg})");
+            }
+        }
+    }
+    let reason = stop_reason.unwrap_or_else(|| "queue exhausted".to_string());
+    println!(
+        "send-pending linkedin: sent {sent}, skipped {skipped} of {} queued — stopped: {reason}",
+        domains.len()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,6 +454,144 @@ mod tests {
             )
             .unwrap();
             assert_eq!(linkedin_sent_last_7d(), 2);
+        });
+    }
+
+    #[test]
+    fn is_linkedin_stopping_error_matches_global_gates_only() {
+        assert!(is_linkedin_stopping_error(
+            "weekly LinkedIn cap reached (40/40)"
+        ));
+        assert!(is_linkedin_stopping_error(
+            "daily LinkedIn cap reached (10/10)"
+        ));
+        assert!(is_linkedin_stopping_error(
+            "LinkedIn auto-send is off — open it from the Drafts tab"
+        ));
+        assert!(is_linkedin_stopping_error(
+            "outside the LinkedIn sending window (08:00-20:00 local) — deferring"
+        ));
+        assert!(is_linkedin_stopping_error(
+            "LinkedIn browser is busy — try again in a moment"
+        ));
+        assert!(is_linkedin_stopping_error(
+            "LinkedIn session expired — reconnect needed; stopping"
+        ));
+        // A domain-specific failure must NOT stop the loop — it should be skipped instead.
+        assert!(!is_linkedin_stopping_error(
+            "LinkedIn invite failed: connect button not found"
+        ));
+    }
+
+    #[test]
+    fn pending_linkedin_domains_requires_linkedin_url_and_orders_oldest_first() {
+        crate::testutil::with_home("ct-deliver-pending-li", |_| {
+            crate::db::init().unwrap();
+            let c = crate::db::open().unwrap();
+            c.execute(
+                "INSERT INTO companies (domain, source_query) VALUES ('a.com','q'), ('b.com','q'), ('c.com','q')",
+                [],
+            )
+            .unwrap();
+            // a.com: linkedin contact + pending linkedin draft, created first (oldest).
+            c.execute(
+                "INSERT INTO contacts (domain, founder_name, linkedin_url) \
+                 VALUES ('a.com','Jane','https://www.linkedin.com/in/janedoe')",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO outreach (domain, contact_id, channel, subject, body, status, created_at) \
+                 VALUES ('a.com', (SELECT id FROM contacts WHERE domain='a.com'), \
+                 'linkedin', '', 'Hi Jane', 'draft_pending', datetime('now','-2 hours'))",
+                [],
+            )
+            .unwrap();
+            // b.com: linkedin contact + pending linkedin draft, created after a.com.
+            c.execute(
+                "INSERT INTO contacts (domain, founder_name, linkedin_url) \
+                 VALUES ('b.com','Bob','https://www.linkedin.com/in/bobsmith')",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO outreach (domain, contact_id, channel, subject, body, status, created_at) \
+                 VALUES ('b.com', (SELECT id FROM contacts WHERE domain='b.com'), \
+                 'linkedin', '', 'Hi Bob', 'draft_pending', datetime('now','-1 hours'))",
+                [],
+            )
+            .unwrap();
+            // c.com: a pending linkedin draft but NO linkedin_url on its contact — must be excluded.
+            c.execute(
+                "INSERT INTO contacts (domain, founder_name, email) VALUES ('c.com','Carl','carl@c.com')",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO outreach (domain, contact_id, channel, subject, body, status) \
+                 VALUES ('c.com', (SELECT id FROM contacts WHERE domain='c.com'), \
+                 'linkedin', '', 'Hi Carl', 'draft_pending')",
+                [],
+            )
+            .unwrap();
+
+            let domains = pending_linkedin_domains(None).unwrap();
+            assert_eq!(domains, vec!["a.com".to_string(), "b.com".to_string()]);
+
+            // `limit` bounds how many are fetched.
+            let limited = pending_linkedin_domains(Some(1)).unwrap();
+            assert_eq!(limited, vec!["a.com".to_string()]);
+        });
+    }
+
+    #[test]
+    fn send_pending_rejects_non_linkedin_channel_without_touching_the_db() {
+        // No `with_home`/`db::init` here on purpose: an unsupported channel must return before
+        // ever touching the database, so this must not panic even with no workspace set up.
+        let res = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(send_pending("email", None));
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn send_pending_stops_immediately_when_auto_send_off() {
+        crate::testutil::with_home("ct-deliver-send-pending-off", |_| {
+            crate::db::init().unwrap();
+            let c = crate::db::open().unwrap();
+            c.execute(
+                "INSERT INTO companies (domain, source_query) VALUES ('acme.com','q')",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO contacts (domain, founder_name, linkedin_url) \
+                 VALUES ('acme.com','Jane','https://www.linkedin.com/in/janedoe')",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO outreach (domain, contact_id, channel, subject, body, status) \
+                 VALUES ('acme.com', (SELECT id FROM contacts WHERE domain='acme.com'), \
+                 'linkedin', '', 'Hi Jane', 'draft_pending')",
+                [],
+            )
+            .unwrap();
+            // Fresh config → linkedin_auto_send defaults off, so the very first `send` call hits
+            // the global "auto-send is off" gate and the loop must stop (not retry/panic/loop).
+            let res = tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(send_pending("linkedin", None));
+            assert!(res.is_ok());
+            // The row is untouched (still draft_pending) since the gate ran before any send.
+            let status: String = c
+                .query_row(
+                    "SELECT status FROM outreach WHERE domain='acme.com'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "draft_pending");
         });
     }
 }

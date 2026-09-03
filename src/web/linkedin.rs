@@ -303,6 +303,31 @@ pub async fn send(
     Ok(Json(serde_json::json!({ "sending": true })).into_response())
 }
 
+/// `POST /api/drafts/linkedin/send-all` — the Drafts "Send all" button on the LinkedIn (and All)
+/// tab: kick the sequential, paced, cap-aware LinkedIn bulk sender. Requires LinkedIn auto-send to
+/// be ON — with it off there is no unattended send path here at all (the human sends by hand via
+/// "Open in LinkedIn" per row), same gate `send` above enforces per-domain.
+///
+/// Like `send`, this SPAWNS A DETACHED `coldtrail send-pending linkedin` subprocess (the same
+/// `schedules::run_now`/`send` idiom) rather than looping in-process: a full bulk run can take many
+/// minutes (inter-invite pacing plus up to the daily cap's worth of browser drives), which must not
+/// block the axum handler. Exactly ONE process is spawned — never one per pending domain —
+/// because `send-pending` itself loops sequentially over the whole queue; spawning N processes
+/// would have them all contend for the same one-Chrome-profile lock instead of pacing in turn.
+pub async fn send_all(State(_state): State<Arc<AppState>>) -> Result<Response, ApiErr> {
+    if !crate::config::load().linkedin_auto_send {
+        return Ok((StatusCode::CONFLICT, "LinkedIn auto-send is off").into_response());
+    }
+    let exe = std::env::current_exe().map_err(|e| ApiErr(anyhow::anyhow!(e)))?;
+    tokio::spawn(async move {
+        let _ = tokio::process::Command::new(exe)
+            .args(["send-pending", "linkedin"])
+            .status()
+            .await;
+    });
+    Ok(Json(serde_json::json!({ "sending": true })).into_response())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -521,6 +546,20 @@ mod tests {
             let resp = tokio::runtime::Runtime::new()
                 .unwrap()
                 .block_on(send(State(state()), Path("acme.com".to_string())))
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CONFLICT);
+        });
+    }
+
+    #[test]
+    fn send_all_rejects_when_linkedin_auto_send_off_without_spawning() {
+        crate::testutil::with_home("ct-web-li-sendall-autooff", |_| {
+            crate::db::init().unwrap();
+            // Fresh config → linkedin_auto_send defaults off. CONFLICT (not a spawned
+            // `send-pending` child) proves the opt-in gate ran before any subprocess is launched.
+            let resp = tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(send_all(State(state())))
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::CONFLICT);
         });

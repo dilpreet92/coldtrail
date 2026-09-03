@@ -105,6 +105,7 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Commands::Mark { domain, value }) => mark::run(&domain, &value),
         Some(Commands::LinkedinNote { domain, note }) => linkedin::note::add(&domain, &note),
         Some(Commands::Send { domain }) => deliver::run(&domain).await,
+        Some(Commands::SendPending { channel, max }) => deliver::send_pending(&channel, max).await,
         Some(Commands::Seed) => seed::run(),
         Some(Commands::Update) => update::run().await,
         Some(Commands::Run {
