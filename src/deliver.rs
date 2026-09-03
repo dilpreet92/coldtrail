@@ -208,6 +208,7 @@ fn is_linkedin_stopping_error(msg: &str) -> bool {
         || msg.contains("sending window")
         || msg.contains("browser is busy")
         || msg.contains("reconnect")
+        || msg.contains("dry run")
 }
 
 /// CLI entry: `coldtrail send-pending linkedin [max]` — the sequential, paced, cap-aware bulk
