@@ -1,5 +1,6 @@
 //! One unattended cycle: plan queries from product.md + history, source -> enrich -> draft, and
-//! (only if auto_send) send within the daily cap. Always returns Ok after recording an outcome so
+//! send within the caps — emails if auto_send, LinkedIn (via `send-pending linkedin`) if
+//! linkedin_auto_send. Always returns Ok after recording an outcome so
 //! the OS timer never loops on failure. This is what `coldtrail run` and the scheduler invoke.
 use crate::provider::cli::Tools;
 use crate::provider::{resolve, run_turn, AgentEvent, GMAIL_TOOL};
@@ -10,8 +11,11 @@ pub fn agent_brief() -> String {
      Read product.md and the workspace history. Plan 3–5 fresh, genuinely diverse angles that \
      AVOID companies already sourced or contacted. Run the full loop: source → enrich (prefer your \
      own web tools) → draft, generously; report coverage. If config.toml has auto_send = true, \
-     send the drafts with `coldtrail send <domain>` up to the remaining daily cap; otherwise leave \
-     them as drafts for review. Never exceed the cap; never re-contact a known domain."
+     send the EMAIL drafts with `coldtrail send <domain>` up to the remaining daily cap. If \
+     config.toml has linkedin_auto_send = true, ALSO send the LinkedIn drafts by running \
+     `coldtrail send-pending linkedin` once — it drives the connected LinkedIn browser one at a \
+     time, paced, and stops on its own at the daily cap. Otherwise leave drafts for review. Never \
+     exceed a cap; never re-contact a known domain."
         .to_string()
 }
 
@@ -20,9 +24,11 @@ pub fn custom_brief(instruction: &str) -> String {
         "This is an automated scheduled run — no human is watching, so don't ask questions; act. \
          Your task for this run: {instruction}\n\n\
          Work within coldtrail's loop: source (`coldtrail source`) → enrich (prefer your own web \
-         tools) → draft (`coldtrail draft`). Never re-contact a known domain. If config.toml has \
-         auto_send = true, you may send with `coldtrail send <domain>` up to the remaining daily \
-         cap; otherwise leave drafts for review. Report what you did."
+         tools) → draft (`coldtrail draft` for email; `coldtrail linkedin-note` for LinkedIn-only \
+         contacts). Never re-contact a known domain. If config.toml has auto_send = true, you may \
+         send the email drafts with `coldtrail send <domain>` up to the remaining daily cap; if \
+         linkedin_auto_send = true, ALSO run `coldtrail send-pending linkedin` once (paced, \
+         daily-capped) to send the LinkedIn drafts. Otherwise leave drafts for review. Report what you did."
     )
 }
 
@@ -271,7 +277,9 @@ mod tests {
         let b = agent_brief();
         assert!(b.contains("automated scheduled run"));
         assert!(b.to_lowercase().contains("avoid")); // history-aware
-        assert!(b.contains("auto_send")); // the gate
+        assert!(b.contains("auto_send")); // the email gate
+        assert!(b.contains("linkedin_auto_send")); // the LinkedIn gate
+        assert!(b.contains("send-pending linkedin")); // the LinkedIn bulk sender
     }
 
     #[test]
