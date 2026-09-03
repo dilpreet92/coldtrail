@@ -1,8 +1,8 @@
 # coldtrail
 
 > **Discovery-first cold outreach for solo founders & one-person sales teams.**
-> Find the companies other tools miss, draft each email in your own voice, send from your own
-> Gmail — all on your machine. Built on [Canonical](https://trycanonical.ai).
+> Find the companies other tools miss, draft each touch in your own voice, send from your own
+> email (Gmail) and LinkedIn — all on your machine. Built on [Canonical](https://trycanonical.ai).
 
 Most outreach tools start from a list you already have and optimize the *sending*. coldtrail
 starts from the opposite end: **discovery**. You describe who you want to reach in plain English;
@@ -49,7 +49,9 @@ The browser opens to a short **Setup** wizard:
 2. **Discovery — Canonical** (sourcing). Keyless: click Connect and approve in the browser.
 3. **Destination — Gmail.** Easiest is a **Gmail app password** (keyless, ~2 min): turn on
    2-Step Verification, create an app password, enable IMAP. (Advanced: bring your own Google
-   OAuth client instead.)
+   OAuth client instead.) LinkedIn is also a destination — see
+   [LinkedIn destination](#linkedin-destination) below; connect it anytime from Settings →
+   Destination.
 4. **Company** — chat-free, just an editable profile. Describe what you sell, who it helps, your
    offer, your link, your voice. The agent writes **every email from this**, in your words — it
    never invents claims. Edit it anytime in the **Company** tab; it saves as you type.
@@ -97,6 +99,32 @@ confident the drafts are good, flip on **Auto-send** in Settings → Destination
 Then the Drafts screen sends for real on your click, and the agent can send within a run after you
 confirm. Sending is gated two ways — it won't fire unless *both* auto-send is on *and* you say yes
 — so nothing goes out by accident.
+
+## Cron — scheduled runs
+
+The **Cron** tab runs coldtrail while you're away. Create any number of **named schedules**,
+each with its own cadence — **daily** or **weekly** at a time you pick (weekly also picks a
+weekday) — and its own **task**: either **agent decides**, where the agent plans fresh, diverse
+search queries from your `product.md` profile and what it's already sourced, or a **custom
+prompt** you write yourself (e.g. _"source 20 companies like Linear and draft intros"_). Each
+schedule installs exactly **one OS timer** — macOS `launchd` (`ai.coldtrail.run.<id>`) or Linux
+`systemd` (`coldtrail-<id>`) — so schedules survive reboots and don't depend on coldtrail staying
+open. The tab shows each schedule's **next run** and a **run history** with **last run**, and two
+buttons that jump straight to the run's chat and stream it live: **Run now** (runs it immediately,
+same as its scheduled trigger) and **Dry run** (drafts only — it hard-gates every send, so nothing
+goes out no matter your auto-send settings).
+
+A scheduled run (and a manually triggered "Run now") does the full loop — source → enrich →
+draft — and then **sends per your existing config**: emails go out if **auto-send** is on (under
+its daily cap), and LinkedIn connection requests go out if **LinkedIn auto-send** is on (via the
+same paced, daily- and weekly-capped sender used everywhere else). Leave both off and a schedule
+only ever produces drafts for you to review.
+
+One caveat worth knowing: LinkedIn sends drive a real, human-visible Chrome window, so a
+scheduled LinkedIn send only completes if the machine is awake, you're logged in, the screen is
+unlocked, and LinkedIn is connected at run time — otherwise it fails safe (nothing sent, the
+draft stays in **Drafts** for you to send by hand later). Email sends need no browser and aren't
+affected by machine/screen state.
 
 ## LinkedIn destination
 

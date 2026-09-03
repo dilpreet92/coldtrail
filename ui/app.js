@@ -124,6 +124,7 @@ async function loadStatus() {
   led("led-provider", !!s.provider);
   led("led-canonical", s.discovery_connected);
   led("led-gmail", s.destination_connected ? true : "warn");
+  led("led-linkedin", s.linkedin_connected ? true : "warn");
   const st = $("#disc-state");
   if (st) st.textContent = s.discovery_connected ? "· connected" : "";
   const dt = $("#dest-state");
@@ -228,8 +229,8 @@ function renderSetup(s) {
   $("#nav-setup-label").textContent = wizard ? "Setup" : "Settings";
   $("#setup-title").textContent = wizard ? "Get set up" : "Settings";
   $("#setup-sub").textContent = wizard
-    ? "A few steps to get coldtrail running. coldtrail owns sourcing (Canonical) and drafting (Gmail); drafts are never auto-sent — you send by hand."
-    : "Change your provider, connections, brief, and enrichment anytime. coldtrail owns Canonical + Gmail directly.";
+    ? "A few steps to get coldtrail running. coldtrail owns sourcing (Canonical) and drafting for email (Gmail) or LinkedIn; drafts are never auto-sent — you send by hand."
+    : "Change your provider, connections, brief, and enrichment anytime. coldtrail owns Canonical, Gmail, and LinkedIn directly.";
 
   if (!wizard) {
     panels.classList.remove("wizard");

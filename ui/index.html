@@ -36,6 +36,7 @@
     <div class="conn"><span class="led" id="led-provider"></span><span id="provider-label">—</span></div>
     <div class="conn"><span class="led" id="led-canonical"></span>canonical</div>
     <div class="conn"><span class="led" id="led-gmail"></span>gmail</div>
+    <div class="conn"><span class="led" id="led-linkedin"></span>linkedin</div>
     <button class="theme-toggle" id="theme-toggle" type="button" title="Toggle light / dark" aria-label="Toggle theme"><span id="theme-icon">◐</span> <span id="theme-label">theme</span></button>
   </div>
 </aside>
@@ -45,7 +46,7 @@
   <section class="view" id="view-onboarding">
     <header class="view-head">
       <h1 id="setup-title">Get set up</h1>
-      <p class="sub" id="setup-sub">Discovery-first outreach. coldtrail owns sourcing (Canonical) and drafting (Gmail); drafts are never auto-sent — you send by hand.</p>
+      <p class="sub" id="setup-sub">Discovery-first outreach. coldtrail owns sourcing (Canonical) and drafting for email (Gmail) or LinkedIn; drafts are never auto-sent — you send by hand.</p>
     </header>
 
     <ol class="checklist" id="checklist"></ol>
@@ -58,7 +59,7 @@
         <div class="agent-row" id="agent-row"></div>
         <div id="agent-auth" class="agent-auth" hidden></div>
         <div id="byok" class="byok" hidden>
-          <p class="hint">Any OpenAI-compatible endpoint — local <strong>Ollama</strong> or a BYOK gateway. Sourcing (Canonical) and drafting (Gmail) are coldtrail's own — they work on every backend.</p>
+          <p class="hint">Any OpenAI-compatible endpoint — local <strong>Ollama</strong> or a BYOK gateway. Sourcing (Canonical) and drafting for email (Gmail) or LinkedIn are coldtrail's own — they work on every backend.</p>
           <div class="row"><button class="btn" type="button" id="ollama-preset">Ollama (localhost)</button></div>
           <label>Base URL <input id="byok-base" placeholder="http://localhost:11434/v1" autocomplete="off" /></label>
           <label>Model <input id="byok-model" placeholder="llama3.1" autocomplete="off" /></label>
@@ -170,7 +171,7 @@
 
   <!-- PIPELINE -->
   <section class="view" id="view-pipeline">
-    <header class="view-head"><h1>Pipeline</h1><p class="sub">Every company you've sourced, deduped by domain. Stages: <em>sourced → contact found → in&nbsp;Gmail → sent</em>. Act on any row — enrich, draft, or skip.</p>
+    <header class="view-head"><h1>Pipeline</h1><p class="sub">Every company you've sourced, deduped by domain. Stages: <em>sourced → contact found → drafted → sent</em>. Act on any row — enrich, draft, or skip.</p>
       <div class="filters" id="pipe-filters"></div>
       <div class="filters" id="pipe-query-row"></div>
     </header>
