@@ -22,6 +22,7 @@ mod message;
 mod oauth;
 mod osint;
 mod probe;
+mod product;
 mod prompt;
 mod provider;
 mod run;
@@ -104,6 +105,7 @@ async fn async_main() -> anyhow::Result<()> {
         }) => draft::followup_add(&domain, &subject, &body),
         Some(Commands::Mark { domain, value }) => mark::run(&domain, &value),
         Some(Commands::LinkedinNote { domain, note }) => linkedin::note::add(&domain, &note),
+        Some(Commands::LinkedinRelink) => linkedin::note::relink().map(|_| ()),
         Some(Commands::Send { domain }) => deliver::run(&domain).await,
         Some(Commands::SendPending { channel, max }) => deliver::send_pending(&channel, max).await,
         Some(Commands::Seed) => seed::run(),
