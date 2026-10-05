@@ -30,7 +30,8 @@ pub struct SetupOpts {
 pub fn ensure() -> Result<()> {
     crate::home::workspace()?;
     crate::home::write_asset("CLAUDE.md", CLAUDE_MD, true)?;
-    // Codex reads AGENTS.md (not CLAUDE.md) — same brief so both CLI backends get the loop.
+    // Codex and opencode read AGENTS.md (not CLAUDE.md) — same brief so every CLI backend gets
+    // the loop.
     crate::home::write_asset("AGENTS.md", CLAUDE_MD, true)?;
     crate::home::write_asset("enrichment.md", ENRICHMENT_MD, true)?;
     crate::home::write_asset("message.toml", MESSAGE_TOML, false)?;
@@ -69,7 +70,7 @@ pub fn run(opts: SetupOpts) -> Result<()> {
         && opts.provider.is_none()
         && statuses.iter().filter(|s| s.present).count() >= 2
     {
-        crate::prompt::select("default agent", &["claude", "codex"], "claude")
+        crate::prompt::select("default agent", &["claude", "codex", "opencode"], "claude")
     } else {
         None
     };
@@ -78,7 +79,7 @@ pub fn run(opts: SetupOpts) -> Result<()> {
         match AgentKind::from_str(flag) {
             None => {
                 return Err(anyhow!(
-                    "unknown --provider '{flag}' (expected claude or codex)"
+                    "unknown --provider '{flag}' (expected claude, codex or opencode)"
                 ));
             }
             Some(k) if !statuses.iter().any(|s| s.kind == k && s.present) => {
@@ -162,6 +163,11 @@ pub fn run(opts: SetupOpts) -> Result<()> {
                 "  ! HTTP-MCP support varies by Codex version; if `codex` doesn't pick these up, \
                  check its MCP docs."
             );
+        }
+        AgentKind::Opencode => {
+            // The agent drives everything through the `coldtrail` CLI, which owns Canonical +
+            // Gmail itself — nothing to wire into opencode.
+            println!("  – opencode: no MCP to wire (coldtrail connects Canonical + Gmail itself)");
         }
     }
 
@@ -303,6 +309,8 @@ pub fn wire_mcp(
             codex_wire(&servers)?;
             wired = servers.into_iter().map(|s| s.name).collect();
         }
+        // coldtrail owns Canonical + Gmail itself; opencode gets no MCP.
+        AgentKind::Opencode => {}
     }
     Ok(wired)
 }

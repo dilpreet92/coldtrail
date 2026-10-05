@@ -147,7 +147,7 @@ async function loadStatus() {
     .map(([n, done]) => `<li class="${done ? "done" : ""}"><span class="tick">${done ? "✓" : ""}</span>${n}</li>`)
     .join("");
 
-  // agents (claude/codex cards + a BYOK/Local card)
+  // agents (claude/codex/opencode cards + a BYOK/Local card)
   let cards = s.agents
     .map((a) => {
       const cur = a.kind === s.provider;
@@ -163,7 +163,11 @@ async function loadStatus() {
   // Sign-in / re-auth helper for the selected CLI provider. The auth check is a heuristic and
   // can be stale, and there was no in-app way to re-authenticate — so always show the login
   // command + a Re-check button (a stronger warning when it looks signed-out).
-  const LOGIN = { claude: "claude   (sign in when it opens; or type /login)", codex: "codex login" };
+  const LOGIN = {
+    claude: "claude   (sign in when it opens; or type /login)",
+    codex: "codex login",
+    opencode: "opencode auth login",
+  };
   const sel = s.agents.find((a) => a.kind === s.provider);
   const authEl = $("#agent-auth");
   if (authEl && sel && sel.present && LOGIN[sel.kind]) {

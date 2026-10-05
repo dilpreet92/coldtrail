@@ -12,7 +12,7 @@ you say so) sends it. No CRM to feed, no seat to buy, nothing leaves your laptop
 emails you approve.
 
 `coldtrail` is a single binary. Run it and it opens a **local app in your browser** — a chat that
-drives an agent (Claude Code / Codex, or your own model) to source, enrich, and draft, plus a
+drives an agent (Claude Code / Codex / opencode, or your own model) to source, enrich, and draft, plus a
 pipeline dashboard, an editable company profile, and a drafts view.
 
 ## Demo
@@ -29,7 +29,8 @@ curl -fsSL https://raw.githubusercontent.com/dilpreet92/coldtrail/main/install.s
 ```
 
 You need a **provider** (the brain): [Claude Code](https://claude.com/claude-code) (`claude`) or
-[Codex](https://github.com/openai/codex) (`codex`) — which reuse your existing subscription — or
+[Codex](https://github.com/openai/codex) (`codex`) — which reuse your existing subscription —
+[opencode](https://opencode.ai) (`opencode`, with whatever providers you've signed it into), or
 any OpenAI-compatible endpoint / local **Ollama**. The installer checks for one and tells you how
 to get it if it's missing. Then:
 
@@ -45,7 +46,10 @@ to skip the check).
 
 The browser opens to a short **Setup** wizard:
 
-1. **Provider** — pick Claude Code / Codex, or point at your own OpenAI-compatible/Ollama model.
+1. **Provider** — pick Claude Code / Codex / opencode, or point at your own OpenAI-compatible/Ollama
+   model. For opencode, pin the model in `~/.coldtrail/config.toml`
+   (`opencode_model = "provider/model"`, any id from `opencode models`) so scheduled runs don't
+   depend on whatever you last used in its TUI.
 2. **Discovery — Canonical** (sourcing). Keyless: click Connect and approve in the browser.
 3. **Destination — Gmail.** Easiest is a **Gmail app password** (keyless, ~2 min): turn on
    2-Step Verification, create an app password, enable IMAP. (Advanced: bring your own Google
@@ -112,7 +116,8 @@ schedule installs exactly **one OS timer** — macOS `launchd` (`ai.coldtrail.ru
 open. The tab shows each schedule's **next run** and a **run history** with **last run**, and two
 buttons that jump straight to the run's chat and stream it live: **Run now** (runs it immediately,
 same as its scheduled trigger) and **Dry run** (drafts only — it hard-gates every send, so nothing
-goes out no matter your auto-send settings).
+goes out no matter your auto-send settings). Every run uses the agent you picked in Setup — switch
+it there (e.g. to opencode) and the schedules follow.
 
 A scheduled run (and a manually triggered "Run now") does the full loop — source → enrich →
 draft — and then **sends per your existing config**: emails go out if **auto-send** is on (under

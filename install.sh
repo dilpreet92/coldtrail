@@ -16,17 +16,20 @@ info() { printf '  %s\n' "$*"; }
 err()  { printf 'error: %s\n' "$*" >&2; }
 
 # --- 1. provider check (non-fatal) --------------------------------------------
-# coldtrail needs a "brain": a CLI agent (Claude Code or Codex) is easiest, but you can also
+# coldtrail needs a "brain": a CLI agent (Claude Code, Codex or opencode) is easiest, but you can also
 # bring your own OpenAI-compatible endpoint / local Ollama and pick it in Setup — no CLI needed.
 # So this is informational; installation continues regardless.
 if command -v claude >/dev/null 2>&1; then
   info "found Claude Code (\`claude\`)."
 elif command -v codex >/dev/null 2>&1; then
   info "found Codex (\`codex\`)."
+elif command -v opencode >/dev/null 2>&1 || [ -x "$HOME/.opencode/bin/opencode" ]; then
+  info "found opencode (\`opencode\`)."
 else
-  info "no agent CLI found yet — that's fine. In Setup you can use either:"
+  info "no agent CLI found yet — that's fine. In Setup you can use any of:"
   info "    Claude Code:  npm i -g @anthropic-ai/claude-code"
   info "    Codex:        npm i -g @openai/codex"
+  info "    opencode:     curl -fsSL https://opencode.ai/install | bash"
   info "  …or pick BYOK / Ollama (any OpenAI-compatible endpoint), which needs no CLI."
 fi
 

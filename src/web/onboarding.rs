@@ -351,6 +351,7 @@ fn mcp_wired(provider: AgentKind, name: &str) -> bool {
                     .unwrap_or(false)
             })
             .unwrap_or(false),
+        AgentKind::Opencode => false, // nothing is wired into opencode
     }
 }
 

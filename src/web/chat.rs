@@ -81,7 +81,7 @@ pub async fn start(
             match &ev {
                 AgentEvent::Text { text } => assistant.push_str(text),
                 AgentEvent::Done { ok: o, .. } => ok = *o,
-                // codex assigns its own thread id — capture it for resume, don't show it.
+                // codex/opencode assign their own session id — capture it for resume, don't show it.
                 AgentEvent::Session { id } => {
                     new_session = Some(id.clone());
                     continue;
@@ -97,7 +97,7 @@ pub async fn start(
         }
         drop(rx_a);
 
-        // Persist the provider-assigned session id (codex) so a later resume targets it.
+        // Persist the provider-assigned session id (codex/opencode) so a later resume targets it.
         if let Some(sid) = &new_session {
             if let Ok(c) = crate::db::open() {
                 let _ = c.execute(

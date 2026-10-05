@@ -1,6 +1,7 @@
-//! Headless CLI-agent backends: spawn `claude -p --output-format stream-json` or
-//! `codex exec --json` in the workspace and map their JSONL events to `AgentEvent`s.
-//! Both share `stream_child`; codex assigns its own thread id (surfaced as a `Session` event).
+//! Headless CLI-agent backends: spawn `claude -p --output-format stream-json`,
+//! `codex exec --json` or `opencode run --format json` in the workspace and map their JSONL
+//! events to `AgentEvent`s. All share `stream_child`; codex and opencode assign their own
+//! session ids (surfaced as a `Session` event).
 
 use serde_json::Value;
 use std::path::Path;
@@ -65,7 +66,8 @@ fn auth_hint(raw: &str, cli: &str, relogin: &str) -> Option<String> {
         || low.contains("oauth access token has expired")
         || low.contains("re-authenticate")
         || low.contains("401 unauthorized")
-        || (low.contains("\"status\":401") || low.contains("error: 401"));
+        || (low.contains("\"status\":401") || low.contains("error: 401"))
+        || low.contains("\"statuscode\":401");
     is_auth.then(|| {
         format!(
             "{cli} needs to sign in again — its login expired. In a terminal run `{relogin}` and \
@@ -164,6 +166,7 @@ pub async fn run_turn(
     match kind {
         AgentKind::Claude => run_claude(session_id, first_turn, msg, home, tools, tx).await,
         AgentKind::Codex => run_codex(session_id, first_turn, msg, home, tx).await,
+        AgentKind::Opencode => run_opencode(session_id, first_turn, msg, home, tx).await,
     }
 }
 
@@ -284,6 +287,163 @@ fn codex_item_name(it: &Value) -> String {
             .to_string(),
         other => other.to_string(),
     }
+}
+
+/// Build the argv for a headless opencode turn (`opencode run --format json`). First turn starts
+/// a new session (opencode assigns the id, surfaced via `Session`); later turns continue it with
+/// `-s`. `model` is the configured `provider/model`; None/blank leaves opencode's default.
+pub fn opencode_args(
+    session_id: &str,
+    first_turn: bool,
+    msg: &str,
+    model: Option<&str>,
+) -> Vec<String> {
+    let mut a: Vec<String> = vec!["run".into(), "--format".into(), "json".into()];
+    // Headless automation: approve tool permissions without prompting (like codex's bypass).
+    // opencode has no per-tool gate; the brief (AGENTS.md) forbids Gmail.
+    a.push("--auto".into());
+    if let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) {
+        a.push("-m".into());
+        a.push(m.into());
+    }
+    if !first_turn {
+        a.push("-s".into());
+        a.push(session_id.into());
+    }
+    // `--` ends option parsing — without it a message starting with "-" is read as a flag and
+    // opencode prints its help instead of running.
+    a.push("--".into());
+    a.push(msg.into());
+    a
+}
+
+/// Env for every opencode turn. Skip the user's Claude Code compat layer (~/.claude skills +
+/// CLAUDE.md) so runs see only the workspace AGENTS.md — the analogue of claude's
+/// `--strict-mcp-config`; no self-update mid-run; and enable the Exa-backed `websearch` tool
+/// (otherwise only offered on opencode's own models) for the enrichment "web" rung.
+pub const OPENCODE_ENV: [(&str, &str); 3] = [
+    ("OPENCODE_DISABLE_CLAUDE_CODE", "1"),
+    ("OPENCODE_DISABLE_AUTOUPDATE", "1"),
+    ("OPENCODE_ENABLE_EXA", "1"),
+];
+
+/// Map one line of `opencode run --format json` to zero or more events. There's no terminal
+/// "result" event — the turn ends when the process exits (see `stream_child`).
+fn parse_opencode_line(line: &str) -> Vec<AgentEvent> {
+    let v: Value = match serde_json::from_str(line.trim()) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    let part = &v["part"];
+    match v["type"].as_str().unwrap_or("") {
+        "step_start" => v["sessionID"]
+            .as_str()
+            .map(|id| vec![AgentEvent::Session { id: id.to_string() }])
+            .unwrap_or_default(),
+        "text" => part["text"]
+            .as_str()
+            .filter(|t| !t.is_empty())
+            .map(|t| {
+                vec![AgentEvent::Text {
+                    text: t.to_string(),
+                }]
+            })
+            .unwrap_or_default(),
+        // One line per call, emitted once it has finished — so start + end together.
+        "tool_use" => {
+            let st = &part["state"];
+            let ok = st["status"].as_str() != Some("error")
+                && st["metadata"]["exit"].as_i64().unwrap_or(0) == 0;
+            vec![
+                AgentEvent::ToolStart {
+                    name: opencode_tool_name(part),
+                    input: st["input"].clone(),
+                },
+                AgentEvent::ToolEnd { ok },
+            ]
+        }
+        "error" => {
+            let e = &v["error"];
+            let raw = e["data"]["message"]
+                .as_str()
+                .or_else(|| e["message"].as_str())
+                .or_else(|| e["name"].as_str())
+                .unwrap_or("opencode turn failed")
+                .to_string();
+            // The whole error object, so a provider's statusCode reaches the auth check.
+            let message =
+                auth_hint(&e.to_string(), "opencode", "opencode auth login").unwrap_or(raw);
+            vec![
+                AgentEvent::Error { message },
+                AgentEvent::Done {
+                    ok: false,
+                    result: None,
+                },
+            ]
+        }
+        _ => vec![], // step_finish / anything else
+    }
+}
+
+/// A short label for an opencode tool call (shown as a chip): the command for bash, else the
+/// tool name.
+fn opencode_tool_name(part: &Value) -> String {
+    let tool = part["tool"].as_str().unwrap_or("tool");
+    if tool == "bash" {
+        let cmd: String = part["state"]["input"]["command"]
+            .as_str()
+            .unwrap_or("")
+            .chars()
+            .take(48)
+            .collect();
+        if !cmd.trim().is_empty() {
+            return format!("$ {cmd}");
+        }
+    }
+    tool.to_string()
+}
+
+async fn run_opencode(
+    session_id: &str,
+    first_turn: bool,
+    msg: &str,
+    home: &Path,
+    tx: Sender<AgentEvent>,
+) -> bool {
+    let model = crate::config::load().opencode_model;
+    crate::logf::log(&format!(
+        "opencode turn: session={session_id} ({}) model={}",
+        if first_turn { "new" } else { "resume" },
+        model.as_deref().unwrap_or("default")
+    ));
+    let spawn = Command::new(crate::agents::program_path(AgentKind::Opencode))
+        .args(opencode_args(session_id, first_turn, msg, model.as_deref()))
+        .envs(OPENCODE_ENV)
+        .current_dir(home)
+        // opencode waits on an open stdin before running — it must be closed.
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let child = match spawn {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx
+                .send(AgentEvent::Error {
+                    message: format!("failed to launch opencode: {e}"),
+                })
+                .await;
+            let _ = tx
+                .send(AgentEvent::Done {
+                    ok: false,
+                    result: None,
+                })
+                .await;
+            crate::logf::log(&format!("opencode failed to launch: {e}"));
+            return false;
+        }
+    };
+    stream_child(child, "opencode", parse_opencode_line, tx).await
 }
 
 async fn run_codex(
@@ -441,6 +601,15 @@ async fn stream_child(
     let status = child.wait().await;
     let err = err_task.await.unwrap_or_default();
 
+    // opencode signals the end of a turn only by exiting (non-zero on failure), so a clean exit
+    // is its successful result. Decided before logging so the log line reflects it.
+    let exit_is_result =
+        !saw_done && label == "opencode" && status.as_ref().is_ok_and(|s| s.success());
+    if exit_is_result {
+        saw_done = true;
+        done_ok = true;
+    }
+
     // Log the outcome (+ any stderr) so a tester can see why a backend failed, even when the
     // browser only shows a generic failure.
     let code = status.as_ref().ok().and_then(|s| s.code());
@@ -449,6 +618,16 @@ async fn stream_child(
     ));
     if !err.trim().is_empty() {
         crate::logf::log(&format!("{label} stderr:\n{}", err.trim()));
+    }
+
+    if exit_is_result {
+        let _ = tx
+            .send(AgentEvent::Done {
+                ok: true,
+                result: None,
+            })
+            .await;
+        return true;
     }
 
     if !saw_done {
@@ -470,10 +649,10 @@ async fn stream_child(
                     .join("\n")
             }
         };
-        let (cli, relogin) = if label == "codex" {
-            ("Codex CLI", "codex login")
-        } else {
-            ("Claude Code", "claude  (then /login)")
+        let (cli, relogin) = match label {
+            "codex" => ("Codex CLI", "codex login"),
+            "opencode" => ("opencode", "opencode auth login"),
+            _ => ("Claude Code", "claude  (then /login)"),
         };
         let message = auth_hint(&err, cli, relogin).unwrap_or(tail);
         let _ = tx.send(AgentEvent::Error { message }).await;
@@ -516,6 +695,163 @@ mod tests {
             .any(|w| w == ["-c", "tools.web_search=true"])); // pin web search
         let resume = codex_args("t-1", false, "again");
         assert!(resume.windows(2).any(|w| w == ["resume", "t-1"]));
+    }
+
+    #[test]
+    fn opencode_args_first_resume_and_model() {
+        let first = opencode_args("ses_x", true, "hi", Some("opencode/muse-spark"));
+        assert_eq!(first[0], "run");
+        assert!(first.windows(2).any(|w| w == ["--format", "json"]));
+        assert!(first.iter().any(|x| x == "--auto")); // headless: no permission prompts
+        assert!(first.windows(2).any(|w| w == ["-m", "opencode/muse-spark"]));
+        assert!(!first.iter().any(|x| x == "-s"));
+        // the message goes after `--` so one starting with "-" isn't parsed as a flag
+        assert_eq!(&first[first.len() - 2..], ["--", "hi"]);
+        let resume = opencode_args("ses_x", false, "again", None);
+        assert!(resume.windows(2).any(|w| w == ["-s", "ses_x"]));
+        assert!(!resume.iter().any(|x| x == "-m")); // no model pinned -> opencode's default
+        let blank = opencode_args("s", true, "m", Some("  "));
+        assert!(!blank.iter().any(|x| x == "-m"));
+    }
+
+    #[test]
+    fn opencode_env_isolates_from_user_claude_setup() {
+        let env = OPENCODE_ENV;
+        assert!(env.contains(&("OPENCODE_DISABLE_CLAUDE_CODE", "1"))); // no ~/.claude skills
+        assert!(env.contains(&("OPENCODE_DISABLE_AUTOUPDATE", "1")));
+        assert!(env.contains(&("OPENCODE_ENABLE_EXA", "1"))); // websearch for the enrich rung
+    }
+
+    #[test]
+    fn parse_opencode_events() {
+        assert_eq!(
+            parse_opencode_line(
+                r#"{"type":"step_start","sessionID":"ses_abc","part":{"type":"step-start"}}"#
+            ),
+            vec![AgentEvent::Session {
+                id: "ses_abc".into()
+            }]
+        );
+        assert_eq!(
+            parse_opencode_line(
+                r#"{"type":"text","sessionID":"ses_abc","part":{"type":"text","text":"DONE"}}"#
+            ),
+            vec![AgentEvent::Text {
+                text: "DONE".into()
+            }]
+        );
+        // step_finish carries no terminal signal (reason "stop" vs "tool-calls"); exit does.
+        assert!(parse_opencode_line(
+            r#"{"type":"step_finish","sessionID":"ses_abc","part":{"type":"step-finish","reason":"stop"}}"#
+        )
+        .is_empty());
+        assert!(parse_opencode_line("not json").is_empty());
+    }
+
+    #[test]
+    fn parse_opencode_tool_outcomes() {
+        // opencode emits one tool_use line per call, already finished: start + end together.
+        let ok = parse_opencode_line(
+            r#"{"type":"tool_use","part":{"type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"coldtrail source x"},"metadata":{"exit":0}}}}"#,
+        );
+        match ok.as_slice() {
+            [AgentEvent::ToolStart { name, .. }, AgentEvent::ToolEnd { ok: true }] => {
+                assert_eq!(name, "$ coldtrail source x")
+            }
+            e => panic!("unexpected {e:?}"),
+        }
+        // a shell command that ran but failed: completed + non-zero exit
+        let failed_cmd = parse_opencode_line(
+            r#"{"type":"tool_use","part":{"type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"ls /nope"},"metadata":{"exit":1}}}}"#,
+        );
+        assert_eq!(failed_cmd.last(), Some(&AgentEvent::ToolEnd { ok: false }));
+        // a tool that errored outright
+        let errored = parse_opencode_line(
+            r#"{"type":"tool_use","part":{"type":"tool","tool":"read","state":{"status":"error","input":{"filePath":"/x"},"error":"File not found: /x"}}}"#,
+        );
+        match errored.as_slice() {
+            [AgentEvent::ToolStart { name, .. }, AgentEvent::ToolEnd { ok: false }] => {
+                assert_eq!(name, "read")
+            }
+            e => panic!("unexpected {e:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_error_ends_turn() {
+        let ev = parse_opencode_line(
+            r#"{"type":"error","sessionID":"ses_x","error":{"name":"UnknownError","data":{"message":"Unexpected server error."}}}"#,
+        );
+        assert_eq!(
+            ev,
+            vec![
+                AgentEvent::Error {
+                    message: "Unexpected server error.".into()
+                },
+                AgentEvent::Done {
+                    ok: false,
+                    result: None
+                }
+            ]
+        );
+        // a provider 401 becomes the actionable re-login hint
+        let auth = parse_opencode_line(
+            r#"{"type":"error","error":{"name":"APIError","data":{"message":"Unauthorized","statusCode":401}}}"#,
+        );
+        match &auth[0] {
+            AgentEvent::Error { message } => assert!(message.contains("opencode auth login")),
+            e => panic!("unexpected {e:?}"),
+        }
+    }
+
+    async fn stream_sh(script: &str) -> (bool, Vec<AgentEvent>) {
+        let child = Command::new("sh")
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let ok = stream_child(child, "opencode", parse_opencode_line, tx).await;
+        let mut evs = vec![];
+        while let Ok(e) = rx.try_recv() {
+            evs.push(e);
+        }
+        (ok, evs)
+    }
+
+    #[tokio::test]
+    async fn opencode_clean_exit_is_success() {
+        let line = r#"{"type":"text","part":{"type":"text","text":"all done"}}"#;
+        let (ok, evs) = stream_sh(&format!("printf '%s\\n' '{line}'")).await;
+        assert!(ok);
+        assert_eq!(
+            evs,
+            vec![
+                AgentEvent::Text {
+                    text: "all done".into()
+                },
+                AgentEvent::Done {
+                    ok: true,
+                    result: None
+                }
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_nonzero_exit_is_failure() {
+        let (ok, evs) = stream_sh("exit 1").await;
+        assert!(!ok);
+        assert!(matches!(evs.first(), Some(AgentEvent::Error { .. })));
+        assert_eq!(
+            evs.last(),
+            Some(&AgentEvent::Done {
+                ok: false,
+                result: None
+            })
+        );
     }
 
     #[test]

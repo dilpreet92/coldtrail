@@ -6,8 +6,11 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
-    /// "claude" | "codex" | "openai"
+    /// "claude" | "codex" | "opencode" | "openai"
     pub agent: Option<String>,
+    /// opencode's `provider/model` (e.g. "opencode/muse-spark-1.3-contributor-free"). Pinned
+    /// because unattended runs can't rely on opencode's last-used model. Unset = opencode's default.
+    pub opencode_model: Option<String>,
     pub provider: Option<Provider>,
     /// Opt-in: actually SEND from the Drafts screen instead of only creating a Gmail draft.
     /// Off by default — the standing guardrail is draft-only until the human turns this on.
@@ -70,6 +73,27 @@ mod tests {
             assert_eq!(got.agent.as_deref(), Some("openai"));
             assert!(!got.auto_send, "auto_send defaults off");
             assert_eq!(got.provider.unwrap().model.as_deref(), Some("llama3.1"));
+        });
+    }
+
+    #[test]
+    fn opencode_model_roundtrips() {
+        crate::testutil::with_home("ct-config-opencode", |_| {
+            crate::home::workspace().unwrap();
+            let c = Config {
+                agent: Some("opencode".into()),
+                opencode_model: Some("opencode/muse-spark-1.3-contributor-free".into()),
+                auto_send: true,
+                ..Default::default()
+            };
+            save(&c).unwrap();
+            let got = load();
+            assert_eq!(got.agent.as_deref(), Some("opencode"));
+            assert_eq!(
+                got.opencode_model.as_deref(),
+                Some("opencode/muse-spark-1.3-contributor-free")
+            );
+            assert!(got.auto_send, "other settings survive the save");
         });
     }
 

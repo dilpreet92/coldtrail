@@ -29,7 +29,7 @@ pub enum Commands {
     Agent,
     /// Detect agents, pick a default provider, and wire Canonical + Gmail MCP
     Setup {
-        /// Force a provider (claude|codex) instead of detecting/asking
+        /// Force a provider (claude|codex|opencode) instead of detecting/asking
         #[arg(long)]
         provider: Option<String>,
         /// Fixed OAuth callback port for the Gmail MCP redirect URI

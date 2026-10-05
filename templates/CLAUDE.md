@@ -49,8 +49,8 @@ sourcing and wait — keep going through enrichment and drafting — unless the 
    — email is MX-verified and generic/placeholder addresses are rejected; `--linkedin` is optional
    when an email is given, and email is optional when `--linkedin` is given (at least one is
    required). Skip any email rung your tools can't run.
-   **Prefer your own web tools for the web rung.** If you have `WebSearch`/`WebFetch` (Claude Code)
-   or `web_search` (Codex), use them to hunt founder emails **and** LinkedIn URLs — ranked, real
+   **Prefer your own web tools for the web rung.** If you have `WebSearch`/`WebFetch` (Claude Code),
+   `web_search` (Codex) or `websearch`/`webfetch` (opencode), use them to hunt founder emails **and** LinkedIn URLs — ranked, real
    results, far higher signal than scraping. `coldtrail find-emails [max]` is the **fallback**
    for backends without a web tool (BYOK / local models): it automates the DuckDuckGo + on-domain
    rung, runs ~6 companies in parallel (so a bigger `max` is cheap), and prints coverage —

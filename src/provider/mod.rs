@@ -17,7 +17,7 @@ pub const GMAIL_TOOL: &str = "mcp__gmail";
 
 /// The resolved runtime backend the agent runs on.
 pub enum Backend {
-    /// Headless Claude Code / Codex (Phase 1) — reuses subscription auth + MCP.
+    /// Headless Claude Code / Codex / opencode — reuses the CLI's own auth.
     Cli(AgentKind),
     /// Any OpenAI-compatible endpoint (Ollama, or a BYOK gateway).
     OpenAi {
@@ -28,7 +28,7 @@ pub enum Backend {
 }
 
 impl Backend {
-    /// Is this a CLI backend (claude/codex)? Only these can send via Gmail MCP today.
+    /// Is this a CLI backend (claude/codex/opencode)? Only these can send via Gmail MCP today.
     pub fn is_cli(&self) -> bool {
         matches!(self, Backend::Cli(_))
     }
@@ -89,7 +89,7 @@ pub enum AgentEvent {
     ToolEnd { ok: bool },
     /// A non-fatal error message to show the user.
     Error { message: String },
-    /// The provider assigned a session id (codex thread) — consumed internally to persist
+    /// The provider assigned a session id (codex thread / opencode session) — consumed internally to persist
     /// for resume; not shown to the user.
     Session { id: String },
     /// The turn finished.

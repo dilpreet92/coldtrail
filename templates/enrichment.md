@@ -43,7 +43,8 @@ everywhere) — skip a rung you can't run rather than stalling.
 
 5. **On-domain + web** — about / team / contact pages, and a web search for
    "<founder> <company> email". **If your runtime has its own web tools, use them for this rung** —
-   Claude Code's `WebSearch` + `WebFetch`, or Codex's built-in `web_search`. They return ranked,
+   Claude Code's `WebSearch` + `WebFetch`, Codex's built-in `web_search`, or opencode's
+   `websearch` + `webfetch`. They return ranked,
    real results and extract far better than HTML scraping. `coldtrail find-emails` is the
    **fallback** for backends with no web tool (BYOK / local models): it automates a DuckDuckGo +
    on-domain scan, but it's slower and lower-signal (snippet noise, throttling), so reach for your
