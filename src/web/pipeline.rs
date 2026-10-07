@@ -217,7 +217,7 @@ pub async fn drafts() -> Result<Json<Vec<DraftDto>>, ApiErr> {
         // the linkedin channel — same recipient rule as `deliver::reviewable`.
         "SELECT o.domain, COALESCE(o.channel,'email'), \
                 CASE WHEN COALESCE(o.channel,'email')='linkedin' THEN k.linkedin_url ELSE k.email END, \
-                o.subject, o.body, o.status, o.gmail_draft_id \
+                o.subject, o.body, o.status, o.gmail_draft_id, o.auto_skip \
          FROM outreach o LEFT JOIN contacts k ON k.id = o.contact_id \
          WHERE o.status IN ('draft_pending','drafted') \
          ORDER BY o.created_at DESC",
@@ -232,6 +232,7 @@ pub async fn drafts() -> Result<Json<Vec<DraftDto>>, ApiErr> {
                 body: r.get(4)?,
                 status: r.get(5)?,
                 gmail_draft_id: r.get(6)?,
+                auto_skip: r.get(7)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -297,6 +298,37 @@ mod tests {
             let email = rows.iter().find(|r| r.domain == "beta.com").unwrap();
             assert_eq!(email.channel, "email");
             assert_eq!(email.to.as_deref(), Some("bob@beta.com"));
+            assert_eq!(li.auto_skip, None);
+        });
+    }
+
+    /// A LinkedIn draft parked out of auto-send still shows in Drafts (the human can send it by
+    /// hand) and carries the reason, so the UI can say why it was skipped.
+    #[test]
+    fn drafts_surface_why_auto_send_skipped_a_draft() {
+        crate::testutil::with_home("ct-web-pipeline-drafts-autoskip", |_| {
+            crate::db::init().unwrap();
+            let c = crate::db::open().unwrap();
+            c.execute(
+                "INSERT INTO companies (domain, source_query) VALUES ('acme.com','q')",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO outreach (domain, channel, body, status, auto_skip) \
+                 VALUES ('acme.com','linkedin','Hi','draft_pending','LinkedIn asks for their email')",
+                [],
+            )
+            .unwrap();
+            let rows = tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(drafts())
+                .unwrap()
+                .0;
+            assert_eq!(
+                rows[0].auto_skip.as_deref(),
+                Some("LinkedIn asks for their email")
+            );
         });
     }
 }

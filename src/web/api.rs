@@ -150,6 +150,8 @@ pub struct DraftDto {
     pub gmail_draft_id: Option<String>,
     /// "email" | "linkedin" — drives which action buttons the Drafts UI renders.
     pub channel: String,
+    /// Why automatic LinkedIn sending skips this draft (None = still queued for auto-send).
+    pub auto_skip: Option<String>,
 }
 
 #[derive(Deserialize)]

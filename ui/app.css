@@ -284,6 +284,7 @@ a.btn{display:inline-block; text-decoration:none}
 .s-linkedin{color:var(--cyan); border-color:var(--cyan-dim)}
 .li-charcount{font-family:var(--mono); font-size:11.5px; color:var(--faint); padding:0 16px 12px; text-align:right}
 .li-charcount.over{color:var(--bad)}
+.li-autoskip{font-size:12.5px; color:var(--warn); padding:0 16px 10px}
 .li-confirm{display:flex; align-items:center; gap:8px}
 .li-confirm-q{font-family:var(--mono); font-size:12px; color:var(--mut)}
 

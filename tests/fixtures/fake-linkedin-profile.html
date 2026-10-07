@@ -62,6 +62,20 @@
           marker tied to the TARGET's /in/<slug> href, so this decoy (wrong slug, and EXCLUDE-scoped
           out of the aside besides) can NEVER confirm. With the old unscoped whole-page Pending check
           it alone would have recorded a false Sent even if the real Send were intercepted.
+
+      Variant states, picked by a `?state=` query param (the fixture server also 302-redirects
+      /in/jane-doe-old to /in/janedoe, the way LinkedIn sends an old profile URL to the member's
+      current vanity URL — so the Pending marker's /in/janedoe never matches the URL the driver was
+      given, only the one it landed on):
+        * state=email   — the live "To verify this member knows you, please enter their email to
+                          connect" gate: Add-a-note reveals an email input above the note, and Send
+                          stays DISABLED until an email is typed (captured from a real dump).
+        * state=pending — this person was already invited: the action bar shows their Pending <a>
+                          from the start and the "…" menu has no Connect (as on real LinkedIn).
+        * state=noconnect — no Connect anywhere and NO invite to this person, but a Pending <a> for a
+                          DIFFERENT person (/in/someone-else) sits inside <main>, outside every
+                          EXCLUDE region: the "already invited" check must not mistake it for this
+                          target's (that would record a false Sent).
     -->
 
     <!-- DECOY: global top-nav. The OLD unscoped "…"/More matcher could hit this app "More"; the
@@ -144,6 +158,10 @@
         <div id="modal" class="hidden artdeco-modal artdeco-modal--layer-default send-invite"
              data-test-modal role="dialog" aria-labelledby="send-invite-modal">
           <h2 id="send-invite-modal">Add a note to your invitation?</h2>
+          <label for="email" id="email-gate" class="hidden">
+            To verify this member knows you, please enter their email to connect.
+            <input name="email" type="email" id="email">
+          </label>
           <div class="artdeco-modal__actionbar">
             <button id="add-note" aria-label="Add a note"><span class="artdeco-button__text">Add a note</span></button>
             <button id="send-without" aria-label="Send without a note"><span class="artdeco-button__text">Send without a note</span></button>
@@ -155,6 +173,31 @@
       const addNote = shadow.getElementById("add-note");
       const textarea = shadow.getElementById("custom-message");
       const send = shadow.getElementById("send");
+      const emailGate = shadow.getElementById("email-gate");
+      const emailInput = shadow.getElementById("email");
+      const state = new URLSearchParams(location.search).get("state");
+
+      // state=pending: already invited — Pending replaces Connect, exactly as on real LinkedIn.
+      if (state === "pending") {
+        connect.remove();
+        const pending = document.createElement("a");
+        pending.id = "pending";
+        pending.setAttribute("href", "https://www.linkedin.com/in/janedoe/");
+        pending.setAttribute("componentkey", "ConnectButtonstate:invitation:urn:li:member:1_pending");
+        pending.setAttribute("aria-label", "Pending, click to withdraw invitation sent to Jane Doe");
+        pending.innerHTML = "<span>Pending</span>";
+        document.getElementById("message").after(pending);
+      }
+      // state=noconnect: no way to connect, and the only Pending on the page is someone else's.
+      if (state === "noconnect") {
+        connect.remove();
+        const other = document.createElement("a");
+        other.setAttribute("href", "https://www.linkedin.com/in/someone-else/");
+        other.setAttribute("componentkey", "ConnectButtonstate:invitation:urn:li:member:999_pending");
+        other.setAttribute("aria-label", "Pending, click to withdraw invitation sent to Someone Else");
+        other.innerHTML = "<span>Pending</span>";
+        document.querySelector("main").appendChild(other);
+      }
 
       // DECOYS: clicking any of the out-of-scope look-alikes navigates AWAY from the profile — the
       // fixture server returns this same page for any path, so the URL changes to /notifications or
@@ -186,6 +229,13 @@
       addNote.addEventListener("click", () => {
         textarea.classList.remove("hidden");
         send.classList.remove("hidden");
+        if (state === "email") {
+          // The email gate: Send stays disabled until an email is entered.
+          emailGate.classList.remove("hidden");
+          shadow.getElementById("send-without").classList.add("hidden");
+          send.disabled = true;
+          emailInput.addEventListener("input", () => { send.disabled = !emailInput.value.includes("@"); });
+        }
         textarea.focus();
       });
 

@@ -38,7 +38,9 @@ CREATE TABLE IF NOT EXISTS outreach (
     created_at      TEXT DEFAULT (datetime('now')),
     sent_at         TEXT,
     status          TEXT DEFAULT 'draft_pending',  -- draft_pending -> drafted -> sent -> replied -> bounced
-    reply           TEXT
+    reply           TEXT,
+    auto_failures   INTEGER NOT NULL DEFAULT 0,    -- failed automatic LinkedIn drives
+    auto_skip       TEXT                           -- set = parked out of auto-send, with the reason
 );
 
 -- Chat history: one row per conversation, with its provider agent-session id for resume.

@@ -217,6 +217,11 @@ pub async fn assist(
             )
                 .into_response())
         }
+        // An earlier invite is still Pending on their profile — record it as sent, nothing to open.
+        Err(AssistError::AlreadyInvited) => {
+            crate::linkedin::send::mark_linkedin_sent(&domain)?;
+            Ok(Json(serde_json::json!({ "already_invited": true })).into_response())
+        }
         Err(AssistError::Failed(reason)) => {
             Ok((StatusCode::INTERNAL_SERVER_ERROR, reason).into_response())
         }

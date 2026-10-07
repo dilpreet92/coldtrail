@@ -38,10 +38,12 @@ pub fn init() -> Result<()> {
             "ALTER TABLE chat_sessions ADD COLUMN running INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
-    // channel/linkedin_url exist in the schema template but predate this feature on old DBs.
+    // These exist in the schema template but predate their features on old DBs.
     for (table, col, decl) in [
         ("outreach", "channel", "TEXT DEFAULT 'email'"),
         ("contacts", "linkedin_url", "TEXT"),
+        ("outreach", "auto_failures", "INTEGER NOT NULL DEFAULT 0"),
+        ("outreach", "auto_skip", "TEXT"),
     ] {
         let exists: bool = c
             .prepare(&format!(
@@ -331,6 +333,32 @@ mod tests {
         let c = Connection::open_in_memory().unwrap();
         c.execute_batch(SCHEMA).unwrap();
         c
+    }
+
+    /// An existing workspace's outreach table predates the auto-send bookkeeping columns; `init`
+    /// must add them (and stay idempotent on a second run).
+    #[test]
+    fn init_adds_auto_send_columns_to_an_existing_outreach_table() {
+        crate::testutil::with_home("ct-db-autosend-cols", |_| {
+            let c = Connection::open(crate::home::path("outreach.db").unwrap()).unwrap();
+            c.execute_batch(
+                "CREATE TABLE outreach (id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT, \
+                 status TEXT DEFAULT 'draft_pending');",
+            )
+            .unwrap();
+            drop(c);
+            init().unwrap();
+            init().unwrap();
+            let c = open().unwrap();
+            for col in ["auto_failures", "auto_skip"] {
+                let has: bool = c
+                    .prepare("SELECT 1 FROM pragma_table_info('outreach') WHERE name=?1")
+                    .unwrap()
+                    .exists([col])
+                    .unwrap();
+                assert!(has, "missing outreach.{col}");
+            }
+        });
     }
 
     #[test]

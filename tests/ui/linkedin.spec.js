@@ -234,3 +234,36 @@ test("Drafts: a LinkedIn draft shows its badge + live char count + Open-in-Linke
   await expect(card.locator(".li-no")).toBeVisible();
   await expect(card.locator(".li-assist")).toHaveCount(0);
 });
+
+test("Drafts: a parked LinkedIn draft says why auto-send skips it and is left out of Send all", async ({
+  page,
+}) => {
+  const parked = {
+    ...LINKEDIN_DRAFT,
+    domain: "franklin.example",
+    to: "https://www.linkedin.com/in/gary",
+    auto_skip: "LinkedIn asks for their email to connect — use Open in LinkedIn and enter it there, or delete this draft",
+  };
+  await page.route("**/api/drafts", (route) => route.fulfill({ json: [LINKEDIN_DRAFT, parked] }));
+  await page.route("**/api/status", (route) =>
+    route.fulfill({ json: { ...STATUS_STUB, linkedin_auto_send: true } })
+  );
+  await page.click('[data-nav="drafts"]');
+  await page.click("#drafts-tabs .chip[data-t='linkedin']");
+
+  const parkedCard = page.locator('.draft[data-domain="franklin.example"]');
+  await expect(parkedCard.locator(".li-autoskip")).toContainText("Auto-send skipped: LinkedIn asks for their email");
+  // The other draft carries no note.
+  await expect(page.locator('.draft[data-domain="acme.com"] .li-autoskip')).toHaveCount(0);
+  // send-pending skips parked drafts, so the bulk button only counts the sendable one.
+  await expect(page.locator("#bulk-li-send")).toHaveText("Send all (1)");
+});
+
+test("Drafts: Open in LinkedIn on an already-invited profile says so instead of erroring", async ({ page }) => {
+  await page.route("**/api/drafts/*/linkedin/assist", (route) =>
+    route.fulfill({ json: { already_invited: true } })
+  );
+  await page.click('[data-nav="drafts"]');
+  await page.locator('.draft[data-channel="linkedin"] .li-assist').click();
+  await expect(page.locator(".toast").last()).toContainText("Already invited on LinkedIn");
+});

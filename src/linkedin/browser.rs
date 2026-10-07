@@ -41,6 +41,13 @@ pub enum InviteOutcome {
     LoggedOut,
     /// A selector/step failed; carries a short reason (a screenshot path may be embedded).
     Failed(String),
+    /// The invite dialog demands the member's email ("To verify this member knows you, please
+    /// enter their email to connect") and keeps Send disabled until it's filled. Not retryable —
+    /// every future attempt hits the same gate.
+    NeedsEmail,
+    /// The profile already shows THIS person's "Pending" invite (no Connect to click) — an earlier
+    /// invite went out. Nothing new is sent.
+    AlreadyInvited,
 }
 
 /// Why an `assist_open` drive did not reach the Staged (note-filled, pre-Send) state. Lets the
@@ -53,6 +60,8 @@ pub enum AssistError {
     LoggedOut,
     /// A step failed (selector/timeout/launch/etc.); carries a short human-readable reason.
     Failed(String),
+    /// The profile already shows this person's "Pending" invite — nothing to send.
+    AlreadyInvited,
 }
 
 #[async_trait]
@@ -363,18 +372,21 @@ __HELPERS__
 ///
 /// Confirmation is then two passes:
 ///  1. PREFERRED: a pending signal whose OWN href, or its nearest composed-ancestor `<a>`'s href,
-///     has a `/in/<slug>` segment EXACTLY equal to the target slug (`__SLUG__`). A DIFFERENT person's
+///     has a `/in/<slug>` segment EXACTLY equal to one of the target slugs (`__SLUGS__`). A DIFFERENT person's
 ///     marker (different slug) fails this.
 ///  2. FALLBACK (defensive, only if no slug match): a pending signal inside `<main>` that carries NO
 ///     href at all — for a legitimate marker that lost its href. A marker with an href to a DIFFERENT
 ///     slug is matched by NEITHER pass (slug mismatch above; has-an-href here), so it can't confirm.
 ///
-/// Requiring a real client rect keeps a hidden/stale template marker from confirming. `__SLUG__` is
-/// substituted (lowercased) before injection; an empty slug disables pass 1 (fail-safe: only the
-/// no-href fallback remains). Run as an IIFE via `evaluate_expression`.
+/// Requiring a real client rect keeps a hidden/stale template marker from confirming. `__SLUGS__` is
+/// the target's slugs (lowercased JS array): the one it was given AND the one LinkedIn landed on
+/// after redirecting an old profile URL to the member's vanity URL — both name the same person. An
+/// empty array disables pass 1 (fail-safe: only the no-href fallback remains). `__ALLOW_NOHREF__`
+/// gates pass 2: on for the post-Send confirmation, off for the pre-Connect "already invited" check,
+/// which must be tied to this target by slug. Run as an IIFE via `evaluate_expression`.
 const PENDING_EXISTS_JS: &str = r#"(() => {
 __HELPERS__
-  const slug = "__SLUG__";
+  const slugs = __SLUGS__;
   const excludeSel = "__EXCLUDE__";
   const excluded = (el) => !!excludeSel && composedTest(el, (n) => { try { return n.matches(excludeSel); } catch (e) { return false; } });
   const inMain = (el) => composedTest(el, (n) => { try { return n.matches('main'); } catch (e) { return false; } });
@@ -415,14 +427,35 @@ __HELPERS__
   for (const el of all) {
     if (!el.getAttribute || !visible(el) || excluded(el)) continue;
     if (!isPending(el)) continue;
-    if (slug && slugOf(hrefOf(el)) === slug) return true;
+    const s = slugOf(hrefOf(el));
+    if (s && slugs.includes(s)) return true;
   }
+  if (!__ALLOW_NOHREF__) return false;
   // Pass 2 (FALLBACK): a pending signal in <main> with NO href — defensive, prefer the slug match.
   for (const el of all) {
     if (!el.getAttribute || !visible(el) || excluded(el)) continue;
     if (!isPending(el)) continue;
     if (hrefOf(el) !== '') continue;
     if (inMain(el)) return true;
+  }
+  return false;
+})()"#;
+
+/// LinkedIn's "To verify this member knows you, please enter their email to connect" gate: a
+/// visible email input inside the open invite dialog (shadow-piercing, EXCLUDE regions dropped).
+/// When it shows, Send stays disabled until the member's email is typed, so an Auto send can never
+/// go through. Run as an IIFE via `evaluate_expression`.
+const EMAIL_GATE_JS: &str = r#"(() => {
+__HELPERS__
+  const excludeSel = "__EXCLUDE__";
+  const excluded = (el) => !!excludeSel && composedTest(el, (n) => { try { return n.matches(excludeSel); } catch (e) { return false; } });
+  const inDialog = (el) => composedTest(el, (n) => { try { return n.matches("[role='dialog'], .artdeco-modal, dialog"); } catch (e) { return false; } });
+  for (const el of allElements()) {
+    if (el.tagName !== 'INPUT') continue;
+    const type = (el.getAttribute('type') || '').toLowerCase();
+    const name = (el.getAttribute('name') || '').toLowerCase();
+    if (type !== 'email' && name !== 'email') continue;
+    if (visible(el) && !excluded(el) && inDialog(el)) return true;
   }
   return false;
 })()"#;
@@ -605,6 +638,11 @@ impl ChromeBrowser {
             }
         }
 
+        // This person's slugs: the one we were given and the one LinkedIn landed on (it redirects
+        // an old /in/<id> to the member's current vanity URL, and its Pending marker carries THAT
+        // slug). Read now, before any click, so it can only be this target's own profile.
+        let slugs = target_slugs(url, &landed_url(&page).await);
+
         // Human-like pause before the first click, so the drive doesn't fire the instant the page
         // settles (no-op against a fixture base).
         self.pace(PACE_STEP_MIN_MS, PACE_STEP_MAX_MS).await;
@@ -613,6 +651,11 @@ impl ChromeBrowser {
         // in-menu Connect item. Each target is located by TEXT/ROLE in JS, tagged, and clicked with
         // a REAL (trusted CDP) gesture — LinkedIn may ignore an untrusted synthetic `.click()`.
         if !locate_connect(&page).await {
+            // No Connect because this person was ALREADY invited: their own Pending marker shows
+            // instead. Recognize it (slug-tied only) so the draft isn't retried forever.
+            if pending_for(&page, &slugs, false, WAIT_TRIES / 4).await {
+                return Ok(InviteOutcome::AlreadyInvited);
+            }
             return Ok(failed(
                 &page,
                 "could not find Connect (no top-level button and none in the More \"…\" overflow menu)",
@@ -680,6 +723,13 @@ impl ChromeBrowser {
             return Ok(InviteOutcome::Staged);
         }
 
+        // The email gate: LinkedIn wants the member's email before it enables Send. We don't type
+        // one, so this can never send — say so now instead of clicking a disabled Send and waiting
+        // out the Pending timeout.
+        if eval_bool(&page, email_gate_js()).await {
+            return Ok(InviteOutcome::NeedsEmail);
+        }
+
         // Human-like pause after the note is filled and before clicking Send (a beat longer — a
         // person re-reads the note before sending).
         self.pace(PACE_PRESEND_MIN_MS, PACE_PRESEND_MAX_MS).await;
@@ -712,8 +762,7 @@ impl ChromeBrowser {
         // the shape of the live FALSE-NEGATIVE bug (invite sent on screen, driver reported Failed).
         // Confirmation is tied to THIS invite's target: the Pending marker's href must carry the
         // profile's `/in/<slug>` (so a sidebar "Pending" for a DIFFERENT person cannot confirm).
-        let slug = profile_slug(url).unwrap_or_default();
-        if !confirm_pending(&page, &slug).await {
+        if !pending_for(&page, &slugs, true, CONFIRM_TRIES).await {
             return Ok(failed(
                 &page,
                 &format!(
@@ -757,7 +806,17 @@ impl ChromeBrowser {
                 session.close().await;
                 Err(AssistError::Failed(reason))
             }
-            // Assist never clicks Send, so a real driver should never report this.
+            Ok(InviteOutcome::AlreadyInvited) => {
+                session.close().await;
+                Err(AssistError::AlreadyInvited)
+            }
+            // Assist never clicks Send, so a real driver should never report these.
+            Ok(InviteOutcome::NeedsEmail) => {
+                session.close().await;
+                Err(AssistError::Failed(
+                    "unexpected: an Assist drive reported NeedsEmail".to_string(),
+                ))
+            }
             Ok(InviteOutcome::Sent) => {
                 session.close().await;
                 Err(AssistError::Failed(
@@ -1000,24 +1059,62 @@ fn profile_slug(profile_url: &str) -> Option<String> {
     }
 }
 
-/// Build the Pending-confirmation IIFE for `slug` (the target `/in/<slug>` this invite belongs to),
-/// injecting the shadow-piercing helpers, the target slug, and the EXCLUDE regions. An empty slug
-/// (URL without an `/in/` segment) disables the slug pass — fail-safe, leaving only the no-href
-/// fallback so a stray/mismatched marker still can't confirm.
-fn pending_exists_js(slug: &str) -> String {
+/// The target's slugs: from the URL we were given and from the URL the page landed on (deduped,
+/// empties dropped). Both name the same person — LinkedIn redirects an old `/in/<id>` URL to the
+/// member's current vanity URL, and the Pending marker carries the landed one.
+fn target_slugs(given_url: &str, landed_url: &str) -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    for s in [profile_slug(given_url), profile_slug(landed_url)]
+        .into_iter()
+        .flatten()
+    {
+        if !v.contains(&s) {
+            v.push(s);
+        }
+    }
+    v
+}
+
+/// The page's current `location.href` (reflects server redirects and SPA URL rewrites); "" if it
+/// can't be read, which simply leaves only the given URL's slug.
+async fn landed_url(page: &Page) -> String {
+    page.evaluate_expression("location.href")
+        .await
+        .ok()
+        .and_then(|r| r.into_value::<String>().ok())
+        .unwrap_or_default()
+}
+
+/// Build the Pending IIFE for `slugs` (this target's `/in/<slug>`s), injecting the shadow-piercing
+/// helpers and the EXCLUDE regions. `allow_nohref` enables the no-href `<main>` fallback pass (see
+/// `PENDING_EXISTS_JS`). No slugs disables the slug pass — fail-safe, so a stray/mismatched marker
+/// still can't match.
+fn pending_exists_js(slugs: &[String], allow_nohref: bool) -> String {
+    // JSON-encode: slugs come from stored/landed URLs, so quote them safely into the JS.
+    let arr = serde_json::to_string(slugs).unwrap_or_else(|_| "[]".into());
     with_helpers(PENDING_EXISTS_JS)
-        .replace("__SLUG__", slug)
+        .replace("__SLUGS__", &arr)
+        .replace(
+            "__ALLOW_NOHREF__",
+            if allow_nohref { "true" } else { "false" },
+        )
         .replace("__EXCLUDE__", EXCLUDE)
 }
 
-/// Poll up to `CONFIRM_TRIES` (~`CONFIRM_TRIES * WAIT_INTERVAL`) for the shadow-piercing Pending
-/// marker (see `PENDING_EXISTS_JS`) that belongs to THIS target's `slug` — the AUTHORITATIVE "invite
-/// sent" signal. Returns true once observed. This is the sole never-false-Sent gate: the caller
-/// returns `Sent` only when this is true, and only for a marker tied to the target's slug (a stray
-/// sidebar "Pending" for a different person cannot satisfy it).
-async fn confirm_pending(page: &Page, slug: &str) -> bool {
-    let js = pending_exists_js(slug);
-    for _ in 0..CONFIRM_TRIES {
+/// JS: is LinkedIn's email-required invite gate showing? See `EMAIL_GATE_JS`.
+fn email_gate_js() -> String {
+    with_helpers(EMAIL_GATE_JS).replace("__EXCLUDE__", EXCLUDE)
+}
+
+/// Poll up to `tries` (~`tries * WAIT_INTERVAL`) for the shadow-piercing Pending marker (see
+/// `PENDING_EXISTS_JS`) that belongs to THIS target's `slugs`. After Send (with `CONFIRM_TRIES`) it
+/// is the AUTHORITATIVE "invite sent" signal and the sole never-false-Sent gate: the caller returns
+/// `Sent` only when this is true, and only for a marker tied to the target (a stray sidebar
+/// "Pending" for a different person cannot satisfy it). Before Connect it detects an invite that
+/// already went out.
+async fn pending_for(page: &Page, slugs: &[String], allow_nohref: bool, tries: u32) -> bool {
+    let js = pending_exists_js(slugs, allow_nohref);
+    for _ in 0..tries {
         if eval_bool(page, js.clone()).await {
             return true;
         }
@@ -1371,6 +1468,29 @@ mod tests {
         ] {
             assert_eq!(profile_slug(url).as_deref(), Some(want), "url: {url}");
         }
+    }
+
+    #[test]
+    fn target_slugs_include_the_landed_vanity_slug_once() {
+        assert_eq!(
+            target_slugs(
+                "https://www.linkedin.com/in/toni-grunwald-b50615176",
+                "https://www.linkedin.com/in/tonigrunwald/"
+            ),
+            vec!["toni-grunwald-b50615176", "tonigrunwald"]
+        );
+        // no redirect -> one slug; unreadable landed URL -> just the given one
+        assert_eq!(
+            target_slugs(
+                "https://www.linkedin.com/in/JaneDoe",
+                "https://www.linkedin.com/in/janedoe/?x=1"
+            ),
+            vec!["janedoe"]
+        );
+        assert_eq!(
+            target_slugs("https://www.linkedin.com/in/janedoe", ""),
+            vec!["janedoe"]
+        );
     }
 
     #[test]

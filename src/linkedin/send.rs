@@ -59,6 +59,64 @@ fn secs_since_last_linkedin_send() -> Option<i64> {
     })
 }
 
+/// Automatic drives that may fail on one draft before `send-pending` stops retrying it. A
+/// failure that is the same on every attempt (e.g. LinkedIn demanding the member's email) parks
+/// the draft at once instead.
+pub const MAX_AUTO_FAILURES: i64 = 3;
+
+/// The `auto_skip` reason for a draft LinkedIn won't let us send without the member's email.
+const NEEDS_EMAIL_REASON: &str =
+    "LinkedIn asks for their email to connect — use Open in LinkedIn and enter it there, or delete this draft";
+
+/// The human part of a driver failure reason: `failed()` appends " — screenshot: …" and
+/// " — html: …" debug paths, which don't belong in the Drafts UI.
+fn short_reason(reason: &str) -> &str {
+    reason
+        .split(" — screenshot:")
+        .next()
+        .unwrap_or(reason)
+        .split(" — html:")
+        .next()
+        .unwrap_or(reason)
+        .trim()
+}
+
+/// Park this domain's pending LinkedIn draft out of the automatic queue (`send-pending` skips rows
+/// with `auto_skip` set). The draft stays in Drafts so the human can still send or delete it.
+fn park_auto(domain: &str, reason: &str) -> anyhow::Result<()> {
+    crate::db::open()?.execute(
+        "UPDATE outreach SET auto_skip=?2 \
+         WHERE domain=?1 AND channel='linkedin' AND status IN ('draft_pending','drafted')",
+        rusqlite::params![domain, reason],
+    )?;
+    Ok(())
+}
+
+/// Count one failed automatic drive on this domain's pending LinkedIn draft; on the
+/// `MAX_AUTO_FAILURES`-th, park it with the last failure as the reason.
+fn record_auto_failure(domain: &str, reason: &str) -> anyhow::Result<()> {
+    let conn = crate::db::open()?;
+    conn.execute(
+        "UPDATE outreach SET auto_failures = auto_failures + 1 \
+         WHERE domain=?1 AND channel='linkedin' AND status IN ('draft_pending','drafted')",
+        [domain],
+    )?;
+    conn.execute(
+        "UPDATE outreach SET auto_skip=?2 \
+         WHERE domain=?1 AND channel='linkedin' AND status IN ('draft_pending','drafted') \
+           AND auto_skip IS NULL AND auto_failures >= ?3",
+        rusqlite::params![
+            domain,
+            format!(
+                "auto-send failed {MAX_AUTO_FAILURES} times (last: {})",
+                short_reason(reason)
+            ),
+            MAX_AUTO_FAILURES
+        ],
+    )?;
+    Ok(())
+}
+
 /// Mark this domain's LinkedIn invite as sent, scoped to the `linkedin` channel so a same-domain
 /// row on another channel (e.g. an email follow-up created by `draft::followup_add`) is never
 /// false-marked. Mirrors the company-status bump the email path does via `mark::run`. Shared by
@@ -145,7 +203,28 @@ pub async fn deliver(
                 "LinkedIn session expired — reconnect needed; stopping"
             ))
         }
-        InviteOutcome::Failed(reason) => Err(anyhow!("LinkedIn invite failed: {reason}")),
+        InviteOutcome::AlreadyInvited => {
+            mark_linkedin_sent(domain)?;
+            Ok(format!(
+                "{} was already invited on LinkedIn (Pending) — marked sent, no new invite",
+                d.to
+            ))
+        }
+        InviteOutcome::NeedsEmail => {
+            if let Err(e) = park_auto(domain, NEEDS_EMAIL_REASON) {
+                crate::logf::log(&format!("{domain}: could not park draft: {e}"));
+            }
+            Err(anyhow!(
+                "LinkedIn requires {}'s email to connect — taken out of auto-send",
+                d.to
+            ))
+        }
+        InviteOutcome::Failed(reason) => {
+            if let Err(e) = record_auto_failure(domain, &reason) {
+                crate::logf::log(&format!("{domain}: could not record failure: {e}"));
+            }
+            Err(anyhow!("LinkedIn invite failed: {reason}"))
+        }
         InviteOutcome::Staged => Err(anyhow!("unexpected Staged outcome from an Auto send")),
     }
 }
@@ -278,6 +357,111 @@ mod tests {
             // The LinkedIn row is sent; the email follow-up row is left untouched.
             assert_eq!(li, "sent");
             assert_eq!(em, "draft_pending", "email row must NOT be false-marked");
+        });
+    }
+
+    /// A pending LinkedIn draft for `domain` whose contact has a LinkedIn URL — the shape
+    /// `deliver::pending_linkedin_domains` (the `send-pending` queue) picks up.
+    fn seed_li_draft(domain: &str) {
+        let c = crate::db::open().unwrap();
+        c.execute(
+            "INSERT INTO companies (domain, source_query) VALUES (?1,'q')",
+            [domain],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO contacts (domain, linkedin_url) VALUES (?1,'https://www.linkedin.com/in/x')",
+            [domain],
+        )
+        .unwrap();
+        let cid = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO outreach (domain, contact_id, channel, subject, body, status) \
+             VALUES (?1, ?2, 'linkedin', '', 'Hi', 'draft_pending')",
+            rusqlite::params![domain, cid],
+        )
+        .unwrap();
+    }
+
+    fn li_row(domain: &str) -> (String, Option<String>) {
+        crate::db::open()
+            .unwrap()
+            .query_row(
+                "SELECT status, auto_skip FROM outreach WHERE domain=?1 AND channel='linkedin'",
+                [domain],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    fn drive(domain: &str, outcome: InviteOutcome) -> Result<String> {
+        let b = FakeBrowser {
+            invite: outcome,
+            ..Default::default()
+        };
+        tokio::runtime::Runtime::new().unwrap().block_on(deliver(
+            domain,
+            &li_draft(),
+            &b,
+            &cfg_on(),
+            10,
+        ))
+    }
+
+    #[test]
+    fn needs_email_parks_the_draft_out_of_the_auto_queue() {
+        crate::testutil::with_home("ct-lisend-needs-email", |_| {
+            crate::db::init().unwrap();
+            seed_li_draft("acme.com");
+            let err = drive("acme.com", InviteOutcome::NeedsEmail)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("email"), "got: {err}");
+            let (status, skip) = li_row("acme.com");
+            assert_eq!(status, "draft_pending", "still a draft the human can send");
+            assert!(skip.unwrap().contains("email"));
+            assert!(crate::deliver::pending_linkedin_domains(None)
+                .unwrap()
+                .is_empty());
+        });
+    }
+
+    #[test]
+    fn repeated_failures_park_after_the_limit() {
+        crate::testutil::with_home("ct-lisend-failures", |_| {
+            crate::db::init().unwrap();
+            seed_li_draft("acme.com");
+            let fail = || {
+                InviteOutcome::Failed(
+                    "could not find Connect — screenshot: /x.png — html: /x.html".into(),
+                )
+            };
+            for _ in 1..MAX_AUTO_FAILURES {
+                assert!(drive("acme.com", fail()).is_err());
+                assert_eq!(li_row("acme.com").1, None, "not parked before the limit");
+                assert_eq!(
+                    crate::deliver::pending_linkedin_domains(None).unwrap(),
+                    vec!["acme.com".to_string()]
+                );
+            }
+            assert!(drive("acme.com", fail()).is_err());
+            let skip = li_row("acme.com").1.expect("parked at the limit");
+            assert!(skip.contains("could not find Connect"), "got: {skip}");
+            assert!(!skip.contains("screenshot"), "debug paths stripped: {skip}");
+            assert!(crate::deliver::pending_linkedin_domains(None)
+                .unwrap()
+                .is_empty());
+        });
+    }
+
+    #[test]
+    fn already_invited_marks_sent_without_a_new_invite() {
+        crate::testutil::with_home("ct-lisend-already", |_| {
+            crate::db::init().unwrap();
+            seed_li_draft("acme.com");
+            let msg = drive("acme.com", InviteOutcome::AlreadyInvited).unwrap();
+            assert!(msg.contains("already invited"), "got: {msg}");
+            assert_eq!(li_row("acme.com").0, "sent");
         });
     }
 

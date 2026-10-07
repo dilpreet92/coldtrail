@@ -1107,9 +1107,11 @@ function linkedinDraftRow(r, liAuto) {
       <span class="status s-${esc(r.status)}">${esc(DRAFT_LABEL[r.status] || r.status)}</span>
       ${actions}
     </div>`;
+  // Why automatic sending (cron / Send all) skips this draft — it stays here to send by hand.
+  const skipNote = r.auto_skip ? `<div class="li-autoskip">⚠ Auto-send skipped: ${esc(r.auto_skip)}</div>` : "";
   const bodyBlock = `<textarea class="draft-body-edit li-note" rows="6" spellcheck="false">${esc(note)}</textarea>
       <div class="li-charcount${len > 300 ? " over" : ""}">${len}/300</div>`;
-  return `<div class="draft" data-domain="${escAttr(r.domain)}" data-channel="linkedin">${head}${bodyBlock}</div>`;
+  return `<div class="draft" data-domain="${escAttr(r.domain)}" data-channel="linkedin">${head}${skipNote}${bodyBlock}</div>`;
 }
 
 loaders.drafts = async () => {
@@ -1181,8 +1183,10 @@ loaders.drafts = async () => {
   // auto-send is on — the LinkedIn bulk sender is also kicked. With auto-send off, All's
   // Send-all only touches the email drafts (the confirm says so).
   const pendingEmail = rows.filter((r) => r.status === "draft_pending" && r.channel !== "linkedin");
+  // Parked drafts (auto_skip) are left out: `send-pending linkedin` skips them, so they'd never
+  // leave this count and "Send all" would promise sends it won't make.
   const pendingLinkedin = rows.filter(
-    (r) => r.channel === "linkedin" && (r.status === "draft_pending" || r.status === "drafted")
+    (r) => r.channel === "linkedin" && (r.status === "draft_pending" || r.status === "drafted") && !r.auto_skip
   );
   liLastPendingCount = pendingLinkedin.length; // read by liBulkStart's poller
   const liAutoOn = !!st.linkedin_auto_send;
@@ -1364,6 +1368,7 @@ loaders.drafts = async () => {
         await postJSON(`/api/drafts/${encodeURIComponent(dom)}`, edits(card)); // persist the edited note first
         const r = await postJSON(`/api/drafts/${encodeURIComponent(dom)}/linkedin/assist`, {});
         if (r.staged) { liStagedDomains.add(dom); toast("Opened in LinkedIn — review and click Send there.", "ok"); await loaders.drafts(); }
+        else if (r.already_invited) { toast("Already invited on LinkedIn (Pending) — marked as sent.", "ok"); await loaders.drafts(); }
         else { b.disabled = false; b.textContent = "Open in LinkedIn"; toast("could not open LinkedIn", "err"); }
       } catch (e) { b.disabled = false; b.textContent = "Open in LinkedIn"; toast(e.message, "err"); }
     })

@@ -176,7 +176,9 @@ pub async fn run(domain: &str) -> Result<()> {
 /// Pending LinkedIn drafts eligible for the sequential bulk sender (`send_pending`): outreach rows
 /// still `draft_pending`/`drafted` on the `linkedin` channel whose company has a contact with a
 /// `linkedin_url` on file — the same recipient rule `reviewable` enforces, checked up front here so
-/// the bulk loop never queues a domain it can't actually send. Oldest-drafted first, so a bulk run
+/// the bulk loop never queues a domain it can't actually send — and not parked (`auto_skip`, set by
+/// `linkedin::send` when LinkedIn demands the member's email or after `MAX_AUTO_FAILURES` failed
+/// drives), so an unsendable draft isn't retried on every run. Oldest-drafted first, so a bulk run
 /// works the queue in the order the drafts were created. `limit` bounds how many domains are
 /// fetched (`None` = no bound); it is the same knob as the CLI's `max` argument, so passing it
 /// through to the query (rather than the loop) keeps "how many to attempt" and "how many exist" in
@@ -187,7 +189,7 @@ pub fn pending_linkedin_domains(limit: Option<usize>) -> Result<Vec<String>> {
     let mut stmt = c.prepare(
         "SELECT o.domain FROM outreach o JOIN contacts k ON k.id = o.contact_id \
          WHERE COALESCE(o.channel,'email')='linkedin' AND o.status IN ('draft_pending','drafted') \
-           AND k.linkedin_url IS NOT NULL \
+           AND k.linkedin_url IS NOT NULL AND o.auto_skip IS NULL \
          GROUP BY o.domain ORDER BY MIN(o.created_at) ASC LIMIT ?1",
     )?;
     let rows = stmt
@@ -224,7 +226,8 @@ fn is_linkedin_stopping_error(msg: &str) -> bool {
 /// sending window, the browser is busy, or the session needs reconnecting) — every domain still
 /// queued would fail the same way, so there's nothing to gain by continuing; or the queue (bounded
 /// by `max`, if given) is exhausted. A domain-specific failure is logged and skipped — its draft
-/// stays `draft_pending` for a later attempt — so one bad row can't wedge the whole run. ALWAYS
+/// stays `draft_pending` for a later attempt, up to `linkedin::send::MAX_AUTO_FAILURES` failures
+/// before it's parked out of this queue — so one bad row can't wedge the whole run. ALWAYS
 /// returns `Ok`: every stop condition here (including a cap reached) is a normal outcome for an
 /// unattended bulk send, never a process failure.
 pub async fn send_pending(channel: &str, max: Option<usize>) -> Result<()> {

@@ -85,14 +85,16 @@ mod browser;
 use browser::{ChromeBrowser, InviteOutcome, LinkedInBrowser, SendMode};
 
 /// Serve the fixture HTML for any request on an ephemeral 127.0.0.1 port. Returns the base URL.
-/// The server thread runs for the lifetime of the test process.
+/// The server thread runs for the lifetime of the test process. `/in/jane-doe-old…` answers with a
+/// 302 to `/in/janedoe…` (query kept) — how LinkedIn redirects an old profile URL to the member's
+/// current vanity URL.
 fn serve_fixture() -> String {
     let html = include_str!("fixtures/fake-linkedin-profile.html").to_string();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let port = listener.local_addr().expect("local addr").port();
 
     std::thread::spawn(move || {
-        let response = format!(
+        let ok = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
              Content-Length: {}\r\nConnection: close\r\n\r\n{}",
             html.len(),
@@ -100,15 +102,85 @@ fn serve_fixture() -> String {
         );
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
-            // Drain the request line/headers so the client doesn't see a reset; content ignored.
-            let mut buf = [0u8; 1024];
-            let _ = stream.read(&mut buf);
+            // Read the request line for the path; the rest of the request is ignored.
+            let mut buf = [0u8; 2048];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let path = req.split_whitespace().nth(1).unwrap_or("/");
+            let response = match path.strip_prefix("/in/jane-doe-old") {
+                Some(rest) => format!(
+                    "HTTP/1.1 302 Found\r\nLocation: /in/janedoe{rest}\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                ),
+                None => ok.clone(),
+            };
             let _ = stream.write_all(response.as_bytes());
             let _ = stream.flush();
         }
     });
 
     format!("http://127.0.0.1:{port}")
+}
+
+/// Drive one Auto invite against a fresh fixture server at `path`. These tests each launch their
+/// own Chrome and share `COLDTRAIL_LINKEDIN_BASE`, so run them serially (`--test-threads=1`).
+async fn auto_on_fixture(path: &str) -> InviteOutcome {
+    let base = serve_fixture();
+    std::env::set_var("COLDTRAIL_LINKEDIN_BASE", &base);
+    ChromeBrowser::for_fixture_from_env()
+        .send_connection_request(
+            &format!("{base}{path}"),
+            "Hi Jane —\n\nquick note.",
+            SendMode::Auto,
+        )
+        .await
+        .expect("auto drive should not error")
+}
+
+/// LinkedIn's "enter their email to connect" gate keeps Send disabled: report NeedsEmail at once
+/// (no Send click, no 18s wait for a Pending that can never appear) so the caller can stop retrying.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a real Chrome binary + display; run with --ignored"]
+async fn email_gate_reports_needs_email() {
+    assert_eq!(
+        auto_on_fixture("/in/janedoe?state=email").await,
+        InviteOutcome::NeedsEmail
+    );
+}
+
+/// The stored URL redirects to the member's vanity URL, so the Pending marker carries the slug the
+/// driver LANDED on, not the one it was given — a real send must still confirm.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a real Chrome binary + display; run with --ignored"]
+async fn confirms_sent_on_a_redirected_profile_url() {
+    assert_eq!(
+        auto_on_fixture("/in/jane-doe-old").await,
+        InviteOutcome::Sent
+    );
+}
+
+/// The live loop: an invite that already went out shows Pending (no Connect). Recognize it as
+/// already invited — through the same old-URL redirect — instead of failing on "no Connect".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a real Chrome binary + display; run with --ignored"]
+async fn already_pending_profile_reports_already_invited() {
+    assert_eq!(
+        auto_on_fixture("/in/jane-doe-old?state=pending").await,
+        InviteOutcome::AlreadyInvited
+    );
+}
+
+/// The never-false-Sent guard for the "already invited" check: no Connect and no invite to THIS
+/// person, while someone else's Pending sits in <main>. Must stay a plain failure — reporting
+/// AlreadyInvited here would mark a draft sent that never went out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a real Chrome binary + display; run with --ignored"]
+async fn someone_elses_pending_is_not_already_invited() {
+    let out = auto_on_fixture("/in/janedoe?state=noconnect").await;
+    assert!(
+        matches!(&out, InviteOutcome::Failed(r) if r.contains("could not find Connect")),
+        "got {out:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
