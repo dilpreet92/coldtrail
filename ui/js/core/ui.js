@@ -1,7 +1,10 @@
 // Feedback and overlays (spec §4): toasts, confirm/dialog, drawer, menu. Overlays live in
 // #overlays, stack (Esc closes the top one), trap Tab inside, make the app behind a modal inert,
-// and give focus back to whatever opened them. Every open overlay carries [data-overlay], which
-// keys.js checks so page shortcuts stay off while one is open.
+// and give focus back to whatever opened them: the `opener` option when given (a menu's anchor),
+// else the element focused at open, else #view. Pass `opener` when the triggering control is
+// known: WebKit does not focus a clicked button, so a mouse-opened overlay sees <body> focused.
+// Every open overlay carries [data-overlay], which keys.js checks so page shortcuts stay off
+// while one is open.
 //
 // Class hooks for components.css: .overlay (.overlay-dialog | .overlay-drawer: the backdrop),
 // .dialog > .dialog-head (.dialog-title, .overlay-close) + .dialog-body + .dialog-actions
@@ -192,12 +195,13 @@ function listen(on) {
 
 /**
  * Put an overlay on the stack. el: the root appended to #overlays; panel: the element that
- * holds focus. Returns the entry with close(reason, { restore = true }).
+ * holds focus; opener: where focus goes back on close (default: the element focused now).
+ * Returns the entry with close(reason, { restore = true }).
  */
-function pushOverlay({ el, panel, modal, kind, anchor = null, onKey = null, onClose = null, initialFocus }) {
+function pushOverlay({ el, panel, modal, kind, anchor = null, opener = null, onKey = null, onClose = null, initialFocus }) {
   const active = document.activeElement;
   const entry = { el, panel, modal, kind, anchor, onKey, closed: false };
-  entry.opener = active && active !== document.body ? active : null;
+  entry.opener = opener || (active && active !== document.body ? active : null);
   entry.close = (reason = 'api', { restore = true } = {}) => {
     if (entry.closed) return;
     entry.closed = true;
@@ -293,13 +297,13 @@ export function toast(text, kind = 'info') {
 
 /**
  * openDialog({ title, content, actions: [{ label, kind = 'secondary', onClick?, autofocus? }],
- * onClose?(reason) }) → { close, el }. An action without onClick just closes. Otherwise the
- * dialog closes after onClick unless it returns (or resolves to) false; while a returned Promise
- * is pending the buttons are disabled, and if it rejects the dialog stays open and its message
- * is shown as an error toast. Initial focus: [data-autofocus] / [autofocus], else the first
- * field in the body, else the first action.
+ * onClose?(reason), opener? }) → { close, el }. An action without onClick just closes.
+ * Otherwise the dialog closes after onClick unless it returns (or resolves to) false; while a
+ * returned Promise is pending the buttons are disabled, and if it rejects the dialog stays open
+ * and its message is shown as an error toast. Initial focus: [data-autofocus] / [autofocus],
+ * else the first field in the body, else the first action.
  */
-export function openDialog({ title, content, actions = [], onClose, role = 'dialog' }) {
+export function openDialog({ title, content, actions = [], onClose, role = 'dialog', opener = null }) {
   const titleId = nextId('dialog-title');
   const bodyId = nextId('dialog-body');
   let entry;
@@ -360,6 +364,7 @@ export function openDialog({ title, content, actions = [], onClose, role = 'dial
     panel,
     modal: true,
     kind: 'dialog',
+    opener,
     onClose,
     initialFocus: () =>
       panel.querySelector('[data-autofocus],[autofocus]') || tabbables(body)[0] || buttons[0] || null,
@@ -369,16 +374,18 @@ export function openDialog({ title, content, actions = [], onClose, role = 'dial
 }
 
 /**
- * confirmDialog({ title, body, confirmText = 'Confirm', cancelText = 'Cancel', danger = false })
- * → Promise<boolean>: true only when the confirm button is pressed. Danger dialogs focus Cancel.
+ * confirmDialog({ title, body, confirmText = 'Confirm', cancelText = 'Cancel', danger = false,
+ * opener? }) → Promise<boolean>: true only when the confirm button is pressed. Danger dialogs
+ * focus Cancel.
  */
-export function confirmDialog({ title, body, confirmText = 'Confirm', cancelText = 'Cancel', danger = false }) {
+export function confirmDialog({ title, body, confirmText = 'Confirm', cancelText = 'Cancel', danger = false, opener = null }) {
   return new Promise((resolve) => {
     let confirmed = false;
     openDialog({
       title,
       content: body,
       role: 'alertdialog',
+      opener,
       actions: [
         { label: cancelText, kind: 'secondary', autofocus: danger },
         { label: confirmText, kind: danger ? 'danger' : 'primary', autofocus: !danger, onClick: () => { confirmed = true; } },
@@ -389,11 +396,11 @@ export function confirmDialog({ title, body, confirmText = 'Confirm', cancelText
 }
 
 /**
- * openDrawer({ title, content, onClose?(reason) }) → { close, el, body, setTitle }. A right-side
- * modal panel; reason is 'escape' | 'backdrop' | 'button' | 'api' (close() from code), so a
- * route-driven drawer can update the URL only for user closes.
+ * openDrawer({ title, content, onClose?(reason), opener? }) → { close, el, body, setTitle }. A
+ * right-side modal panel; reason is 'escape' | 'backdrop' | 'button' | 'api' (close() from
+ * code), so a route-driven drawer can update the URL only for user closes.
  */
-export function openDrawer({ title, content, onClose }) {
+export function openDrawer({ title, content, onClose, opener = null }) {
   const titleId = nextId('drawer-title');
   let entry;
   const heading = h('h2', { class: 'drawer-title', id: titleId }, title);
@@ -410,6 +417,7 @@ export function openDrawer({ title, content, onClose }) {
     panel,
     modal: true,
     kind: 'drawer',
+    opener,
     onClose,
     initialFocus: () => panel.querySelector('[data-autofocus],[autofocus]'),
   });
@@ -498,6 +506,7 @@ export function openMenu(anchor, items) {
     modal: false,
     kind: 'menu',
     anchor,
+    opener: anchor,
     onKey,
     onClose: () => anchor.setAttribute('aria-expanded', 'false'),
     initialFocus: () => {
