@@ -32,11 +32,37 @@ test('links: only http(s) become anchors, with target and rel', () => {
 });
 
 test('a link cannot break out of its href attribute', () => {
-  const out = renderMarkdown('[x](https://a.b"onmouseover="alert(1))');
-  assert.doesNotMatch(out, /<a [^>]*\sonmouseover=/i);
+  // This one does become an anchor: the quotes are escaped inside href, not an attribute.
+  const out = renderMarkdown('[x](https://a.b"onmouseover="x)');
+  assert.equal(
+    out,
+    '<p><a href="https://a.b&quot;onmouseover=&quot;x" target="_blank" rel="noopener noreferrer">x</a></p>',
+  );
+  assert.doesNotMatch(out, /\sonmouseover=/i);
   assert.doesNotMatch(out, /"onmouseover/);
+  // Parentheses in the URL: no anchor at all, the whole thing stays text.
+  const parens = renderMarkdown('[x](https://a.b"onmouseover="alert(1))');
+  assert.doesNotMatch(parens, /<a\b/i);
+  assert.doesNotMatch(parens, /"onmouseover/);
   const label = renderMarkdown('[<img src=x onerror=1>](https://a.b)');
   assert.doesNotMatch(label, /<img/i);
+});
+
+test('inline code inside a link', () => {
+  assert.equal(
+    renderMarkdown('[`acme.com`](https://acme.com)'),
+    '<p><a href="https://acme.com" target="_blank" rel="noopener noreferrer"><code>acme.com</code></a></p>',
+  );
+  assert.equal(
+    renderMarkdown('See [`coldtrail status`](https://a.b/c) and [the `docs` page](https://a.b/d)'),
+    '<p>See <a href="https://a.b/c" target="_blank" rel="noopener noreferrer"><code>coldtrail status</code></a>' +
+      ' and <a href="https://a.b/d" target="_blank" rel="noopener noreferrer">the <code>docs</code> page</a></p>',
+  );
+  // A code span inside the URL is not a URL: the link stays literal text.
+  assert.equal(renderMarkdown('[a](https://x`y`z)'), '<p>[a](https://x<code>y</code>z)</p>');
+  for (const md of ['[`a`](https://a.b)', '*[`a`](https://a.b)*', '- [`a`](https://a.b)', '[a](https://x`y`z)', '`a` [`b`](https://c.d) `e`']) {
+    assert.ok(!renderMarkdown(md).includes('\u0000'), `no placeholder leaks: ${md}`);
+  }
 });
 
 test('bold, italic and inline code', () => {

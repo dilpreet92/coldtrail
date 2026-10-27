@@ -16,15 +16,19 @@ function inline(raw) {
   let s = esc(raw);
   // Code spans first, so nothing inside them is formatted.
   s = s.replace(/`([^`\n]+)`/g, (_, code) => keep(`<code>${code}</code>`));
-  // Links: the URL is already escaped (quotes included), so it cannot leave the attribute.
+  // Links: the URL is already escaped (quotes included), so it cannot leave the attribute. The
+  // text may hold code-span slots (restored below); a URL holding one is not a URL, so it stays
+  // literal text.
   s = s.replace(/\[([^\]\n]+)\]\(([^()\s]+)\)/g, (m, text, url) =>
-    /^https?:\/\/[^\s/]/i.test(url)
+    /^https?:\/\/[^\s/]/i.test(url) && !url.includes('\u0000')
       ? keep(`<a href="${url}" target="_blank" rel="noopener noreferrer">${text}</a>`)
       : m,
   );
   s = s.replace(/\*\*(?=\S)([^*\n]*?\S)\*\*/g, '<strong>$1</strong>');
   s = s.replace(/(^|[^*\w])\*(?=[^\s*])([^*\n]*?[^\s*])\*(?![*\w])/g, '$1<em>$2</em>');
-  return s.replace(/\u0000(\d+)\u0000/g, (_, i) => slots[Number(i)]);
+  // Slots nest (a link slot can hold a code slot), and a slot only ever refers to earlier ones.
+  const restore = (t) => t.replace(/\u0000(\d+)\u0000/g, (_, i) => restore(slots[Number(i)]));
+  return restore(s);
 }
 
 /** Render agent text to an HTML string using only the safe subset above. */
