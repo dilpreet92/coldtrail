@@ -97,6 +97,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/onboarding/files", get(onboarding::files))
         .route("/api/onboarding/provider", post(onboarding::set_provider))
         .route("/api/provider/probe", post(onboarding::probe_provider))
+        .route(
+            "/api/provider/opencode/models",
+            get(onboarding::opencode_models),
+        )
         .route("/api/onboarding/mcp", post(onboarding::set_mcp))
         .route("/api/onboarding/message", post(onboarding::set_message))
         .route(

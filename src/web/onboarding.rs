@@ -1,9 +1,14 @@
 //! Onboarding over HTTP — the browser equivalent of `coldtrail setup`, reusing the
 //! same detection + wiring logic.
 
+use std::path::Path;
+use std::process::Stdio;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use axum::Json;
 
-use super::api::{AgentDto, McpReq, MsgResp, ProviderReq, StatusDto, TomlReq};
+use super::api::{AgentDto, McpReq, MsgResp, OpencodeModelsDto, ProviderReq, StatusDto, TomlReq};
 use super::ApiErr;
 use crate::agents::{self, AgentKind};
 use crate::setup;
@@ -66,6 +71,7 @@ pub async fn status() -> Result<Json<StatusDto>, ApiErr> {
         base_url,
         model,
         key_set,
+        opencode_model: cfg.opencode_model,
         discovery_connected,
         destination_connected,
         auto_send: cfg.auto_send,
@@ -275,12 +281,95 @@ pub async fn set_provider(Json(req): Json<ProviderReq>) -> Result<Json<MsgResp>,
             {
                 return Err(anyhow::anyhow!("{} is not installed", kind.label()).into());
             }
-            let mut c = crate::config::load();
-            c.agent = Some(kind.config_value().to_string());
-            crate::config::save(&c)?;
+            save_cli_agent(kind, req.opencode_model.as_deref())?;
             Ok(Json(MsgResp::ok()))
         }
     }
+}
+
+/// Make CLI agent `kind` the provider. For opencode, `opencode_model` pins the model chat and
+/// scheduled runs pass to `opencode run`: a non-blank value is saved trimmed, a blank one
+/// clears the pin (opencode's own default), and `None` keeps what is saved. Other agents
+/// ignore it, so switching away and back keeps the pin.
+fn save_cli_agent(kind: AgentKind, opencode_model: Option<&str>) -> anyhow::Result<()> {
+    let mut c = crate::config::load();
+    c.agent = Some(kind.config_value().to_string());
+    if let (AgentKind::Opencode, Some(m)) = (kind, opencode_model) {
+        let m = m.trim();
+        c.opencode_model = (!m.is_empty()).then(|| m.to_string());
+    }
+    crate::config::save(&c)
+}
+
+/// How long a successful `opencode models` listing is reused before it runs again.
+const MODELS_TTL: Duration = Duration::from_secs(10 * 60);
+/// `opencode models` gets this long before the picker falls back to free text.
+const MODELS_TIMEOUT: Duration = Duration::from_secs(5);
+/// The last non-empty listing and when it was taken. Failures aren't cached, so installing or
+/// signing in to opencode shows up on the next request.
+static MODELS_CACHE: Mutex<Option<(Instant, Vec<String>)>> = Mutex::new(None);
+
+/// The models the opencode card's picker offers. When opencode is missing, fails or is slow
+/// this is still a 200: the list is empty and `message` says why (the UI then takes free text).
+pub async fn opencode_models() -> Result<Json<OpencodeModelsDto>, ApiErr> {
+    let cached = MODELS_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|(at, _)| at.elapsed() < MODELS_TTL)
+        .map(|(_, models)| models.clone());
+    if let Some(models) = cached {
+        return Ok(Json(OpencodeModelsDto {
+            models,
+            message: None,
+        }));
+    }
+    // The workspace is the cwd opencode turns run in, so a project config there counts too.
+    let ws = crate::home::workspace()?;
+    let program = agents::program_path(AgentKind::Opencode);
+    let (models, message) = match run_models(&program, &ws, MODELS_TIMEOUT).await {
+        Some(models) if !models.is_empty() => {
+            *MODELS_CACHE.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some((Instant::now(), models.clone()));
+            (models, None)
+        }
+        Some(_) => (Vec::new(), Some("opencode didn't list any models".into())),
+        None => (
+            Vec::new(),
+            Some("opencode isn't installed or didn't respond".into()),
+        ),
+    };
+    Ok(Json(OpencodeModelsDto { models, message }))
+}
+
+/// Run `<program> models` in `cwd` with the same environment as opencode turns. `None` when it
+/// can't start, exits non-zero, or outlives `limit` (the child is killed then).
+async fn run_models(program: &Path, cwd: &Path, limit: Duration) -> Option<Vec<String>> {
+    let out = tokio::process::Command::new(program)
+        .arg("models")
+        .envs(crate::provider::cli::OPENCODE_ENV)
+        .current_dir(cwd)
+        // opencode waits on an open stdin before running — it must be closed.
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let out = tokio::time::timeout(limit, out).await.ok()?.ok()?;
+    out.status
+        .success()
+        .then(|| parse_models(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Model ids from `opencode models` output: one `provider/model` per line. Blank lines and
+/// anything with inner whitespace (log or warning lines) are dropped; repeats keep the first.
+pub fn parse_models(stdout: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.contains(char::is_whitespace))
+        .filter(|l| seen.insert(*l))
+        .map(str::to_string)
+        .collect()
 }
 
 pub async fn set_mcp(Json(req): Json<McpReq>) -> Result<Json<MsgResp>, ApiErr> {
@@ -361,4 +450,111 @@ fn file_differs(name: &str, default: &str) -> bool {
         .and_then(|p| std::fs::read_to_string(p).ok())
         .map(|s| s.trim() != default.trim())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_models_trims_dedupes_and_skips_noise() {
+        assert_eq!(
+            parse_models("a/b\n\n  c/d \na/b\nWARN something\n"),
+            vec!["a/b".to_string(), "c/d".to_string()]
+        );
+        assert!(parse_models("").is_empty());
+    }
+
+    #[test]
+    fn status_reports_opencode_model() {
+        crate::testutil::with_home("ct-web-onboarding-model-status", |dir| {
+            crate::home::workspace().unwrap();
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            std::fs::write(
+                dir.join("config.toml"),
+                "agent = \"opencode\"\nopencode_model = \"opencode/grok-code\"\n",
+            )
+            .unwrap();
+            let s = rt.block_on(status()).unwrap().0;
+            assert_eq!(s.opencode_model.as_deref(), Some("opencode/grok-code"));
+            std::fs::write(dir.join("config.toml"), "agent = \"opencode\"\n").unwrap();
+            assert_eq!(rt.block_on(status()).unwrap().0.opencode_model, None);
+        });
+    }
+
+    #[test]
+    fn set_provider_saves_and_clears_opencode_model() {
+        crate::testutil::with_home("ct-web-onboarding-model-save", |_| {
+            crate::home::workspace().unwrap();
+            let saved = || crate::config::load().opencode_model;
+            save_cli_agent(AgentKind::Opencode, Some("  opencode/grok-code ")).unwrap();
+            assert_eq!(crate::config::load().agent.as_deref(), Some("opencode"));
+            assert_eq!(saved().as_deref(), Some("opencode/grok-code"));
+            // Absent keeps the pin (a plain card click doesn't wipe it).
+            save_cli_agent(AgentKind::Opencode, None).unwrap();
+            assert_eq!(saved().as_deref(), Some("opencode/grok-code"));
+            // Another agent ignores the field and keeps the pin for a switch back.
+            save_cli_agent(AgentKind::Claude, Some("x/y")).unwrap();
+            assert_eq!(crate::config::load().agent.as_deref(), Some("claude"));
+            assert_eq!(saved().as_deref(), Some("opencode/grok-code"));
+            // Blank clears it, back to opencode's own default.
+            save_cli_agent(AgentKind::Opencode, Some("")).unwrap();
+            assert_eq!(saved(), None);
+        });
+    }
+
+    /// A fresh listing is served as-is, without running opencode again.
+    #[test]
+    fn opencode_models_reuses_a_fresh_listing() {
+        let listing = vec!["cached/model".to_string()];
+        *MODELS_CACHE.lock().unwrap() = Some((Instant::now(), listing.clone()));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let got = rt.block_on(opencode_models()).unwrap().0;
+        *MODELS_CACHE.lock().unwrap() = None;
+        assert_eq!(got.models, listing);
+        assert_eq!(got.message, None);
+    }
+
+    /// A stand-in `opencode` that runs `body` as a shell script.
+    #[cfg(unix)]
+    fn fake_opencode(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join("opencode");
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_models_lists_and_reports_failures() {
+        crate::testutil::with_home("ct-web-onboarding-models", |dir| {
+            let ws = crate::home::workspace().unwrap();
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let limit = Duration::from_secs(5);
+            let ok = fake_opencode(
+                &dir.join("ok"),
+                r#"[ "$1" = models ] && printf 'b/one\na/two\n'"#,
+            );
+            assert_eq!(
+                rt.block_on(run_models(&ok, &ws, limit)),
+                Some(vec!["b/one".to_string(), "a/two".to_string()])
+            );
+            let failing = fake_opencode(&dir.join("fail"), "echo x/y; exit 1");
+            assert_eq!(rt.block_on(run_models(&failing, &ws, limit)), None);
+            assert_eq!(
+                rt.block_on(run_models(&dir.join("missing"), &ws, limit)),
+                None
+            );
+            // Past the limit the child is killed and the call gives up.
+            let slow = fake_opencode(&dir.join("slow"), "exec sleep 5");
+            let t = Instant::now();
+            assert_eq!(
+                rt.block_on(run_models(&slow, &ws, Duration::from_millis(200))),
+                None
+            );
+            assert!(t.elapsed() < Duration::from_secs(3));
+        });
+    }
 }

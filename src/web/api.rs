@@ -25,6 +25,8 @@ pub struct StatusDto {
     pub base_url: Option<String>,
     pub model: Option<String>,
     pub key_set: bool,
+    /// The model opencode runs are pinned to (`provider/model`); None = opencode's default.
+    pub opencode_model: Option<String>,
     /// Unified connected state for the chosen provider (MCP-wired for CLI, token for BYOK).
     pub discovery_connected: bool,
     pub destination_connected: bool,
@@ -365,6 +367,17 @@ pub struct ProviderReq {
     pub base_url: Option<String>,
     pub model: Option<String>,
     pub api_key: Option<String>,
+    /// For provider = "opencode": the `provider/model` to pin; "" clears the pin, absent keeps it.
+    pub opencode_model: Option<String>,
+}
+
+/// `GET /api/provider/opencode/models` — what the opencode model picker offers.
+#[derive(Serialize)]
+pub struct OpencodeModelsDto {
+    /// `provider/model` ids in the order `opencode models` lists them.
+    pub models: Vec<String>,
+    /// Why `models` is empty; None when the listing worked.
+    pub message: Option<String>,
 }
 
 #[derive(Deserialize)]
