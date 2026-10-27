@@ -567,12 +567,15 @@ mod tests {
 
     #[test]
     fn send_pending_rejects_non_linkedin_channel_without_touching_the_db() {
-        // No `with_home`/`db::init` here on purpose: an unsupported channel must return before
-        // ever touching the database, so this must not panic even with no workspace set up.
-        let res = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(send_pending("email", None));
-        assert!(res.is_ok());
+        // An unsupported channel returns before reading any outreach rows. `send_pending` still
+        // runs `db::init` first, so this holds a temp home: unguarded, that init raced other
+        // tests' COLDTRAIL_HOME (and, with none set, would open the real ~/.coldtrail).
+        crate::testutil::with_home("ct-deliver-send-pending-email", |_| {
+            let res = tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(send_pending("email", None));
+            assert!(res.is_ok());
+        });
     }
 
     #[test]
