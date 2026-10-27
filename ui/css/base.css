@@ -1,0 +1,168 @@
+/* Base: reset, typography, app layout, focus ring. Shared components live in components.css;
+   screen-specific styles in css/views/<name>.css (loaded by the router). */
+
+/* ---- Reset ---- */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  min-height: 100dvh;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.45 var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+h1, h2, h3, h4, p, figure, blockquote, dl, dd, pre { margin: 0; }
+
+img, video { max-width: 100%; height: auto; }
+svg { flex-shrink: 0; }
+
+button, input, select, textarea { font: inherit; color: inherit; letter-spacing: inherit; }
+button { cursor: pointer; }
+button:disabled { cursor: default; }
+textarea { resize: vertical; }
+
+a { color: var(--accent); text-underline-offset: 2px; }
+
+table { border-collapse: collapse; }
+
+[hidden] { display: none !important; }
+
+::selection { background: var(--accent-soft); color: var(--accent-ink); }
+
+/* ---- Focus: one visible ring on every interactive element ---- */
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Headings and #view take focus programmatically (router, skip-to-content); no ring there. */
+#view:focus, [tabindex="-1"]:focus:not(:focus-visible) { outline: none; }
+
+/* ---- Typography ---- */
+
+h1, .h1 { font-size: 22px; line-height: 1.25; font-weight: 600; letter-spacing: -0.01em; }
+h2, .h2 { font-size: 16px; line-height: 1.35; font-weight: 600; }
+h3, .h3 { font-size: 15px; line-height: 1.4; font-weight: 600; }
+
+/* Data only: domains, counts, times, keyboard hints. */
+.mono, code, kbd, samp, pre {
+  font-family: var(--font-mono);
+  font-size: 0.93em;
+  font-variant-ligatures: none;
+}
+
+.num { font-variant-numeric: tabular-nums; }
+.text-2 { color: var(--text-2); }
+.text-3 { color: var(--text-3); }
+
+/* Tiny section labels: the only all-caps text allowed (spec §5.10). */
+.eyebrow {
+  font-size: 11px;
+  line-height: 1.4;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ---- App layout: sidebar + main column (top bar over the view) ---- */
+
+#app {
+  display: grid;
+  grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+
+#nav {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  height: 100dvh;
+  overflow-y: auto;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+}
+
+.main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+#topbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: var(--topbar-h);
+  padding: 0 var(--space-6);
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+}
+
+#view {
+  flex: 1;
+  min-width: 0;
+  padding: var(--space-6) var(--space-8) var(--space-8);
+}
+
+/* Below 900px the sidebar is an off-canvas menu: the shell's top-bar menu button toggles
+   .nav-open on #app. visibility keeps the closed menu out of the tab order. */
+@media (max-width: 899px) {
+  #app { grid-template-columns: minmax(0, 1fr); }
+
+  #nav {
+    position: fixed;
+    inset: 0 auto 0 0;
+    z-index: 40;
+    width: min(var(--sidebar-w), 85vw);
+    height: auto;
+    transform: translateX(-100%);
+    visibility: hidden;
+    transition: transform 0.2s ease, visibility 0.2s;
+  }
+
+  #app.nav-open #nav {
+    transform: none;
+    visibility: visible;
+    box-shadow: var(--shadow-overlay);
+  }
+
+  #topbar { padding: 0 var(--space-4); }
+  #view { padding: var(--space-4); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

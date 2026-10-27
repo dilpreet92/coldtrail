@@ -1,0 +1,109 @@
+/* coldtrail design tokens: direction A "Clean ledger" (design spec §2).
+   Light values live on :root. Dark values apply in two cases, so they are written twice and must
+   stay identical (tests/js/assets.test.mjs checks): theme = System while the OS is dark, and
+   theme = Dark (js/core/theme.js sets data-theme on <html>; System removes it). */
+
+@font-face {
+  font-family: 'Geist';
+  src: url(/assets/fonts/Geist-Variable.woff2) format('woff2');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Geist Mono';
+  src: url(/assets/fonts/GeistMono-Variable.woff2) format('woff2');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  color-scheme: light;
+
+  /* Color (spec §2 table) */
+  --bg: #FAFAF9;
+  --surface: #FFFFFF;
+  --surface-2: #F5F5F4;
+  --border: #E7E5E4;
+  --border-strong: #D6D3D1;
+  --text: #1C1917;
+  --text-2: #57534E;
+  --text-3: #78716C;
+  --accent: #1D4ED8;
+  --accent-soft: #EFF6FF;
+  --accent-ink: #1E3A8A;
+  --ok: #15803D;
+  --warn: #B45309;
+  --danger: #B91C1C;
+
+  /* Derived: text on an --accent fill (primary buttons). White fails 4.5:1 on the dark accent. */
+  --on-accent: #FFFFFF;
+  /* The one overlay shadow (menus, dialogs, drawers, toasts) and the backdrop behind dialogs. */
+  --shadow-overlay: 0 12px 32px rgba(28, 25, 23, 0.12), 0 2px 6px rgba(28, 25, 23, 0.08);
+  --scrim: rgba(28, 25, 23, 0.32);
+
+  /* Type: Geist for UI text, Geist Mono for data (domains, counts, times, key hints). */
+  --font-sans: 'Geist', system-ui, sans-serif;
+  --font-mono: 'Geist Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  /* Shape and space */
+  --radius-control: 6px;
+  --radius-input: 8px;
+  --radius-dialog: 12px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  /* Layout */
+  --sidebar-w: 232px;
+  --topbar-h: 56px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #0F1012;
+    --surface: #17181B;
+    --surface-2: #1F2024;
+    --border: #2A2C31;
+    --border-strong: #3A3D44;
+    --text: #ECECEE;
+    --text-2: #A6A8AE;
+    --text-3: #8A8D94;
+    --accent: #5B8CFF;
+    --accent-soft: #1B2440;
+    --accent-ink: #C9D7FF;
+    --ok: #3FB27F;
+    --warn: #E0A23B;
+    --danger: #F07070;
+    --on-accent: #0F1012;
+    --shadow-overlay: 0 12px 32px rgba(0, 0, 0, 0.5), 0 2px 6px rgba(0, 0, 0, 0.35);
+    --scrim: rgba(0, 0, 0, 0.55);
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0F1012;
+  --surface: #17181B;
+  --surface-2: #1F2024;
+  --border: #2A2C31;
+  --border-strong: #3A3D44;
+  --text: #ECECEE;
+  --text-2: #A6A8AE;
+  --text-3: #8A8D94;
+  --accent: #5B8CFF;
+  --accent-soft: #1B2440;
+  --accent-ink: #C9D7FF;
+  --ok: #3FB27F;
+  --warn: #E0A23B;
+  --danger: #F07070;
+  --on-accent: #0F1012;
+  --shadow-overlay: 0 12px 32px rgba(0, 0, 0, 0.5), 0 2px 6px rgba(0, 0, 0, 0.35);
+  --scrim: rgba(0, 0, 0, 0.55);
+}

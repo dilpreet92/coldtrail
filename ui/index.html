@@ -1,205 +1,27 @@
 <!doctype html>
-<html lang="en" data-view="onboarding">
+<html lang="en">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="color-scheme" content="light dark" />
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" />
 <title>coldtrail</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230c0f14'/%3E%3Cpath d='M6 22 L13 15 L18 19 L26 9' fill='none' stroke='%23ff7a3d' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
-<link rel="stylesheet" href="/assets/app.css" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231D4ED8'/%3E%3Cpath d='M6 22 L13 15 L18 19 L26 9' fill='none' stroke='%23FFFFFF' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+<link rel="preload" href="/assets/fonts/Geist-Variable.woff2" as="font" type="font/woff2" crossorigin />
+<link rel="stylesheet" href="/assets/css/tokens.css" />
+<link rel="stylesheet" href="/assets/css/base.css" />
+<link rel="stylesheet" href="/assets/css/components.css" />
+<script type="module" src="/assets/js/main.js"></script>
 </head>
 <body>
-<div class="grain" aria-hidden="true"></div>
-
-<aside class="rail">
-  <div class="brand">
-    <svg class="mark" viewBox="0 0 40 40" aria-hidden="true">
-      <path d="M4 30 L14 18 L22 24 L36 8" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
-      <circle cx="36" cy="8" r="3.2" fill="currentColor"/>
-      <circle cx="4" cy="30" r="2.4" fill="none" stroke="currentColor" stroke-width="2"/>
-    </svg>
-    <span class="wordmark">coldtrail</span>
+<div id="app">
+  <aside id="nav"></aside>
+  <div class="main">
+    <header id="topbar"></header>
+    <main id="view" tabindex="-1"></main>
   </div>
-
-  <nav class="nav">
-    <button class="nav-item" data-nav="onboarding"><span class="dot"></span><span class="nav-label" id="nav-setup-label">Setup</span></button>
-    <button class="nav-item" data-nav="company"><span class="dot"></span>Company</button>
-    <button class="nav-item" data-nav="overview"><span class="dot"></span>Overview</button>
-    <button class="nav-item" data-nav="chat"><span class="dot"></span>Chat</button>
-    <button class="nav-item" data-nav="cron"><span class="dot"></span>Cron</button>
-    <button class="nav-item" data-nav="pipeline"><span class="dot"></span>Pipeline</button>
-    <button class="nav-item" data-nav="drafts"><span class="dot"></span>Drafts</button>
-    <button class="nav-item" data-nav="followups"><span class="dot"></span>Follow-ups</button>
-  </nav>
-
-  <div class="rail-foot">
-    <div class="conn"><span class="led" id="led-provider"></span><span id="provider-label">—</span></div>
-    <div class="conn"><span class="led" id="led-canonical"></span>canonical</div>
-    <div class="conn"><span class="led" id="led-gmail"></span>gmail</div>
-    <div class="conn"><span class="led" id="led-linkedin"></span>linkedin</div>
-    <button class="theme-toggle" id="theme-toggle" type="button" title="Toggle light / dark" aria-label="Toggle theme"><span id="theme-icon">◐</span> <span id="theme-label">theme</span></button>
-  </div>
-</aside>
-
-<main class="stage">
-  <!-- ONBOARDING / SETTINGS -->
-  <section class="view" id="view-onboarding">
-    <header class="view-head">
-      <h1 id="setup-title">Get set up</h1>
-      <p class="sub" id="setup-sub">Discovery-first outreach. coldtrail owns sourcing (Canonical) and drafting for email (Gmail) or LinkedIn; drafts are never auto-sent — you send by hand.</p>
-    </header>
-
-    <ol class="checklist" id="checklist"></ol>
-    <div class="wizard-bar" id="wizard-bar" hidden></div>
-
-    <div class="panels" id="panels">
-      <div class="panel" data-step="provider" id="panel-provider">
-        <h2>1 · Agent</h2>
-        <p class="hint">coldtrail drives an agent. Use a headless CLI (Claude Code / Codex CLI / opencode) or bring your own model.</p>
-        <div class="agent-row" id="agent-row"></div>
-        <div id="agent-auth" class="agent-auth" hidden></div>
-        <div id="byok" class="byok" hidden>
-          <p class="hint">Any OpenAI-compatible endpoint — local <strong>Ollama</strong> or a BYOK gateway. Sourcing (Canonical) and drafting for email (Gmail) or LinkedIn are coldtrail's own — they work on every backend.</p>
-          <div class="row"><button class="btn" type="button" id="ollama-preset">Ollama (localhost)</button></div>
-          <label>Base URL <input id="byok-base" placeholder="http://localhost:11434/v1" autocomplete="off" /></label>
-          <label>Model <input id="byok-model" placeholder="llama3.1" autocomplete="off" /></label>
-          <label>API key <span style="text-transform:none">(blank for local Ollama)</span> <input id="byok-key" type="password" autocomplete="off" /></label>
-          <div class="row"><button class="btn primary" id="save-byok">Save backend</button><span class="form-msg" id="byok-msg"></span></div>
-        </div>
-      </div>
-
-      <div class="panel" data-step="discovery" id="panel-discovery">
-        <h2>2 · Discovery <span class="conn-state" id="disc-state"></span></h2>
-        <p class="hint">Where companies come from. <strong>Canonical</strong> — verified, long-tail company search, connected to <strong>coldtrail itself</strong> (one browser consent). Works the same on every provider; the agent sources with <code>coldtrail source</code>.</p>
-        <div class="row"><button class="btn primary" id="connect-canonical">Connect Canonical</button><span class="form-msg" id="disc-msg"></span></div>
-      </div>
-
-      <div class="panel" data-step="destination" id="panel-destination">
-        <h2>3 · Destination <span class="conn-state" id="dest-state"></span></h2>
-        <p class="hint" id="dest-hint">Where outreach goes. <strong>Gmail</strong> — coldtrail creates the draft; you review and hit Send. It never auto-sends.</p>
-        <div id="dest-gcloud"></div>
-        <div class="row"><button class="btn primary" id="connect-gmail">Connect Gmail</button><span class="form-msg" id="dest-msg"></span></div>
-
-        <div class="li-sep"><span class="li-label">LinkedIn</span><span class="conn-state" id="li-conn-badge"></span></div>
-        <p class="hint">Also a destination — coldtrail opens a connection request in a real LinkedIn window for you to review, or (opt-in) clicks Send itself within your caps.</p>
-        <div id="li-body"></div>
-      </div>
-
-      <div class="panel" data-step="brief" id="panel-message">
-        <h2>4 · Your company</h2>
-        <p class="hint">Write your company profile in <em>your</em> words — the agent writes each cold email fresh from it (it won't invent claims), and it all stays local. It saves as you type; refine it anytime in the <strong>Company</strong> tab.</p>
-        <div id="company-mount-wizard" class="company-canvas-mount"></div>
-      </div>
-    </div>
-  </section>
-
-  <!-- COMPANY -->
-  <section class="view" id="view-company">
-    <header class="view-head"><h1>Company</h1><p class="sub">Your company profile, in <em>your</em> words. The agent writes each cold email fresh from this — it never invents claims beyond what's here, and it all stays local. Edit freely; it saves as you type.</p></header>
-    <div id="company-mount" class="company-canvas-mount"></div>
-  </section>
-
-  <!-- OVERVIEW -->
-  <section class="view" id="view-overview">
-    <header class="view-head"><h1>Overview</h1><p class="sub">Your pipeline at a glance — what you searched, who you found, what's drafted and sent.</p></header>
-    <div class="tiles" id="ov-tiles"></div>
-    <div class="ov-cols">
-      <div class="panel"><h2>ICP searches</h2><div class="ov-list" id="ov-queries"></div></div>
-      <div class="panel"><h2>Funnel</h2><div class="ov-list" id="ov-funnel"></div></div>
-    </div>
-  </section>
-
-  <!-- CHAT -->
-  <section class="view" id="view-chat">
-    <div class="chat-wrap">
-      <aside class="chat-history">
-        <button class="btn primary chat-new" id="chat-new" type="button">+ New chat</button>
-        <div class="chat-list" id="chat-list"></div>
-      </aside>
-      <div class="chat-main">
-        <div class="chat" id="chat-log"></div>
-        <form class="composer" id="chat-form">
-          <textarea id="chat-input" rows="1" placeholder="e.g. Source 20 companies like Linear and draft intros to the founders"></textarea>
-          <button class="btn primary" type="submit" id="chat-send">Send ↵</button>
-        </form>
-      </div>
-    </div>
-  </section>
-
-  <!-- CRON -->
-  <section class="view" id="view-cron">
-    <header class="view-head">
-      <h1>Cron</h1>
-      <p class="sub">Run coldtrail on a schedule while you're away — source, enrich, draft, and (only if auto-send is on) send. Dry run always drafts only, regardless of auto-send.</p>
-      <div class="row" style="margin-top:12px"><button class="btn primary" id="cron-new" type="button">+ New schedule</button></div>
-    </header>
-
-    <div class="cron-list" id="cron-list"></div>
-
-    <form class="panel cron-form" id="cron-form" hidden>
-      <h2 id="cron-form-title">New schedule</h2>
-      <input type="hidden" id="cf-id" />
-      <label>Name <input id="cf-name" placeholder="e.g. Morning source + draft" autocomplete="off" /></label>
-      <div class="cap-row">
-        <select id="cf-freq" class="pipe-select">
-          <option value="daily">Daily</option>
-          <option value="weekly">Weekly</option>
-        </select>
-        <input type="time" id="cf-time" value="09:00">
-        <select id="cf-weekday" class="pipe-select" hidden>
-          <option value="1">Mon</option><option value="2">Tue</option><option value="3">Wed</option>
-          <option value="4">Thu</option><option value="5">Fri</option><option value="6">Sat</option><option value="0">Sun</option>
-        </select>
-      </div>
-      <div class="cf-taskmode">
-        <label class="check"><input type="radio" name="cf-task-mode" value="agent" checked> Agent decides</label>
-        <label class="check"><input type="radio" name="cf-task-mode" value="custom"> Custom instruction</label>
-      </div>
-      <textarea id="cf-prompt" rows="4" placeholder="e.g. Source 20 companies like Linear and draft intros to the founders" hidden></textarea>
-      <div class="row">
-        <button class="btn primary" type="submit" id="cf-save">Save</button>
-        <button class="btn" type="button" id="cf-cancel">Cancel</button>
-        <span class="form-msg" id="cf-msg"></span>
-      </div>
-    </form>
-
-    <div class="panel">
-      <h2>Run history</h2>
-      <div class="cron-runs" id="cron-runs"></div>
-    </div>
-  </section>
-
-  <!-- PIPELINE -->
-  <section class="view" id="view-pipeline">
-    <header class="view-head"><h1>Pipeline</h1><p class="sub">Every company you've sourced, deduped by domain. Stages: <em>sourced → contact found → drafted → sent</em>. Act on any row — enrich, draft, or skip.</p>
-      <div class="filters" id="pipe-filters"></div>
-      <div class="filters" id="pipe-query-row"></div>
-    </header>
-    <div class="table-wrap"><table class="grid" id="companies-table"><thead><tr><th>Company</th><th>Domain</th><th>Status</th><th>Sourced by</th><th>First seen</th><th></th></tr></thead><tbody></tbody></table></div>
-  </section>
-
-  <!-- DRAFTS -->
-  <section class="view" id="view-drafts">
-    <header class="view-head">
-      <h1>Drafts</h1>
-      <p class="sub" id="drafts-sub"></p>
-      <div class="filters" id="drafts-tabs"></div>
-    </header>
-    <div class="drafts-bulk" id="drafts-bulk"></div>
-    <div class="drafts" id="drafts-list"></div>
-  </section>
-
-  <!-- FOLLOW-UPS -->
-  <section class="view" id="view-followups">
-    <header class="view-head">
-      <h1>Follow-ups</h1>
-      <p class="sub">Who you've contacted, who replied, and who's due for a nudge.</p>
-      <div class="row" style="margin-top:12px"><button class="btn primary" id="check-replies">Check for replies</button><span class="form-msg" id="fu-msg"></span></div>
-    </header>
-    <div class="fu-list" id="followups-list"></div>
-  </section>
-</main>
-
-<script src="/assets/app.js"></script>
+</div>
+<div id="overlays"></div>
+<div id="toasts" aria-live="polite"></div>
 </body>
 </html>

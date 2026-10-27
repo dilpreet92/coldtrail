@@ -1,0 +1,41 @@
+/* Shared components (design spec §2, §4, §6). Sections are filled in by the components + shell
+   task; screen-specific styles belong in css/views/<name>.css, not here. Use tokens.css values
+   only: no new colors, radii or spacing. */
+
+/* ---- Shell: sidebar (wordmark, groups, items, counts, connection dots) ---- */
+
+/* ---- Shell: top bar (menu button, search + results popover, schedule chip) ---- */
+
+/* ---- Session-expired banner ---- */
+
+/* ---- Page header (title, description, primary action, tabs/filters row) ---- */
+
+/* ---- Buttons ---- */
+
+/* ---- Inputs, selects, textareas, field errors ---- */
+
+/* ---- Switch ---- */
+
+/* ---- Tabs ---- */
+
+/* ---- Table ---- */
+
+/* ---- Pager ---- */
+
+/* ---- Search select (combobox + listbox) ---- */
+
+/* ---- List + detail ---- */
+
+/* ---- Badge ---- */
+
+/* ---- Empty state ---- */
+
+/* ---- Skeleton ---- */
+
+/* ---- Menu ---- */
+
+/* ---- Dialog ---- */
+
+/* ---- Drawer ---- */
+
+/* ---- Toast ---- */
