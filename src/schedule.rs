@@ -151,11 +151,29 @@ fn bin_path() -> Result<String> {
     Ok(std::env::current_exe()?.to_string_lossy().into_owned())
 }
 
+/// Test-safety switch: `COLDTRAIL_NO_TIMERS` set to any non-empty value turns every OS-timer
+/// install/remove below into a logged no-op, so tests and e2e servers can create, toggle and
+/// delete schedules without touching launchd/systemd. The DB rows are still written as normal.
+pub fn timers_disabled() -> bool {
+    std::env::var_os("COLDTRAIL_NO_TIMERS").is_some_and(|v| !v.is_empty())
+}
+
+fn skip_if_disabled() -> bool {
+    let off = timers_disabled();
+    if off {
+        crate::logf::log("timers disabled (COLDTRAIL_NO_TIMERS)");
+    }
+    off
+}
+
 /// Install (or remove, if `s.enabled` is false) the OS timer for a single schedule row, keyed by
 /// `s.id`. Each schedule gets its own launchd label / systemd unit pair so multiple schedules can
 /// run independently.
 #[allow(dead_code)] // macos/linux cfg-gated bodies; each half is dead on the other OS
 pub fn apply_one(s: &DbSchedule) -> Result<()> {
+    if skip_if_disabled() {
+        return Ok(());
+    }
     if !s.enabled {
         return remove_one(&s.id);
     }
@@ -206,6 +224,9 @@ pub fn apply_one(s: &DbSchedule) -> Result<()> {
 /// installed). Targets `ai.coldtrail.run.<id>` / `coldtrail-<id>.*`.
 #[allow(dead_code)] // macos/linux cfg-gated bodies; each half is dead on the other OS
 pub fn remove_one(id: &str) -> Result<()> {
+    if skip_if_disabled() {
+        return Ok(());
+    }
     #[cfg(target_os = "macos")]
     {
         let uid = users_uid();
@@ -237,6 +258,9 @@ pub fn remove_one(id: &str) -> Result<()> {
 /// from v0.9.15 with a schedule already enabled doesn't keep an orphaned timer firing
 /// unattended alongside the new per-id ones. Best-effort: every step ignores its own errors.
 fn remove_legacy_singular() {
+    if skip_if_disabled() {
+        return;
+    }
     #[cfg(target_os = "macos")]
     {
         let uid = users_uid();
@@ -266,6 +290,9 @@ fn remove_legacy_singular() {
 /// would linger on disk. Enumerate-and-prune is a future nicety, not implemented here.
 #[allow(dead_code)] // exercised via `coldtrail schedule sync`; allow kept for platforms where apply_one/remove_one bodies are cfg'd out
 pub fn sync() -> Result<()> {
+    if skip_if_disabled() {
+        return Ok(());
+    }
     remove_legacy_singular(); // upgrade migration: drop the v0.9.15 singular timer, if present
     crate::db::init()?; // matches every other DB-touching CLI entrypoint; needed on a fresh COLDTRAIL_HOME
     for s in crate::db::list_schedules()? {
@@ -328,5 +355,67 @@ mod tests {
         let (svc, timer) = systemd_units_for(&s, "/x/coldtrail", "/usr/bin", None);
         assert!(svc.contains("--schedule abc123"));
         assert!(timer.contains("OnCalendar=Mon 08:00:00"));
+    }
+
+    #[test]
+    fn timers_disabled_needs_a_non_empty_value() {
+        let _g = crate::testutil::env_guard();
+        std::env::remove_var("COLDTRAIL_NO_TIMERS");
+        let unset = timers_disabled();
+        std::env::set_var("COLDTRAIL_NO_TIMERS", "");
+        let empty = timers_disabled();
+        std::env::set_var("COLDTRAIL_NO_TIMERS", "1");
+        let set = timers_disabled();
+        std::env::remove_var("COLDTRAIL_NO_TIMERS");
+        assert!(
+            !unset && !empty && set,
+            "unset={unset} empty={empty} set={set}"
+        );
+    }
+
+    #[test]
+    fn no_timers_env_makes_apply_and_remove_noops() {
+        // with_home holds the env lock and points the log/DB at a temp workspace.
+        crate::testutil::with_home("ct-no-timers", |_| {
+            std::env::set_var("COLDTRAIL_NO_TIMERS", "1");
+            let id = uuid::Uuid::new_v4().to_string();
+            let s = crate::db::Schedule {
+                id: id.clone(),
+                name: "NT".into(),
+                enabled: true,
+                freq: "daily".into(),
+                time: "09:30".into(),
+                weekday: None,
+                task_mode: "agent".into(),
+                prompt: None,
+            };
+            let applied = apply_one(&s);
+            #[cfg(target_os = "macos")]
+            let unit = dirs_home()
+                .unwrap()
+                .join(format!("Library/LaunchAgents/ai.coldtrail.run.{id}.plist"));
+            #[cfg(target_os = "linux")]
+            let unit = dirs_home()
+                .unwrap()
+                .join(format!(".config/systemd/user/coldtrail-{id}.timer"));
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            let written = unit.exists();
+            let removed = remove_one(&id);
+            let synced = sync();
+            std::env::remove_var("COLDTRAIL_NO_TIMERS");
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            {
+                if written {
+                    let _ = remove_one(&id); // switch regressed: don't leave a live timer behind
+                }
+                assert!(
+                    !written,
+                    "timer installed despite COLDTRAIL_NO_TIMERS: {unit:?}"
+                );
+            }
+            assert!(applied.is_ok(), "apply_one: {applied:?}");
+            assert!(removed.is_ok(), "remove_one: {removed:?}");
+            assert!(synced.is_ok(), "sync: {synced:?}");
+        });
     }
 }

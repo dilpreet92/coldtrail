@@ -258,6 +258,8 @@ fn mime_for(path: &str) -> &'static str {
         Some("html") => "text/html; charset=utf-8",
         Some("svg") => "image/svg+xml",
         Some("json") => "application/json",
+        Some("woff2") => "font/woff2",
+        Some("txt") => "text/plain; charset=utf-8",
         _ => "application/octet-stream",
     }
 }
@@ -345,6 +347,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn mime_for_fonts_and_text() {
+        assert_eq!(mime_for("fonts/Geist-Variable.woff2"), "font/woff2");
+        assert_eq!(mime_for("fonts/OFL.txt"), "text/plain; charset=utf-8");
+        assert_eq!(mime_for("js/main.js"), "text/javascript; charset=utf-8");
     }
 
     #[tokio::test]
