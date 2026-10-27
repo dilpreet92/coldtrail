@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# Fake `opencode` for the e2e harness. harness/server.mjs puts this directory first on the
+# server's PATH, so every agent turn, probe and model listing hits this script instead of a real
+# model. It prints the same `opencode run --format json` JSONL that src/provider/cli.rs parses:
+#
+#   opencode models                 fake/model-a, fake/model-b, opencode/free-c (one per line)
+#   opencode run ... -- <message>   chosen by the message:
+#     "Reply with exactly: ok"      the provider probe: text "ok"
+#     contains SLOW                 step_start, 20 tool_use lines 0.4s apart, then text
+#     contains FAIL                 an error event, exit 1
+#     anything else                 step_start, one tool_use (bash `coldtrail status`, exit 0),
+#                                   text "Fake agent reply: <first 40 chars of the message>"
+#
+# FAKE_OPENCODE_STEP_DELAY overrides the SLOW step delay (seconds). Never touches the network.
+set -u
+
+# Character-wise substring for the reply, whatever locale the server was started in.
+case "$(uname)" in
+  Darwin) export LC_ALL=en_US.UTF-8 ;;
+  *) export LC_ALL=C.UTF-8 ;;
+esac
+
+json_escape() {
+  local s
+  # Drop control characters JSON can't carry raw (keeping tab, newline and carriage return).
+  s=$(printf '%s' "$1" | LC_ALL=C tr -d '\000-\010\013\014\016-\037')
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}
+  printf '%s' "$s"
+}
+
+if [ "${1:-}" = "models" ]; then
+  printf '%s\n' fake/model-a fake/model-b opencode/free-c
+  exit 0
+fi
+
+if [ "${1:-}" != "run" ]; then
+  echo "fake opencode: unsupported command: $*" >&2
+  exit 2
+fi
+shift
+
+# argv from opencode_args(): run --format json --auto [-m <model>] [-s <session>] -- <message>
+session="ses_fake_$$"
+message=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --)
+      shift
+      message="${1:-}"
+      break
+      ;;
+    -s)
+      shift
+      session="${1:-$session}"
+      ;;
+    -m | --format)
+      shift
+      ;;
+  esac
+  shift
+done
+
+emit_step_start() {
+  printf '{"type":"step_start","sessionID":"%s","part":{"type":"step-start"}}\n' "$session"
+}
+
+emit_tool() {
+  printf '{"type":"tool_use","sessionID":"%s","part":{"type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"%s"},"metadata":{"exit":0}}}}\n' \
+    "$session" "$(json_escape "$1")"
+}
+
+emit_text() {
+  printf '{"type":"text","sessionID":"%s","part":{"type":"text","text":"%s"}}\n' \
+    "$session" "$(json_escape "$1")"
+}
+
+emit_step_finish() {
+  printf '{"type":"step_finish","sessionID":"%s","part":{"type":"step-finish","reason":"stop"}}\n' "$session"
+}
+
+if [ "$message" = "Reply with exactly: ok" ]; then
+  emit_step_start
+  emit_text "ok"
+  emit_step_finish
+  exit 0
+fi
+
+reply="Fake agent reply: ${message:0:40}"
+
+case "$message" in
+  *SLOW*)
+    emit_step_start
+    for i in $(seq 1 20); do
+      sleep "${FAKE_OPENCODE_STEP_DELAY:-0.4}"
+      emit_tool "coldtrail find-emails 20 # step $i"
+    done
+    emit_text "$reply"
+    emit_step_finish
+    exit 0
+    ;;
+  *FAIL*)
+    printf '%s\n' '{"type":"error","error":{"data":{"message":"Fake failure"}}}'
+    exit 1
+    ;;
+esac
+
+emit_step_start
+emit_tool "coldtrail status"
+emit_text "$reply"
+emit_step_finish
+exit 0
