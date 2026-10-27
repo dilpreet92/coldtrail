@@ -1,18 +1,20 @@
 // @ts-check
 //
-// Self-tests for the e2e harness: the isolated server, the deterministic seed, the fake opencode,
-// the side-effect intercepts, the console guard and the accessibility helper. Every other spec
-// trusts these pieces, so each one is proven here against the real `coldtrail serve`.
+// Self-tests for the e2e harness: the isolated server and its cleanup, the deterministic seed, the
+// fake agent CLIs, the side-effect intercepts, the console guard and the accessibility helper.
+// Every other spec trusts these pieces, so each one is proven here against the real
+// `coldtrail serve`.
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { delimiter, join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import { seriousViolations, expectAccessible } from '../harness/a11y.mjs';
 import { test, expect } from '../harness/fixtures.mjs';
 import { interceptSideEffects, SIDE_EFFECT_ROUTES } from '../harness/intercept.mjs';
 import { PRODUCT_MD, SEED } from '../harness/seed.mjs';
-import { FAKE_BIN, startServer } from '../harness/server.mjs';
+import { E2E_DIR, FAKE_BIN, serverEnv, startServer, sweepStale } from '../harness/server.mjs';
 
 /** GET a token-guarded API path and return its JSON (asserting a 200). */
 async function getJSON(request, server, path) {
@@ -39,10 +41,10 @@ async function chatTurn(request, server, message) {
     .map((line) => JSON.parse(line.slice('data:'.length)));
 }
 
-/** Run fake-bin/opencode directly and collect its stdout lines. */
-function runFake(args, env = {}) {
+/** Run a fake-bin script (`opencode` by default) directly and collect its output. */
+function runFake(args, env = {}, name = 'opencode') {
   return new Promise((resolveRun, reject) => {
-    const child = spawn(join(FAKE_BIN, 'opencode'), args, {
+    const child = spawn(join(FAKE_BIN, name), args, {
       env: { ...process.env, ...env },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -53,6 +55,57 @@ function runFake(args, env = {}) {
     child.on('error', reject);
     child.on('exit', (code) => resolveRun({ code, lines: out.split('\n').filter(Boolean), err }));
   });
+}
+
+/** Is `pid` a live process (or an unreaped zombie)? */
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === 'EPERM';
+  }
+}
+
+/**
+ * Start a server from a separate Node process, the way a test worker would. `info` resolves to
+ * the server's pid, base URL and three directories once the child reports them; `exit` to how
+ * the child ended. The child is returned at once, so a caller can always kill it.
+ */
+function serverInChild() {
+  const serverUrl = pathToFileURL(join(E2E_DIR, 'harness/server.mjs')).href;
+  const script = `
+    import { startServer } from ${JSON.stringify(serverUrl)};
+    const s = await startServer({ seed: 'empty' });
+    const dirs = [s.home, s.secretsDir, s.userHome];
+    console.log(JSON.stringify({ pid: s.pid, base: s.base, dirs }));
+    setInterval(() => {}, 60_000);
+  `;
+  const child = spawn(process.execPath, ['--no-warnings', '--input-type=module', '-e', script], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const exit = new Promise((resolveExit) =>
+    child.once('exit', (code, signal) => resolveExit({ code, signal })),
+  );
+  const info = new Promise((resolveInfo, reject) => {
+    let out = '';
+    let err = '';
+    child.stderr.on('data', (d) => (err += d));
+    child.stdout.on('data', (d) => {
+      out += d;
+      const end = out.indexOf('\n');
+      if (end < 0) return;
+      try {
+        resolveInfo(JSON.parse(out.slice(0, end)));
+      } catch (e) {
+        reject(e);
+      }
+    });
+    exit.then(({ code, signal }) =>
+      reject(new Error(`server child exited (${code ?? signal}) early:\n${out}\n${err}`)),
+    );
+  });
+  return { child, exit, info };
 }
 
 /** Where an OS timer for schedule `id` would land under `home` if one were installed. */
@@ -89,11 +142,13 @@ test('server starts isolated with seed', async ({ server, request }) => {
     destination_connected: false,
     auto_send: false,
   });
-  // Present through fake-bin on PATH, signed in through the sandboxed HOME's auth file.
-  expect(status.agents.find((a) => a.kind === 'opencode')).toMatchObject({
-    present: true,
-    authed: true,
-  });
+  // All three agent CLIs are the fake-bin copies, so the cards read the same on every machine:
+  // present everywhere, and only opencode signed in (through the sandboxed HOME's auth file).
+  expect(status.agents).toEqual([
+    { kind: 'claude', label: 'Claude Code', present: true, authed: false },
+    { kind: 'codex', label: 'Codex CLI', present: true, authed: false },
+    { kind: 'opencode', label: 'opencode', present: true, authed: true },
+  ]);
 
   // The API is still guarded: no token, no data.
   expect((await request.get(`${server.base}/api/summary`)).status()).toBe(401);
@@ -181,6 +236,72 @@ test('fake opencode turns parse through the real provider code', async ({ server
   ]);
 });
 
+test('serverEnv drops inherited credentials and puts fake-bin first', () => {
+  const kept = { PATH: '/usr/bin:/bin', LANG: 'en_US.UTF-8', FAKE_OPENCODE_STEP_DELAY: '0' };
+  const dropped = {
+    COLDTRAIL_API_KEY: 'real-key',
+    COLDTRAIL_HOME: '/real/.coldtrail',
+    GOOGLE_APPLICATION_CREDENTIALS: '/real/adc.json',
+    ANTHROPIC_API_KEY: 'real-key',
+    ANTHROPIC_BASE_URL: 'https://api.example',
+    OPENAI_API_KEY: 'real-key',
+    CLAUDE_CONFIG_DIR: '/real/.claude',
+    CLAUDE_CODE_USE_BEDROCK: '1',
+    CLAUDECODE: '1',
+    CODEX_HOME: '/real/.codex',
+    OPENCODE_CONFIG: '/real/opencode.json',
+  };
+  expect(serverEnv({ home: '/w', userHome: '/u' }, { ...kept, ...dropped })).toEqual({
+    LANG: 'en_US.UTF-8',
+    FAKE_OPENCODE_STEP_DELAY: '0',
+    PATH: `${FAKE_BIN}${delimiter}/usr/bin:/bin`,
+    COLDTRAIL_HOME: '/w',
+    COLDTRAIL_NO_SEND: '1',
+    COLDTRAIL_NO_TIMERS: '1',
+    COLDTRAIL_NO_UPDATE: '1',
+    HOME: '/u',
+    GOOGLE_APPLICATION_CREDENTIALS: '/u/no-gcloud-adc.json',
+  });
+});
+
+test('claude and codex are fail-closed stubs, never the real CLIs', async ({ server, request }) => {
+  // Straight from fake-bin: a model turn refuses, and `claude mcp` reads as "not configured".
+  const claudeTurn = ['-p', 'Reply with exactly: ok', '--output-format', 'stream-json'];
+  expect(await runFake(claudeTurn, {}, 'claude')).toEqual({
+    code: 1,
+    lines: [],
+    err: 'fake claude: real agents are disabled in e2e\n',
+  });
+  expect(await runFake(['exec', '--json', 'Reply with exactly: ok'], {}, 'codex')).toEqual({
+    code: 1,
+    lines: [],
+    err: 'fake codex: real agents are disabled in e2e\n',
+  });
+  for (const sub of ['get', 'add', 'remove']) {
+    const mcp = await runFake(['mcp', sub, 'canonical'], {}, 'claude');
+    expect(mcp, `claude mcp ${sub}`).toMatchObject({ code: 1, lines: [] });
+  }
+
+  // Through the server: either can be chosen (both are "installed"), and Test connection reaches
+  // the stub, not a model.
+  try {
+    for (const name of ['claude', 'codex']) {
+      await sendJSON(request, server, 'POST', '/api/onboarding/provider', { provider: name });
+      expect((await getJSON(request, server, '/api/status')).provider).toBe(name);
+      expect(await sendJSON(request, server, 'POST', '/api/provider/probe')).toEqual({
+        ok: false,
+        message: `fake ${name}: real agents are disabled in e2e`,
+      });
+    }
+  } finally {
+    await sendJSON(request, server, 'POST', '/api/onboarding/provider', { provider: 'opencode' });
+  }
+  expect(await getJSON(request, server, '/api/status')).toMatchObject({
+    provider: 'opencode',
+    opencode_model: 'fake/model-a',
+  });
+});
+
 test('fake opencode SLOW turn streams 20 tool steps before its reply', async () => {
   // The step delay is 0.4s by default; shrink it so this self-test stays quick.
   const { code, lines } = await runFake(
@@ -239,8 +360,9 @@ test('sends are blocked', async ({ server, request }) => {
     (d) => d.status === 'draft_pending' && d.domain !== SEED.xss.domain,
   );
   // With auto-send off the button only makes a Gmail draft; turn it on to reach the send gate.
+  // No daily_cap: it is optional, and sending one would leave it in the workspace config.
   const autoSend = (enabled) =>
-    sendJSON(request, server, 'POST', '/api/destination/auto-send', { enabled, daily_cap: 20 });
+    sendJSON(request, server, 'POST', '/api/destination/auto-send', { enabled });
   await autoSend(true);
   try {
     const res = await request.post(server.apiUrl(`/api/drafts/${draft.domain}/send`), { data: {} });
@@ -256,6 +378,8 @@ test('sends are blocked', async ({ server, request }) => {
   } finally {
     await autoSend(false);
   }
+  // The toggle left no other setting behind for the tests after this one.
+  expect(readFileSync(join(server.home, 'config.toml'), 'utf8')).not.toContain('daily_send_cap');
 });
 
 test('side-effect routes are intercepted and never reach the server', async ({ page, server }) => {
@@ -305,27 +429,40 @@ test('app opens the token URL with intercepts installed', async ({ app }) => {
   ]);
 });
 
+// These two mark themselves as failing only on their last line. Anything that goes wrong before
+// it (say `app.goto` throws) is an ordinary failure; past it, the guard has collected exactly the
+// self-test's problem, so the app fixture's teardown check on that list is all that can fail them.
 test('a console.error fails the test', async ({ app }) => {
-  test.fail(true, 'the app fixture must turn a console.error into a failure');
   await app.goto('');
+  expect(app.problems()).toEqual([]);
   await app.page.evaluate(() => console.error('harness self-test: unexpected error'));
+  await expect
+    .poll(() => app.problems())
+    .toEqual(['console.error: harness self-test: unexpected error']);
+  test.fail(true, 'the app fixture must turn a console.error into a failure');
 });
 
 test('an uncaught page error fails the test', async ({ app }) => {
-  test.fail(true, 'the app fixture must turn a pageerror into a failure');
   await app.goto('');
+  expect(app.problems()).toEqual([]);
   await app.page.evaluate(() => {
     setTimeout(() => {
       throw new Error('harness self-test: uncaught');
     });
   });
-  await app.page.waitForTimeout(100);
+  await expect
+    .poll(() => app.problems())
+    .toEqual([expect.stringMatching(/^pageerror: Error: harness self-test: uncaught\b/)]);
+  test.fail(true, 'the app fixture must turn a pageerror into a failure');
 });
 
 test('allowConsole lets an expected console.error through', async ({ app }) => {
   app.allowConsole(/expected harness noise/);
   await app.goto('');
+  const logged = app.page.waitForEvent('console', (m) => m.text() === 'expected harness noise');
   await app.page.evaluate(() => console.error('expected harness noise'));
+  await logged;
+  expect(app.problems()).toEqual([]);
 });
 
 test('a11y helper reports serious violations and honours exclude', async ({ page }) => {
@@ -365,5 +502,52 @@ test('empty and onboarded seeds start clean, and stop() removes everything', asy
     }
     for (const dir of [s.home, s.secretsDir, s.userHome]) expect(existsSync(dir), dir).toBe(false);
     await expect(request.get(s.apiUrl('/api/status'), { timeout: 2_000 })).rejects.toThrow();
+  }
+});
+
+test('a test process ended by SIGINT, SIGTERM or SIGHUP takes its server with it', async ({
+  request,
+}) => {
+  test.setTimeout(60_000);
+  const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+  const started = signals.map(() => serverInChild());
+  try {
+    const infos = await Promise.all(started.map((s) => s.info));
+    for (const info of infos) {
+      expect(pidAlive(info.pid)).toBe(true);
+      expect((await request.get(`${info.base}/api/status`)).status()).toBe(401);
+    }
+    signals.forEach((signal, i) => started[i].child.kill(signal));
+    for (const [i, info] of infos.entries()) {
+      // Cleaned up, then the signal re-raised: the process still ends by that signal.
+      expect(await started[i].exit).toEqual({ code: null, signal: signals[i] });
+      for (const dir of info.dirs) expect(existsSync(dir), dir).toBe(false);
+      await expect.poll(() => pidAlive(info.pid), { message: `server ${info.pid}` }).toBe(false);
+      await expect(request.get(`${info.base}/api/status`, { timeout: 2_000 })).rejects.toThrow();
+    }
+  } finally {
+    // SIGTERM, not SIGKILL: a child still running after a failure cleans up after itself too.
+    for (const { child } of started) child.kill('SIGTERM');
+  }
+});
+
+test('sweepStale cleans up after a test process killed outright', async ({ request }) => {
+  test.setTimeout(60_000);
+  const { child, exit, info: started } = serverInChild();
+  try {
+    const info = await started;
+    child.kill('SIGKILL');
+    expect(await exit).toEqual({ code: null, signal: 'SIGKILL' });
+    // Nothing in the dead process could clean up: the server and its directories are orphaned.
+    expect(pidAlive(info.pid)).toBe(true);
+    for (const dir of info.dirs) expect(existsSync(dir), dir).toBe(true);
+
+    expect(sweepStale()).toContain(info.dirs[0]);
+    await expect.poll(() => pidAlive(info.pid), { message: `server ${info.pid}` }).toBe(false);
+    for (const dir of info.dirs) expect(existsSync(dir), dir).toBe(false);
+    await expect(request.get(`${info.base}/api/status`, { timeout: 2_000 })).rejects.toThrow();
+  } finally {
+    child.kill('SIGKILL');
+    sweepStale(); // whatever an early failure left behind
   }
 });

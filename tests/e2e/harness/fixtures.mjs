@@ -11,7 +11,8 @@
 // a test-scoped fixture: use it in tests and `beforeEach`, not `beforeAll`.
 //
 // `app` opens the app for one test with the side-effect intercepts installed, and fails the test
-// on any console.error or uncaught page error (allow-list one with `app.allowConsole(/regex/)`).
+// on any console.error or uncaught page error (allow-list one with `app.allowConsole(/regex/)`;
+// `app.problems()` lists the ones that would fail it so far).
 import { test as base, expect } from '@playwright/test';
 
 import { interceptSideEffects } from './intercept.mjs';
@@ -52,6 +53,7 @@ export const test = base.extend({
       if (msg.type() === 'error') problems.push(`console.error: ${msg.text()}`);
     });
     page.on('pageerror', (err) => problems.push(`pageerror: ${err.stack || err.message || err}`));
+    const unexpected = () => problems.filter((p) => !allowed.some((re) => re.test(p)));
 
     await use({
       page,
@@ -63,10 +65,11 @@ export const test = base.extend({
       allowConsole: (re) => {
         allowed.push(re);
       },
+      /** The console errors / page errors so far that `allowConsole` doesn't cover. */
+      problems: unexpected,
     });
 
-    const unexpected = problems.filter((p) => !allowed.some((re) => re.test(p)));
-    expect(unexpected, 'console errors or uncaught page errors during the test').toEqual([]);
+    expect(unexpected(), 'console errors or uncaught page errors during the test').toEqual([]);
   },
 });
 

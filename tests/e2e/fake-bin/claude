@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Fail-closed `claude` for the e2e harness. harness/server.mjs puts this directory first on the
+# server's PATH, so a real Claude Code install (and whatever Keychain login or API key it could
+# reach) is never launched. It makes agent detection the same on every machine: present (found
+# here) and not signed in (the sandbox HOME has no ~/.claude.json).
+#
+#   claude mcp <anything>   exit 1: `mcp get` reads as "not configured", `mcp add` / `remove` fail
+#   anything else           exit 1 with the message below on stderr, which the server shows as
+#                           the turn's error (Test connection, chat, scheduled runs)
+#
+# Specs drive the agent through the fake opencode; this script exists only to refuse.
+set -u
+
+if [ "${1:-}" = "mcp" ]; then
+  echo "fake claude: MCP wiring is disabled in e2e" >&2
+  exit 1
+fi
+echo "fake claude: real agents are disabled in e2e" >&2
+exit 1

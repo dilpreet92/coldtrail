@@ -2,7 +2,7 @@
   "name": "coldtrail-e2e",
   "private": true,
   "version": "0.0.0",
-  "description": "End-to-end Playwright suite for coldtrail's browser UI. Every spec drives a real `coldtrail serve` started by harness/server.mjs in a throwaway COLDTRAIL_HOME with sending, OS timers and self-update switched off and a fake `opencode` first on PATH; routes that would open Chrome, OAuth or LinkedIn are intercepted in the page. Nothing here may touch ~/.coldtrail, real secrets, LaunchAgents, Gmail, Canonical, LinkedIn or a model.",
+  "description": "End-to-end Playwright suite for coldtrail's browser UI. Every spec drives a real `coldtrail serve` started by harness/server.mjs in a throwaway COLDTRAIL_HOME with sending, OS timers and self-update switched off and fake agent CLIs first on PATH (`opencode` answers with canned turns, `claude` and `codex` refuse); routes that would open Chrome, OAuth or LinkedIn are intercepted in the page. Nothing here may touch ~/.coldtrail, real secrets, LaunchAgents, Gmail, Canonical, LinkedIn or a model.",
   "type": "module",
   "scripts": {
     "test": "playwright test"

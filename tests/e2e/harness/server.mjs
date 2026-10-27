@@ -4,16 +4,31 @@
 //   - COLDTRAIL_HOME is a fresh mkdtemp dir; secrets land beside it in `<home>.secrets`.
 //   - COLDTRAIL_NO_SEND / NO_TIMERS / NO_UPDATE are set: no email or LinkedIn send, no launchd /
 //     systemd timer, no self-update.
-//   - tests/e2e/fake-bin is first on PATH, so `opencode` is the canned fake, never a model.
+//   - tests/e2e/fake-bin is first on PATH, so every agent CLI the server can launch is a fake,
+//     never a model: `opencode` gives canned answers, `claude` and `codex` refuse (exit 1). All
+//     three are present on every machine, whatever is installed for real.
 //   - HOME is a sandbox dir too (`<home>.user`), so nothing the server derives from the user's
 //     home is real: no gcloud ADC (GOOGLE_APPLICATION_CREDENTIALS also points at a missing file),
-//     no ~/Library/LaunchAgents, no agent auth files. The fake opencode is "signed in" there.
-//   - Inherited COLDTRAIL_* variables (an API key, a real home) are dropped.
-// `stop()` kills the server's whole process group and deletes all three directories.
+//     no ~/Library/LaunchAgents, no agent auth files. Only the fake opencode is "signed in" there.
+//   - Inherited credentials and config pointers are dropped: COLDTRAIL_* (an API key, a real
+//     home) and the agent CLIs' ANTHROPIC_*, OPENAI_*, CLAUDE*, CODEX_* and OPENCODE_* variables.
+// `stop()` kills the server's whole process group and deletes all three directories. If the
+// test process ends without calling it (normal exit, a fatal SIGINT / SIGTERM / SIGHUP), the
+// servers it started are killed and their directories removed on the way out. One killed outright
+// (SIGKILL) can't clean up, so the next `startServer` in any process sweeps workspaces whose
+// owner is gone: see `sweepStale`.
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { createServer } from 'node:net';
-import { homedir, tmpdir } from 'node:os';
+import { constants as osConstants, homedir, tmpdir } from 'node:os';
 import { delimiter, dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
@@ -28,6 +43,19 @@ export const DEFAULT_BIN = join(REPO_DIR, 'target/debug/coldtrail');
 
 const SEEDS = ['full', 'empty', 'onboarded'];
 const URL_RE = /http:\/\/127\.0\.0\.1:(\d+)\/\?t=([A-Za-z0-9-]+)/;
+const HOME_PREFIX = 'coldtrail-e2e-';
+// mkdtemp's six-character suffix: the workspace itself, not its `.secrets` / `.user` siblings.
+const HOME_NAME_RE = /^coldtrail-e2e-[A-Za-z0-9]{6}$/;
+// Written into each workspace: who started it, and its server once spawned (read by sweepStale).
+const OWNER_FILE = '.e2e-owner.json';
+// Inherited variables that could hand the server, or an agent CLI it launches, real credentials
+// or a real config: coldtrail's own, Google ADC, and the agent CLIs' keys, config dirs and
+// switches (ANTHROPIC_API_KEY, OPENAI_API_KEY, CLAUDE_CONFIG_DIR, CLAUDE_CODE_*, CODEX_HOME, ...).
+const DROPPED_ENV =
+  /^(COLDTRAIL_|ANTHROPIC_|OPENAI_|CLAUDE|CODEX_|OPENCODE_)|^GOOGLE_APPLICATION_CREDENTIALS$/;
+const CLEANUP_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+// Marks this module's signal handlers, so they don't count each other as "someone else handles it".
+const OWN_HANDLER = Symbol.for('coldtrail.e2e.server-cleanup');
 const START_TIMEOUT_MS = 20_000;
 const OUTPUT_LIMIT = 64 * 1024;
 
@@ -40,9 +68,11 @@ token_endpoint = "https://canonical.invalid/oauth/token"
 client_id = "coldtrail-e2e"
 `;
 
-// Servers still running, killed if the test process exits without stopping them.
-const live = new Set();
+// Servers still running (child -> its three directories), cleaned up if the test process ends
+// without stopping them.
+const live = new Map();
 let exitHookInstalled = false;
+let swept = false;
 
 /**
  * Start an isolated server.
@@ -54,7 +84,12 @@ export async function startServer({ seed = 'full', bin = DEFAULT_BIN } = {}) {
   if (!SEEDS.includes(seed)) throw new Error(`startServer: unknown seed "${seed}"`);
   if (!existsSync(bin)) throw new Error(`coldtrail binary not found at ${bin}; run \`cargo build\` first`);
 
-  const home = mkdtempSync(join(tmpdir(), 'coldtrail-e2e-'));
+  if (!swept) {
+    swept = true;
+    sweepStale();
+  }
+
+  const home = mkdtempSync(join(tmpdir(), HOME_PREFIX));
   const secretsDir = `${home}.secrets`;
   const userHome = `${home}.user`;
   const dirs = [home, secretsDir, userHome];
@@ -67,6 +102,7 @@ export async function startServer({ seed = 'full', bin = DEFAULT_BIN } = {}) {
 
   let child;
   try {
+    writeOwner(home, { owner: process.pid });
     mkdirSync(join(userHome, '.local/share/opencode'), { recursive: true });
     writeFileSync(join(userHome, '.local/share/opencode/auth.json'), '{}\n');
     writeFileSync(join(home, 'config.toml'), CONFIG_TOML);
@@ -99,8 +135,9 @@ export async function startServer({ seed = 'full', bin = DEFAULT_BIN } = {}) {
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    live.add(child);
+    live.set(child, dirs);
     installExitHook();
+    writeOwner(home, { owner: process.pid, server: child.pid, port });
 
     // Keep draining both pipes for the server's whole life (a full pipe would block it) and
     // keep the tail for error messages.
@@ -192,12 +229,14 @@ export async function startServer({ seed = 'full', bin = DEFAULT_BIN } = {}) {
   }
 }
 
-/** The server's environment: the caller's, minus coldtrail/Google credentials, plus isolation. */
-function serverEnv({ home, userHome }) {
+/**
+ * The server's environment: `base` (the caller's) minus anything matching DROPPED_ENV, plus the
+ * isolation variables, with fake-bin first on PATH.
+ */
+export function serverEnv({ home, userHome }, base = process.env) {
   const env = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (k.startsWith('COLDTRAIL_') || k === 'GOOGLE_APPLICATION_CREDENTIALS') continue;
-    env[k] = v;
+  for (const [k, v] of Object.entries(base)) {
+    if (!DROPPED_ENV.test(k)) env[k] = v;
   }
   return {
     ...env,
@@ -205,10 +244,73 @@ function serverEnv({ home, userHome }) {
     COLDTRAIL_NO_SEND: '1',
     COLDTRAIL_NO_TIMERS: '1',
     COLDTRAIL_NO_UPDATE: '1',
-    PATH: [FAKE_BIN, process.env.PATH].filter(Boolean).join(delimiter),
+    PATH: [FAKE_BIN, base.PATH].filter(Boolean).join(delimiter),
     HOME: userHome,
     GOOGLE_APPLICATION_CREDENTIALS: join(userHome, 'no-gcloud-adc.json'),
   };
+}
+
+/**
+ * Clean up after test processes that died without stopping their servers (SIGKILL, a crash):
+ * for each e2e workspace in `dir` whose owner process is gone, SIGKILL its server's group if that
+ * server is still running, and delete the workspace, its secrets and its sandbox HOME. Workspaces
+ * whose owner is alive (another worker, another run) or unknown are left alone.
+ * `startServer` runs this once per process; it is exported for the harness self-test.
+ * @returns {string[]} the workspaces removed
+ */
+export function sweepStale(dir = tmpdir()) {
+  const removed = [];
+  let names;
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return removed;
+  }
+  for (const name of names) {
+    if (!HOME_NAME_RE.test(name)) continue;
+    const home = join(dir, name);
+    let info;
+    try {
+      info = JSON.parse(readFileSync(join(home, OWNER_FILE), 'utf8'));
+    } catch {
+      continue; // not ours, or still being created
+    }
+    if (!Number.isInteger(info.owner) || pidAlive(info.owner)) continue;
+    if (Number.isInteger(info.server) && isOurServer(info.server, info.port)) {
+      try {
+        process.kill(-info.server, 'SIGKILL');
+      } catch {
+        // gone meanwhile
+      }
+    }
+    removeAll([home, `${home}.secrets`, `${home}.user`]);
+    removed.push(home);
+  }
+  return removed;
+}
+
+function writeOwner(home, info) {
+  writeFileSync(join(home, OWNER_FILE), `${JSON.stringify(info)}\n`);
+}
+
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === 'EPERM'; // exists, but not ours to signal
+  }
+}
+
+/**
+ * Is `pid` still the `coldtrail serve` a harness started on `port`, leading its own process
+ * group? Guards the sweep against a recycled pid.
+ */
+function isOurServer(pid, port) {
+  if (!Number.isInteger(port)) return false;
+  const ps = spawnSync('ps', ['-o', 'pgid=,command=', '-p', String(pid)], { encoding: 'utf8' });
+  const m = (ps.stdout || '').trim().match(/^(\d+)\s+([\s\S]*)$/);
+  return !!m && Number(m[1]) === pid && m[2].includes(` serve --port ${port} --no-open`);
 }
 
 function freePort() {
@@ -265,10 +367,35 @@ function removeAll(dirs) {
   for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
 }
 
+/** Synchronously kill every live server group and delete its directories. */
+function cleanupLive() {
+  for (const [child, dirs] of live) {
+    signalGroup(child, 'SIGKILL');
+    removeAll(dirs);
+  }
+  live.clear();
+}
+
+// The servers run in their own process groups (detached), so a terminal's Ctrl-C or hang-up never
+// reaches them: whatever ends this process has to end them too.
 function installExitHook() {
   if (exitHookInstalled) return;
   exitHookInstalled = true;
-  process.on('exit', () => {
-    for (const child of live) signalGroup(child, 'SIGKILL');
-  });
+  process.on('exit', cleanupLive);
+  for (const signal of CLEANUP_SIGNALS) {
+    const onSignal = () => {
+      // Someone else handles this signal, so it won't end the process by itself: a Playwright
+      // worker ignores SIGINT / SIGTERM until the runner stops it, and its fixture teardown or the
+      // 'exit' hook cleans up then.
+      if (process.listeners(signal).some((l) => !l[OWN_HANDLER])) return;
+      // Otherwise the signal was going to end the process without an 'exit' event. Clean up,
+      // then let it do that.
+      cleanupLive();
+      process.off(signal, onSignal);
+      process.kill(process.pid, signal);
+      process.exit(128 + (osConstants.signals[signal] ?? 0)); // only if the re-raise didn't
+    };
+    onSignal[OWN_HANDLER] = true;
+    process.on(signal, onSignal);
+  }
 }
