@@ -6,6 +6,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter};
+use serde::Deserialize;
 
 use super::api::{
     CompaniesPage, CompaniesQuery, CompanyDetail, CompanyDto, ContactDetail, ContactDto, DraftDto,
@@ -88,6 +89,48 @@ pub async fn save_draft(
         return Err(anyhow::anyhow!("no editable draft for {domain}").into());
     }
     Ok(Json(MsgResp::ok()))
+}
+
+#[derive(Deserialize)]
+pub struct DiscardQuery {
+    pub channel: Option<String>,
+}
+
+/// `DELETE /api/drafts/:domain?channel=email|linkedin` — throw away a domain's pending draft on
+/// one channel: its reviewable rows there go (never sent history, never the other channel's
+/// draft) and the company is set to `skip` (excluded from outreach). DB-only: a Gmail draft
+/// already created for a `drafted` row stays in Gmail.
+pub async fn discard_draft(
+    Path(domain): Path<String>,
+    Query(q): Query<DiscardQuery>,
+) -> Result<Response, ApiErr> {
+    let Some(channel) = q
+        .channel
+        .as_deref()
+        .filter(|ch| matches!(*ch, "email" | "linkedin"))
+    else {
+        return Ok((StatusCode::BAD_REQUEST, "channel must be email or linkedin").into_response());
+    };
+    let domain = domain.to_lowercase();
+    let mut c = crate::db::open()?;
+    // One transaction, so a draft never vanishes while its company stays in the queue.
+    let tx = c.transaction()?;
+    let n = tx.execute(
+        "DELETE FROM outreach WHERE domain = ?1 AND COALESCE(channel,'email') = ?2 \
+         AND status IN ('draft_pending','drafted')",
+        params![domain, channel],
+    )?;
+    if n == 0 {
+        return Ok(Json(MsgResp {
+            ok: false,
+            message: Some("no pending draft".into()),
+            wired: None,
+        })
+        .into_response());
+    }
+    crate::db::set_status(&tx, &domain, "skip")?;
+    tx.commit()?;
+    Ok(Json(MsgResp::ok()).into_response())
 }
 
 /// Pipeline summary: totals, the company-status funnel, and per-ICP query counts.
@@ -618,11 +661,18 @@ mod tests {
 
     /// GET through the real router (token guard + route table) → (status, body text).
     fn get(uri: &str) -> (axum::http::StatusCode, String) {
+        call("GET", uri)
+    }
+
+    /// `method uri` through the real router, with the session token added to the query string.
+    fn call(method: &str, uri: &str) -> (axum::http::StatusCode, String) {
         use tower::ServiceExt;
         let rt = tokio::runtime::Runtime::new().unwrap();
         let app = crate::web::router(crate::web::tests::state());
+        let sep = if uri.contains('?') { '&' } else { '?' };
         let req = axum::http::Request::builder()
-            .uri(format!("{uri}?t=secret-tok"))
+            .method(method)
+            .uri(format!("{uri}{sep}t=secret-tok"))
             .body(axum::body::Body::empty())
             .unwrap();
         let resp = rt.block_on(app.oneshot(req)).unwrap();
@@ -804,6 +854,140 @@ mod tests {
                 rows[0].auto_skip.as_deref(),
                 Some("LinkedIn asks for their email")
             );
+        });
+    }
+
+    /// (channel, status) of every outreach row for `domain`, oldest first; NULL reads as email.
+    fn outreach_of(domain: &str) -> Vec<(String, String)> {
+        crate::db::open()
+            .unwrap()
+            .prepare(
+                "SELECT COALESCE(channel,'email'), status FROM outreach WHERE domain = ?1 ORDER BY id",
+            )
+            .unwrap()
+            .query_map([domain], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    fn status_of(domain: &str) -> String {
+        crate::db::open()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM companies WHERE domain = ?1",
+                [domain],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn rows(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect()
+    }
+
+    /// Discard deletes only the reviewable (draft_pending/drafted) rows on the named channel for
+    /// that domain — the other channel's draft, sent history and other domains are untouched —
+    /// and skips the company so it leaves the queue. A legacy NULL channel counts as email.
+    #[test]
+    fn discard_removes_only_pending_rows_on_that_channel() {
+        crate::testutil::with_home("ct-web-pipeline-discard", |_| {
+            seed(
+                "INSERT INTO companies (domain, status) VALUES \
+                 ('acme.com','drafted'), ('other.com','drafted'); \
+                 INSERT INTO outreach (domain, channel, body, status) VALUES \
+                 ('acme.com','linkedin','note','draft_pending'), \
+                 ('acme.com','email','hi','draft_pending'), \
+                 ('acme.com','linkedin','old note','sent'), \
+                 ('acme.com',NULL,'legacy','drafted'), \
+                 ('other.com','linkedin','theirs','draft_pending');",
+            );
+            let (status, body) = call("DELETE", "/api/drafts/ACME.com?channel=linkedin");
+            assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v, serde_json::json!({"ok": true, "message": null}));
+            assert_eq!(
+                outreach_of("acme.com"),
+                rows(&[
+                    ("email", "draft_pending"),
+                    ("linkedin", "sent"),
+                    ("email", "drafted")
+                ])
+            );
+            assert_eq!(status_of("acme.com"), "skip");
+            assert_eq!(
+                outreach_of("other.com"),
+                rows(&[("linkedin", "draft_pending")])
+            );
+            assert_eq!(status_of("other.com"), "drafted");
+
+            // Email takes the legacy NULL-channel draft with it; the sent LinkedIn row stays.
+            let (status, body) = call("DELETE", "/api/drafts/acme.com?channel=email");
+            assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["ok"], true);
+            assert_eq!(outreach_of("acme.com"), rows(&[("linkedin", "sent")]));
+        });
+    }
+
+    /// Nothing reviewable on that channel (only sent history, a draft on the other channel, or
+    /// an unknown domain) is `ok:false` with a reason — and changes neither rows nor status.
+    #[test]
+    fn discard_without_pending_returns_ok_false() {
+        crate::testutil::with_home("ct-web-pipeline-discard-none", |_| {
+            seed(
+                "INSERT INTO companies (domain, status) VALUES ('acme.com','sent'); \
+                 INSERT INTO outreach (domain, channel, status) VALUES \
+                 ('acme.com','email','sent'), ('acme.com','linkedin','draft_pending');",
+            );
+            for uri in [
+                "/api/drafts/acme.com?channel=email",
+                "/api/drafts/nope.com?channel=linkedin",
+            ] {
+                let (status, body) = call("DELETE", uri);
+                assert_eq!(status, axum::http::StatusCode::OK, "{uri}: {body}");
+                let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(
+                    v,
+                    serde_json::json!({"ok": false, "message": "no pending draft"}),
+                    "{uri}"
+                );
+            }
+            assert_eq!(
+                outreach_of("acme.com"),
+                rows(&[("email", "sent"), ("linkedin", "draft_pending")])
+            );
+            assert_eq!(status_of("acme.com"), "sent");
+        });
+    }
+
+    /// The channel is required and must be exactly `email` or `linkedin`; anything else is a
+    /// 400 that deletes nothing (a missing channel never means "every channel").
+    #[test]
+    fn discard_rejects_bad_channel() {
+        crate::testutil::with_home("ct-web-pipeline-discard-channel", |_| {
+            seed(
+                "INSERT INTO companies (domain, status) VALUES ('acme.com','drafted'); \
+                 INSERT INTO outreach (domain, channel, status) VALUES \
+                 ('acme.com','email','draft_pending'), ('acme.com','linkedin','draft_pending');",
+            );
+            for uri in [
+                "/api/drafts/acme.com",
+                "/api/drafts/acme.com?channel=",
+                "/api/drafts/acme.com?channel=sms",
+                "/api/drafts/acme.com?channel=EMAIL",
+            ] {
+                let (status, body) = call("DELETE", uri);
+                assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{uri}: {body}");
+                assert_eq!(body, "channel must be email or linkedin", "{uri}");
+            }
+            assert_eq!(
+                outreach_of("acme.com"),
+                rows(&[("email", "draft_pending"), ("linkedin", "draft_pending")])
+            );
+            assert_eq!(status_of("acme.com"), "drafted");
         });
     }
 }

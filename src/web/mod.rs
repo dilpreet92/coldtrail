@@ -178,7 +178,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/chats/new", post(chats::new_chat))
         .route("/api/chats/:id", get(chats::detail))
         .route("/api/chats/:id/activate", post(chats::activate))
-        .route("/api/drafts/:domain", post(pipeline::save_draft))
+        .route(
+            "/api/drafts/:domain",
+            post(pipeline::save_draft).delete(pipeline::discard_draft),
+        )
         .route("/api/drafts/:domain/send", post(send::send))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state)
