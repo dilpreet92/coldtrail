@@ -176,6 +176,40 @@ pub struct CompaniesPage {
     pub queries: Vec<(String, i64)>,
 }
 
+/// `GET /api/companies/:domain` — everything the Pipeline company drawer shows.
+#[derive(Serialize)]
+pub struct CompanyDetail {
+    /// The same row the Pipeline table shows for this domain.
+    pub company: CompanyDto,
+    /// Every contact for the domain, verified first, then most recently found.
+    pub contacts: Vec<ContactDetail>,
+    /// Every outreach row for the domain on any channel, newest first.
+    pub outreach: Vec<OutreachItem>,
+}
+
+#[derive(Serialize)]
+pub struct ContactDetail {
+    pub founder_name: Option<String>,
+    pub role: Option<String>,
+    pub email: Option<String>,
+    /// direct | inferred | generic
+    pub email_confidence: Option<String>,
+    /// The email's domain has a working MX (NULL in the DB reads as false).
+    pub mx_ok: bool,
+    pub linkedin_url: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct OutreachItem {
+    /// "email" | "linkedin" (a legacy NULL channel reads as "email").
+    pub channel: String,
+    /// draft_pending | drafted | sent | replied | bounced
+    pub status: String,
+    pub created_at: Option<String>,
+    pub sent_at: Option<String>,
+    pub subject: Option<String>,
+}
+
 #[derive(Serialize)]
 pub struct ContactDto {
     pub domain: String,

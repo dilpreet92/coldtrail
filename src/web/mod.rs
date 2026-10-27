@@ -148,6 +148,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/drafts/:domain/linkedin/send", post(linkedin::send))
         .route("/api/drafts/linkedin/send-all", post(linkedin::send_all))
         .route("/api/companies", get(pipeline::companies))
+        .route("/api/companies/:domain", get(pipeline::company_detail))
         .route(
             "/api/companies/:domain/status",
             post(pipeline::set_company_status),
@@ -270,7 +271,8 @@ mod tests {
     use axum::http::Request as HttpRequest;
     use tower::ServiceExt;
 
-    fn state() -> Arc<AppState> {
+    /// Also used by handler tests in sibling modules that go through the real router.
+    pub(super) fn state() -> Arc<AppState> {
         Arc::new(AppState {
             token: "secret-tok".into(),
             port: 8787,

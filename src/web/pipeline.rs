@@ -1,13 +1,15 @@
 //! Read-only pipeline data for the dashboard, straight from SQLite.
 
 use axum::extract::{Path, Query};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter};
 
 use super::api::{
-    CompaniesPage, CompaniesQuery, CompanyDto, ContactDto, DraftDto, DraftEditReq, FollowupDto,
-    MarkReq, MsgResp, OverviewDto,
+    CompaniesPage, CompaniesQuery, CompanyDetail, CompanyDto, ContactDetail, ContactDto, DraftDto,
+    DraftEditReq, FollowupDto, MarkReq, MsgResp, OutreachItem, OverviewDto,
 };
 use super::ApiErr;
 
@@ -176,6 +178,30 @@ fn count_pairs(
         .collect()
 }
 
+/// `CompanyDto` columns over a `companies c` row, read back by `company_dto`: the best contact
+/// that has an email (verified first, then most recent) and whether any contact has a LinkedIn
+/// URL. Shared by the Pipeline table and the company drawer so the two never disagree.
+const COMPANY_COLS: &str = "c.domain, c.name, c.status, COALESCE(c.first_seen,''), \
+    (SELECT k.founder_name FROM contacts k WHERE k.domain=c.domain AND k.email IS NOT NULL \
+       ORDER BY k.mx_ok DESC, k.found_at DESC LIMIT 1), \
+    (SELECT k.email FROM contacts k WHERE k.domain=c.domain AND k.email IS NOT NULL \
+       ORDER BY k.mx_ok DESC, k.found_at DESC LIMIT 1), \
+    c.source_query, \
+    EXISTS (SELECT 1 FROM contacts k WHERE k.domain=c.domain AND k.linkedin_url IS NOT NULL)";
+
+fn company_dto(r: &rusqlite::Row) -> rusqlite::Result<CompanyDto> {
+    Ok(CompanyDto {
+        domain: r.get(0)?,
+        name: r.get(1)?,
+        status: r.get(2)?,
+        first_seen: r.get(3)?,
+        founder: r.get(4)?,
+        email: r.get(5)?,
+        source_query: r.get(6)?,
+        linkedin: r.get(7)?,
+    })
+}
+
 /// One page of the Pipeline table, plus the stage and "Sourced by" counts its filters show.
 pub async fn companies(Query(q): Query<CompaniesQuery>) -> Result<Json<CompaniesPage>, ApiErr> {
     let page = q.page.unwrap_or(1).max(1);
@@ -200,30 +226,13 @@ pub async fn companies(Query(q): Query<CompaniesQuery>) -> Result<Json<Companies
     args.push(Value::Integer((i64::from(page) - 1) * i64::from(per)));
     let (limit, offset) = (args.len() - 1, args.len());
     let mut stmt = c.prepare(&format!(
-        "SELECT c.domain, c.name, c.status, COALESCE(c.first_seen,''), \
-                (SELECT k.founder_name FROM contacts k WHERE k.domain=c.domain AND k.email IS NOT NULL \
-                   ORDER BY k.mx_ok DESC, k.found_at DESC LIMIT 1), \
-                (SELECT k.email FROM contacts k WHERE k.domain=c.domain AND k.email IS NOT NULL \
-                   ORDER BY k.mx_ok DESC, k.found_at DESC LIMIT 1), \
-                c.source_query, \
-                EXISTS (SELECT 1 FROM contacts k WHERE k.domain=c.domain AND k.linkedin_url IS NOT NULL) \
+        "SELECT {COMPANY_COLS} \
          FROM (SELECT c.domain, c.name, c.status, c.first_seen, c.source_query FROM companies c \
                {filter} ORDER BY c.first_seen DESC, c.domain ASC LIMIT ?{limit} OFFSET ?{offset}) c \
          ORDER BY c.first_seen DESC, c.domain ASC"
     ))?;
     let rows = stmt
-        .query_map(params_from_iter(&args), |r| {
-            Ok(CompanyDto {
-                domain: r.get(0)?,
-                name: r.get(1)?,
-                status: r.get(2)?,
-                first_seen: r.get(3)?,
-                founder: r.get(4)?,
-                email: r.get(5)?,
-                source_query: r.get(6)?,
-                linkedin: r.get(7)?,
-            })
-        })?
+        .query_map(params_from_iter(&args), company_dto)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     // Stage tabs keep their counts whichever tab is selected: `q` + `query`, not `stage`.
@@ -260,6 +269,62 @@ pub async fn companies(Query(q): Query<CompaniesQuery>) -> Result<Json<Companies
         stages,
         queries,
     }))
+}
+
+/// Everything the Pipeline company drawer shows for one domain: its Pipeline row, every
+/// contact, and the outreach history on every channel. An unknown domain is a 404.
+pub async fn company_detail(Path(domain): Path<String>) -> Result<Response, ApiErr> {
+    use rusqlite::OptionalExtension;
+    let domain = domain.to_lowercase();
+    let c = crate::db::open()?;
+    let Some(company) = c
+        .query_row(
+            &format!("SELECT {COMPANY_COLS} FROM companies c WHERE c.domain = ?1"),
+            [&domain],
+            company_dto,
+        )
+        .optional()?
+    else {
+        return Ok((StatusCode::NOT_FOUND, "not found").into_response());
+    };
+    // Verified first, then newest — the same preference that picks the row's best contact.
+    let contacts = c
+        .prepare(
+            "SELECT founder_name, role, email, email_confidence, COALESCE(mx_ok,0), linkedin_url \
+             FROM contacts WHERE domain = ?1 ORDER BY mx_ok DESC, found_at DESC, id DESC",
+        )?
+        .query_map([&domain], |r| {
+            Ok(ContactDetail {
+                founder_name: r.get(0)?,
+                role: r.get(1)?,
+                email: r.get(2)?,
+                email_confidence: r.get(3)?,
+                mx_ok: r.get::<_, i64>(4)? != 0,
+                linkedin_url: r.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let outreach = c
+        .prepare(
+            "SELECT COALESCE(channel,'email'), status, created_at, sent_at, subject \
+             FROM outreach WHERE domain = ?1 ORDER BY created_at DESC, id DESC",
+        )?
+        .query_map([&domain], |r| {
+            Ok(OutreachItem {
+                channel: r.get(0)?,
+                status: r.get(1)?,
+                created_at: r.get(2)?,
+                sent_at: r.get(3)?,
+                subject: r.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(Json(CompanyDetail {
+        company,
+        contacts,
+        outreach,
+    })
+    .into_response())
 }
 
 /// Curate a company from the Pipeline: `skip` (exclude from outreach) or `restore`
@@ -542,6 +607,94 @@ mod tests {
             assert_eq!(row("mail.com").founder.as_deref(), Some("New"));
             assert_eq!(row("mail.com").email.as_deref(), Some("new@mail.com"));
             assert!(!row("none.com").linkedin);
+        });
+    }
+
+    /// GET through the real router (token guard + route table) → (status, body text).
+    fn get(uri: &str) -> (axum::http::StatusCode, String) {
+        use tower::ServiceExt;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let app = crate::web::router(crate::web::tests::state());
+        let req = axum::http::Request::builder()
+            .uri(format!("{uri}?t=secret-tok"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = rt.block_on(app.oneshot(req)).unwrap();
+        let status = resp.status();
+        let body = rt
+            .block_on(axum::body::to_bytes(resp.into_body(), usize::MAX))
+            .unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    /// The drawer's company row matches the Pipeline row (best emailed contact, LinkedIn flag);
+    /// contacts list verified first then newest, outreach newest first across channels (a legacy
+    /// NULL channel reads as email), and nothing leaks in from another domain. The URL's domain
+    /// is lowercased before lookup.
+    #[test]
+    fn company_detail_returns_contacts_and_outreach() {
+        crate::testutil::with_home("ct-web-pipeline-company-detail", |_| {
+            seed(
+                "INSERT INTO companies (domain, name, status, source_query, first_seen) VALUES \
+                 ('acme.com','Acme','sent','ICP one','2026-10-01 09:00:00'), \
+                 ('other.com','Other','sourced','ICP two','2026-10-02 09:00:00'); \
+                 INSERT INTO contacts (domain, founder_name, role, email, email_confidence, mx_ok, \
+                                       linkedin_url, found_at) VALUES \
+                 ('acme.com','Old Verified','CEO','old@acme.com','direct',1,NULL,'2026-10-01'), \
+                 ('acme.com','New Verified','CTO','new@acme.com','inferred',1,NULL,'2026-10-02'), \
+                 ('acme.com','Li Only',NULL,NULL,NULL,NULL,'https://www.linkedin.com/in/li','2026-10-03'), \
+                 ('other.com','Not Me','CEO','me@other.com','direct',1,NULL,'2026-10-04'); \
+                 INSERT INTO outreach (domain, channel, subject, status, created_at, sent_at) VALUES \
+                 ('acme.com',NULL,'first','replied','2026-10-01 10:00:00','2026-10-01 11:00:00'), \
+                 ('acme.com','linkedin',NULL,'draft_pending','2026-10-04 10:00:00',NULL), \
+                 ('acme.com','email','hi','sent','2026-10-02 10:00:00','2026-10-02 11:00:00'), \
+                 ('other.com','email','nope','sent','2026-10-05 10:00:00','2026-10-05 11:00:00');",
+            );
+            let (status, body) = get("/api/companies/ACME.com");
+            assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                v["company"],
+                serde_json::json!({
+                    "domain": "acme.com", "name": "Acme", "status": "sent",
+                    "first_seen": "2026-10-01 09:00:00", "founder": "New Verified",
+                    "email": "new@acme.com", "source_query": "ICP one", "linkedin": true,
+                })
+            );
+            assert_eq!(
+                v["contacts"],
+                serde_json::json!([
+                    {"founder_name": "New Verified", "role": "CTO", "email": "new@acme.com",
+                     "email_confidence": "inferred", "mx_ok": true, "linkedin_url": null},
+                    {"founder_name": "Old Verified", "role": "CEO", "email": "old@acme.com",
+                     "email_confidence": "direct", "mx_ok": true, "linkedin_url": null},
+                    {"founder_name": "Li Only", "role": null, "email": null,
+                     "email_confidence": null, "mx_ok": false,
+                     "linkedin_url": "https://www.linkedin.com/in/li"},
+                ])
+            );
+            assert_eq!(
+                v["outreach"],
+                serde_json::json!([
+                    {"channel": "linkedin", "status": "draft_pending",
+                     "created_at": "2026-10-04 10:00:00", "sent_at": null, "subject": null},
+                    {"channel": "email", "status": "sent", "created_at": "2026-10-02 10:00:00",
+                     "sent_at": "2026-10-02 11:00:00", "subject": "hi"},
+                    {"channel": "email", "status": "replied", "created_at": "2026-10-01 10:00:00",
+                     "sent_at": "2026-10-01 11:00:00", "subject": "first"},
+                ])
+            );
+        });
+    }
+
+    /// An unknown domain is a plain 404 (not a 500, not an empty 200), so the drawer can say so.
+    #[test]
+    fn company_detail_404_for_unknown_domain() {
+        crate::testutil::with_home("ct-web-pipeline-company-detail-404", |_| {
+            seed("INSERT INTO companies (domain) VALUES ('acme.com');");
+            let (status, body) = get("/api/companies/nope.com");
+            assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+            assert_eq!(body, "not found");
         });
     }
 
