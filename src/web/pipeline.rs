@@ -16,6 +16,12 @@ use super::ApiErr;
 /// One row per already-contacted domain, with days-since-send and a derived state.
 pub async fn followups() -> Result<Json<Vec<FollowupDto>>, ApiErr> {
     let c = crate::db::open()?;
+    Ok(Json(followup_rows(&c)?))
+}
+
+/// The Follow-ups rows, most recent send first. Shared with `/api/summary`, whose "due" count
+/// must agree with the list it links to.
+pub fn followup_rows(c: &rusqlite::Connection) -> anyhow::Result<Vec<FollowupDto>> {
     let mut stmt = c.prepare(
         "SELECT o.domain, MAX(k.email), \
                 CAST(julianday('now') - julianday(MAX(o.sent_at)) AS INTEGER), \
@@ -51,7 +57,7 @@ pub async fn followups() -> Result<Json<Vec<FollowupDto>>, ApiErr> {
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
-    Ok(Json(rows))
+    Ok(rows)
 }
 
 /// Manually mark a contact replied / bounced (fallback to the agent reply-check).

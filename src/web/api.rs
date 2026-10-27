@@ -210,6 +210,94 @@ pub struct OutreachItem {
     pub subject: Option<String>,
 }
 
+/// `GET /api/summary` — Home, the sidebar counts and the top-bar schedule chip in one request.
+#[derive(Serialize)]
+pub struct SummaryDto {
+    pub counts: SummaryCounts,
+    /// (stage, companies that reached it): always sourced, contact_found, drafted, sent,
+    /// replied — in that order, zeros included.
+    pub funnel: Vec<(String, i64)>,
+    /// The newest run row (a run only gets one when it finishes).
+    pub last_run: Option<LastRun>,
+    /// The enabled schedule that fires soonest.
+    pub next_schedule: Option<NextSchedule>,
+    /// A conversation a run is writing to right now.
+    pub running: Option<RunningChat>,
+    /// Problems only the human can fix, each linking to where they fix it.
+    pub attention: Vec<Attention>,
+}
+
+#[derive(Serialize)]
+pub struct SummaryCounts {
+    pub companies: i64,
+    /// Every contact row, with or without an email.
+    pub contacts: i64,
+    /// Outreach awaiting review (draft_pending | drafted): all, email (incl. a legacy NULL
+    /// channel), linkedin.
+    pub drafts: i64,
+    pub drafts_email: i64,
+    pub drafts_linkedin: i64,
+    /// Follow-ups rows in the `due` state.
+    pub followups_due: i64,
+    /// Outreach rows marked replied.
+    pub replied: i64,
+    /// Outreach rows that went out: sent | replied | bounced.
+    pub sent: i64,
+}
+
+#[derive(Serialize)]
+pub struct LastRun {
+    /// UTC `YYYY-MM-DD HH:MM:SS` — really the finish time (the row is written at the end).
+    pub started_at: String,
+    /// ok | error | auth_failed
+    pub status: String,
+    /// None for a run with no schedule, or whose schedule was deleted.
+    pub schedule_name: Option<String>,
+    pub chat_id: Option<String>,
+    /// What the run added, as recorded and shown on Schedules: new companies, new outreach
+    /// rows, and sends today.
+    pub sourced: i64,
+    pub drafted: i64,
+    pub sent: i64,
+}
+
+impl From<crate::db::RunRow> for LastRun {
+    fn from(r: crate::db::RunRow) -> Self {
+        LastRun {
+            started_at: r.started_at,
+            status: r.status,
+            schedule_name: r.schedule_name,
+            chat_id: r.chat_id,
+            sourced: r.sourced,
+            drafted: r.drafted,
+            sent: r.sent,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct NextSchedule {
+    pub id: String,
+    pub name: String,
+    /// Local wall-clock `YYYY-MM-DDTHH:MM`.
+    pub next_at: String,
+}
+
+#[derive(Serialize)]
+pub struct RunningChat {
+    pub chat_id: String,
+    pub title: String,
+}
+
+#[derive(Serialize)]
+pub struct Attention {
+    /// provider_missing | canonical_disconnected | linkedin_reconnect | last_run_failed
+    pub kind: String,
+    pub message: String,
+    /// The UI route that fixes it, e.g. `#/settings?tab=connections`.
+    pub target: String,
+}
+
 #[derive(Serialize)]
 pub struct ContactDto {
     pub domain: String,

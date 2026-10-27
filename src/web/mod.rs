@@ -11,6 +11,7 @@ pub mod onboarding;
 pub mod pipeline;
 pub mod schedules;
 pub mod send;
+pub mod summary;
 
 use axum::{
     body::Body,
@@ -156,6 +157,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/contacts", get(pipeline::contacts))
         .route("/api/drafts", get(pipeline::drafts))
         .route("/api/overview", get(pipeline::overview))
+        .route("/api/summary", get(summary::summary))
         .route(
             "/api/schedules",
             get(schedules::list).post(schedules::create),

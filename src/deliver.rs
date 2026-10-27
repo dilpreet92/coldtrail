@@ -115,12 +115,19 @@ pub fn capture_local_offset() {
     }
 }
 
-/// Local hour (0..24) for the LinkedIn daytime-window gate. Uses the offset captured at process
-/// start (`capture_local_offset`); if that capture failed, falls back to the real UTC hour
-/// (offset 0) rather than a hardcoded noon — so the window still gates on a real wall clock.
-fn local_hour() -> u32 {
+/// The local wall clock now, at the offset captured at process start (`capture_local_offset`);
+/// if that capture failed, the real UTC time (offset 0). Schedules' next-run times read this.
+pub fn local_now() -> time::PrimitiveDateTime {
     let offset = LOCAL_OFFSET.get().copied().unwrap_or(time::UtcOffset::UTC);
-    time::OffsetDateTime::now_utc().to_offset(offset).hour() as u32
+    let now = time::OffsetDateTime::now_utc().to_offset(offset);
+    time::PrimitiveDateTime::new(now.date(), now.time())
+}
+
+/// Local hour (0..24) for the LinkedIn daytime-window gate, from `local_now` — so with no
+/// captured offset it is the real UTC hour rather than a hardcoded noon, and the window still
+/// gates on a real wall clock.
+fn local_hour() -> u32 {
+    local_now().hour() as u32
 }
 
 /// SEND for real. Refuses unless the human enabled `auto_send`; enforces the per-day cap; sends
@@ -293,6 +300,16 @@ mod tests {
         // derived from the real clock — never the old hardcoded noon.
         capture_local_offset();
         assert!(local_hour() < 24);
+    }
+
+    #[test]
+    fn local_now_is_the_real_clock_at_the_captured_offset() {
+        // Whatever offset was captured (UTC under the threaded test runner), local_now read back
+        // at that offset is this instant — not a stale or shifted clock.
+        capture_local_offset();
+        let offset = LOCAL_OFFSET.get().copied().unwrap_or(time::UtcOffset::UTC);
+        let drift = local_now().assume_offset(offset) - time::OffsetDateTime::now_utc();
+        assert!(drift.abs() < time::Duration::seconds(5), "drift {drift}");
     }
 
     #[test]
