@@ -46,8 +46,9 @@ table { border-collapse: collapse; }
   outline-offset: 2px;
 }
 
-/* Headings and #view take focus programmatically (router, skip-to-content); no ring there. */
-#view:focus, [tabindex="-1"]:focus:not(:focus-visible) { outline: none; }
+/* Headings and #view take focus programmatically (router, skip-to-content); no ring there.
+   Chromium counts focus moved by script before any input as :focus-visible, hence the h1 rule. */
+#view:focus, #view h1[tabindex="-1"]:focus, [tabindex="-1"]:focus:not(:focus-visible) { outline: none; }
 
 /* ---- Typography ---- */
 
