@@ -1,11 +1,13 @@
 //! Read-only pipeline data for the dashboard, straight from SQLite.
 
-use axum::extract::Path;
+use axum::extract::{Path, Query};
 use axum::Json;
-use rusqlite::params;
+use rusqlite::types::Value;
+use rusqlite::{params, params_from_iter};
 
 use super::api::{
-    CompanyDto, ContactDto, DraftDto, DraftEditReq, FollowupDto, MarkReq, MsgResp, OverviewDto,
+    CompaniesPage, CompaniesQuery, CompanyDto, ContactDto, DraftDto, DraftEditReq, FollowupDto,
+    MarkReq, MsgResp, OverviewDto,
 };
 use super::ApiErr;
 
@@ -113,21 +115,104 @@ pub async fn overview() -> Result<Json<OverviewDto>, ApiErr> {
     }))
 }
 
-pub async fn companies() -> Result<Json<Vec<CompanyDto>>, ApiErr> {
+/// Pipeline filters as SQL conditions over `companies c` plus their bound values. `q`,
+/// `stage` and `query` are always parameters, never spliced into the SQL text.
+fn company_filter(
+    q: Option<&str>,
+    stage: Option<&str>,
+    query: Option<&str>,
+) -> (Vec<String>, Vec<Value>) {
+    let mut conds = Vec::new();
+    let mut args = Vec::new();
+    if let Some(q) = q {
+        args.push(Value::Text(like_pattern(q)));
+        let p = format!("?{} ESCAPE '\\'", args.len());
+        conds.push(format!(
+            "(c.name LIKE {p} OR c.domain LIKE {p} OR EXISTS (SELECT 1 FROM contacts k \
+              WHERE k.domain = c.domain AND (k.founder_name LIKE {p} OR k.email LIKE {p})))"
+        ));
+    }
+    if let Some(stage) = stage {
+        args.push(Value::Text(stage.into()));
+        conds.push(format!("c.status = ?{}", args.len()));
+    }
+    if let Some(query) = query {
+        args.push(Value::Text(query.into()));
+        conds.push(format!("c.source_query = ?{}", args.len()));
+    }
+    (conds, args)
+}
+
+fn where_sql(conds: &[String]) -> String {
+    if conds.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", conds.join(" AND "))
+    }
+}
+
+/// `%q%` for `LIKE … ESCAPE '\'`, with the user's own `%`, `_` and `\` matched literally.
+fn like_pattern(q: &str) -> String {
+    let mut p = String::with_capacity(q.len() + 2);
+    p.push('%');
+    for ch in q.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            p.push('\\');
+        }
+        p.push(ch);
+    }
+    p.push('%');
+    p
+}
+
+/// (label, count) pairs from a two-column query, in the query's own order.
+fn count_pairs(
+    c: &rusqlite::Connection,
+    sql: &str,
+    args: &[Value],
+) -> rusqlite::Result<Vec<(String, i64)>> {
+    c.prepare(sql)?
+        .query_map(params_from_iter(args), |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect()
+}
+
+/// One page of the Pipeline table, plus the stage and "Sourced by" counts its filters show.
+pub async fn companies(Query(q): Query<CompaniesQuery>) -> Result<Json<CompaniesPage>, ApiErr> {
+    let page = q.page.unwrap_or(1).max(1);
+    let per = q.per.unwrap_or(50).clamp(1, 200);
+    let search = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let stage = q.stage.as_deref().filter(|s| !s.is_empty());
+    let query = q.query.as_deref().filter(|s| !s.is_empty());
     let c = crate::db::open()?;
-    // Attach the best contact per company (verified first, then most recent) so the
-    // Pipeline row can show who we found — the only place contacts surface in the UI.
-    let mut stmt = c.prepare(
+
+    // One WHERE for both the total and the page, so the footer count matches the rows.
+    let (conds, mut args) = company_filter(search, stage, query);
+    let filter = where_sql(&conds);
+    let total: i64 = c.query_row(
+        &format!("SELECT count(*) FROM companies c {filter}"),
+        params_from_iter(&args),
+        |r| r.get(0),
+    )?;
+
+    // Slice the page first, then attach the best contact per company (verified first, then
+    // most recent) and the LinkedIn flag — so those lookups only run for the rows shown.
+    args.push(Value::Integer(per.into()));
+    args.push(Value::Integer((i64::from(page) - 1) * i64::from(per)));
+    let (limit, offset) = (args.len() - 1, args.len());
+    let mut stmt = c.prepare(&format!(
         "SELECT c.domain, c.name, c.status, COALESCE(c.first_seen,''), \
                 (SELECT k.founder_name FROM contacts k WHERE k.domain=c.domain AND k.email IS NOT NULL \
                    ORDER BY k.mx_ok DESC, k.found_at DESC LIMIT 1), \
                 (SELECT k.email FROM contacts k WHERE k.domain=c.domain AND k.email IS NOT NULL \
                    ORDER BY k.mx_ok DESC, k.found_at DESC LIMIT 1), \
-                c.source_query \
-         FROM companies c ORDER BY c.first_seen DESC",
-    )?;
+                c.source_query, \
+                EXISTS (SELECT 1 FROM contacts k WHERE k.domain=c.domain AND k.linkedin_url IS NOT NULL) \
+         FROM (SELECT c.domain, c.name, c.status, c.first_seen, c.source_query FROM companies c \
+               {filter} ORDER BY c.first_seen DESC, c.domain ASC LIMIT ?{limit} OFFSET ?{offset}) c \
+         ORDER BY c.first_seen DESC, c.domain ASC"
+    ))?;
     let rows = stmt
-        .query_map([], |r| {
+        .query_map(params_from_iter(&args), |r| {
             Ok(CompanyDto {
                 domain: r.get(0)?,
                 name: r.get(1)?,
@@ -136,10 +221,45 @@ pub async fn companies() -> Result<Json<Vec<CompanyDto>>, ApiErr> {
                 founder: r.get(4)?,
                 email: r.get(5)?,
                 source_query: r.get(6)?,
+                linkedin: r.get(7)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(Json(rows))
+
+    // Stage tabs keep their counts whichever tab is selected: `q` + `query`, not `stage`.
+    let (conds, args) = company_filter(search, None, query);
+    let stages = count_pairs(
+        &c,
+        &format!(
+            "SELECT c.status, count(*) FROM companies c {} \
+             GROUP BY c.status ORDER BY count(*) DESC, c.status ASC",
+            where_sql(&conds)
+        ),
+        &args,
+    )?;
+
+    // "Sourced by" options narrow only with `q`. A missing source can't be picked as a
+    // filter value, so it isn't offered as one.
+    let (mut conds, args) = company_filter(search, None, None);
+    conds.push("c.source_query IS NOT NULL AND c.source_query <> ''".into());
+    let queries = count_pairs(
+        &c,
+        &format!(
+            "SELECT c.source_query, count(*) FROM companies c {} \
+             GROUP BY c.source_query ORDER BY count(*) DESC, c.source_query ASC",
+            where_sql(&conds)
+        ),
+        &args,
+    )?;
+
+    Ok(Json(CompaniesPage {
+        total,
+        page,
+        per,
+        rows,
+        stages,
+        queries,
+    }))
 }
 
 /// Curate a company from the Pipeline: `skip` (exclude from outreach) or `restore`
@@ -242,6 +362,202 @@ pub async fn drafts() -> Result<Json<Vec<DraftDto>>, ApiErr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn seed(sql: &str) {
+        crate::db::init().unwrap();
+        crate::db::open().unwrap().execute_batch(sql).unwrap();
+    }
+
+    fn list(q: CompaniesQuery) -> CompaniesPage {
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(companies(Query(q)))
+            .unwrap()
+            .0
+    }
+
+    fn domains(p: &CompaniesPage) -> Vec<&str> {
+        p.rows.iter().map(|r| r.domain.as_str()).collect()
+    }
+
+    fn pairs(v: &[(&str, i64)]) -> Vec<(String, i64)> {
+        v.iter().map(|(s, n)| (s.to_string(), *n)).collect()
+    }
+
+    /// Five companies, newest first (ties broken by domain); `per`/`page` slice them and
+    /// out-of-range values are pulled back to the documented bounds.
+    #[test]
+    fn companies_paginates_and_reports_total() {
+        crate::testutil::with_home("ct-web-pipeline-companies-page", |_| {
+            seed(
+                "INSERT INTO companies (domain, first_seen) VALUES \
+                 ('e.com','2026-10-01 09:00:00'), ('d.com','2026-10-02 09:00:00'), \
+                 ('c.com','2026-10-03 09:00:00'), ('b.com','2026-10-04 09:00:00'), \
+                 ('a.com','2026-10-04 09:00:00');",
+            );
+            let all = list(CompaniesQuery::default());
+            assert_eq!((all.total, all.page, all.per), (5, 1, 50));
+            assert_eq!(domains(&all), ["a.com", "b.com", "c.com", "d.com", "e.com"]);
+
+            let p2 = list(CompaniesQuery {
+                per: Some(2),
+                page: Some(2),
+                ..Default::default()
+            });
+            assert_eq!((p2.total, p2.page, p2.per), (5, 2, 2));
+            assert_eq!(domains(&p2), ["c.com", "d.com"]);
+
+            let p3 = list(CompaniesQuery {
+                per: Some(2),
+                page: Some(3),
+                ..Default::default()
+            });
+            assert_eq!(domains(&p3), ["e.com"]);
+
+            let big = list(CompaniesQuery {
+                per: Some(999),
+                ..Default::default()
+            });
+            assert_eq!((big.per, big.rows.len()), (200, 5));
+
+            let zero = list(CompaniesQuery {
+                page: Some(0),
+                per: Some(0),
+                ..Default::default()
+            });
+            assert_eq!((zero.page, zero.per), (1, 1));
+            assert_eq!(domains(&zero), ["a.com"]);
+        });
+    }
+
+    /// `q` searches company name, domain and any contact's name/email, case-insensitively;
+    /// LIKE wildcards in `q` are literal, and a blank `q` is no filter at all.
+    #[test]
+    fn companies_q_matches_name_domain_and_contact() {
+        crate::testutil::with_home("ct-web-pipeline-companies-q", |_| {
+            seed(
+                "INSERT INTO companies (domain, name, first_seen) VALUES \
+                 ('acme.com','Acme Ltd','2026-10-03'), ('beta.io','Beta','2026-10-02'), \
+                 ('gamma.dev','Gamma','2026-10-01'); \
+                 INSERT INTO contacts (domain, founder_name, email) VALUES \
+                 ('gamma.dev','Jane Roe','jane@gamma.dev'), ('gamma.dev','Jane Two',NULL), \
+                 ('beta.io','Bob','hello@bobmail.net');",
+            );
+            let hits = |q: &str| {
+                let p = list(CompaniesQuery {
+                    q: Some(q.into()),
+                    ..Default::default()
+                });
+                assert_eq!(p.total as usize, p.rows.len(), "total for {q:?}");
+                domains(&p)
+                    .into_iter()
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(hits("ACME"), ["acme.com"]);
+            assert_eq!(hits("beta.io"), ["beta.io"]);
+            // Two matching contacts on one company still yield one row.
+            assert_eq!(hits("jane"), ["gamma.dev"]);
+            assert_eq!(hits("BOBMAIL"), ["beta.io"]);
+            assert_eq!(hits("  "), ["acme.com", "beta.io", "gamma.dev"]);
+            assert_eq!(hits("%"), Vec::<String>::new());
+            assert_eq!(hits("a_m"), Vec::<String>::new());
+        });
+    }
+
+    /// `stage` and `query` filter exactly; `stages` ignores `stage` (so every tab keeps
+    /// its count) and `queries` ignores both, but both honour `q`.
+    #[test]
+    fn companies_stage_and_query_filters_with_counts() {
+        crate::testutil::with_home("ct-web-pipeline-companies-filters", |_| {
+            seed(
+                "INSERT INTO companies (domain, name, status, source_query, first_seen) VALUES \
+                 ('a.com','A','sent','Q1','2026-10-06'), ('b.com','B','sent','Q2','2026-10-05'), \
+                 ('c.com','C','sourced','Q1','2026-10-04'), ('d.com','D','emailed','Q1','2026-10-03'), \
+                 ('e.com','Zed','sourced','Q2','2026-10-02'), ('f.com','F','sourced',NULL,'2026-10-01');",
+            );
+            let sent = list(CompaniesQuery {
+                stage: Some("sent".into()),
+                ..Default::default()
+            });
+            assert_eq!(sent.total, 2);
+            assert_eq!(domains(&sent), ["a.com", "b.com"]);
+            assert_eq!(
+                sent.stages,
+                pairs(&[("sourced", 3), ("sent", 2), ("emailed", 1)])
+            );
+            // Unsourced companies can't be picked as a filter, so they aren't offered.
+            assert_eq!(sent.queries, pairs(&[("Q1", 3), ("Q2", 2)]));
+
+            let sent_q1 = list(CompaniesQuery {
+                stage: Some("sent".into()),
+                query: Some("Q1".into()),
+                ..Default::default()
+            });
+            assert_eq!(domains(&sent_q1), ["a.com"]);
+            assert_eq!(sent_q1.total, 1);
+            assert_eq!(
+                sent_q1.stages,
+                pairs(&[("emailed", 1), ("sent", 1), ("sourced", 1)])
+            );
+            assert_eq!(sent_q1.queries, pairs(&[("Q1", 3), ("Q2", 2)]));
+
+            let zed = list(CompaniesQuery {
+                q: Some("zed".into()),
+                ..Default::default()
+            });
+            assert_eq!(zed.stages, pairs(&[("sourced", 1)]));
+            assert_eq!(zed.queries, pairs(&[("Q2", 1)]));
+
+            // Empty filter values (as a URL like `?stage=&query=` sends them) filter nothing.
+            let blank = list(CompaniesQuery {
+                stage: Some(String::new()),
+                query: Some(String::new()),
+                ..Default::default()
+            });
+            assert_eq!(blank.total, 6);
+        });
+    }
+
+    /// `linkedin` is true when any contact for the domain has a LinkedIn URL, even one with
+    /// no email; `founder`/`email` still come from the best contact that has an email.
+    #[test]
+    fn companies_flags_linkedin_contacts() {
+        crate::testutil::with_home("ct-web-pipeline-companies-linkedin", |_| {
+            seed(
+                "INSERT INTO companies (domain, first_seen) VALUES \
+                 ('li.com','2026-10-03'), ('mail.com','2026-10-02'), ('none.com','2026-10-01'); \
+                 INSERT INTO contacts (domain, founder_name, linkedin_url) VALUES \
+                 ('li.com','Lia','https://www.linkedin.com/in/lia'); \
+                 INSERT INTO contacts (domain, founder_name, email, mx_ok, found_at) VALUES \
+                 ('mail.com','Old','old@mail.com',1,'2026-10-01'), \
+                 ('mail.com','New','new@mail.com',1,'2026-10-02'), \
+                 ('mail.com','Bad','bad@mail.com',0,'2026-10-03');",
+            );
+            let p = list(CompaniesQuery::default());
+            let row = |d: &str| p.rows.iter().find(|r| r.domain == d).unwrap();
+            assert!(row("li.com").linkedin);
+            assert_eq!(row("li.com").founder, None);
+            assert!(!row("mail.com").linkedin);
+            assert_eq!(row("mail.com").founder.as_deref(), Some("New"));
+            assert_eq!(row("mail.com").email.as_deref(), Some("new@mail.com"));
+            assert!(!row("none.com").linkedin);
+        });
+    }
+
+    /// The UI mirrors its URL state, so `?page=&per=` must mean "use the defaults" rather
+    /// than a 400; the session token `t` rides along and is ignored.
+    #[test]
+    fn companies_query_blank_numbers_use_defaults() {
+        let uri: axum::http::Uri = "/api/companies?q=&page=&per=&stage=&t=tok".parse().unwrap();
+        let Query(q) = Query::<CompaniesQuery>::try_from_uri(&uri).unwrap();
+        assert_eq!((q.page, q.per), (None, None));
+        let uri: axum::http::Uri = "/api/companies?page=3&per=20".parse().unwrap();
+        let Query(q) = Query::<CompaniesQuery>::try_from_uri(&uri).unwrap();
+        assert_eq!((q.page, q.per), (Some(3), Some(20)));
+        let uri: axum::http::Uri = "/api/companies?page=x".parse().unwrap();
+        assert!(Query::<CompaniesQuery>::try_from_uri(&uri).is_err());
+    }
 
     /// A linkedin-channel row surfaces its contact's `linkedin_url` as `to` and `channel` as
     /// "linkedin"; a plain (legacy, channel=NULL) email row keeps `to` = email and defaults to

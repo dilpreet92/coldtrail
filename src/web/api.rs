@@ -127,6 +127,53 @@ pub struct CompanyDto {
     pub email: Option<String>,
     /// The ICP query that sourced this company (Pipeline "Sourced by").
     pub source_query: Option<String>,
+    /// Any contact for this domain has a LinkedIn profile URL (Pipeline LinkedIn indicator).
+    pub linkedin: bool,
+}
+
+/// `GET /api/companies` filters. Blank values (`?stage=&page=`, as the UI mirrors its URL
+/// state) mean "not given"; the session token `t` rides along and is ignored.
+#[derive(Deserialize, Default)]
+pub struct CompaniesQuery {
+    /// Free-text search over company name, domain, and contact name/email.
+    pub q: Option<String>,
+    /// Exact `companies.status`.
+    pub stage: Option<String>,
+    /// Exact `companies.source_query` ("Sourced by").
+    pub query: Option<String>,
+    /// 1-based page (default 1).
+    #[serde(default, deserialize_with = "blank_as_none")]
+    pub page: Option<u32>,
+    /// Rows per page (default 50, clamped to 1..=200).
+    #[serde(default, deserialize_with = "blank_as_none")]
+    pub per: Option<u32>,
+}
+
+/// A number from the query string, where an empty value means absent rather than a 400.
+fn blank_as_none<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    match Option::<String>::deserialize(d)?.as_deref().map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(v) => v.parse().map(Some).map_err(serde::de::Error::custom),
+    }
+}
+
+/// One page of the Pipeline table plus the counts its filter controls show.
+#[derive(Serialize)]
+pub struct CompaniesPage {
+    /// Companies matching every filter, across all pages.
+    pub total: i64,
+    pub page: u32,
+    pub per: u32,
+    pub rows: Vec<CompanyDto>,
+    /// (status, count) under `q` + `query` but not `stage`, most common first.
+    pub stages: Vec<(String, i64)>,
+    /// (source_query, count) under `q` only, most common first.
+    pub queries: Vec<(String, i64)>,
 }
 
 #[derive(Serialize)]
