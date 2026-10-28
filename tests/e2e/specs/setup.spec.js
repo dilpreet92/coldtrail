@@ -367,13 +367,27 @@ test('a failed connection test offers the sign-in command again', async ({ app, 
   await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: server.base });
   // "Ready" only means an auth file exists; a login that lapsed fails the test.
   let answer = { ok: false, message: 'opencode: your login expired. Sign in again.' };
-  await page.route('**/api/provider/probe', (route) => route.fulfill({ json: answer }));
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  await page.route('**/api/provider/probe', async (route) => {
+    await held;
+    await route.fulfill({ json: answer });
+  });
   await app.goto('#/setup/agent');
   await expect(card(page, 'opencode').locator('.badge')).toHaveText('Ready');
   const testBox = view(page).locator('.ap-test');
   await expect(testBox.locator('code')).toHaveCount(0);
 
   await testBox.getByRole('button', { name: 'Test connection' }).click();
+  // While it runs: one spinner, the busy button's; the line under it says what's happening.
+  const testing = testBox.getByRole('button', { name: 'Testing…' });
+  await expect(testing).toHaveAttribute('aria-busy', 'true');
+  await expect(testBox.locator('.ap-test-result')).toHaveText('Running a quick check. This can take up to a minute.');
+  await expect(testing.locator('.spinner')).toHaveCount(1);
+  await expect(testBox.locator('.spinner')).toHaveCount(1);
+  release();
   await expect(testBox.locator('.ap-test-result')).toHaveText(answer.message);
   await expect(testBox.locator('code')).toHaveText('opencode auth login');
   await testBox.getByRole('button', { name: 'Copy “opencode auth login”' }).click();
@@ -509,6 +523,9 @@ test('walks all four steps to Home', async ({ app, page, request, server }) => {
   await expect(profile).toHaveValue(new RegExp(reEscape(TEMPLATE_CTA)));
   await expect(saveState(page)).toHaveText('Template · not saved yet');
   await expect(view(page).getByRole('list', { name: 'Profile checklist' })).toBeVisible();
+  // The checklist's title sits under the step's h2.
+  await expect(view(page).getByRole('heading', { level: 3, name: 'Checklist', exact: true })).toBeVisible();
+  await expect(view(page).getByRole('heading', { level: 2, name: 'Checklist', exact: true })).toHaveCount(0);
   await expect(continueBtn(page)).toHaveAttribute('aria-disabled', 'true');
   await profile.fill(PRODUCT_MD);
   await expect(saveState(page)).toHaveText('Saved');
@@ -692,6 +709,29 @@ test('a profile that fails to load says so and can be retried', async ({ app, pa
   await expect(hint).toHaveText('');
 });
 
+test('a profile that meets a stale session points at the fix, once', async ({ app, page, request, server }) => {
+  app.allowConsole(/status of 401/);
+  await onboard(request, server);
+  await page.route('**/api/company', (route) =>
+    route.request().method() === 'GET' ? route.fulfill({ status: 401, contentType: 'text/plain', body: 'unauthorized' }) : route.fallback(),
+  );
+  await app.goto('#/setup/company');
+  await expect(stepTitle(page, 'company')).toBeVisible();
+  const loadError = view(page).locator('.pe-load-error');
+  await expect(loadError).toContainText('Couldn’t load your profile.');
+  await expect(loadError).toContainText('Reopen coldtrail from your terminal.');
+  await expect(page.locator('.session-banner')).toHaveText(SESSION_EXPIRED);
+  // Nothing loads until the tab is reopened: there's no Try again, and the footer doesn't point
+  // at one.
+  await expect(view(page).getByRole('button', { name: 'Try again' })).toHaveCount(0);
+  await expect(foot(page).locator('.setup-hint')).toHaveText("Your profile didn't load.");
+  await expect(continueBtn(page)).toHaveAttribute('aria-disabled', 'true');
+  // The banner says what happened, once and as the only alert.
+  const body = await page.locator('body').innerText();
+  expect(body.split(SESSION_EXPIRED).length - 1).toBe(1);
+  await expect(page.getByRole('alert')).toHaveCount(1);
+});
+
 test('a profile edit made just before leaving is saved', async ({ app, page, request, server }) => {
   await onboard(request, server);
   const file = join(server.home, 'product.md');
@@ -786,6 +826,10 @@ test('an OAuth wait can be cancelled', async ({ app, page, request, server }) =>
   await connect.click();
   const waiting = canonical.getByRole('button', { name: 'Waiting for approval…' });
   await expect(waiting).toHaveAttribute('aria-busy', 'true');
+  // One spinner per wait: the busy button's. The line under it explains, without a second one.
+  await expect(canonical.locator('.setup-msg')).toHaveText("Approve coldtrail in the browser tab that opened. This page updates when you're done.");
+  await expect(waiting.locator('.spinner')).toHaveCount(1);
+  await expect(canonical.locator('.spinner')).toHaveCount(1);
   await canonical.getByRole('button', { name: 'Cancel' }).click();
   await expect(canonical.locator('.setup-msg')).toHaveText(STOPPED);
   await expect(connect).toBeFocused();
@@ -973,8 +1017,11 @@ test('leaving setup stops the LinkedIn poll', async ({ app, page, request, serve
   const linkedin = view(page).getByRole('region', { name: 'LinkedIn' });
   // A sign-in window is open (the server says it's waiting): the card waits for it at once.
   await expect(linkedin.locator('.badge').first()).toHaveText('Waiting for sign-in');
+  // That pickup made a read of its own; the poll's ticks are the reads after it.
+  const pickedUp = await polls();
+  expect(pickedUp).toBeGreaterThanOrEqual(1);
   await page.clock.runFor(2_100);
-  await expect.poll(polls).toBeGreaterThanOrEqual(1);
+  await expect.poll(polls).toBeGreaterThan(pickedUp);
 
   await page.evaluate(() => {
     location.hash = '#/home';

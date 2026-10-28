@@ -231,7 +231,6 @@ a.setup-step-link:hover { color: var(--text); background: var(--surface-2); }
 .setup-msg[data-tone="err"],
 .ap-msg[data-tone="err"] { color: var(--danger); }
 
-
 /* ---- Agent panel (.ap) ---- */
 
 .ap { display: flex; flex-direction: column; width: 100%; }
@@ -419,7 +418,7 @@ a.setup-step-link:hover { color: var(--text); background: var(--surface-2); }
 }
 .setup-conn-title { font-size: 15px; line-height: 1.35; }
 .setup-conn-title:focus { outline: none; }
-.setup-conn-note { max-width: 80ch; margin-top: 2px; font-size: 13px; color: var(--text-2); text-wrap: pretty; }
+.setup-conn-note { max-width: 80ch; margin-top: var(--space-1); font-size: 13px; color: var(--text-2); text-wrap: pretty; }
 .setup-conn-state { display: flex; }
 
 /* Body lines up under the title, past the icon. */

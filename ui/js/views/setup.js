@@ -18,7 +18,7 @@
 //
 // agentPanel(root, ctx) is exported for Settings → Agent; see its JSDoc below.
 
-import { api, SESSION_EXPIRED } from '../core/api.js';
+import { api, errorText, isStaleSession } from '../core/api.js';
 import { fmtNum, h } from '../core/dom.js';
 import { ensureViewCss, href } from '../core/router.js';
 import { copyText, isBusy, setBusy } from '../core/ui.js';
@@ -100,7 +100,8 @@ function icon(name, size = 16) {
 
 /**
  * Put a one-line message into `el` (a live region that stays in the DOM): tone '' (neutral),
- * 'ok', 'err' or 'busy'. Text only; '' clears it.
+ * 'ok', 'err' or 'busy' (with a spinner). Text only; '' clears it. A wait whose button already
+ * spins (setBusy) explains itself in a neutral message: one spinner per wait.
  */
 function say(el, text, tone = '') {
   el.dataset.tone = text ? tone : '';
@@ -114,11 +115,8 @@ function say(el, text, tone = '') {
 }
 
 const aborted = (err) => !!err && err.name === 'AbortError';
-/** A 401: the app's session banner already says so in full, so screens only point at the fix. */
-const staleSession = (err) => !!err && (err.status === 401 || err.message === SESSION_EXPIRED);
-const REOPEN = 'Reopen coldtrail from your terminal.';
-/** What went wrong, for a message on the screen (a stale session: only the fix). */
-const why = (err) => (staleSession(err) ? REOPEN : (err && err.message) || String(err));
+// What went wrong, for a message on the screen: errorText (core/api.js) gives a stale session
+// only the fix, since the app's session banner already says the rest.
 /** An OAuth wait the user stopped. The server may still hold the callback port meanwhile. */
 const STOPPED = 'Stopped waiting. If connecting again fails, restart coldtrail and try once more.';
 
@@ -543,8 +541,8 @@ export function agentPanel(root, ctx = {}) {
       loadError.hidden = false;
       // A stale session: the app's banner explains it, and retrying can't help.
       loadError.replaceChildren(
-        h('p', {}, h('strong', {}, "Couldn't load your agents. "), why(err)),
-        staleSession(err) ? null : h('button', { type: 'button', class: 'btn btn-secondary btn-sm', onClick: load }, 'Try again'),
+        h('p', {}, h('strong', {}, "Couldn't load your agents. "), errorText(err)),
+        isStaleSession(err) ? null : h('button', { type: 'button', class: 'btn btn-secondary btn-sm', onClick: load }, 'Try again'),
       );
     }
   }
@@ -559,7 +557,7 @@ export function agentPanel(root, ctx = {}) {
       if (view !== OWN && saving == null) view = status.provider;
       render();
     } catch (err) {
-      if (!destroyed && !aborted(err)) say(pickError, `Couldn't check again: ${why(err)}`, 'err');
+      if (!destroyed && !aborted(err)) say(pickError, `Couldn't check again: ${errorText(err)}`, 'err');
     } finally {
       if (!destroyed) setBusy(recheckBtn, false);
     }
@@ -606,7 +604,7 @@ export function agentPanel(root, ctx = {}) {
       if (!saved) view = before;
       render();
       const name = (cards.get(kind) || {}).name || kind;
-      say(pickError, saved ? `Switched to ${name}, but couldn't re-check your agents: ${why(err)}` : `Couldn't switch to ${name}: ${why(err)}`, 'err');
+      say(pickError, saved ? `Switched to ${name}, but couldn't re-check your agents: ${errorText(err)}` : `Couldn't switch to ${name}: ${errorText(err)}`, 'err');
     }
     return saved;
   }
@@ -621,7 +619,7 @@ export function agentPanel(root, ctx = {}) {
       models = { state: list.length ? 'ready' : 'empty', list, message: r.message || '' };
     } catch (err) {
       if (destroyed || aborted(err)) return;
-      models = { state: 'error', list: [], message: why(err) };
+      models = { state: 'error', list: [], message: errorText(err) };
     }
     modelSelect.setOptions(models.list.map((m) => ({ value: m, label: m })));
     renderModelHint();
@@ -662,7 +660,7 @@ export function agentPanel(root, ctx = {}) {
         say(modelStatus, 'Model saved', 'ok');
       } else {
         modelSelect.setValue((status && status.opencode_model) || '');
-        say(modelStatus, `Couldn't save the model: ${why(err)}`, 'err');
+        say(modelStatus, `Couldn't save the model: ${errorText(err)}`, 'err');
       }
     }
     return saved;
@@ -726,7 +724,7 @@ export function agentPanel(root, ctx = {}) {
     } catch (err) {
       if (destroyed || aborted(err)) return saved;
       setBusy(byokSave, false);
-      say(byokStatus, saved ? 'Saved. coldtrail now uses your own model.' : `Couldn't save: ${why(err)}`, saved ? 'ok' : 'err');
+      say(byokStatus, saved ? 'Saved. coldtrail now uses your own model.' : `Couldn't save: ${errorText(err)}`, saved ? 'ok' : 'err');
     }
     return saved;
   }
@@ -737,7 +735,7 @@ export function agentPanel(root, ctx = {}) {
     probeFor = provider;
     hideTestCmd();
     setBusy(testBtn, true, { label: 'Testing…' });
-    say(testResult, 'Running a quick check. This can take up to a minute.', 'busy');
+    say(testResult, 'Running a quick check. This can take up to a minute.');
     try {
       const r = await api.post('/api/provider/probe', {}, { signal });
       if (destroyed || probeFor !== provider) return;
@@ -751,7 +749,7 @@ export function agentPanel(root, ctx = {}) {
       }
     } catch (err) {
       if (destroyed || aborted(err)) return;
-      say(testResult, why(err), 'err');
+      say(testResult, errorText(err), 'err');
     } finally {
       if (!destroyed) setBusy(testBtn, false);
     }
@@ -983,7 +981,7 @@ function mountSetup(root, ctx) {
     progress.hidden = true;
     // A stale session: the app's banner above says what happened (once, as the alert), and
     // retrying can't work until the tab is reopened, so the card only points at the fix.
-    const stale = staleSession(err);
+    const stale = isStaleSession(err);
     const retry = stale ? null : h('div', { class: 'setup-error-actions' }, h('button', { type: 'button', class: 'btn btn-secondary', onClick: load }, 'Try again'));
     main.replaceChildren(
       h(
@@ -993,7 +991,7 @@ function mountSetup(root, ctx) {
           'div',
           { class: 'setup-error-body', role: stale ? null : 'alert' },
           icon('alert', 20),
-          h('div', {}, h('h2', { class: 'setup-error-title' }, "Setup couldn't load"), h('p', {}, why(err))),
+          h('div', {}, h('h2', { class: 'setup-error-title' }, "Setup couldn't load"), h('p', {}, errorText(err))),
         ),
         retry,
       ),
@@ -1203,7 +1201,7 @@ function mountSetup(root, ctx) {
       if (isBusy(btn)) return;
       const wait = cancel.start(sc.ctl.signal);
       setBusy(btn, true, { label: 'Waiting for approval…' });
-      say(msg, "Approve coldtrail in the browser tab that opened. This page updates when you're done.", 'busy');
+      say(msg, "Approve coldtrail in the browser tab that opened. This page updates when you're done.");
       const settle = () => {
         cancel.end();
         setBusy(btn, false);
@@ -1222,7 +1220,7 @@ function mountSetup(root, ctx) {
         if (sc.ctl.signal.aborted) return;
         settle();
         if (aborted(err)) say(msg, STOPPED);
-        else say(msg, why(err), 'err');
+        else say(msg, errorText(err), 'err');
       }
       if (scope !== sc) return;
       render();
@@ -1251,6 +1249,8 @@ function mountSetup(root, ctx) {
     // an empty one), saves as you type and never saves a blank profile.
     const editor = mountProfileEditor(box, {
       store: store || undefined,
+      // Its "Checklist" title sits under this step's h2.
+      headingLevel: 3,
       onChange: () => step_.gate(),
     });
     // Leaving the step hands an edit still waiting to the editor's exit save (the next editor
@@ -1260,9 +1260,11 @@ function mountSetup(root, ctx) {
     function gate() {
       const s = editor.state();
       if (!s.loaded) {
-        return s.status === 'load-error'
-          ? { ok: false, reason: "Your profile didn't load. Try again above." }
-          : { ok: false, reason: 'Loading your profile…' };
+        if (s.status !== 'load-error') return { ok: false, reason: 'Loading your profile…' };
+        // On a stale session the editor offers no Try again: its card points at the fix instead.
+        return isStaleSession({ message: s.error })
+          ? { ok: false, reason: "Your profile didn't load." }
+          : { ok: false, reason: "Your profile didn't load. Try again above." };
       }
       if (s.empty) return { ok: false, reason: 'Write a few lines about your company to continue.' };
       if (isTemplate(s.doc)) {
@@ -1279,7 +1281,7 @@ function mountSetup(root, ctx) {
       async beforeContinue() {
         const s = await editor.flush();
         if (s.status === 'error') {
-          step_.showError(`Couldn't save your profile: ${why({ message: s.error })}`);
+          step_.showError(`Couldn't save your profile: ${errorText({ message: s.error })}`);
           return false;
         }
         const g = gate();
@@ -1291,7 +1293,7 @@ function mountSetup(root, ctx) {
           await fetchStatus();
         } catch (err) {
           if (aborted(err)) return false;
-          step_.showError(why(err));
+          step_.showError(errorText(err));
           return false;
         }
         renderProgress();
@@ -1461,7 +1463,7 @@ function mountSetup(root, ctx) {
         return;
       }
       setBusy(apBtn, true, { label: 'Checking…' });
-      say(ap.msg, 'Checking the app password with Gmail…', 'busy');
+      say(ap.msg, 'Checking the app password with Gmail…');
       try {
         const r = await api.post('/api/destination/gmail/app-password', { email: addr, app_password: pass }, { signal: sc.ctl.signal });
         setBusy(apBtn, false);
@@ -1474,14 +1476,14 @@ function mountSetup(root, ctx) {
       } catch (err) {
         if (aborted(err)) return;
         setBusy(apBtn, false);
-        say(ap.msg, why(err), 'err');
+        say(ap.msg, errorText(err), 'err');
       }
     }
 
     async function oauth(btn, out, cancel) {
       const wait = cancel.start(sc.ctl.signal);
       setBusy(btn, true, { label: 'Waiting for Google…' });
-      say(out, "Approve coldtrail in the Google tab that opened. This page updates when you're done.", 'busy');
+      say(out, "Approve coldtrail in the Google tab that opened. This page updates when you're done.");
       const settle = () => {
         cancel.end();
         setBusy(btn, false);
@@ -1498,7 +1500,7 @@ function mountSetup(root, ctx) {
         if (sc.ctl.signal.aborted) return;
         settle();
         if (aborted(err)) say(out, STOPPED);
-        else say(out, why(err), 'err');
+        else say(out, errorText(err), 'err');
       }
     }
 
@@ -1525,7 +1527,7 @@ function mountSetup(root, ctx) {
       } catch (err) {
         if (aborted(err)) return;
         setBusy(byoBtn, false);
-        say(byo.msg, why(err), 'err');
+        say(byo.msg, errorText(err), 'err');
         return;
       }
       setBusy(byoBtn, false);
@@ -1656,7 +1658,7 @@ function mountSetup(root, ctx) {
       } catch (err) {
         if (aborted(err)) return;
         finish();
-        say(msg, why(err), 'err');
+        say(msg, errorText(err), 'err');
         render();
       }
     }
