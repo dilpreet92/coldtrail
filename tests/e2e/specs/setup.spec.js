@@ -1,10 +1,11 @@
 // First-run setup (spec §5.1) on an empty workspace: the four steps (agent with the opencode model
-// picker and Test connection, Canonical, the company profile, where outreach goes) and the
-// "You're set" screen; Continue gating; the address (a bare #/setup stays bare, a step that isn't
-// open yet names the one shown); copy buttons; keyboard-only completion; loading, error and
-// stale-session states; saves that outlive the step; the outreach copy following auto-send; the
-// LinkedIn poll stopping on unmount; hostile text staying text; and the exported agentPanel
-// working outside the wizard (Settings reuses it).
+// picker and Test connection, Canonical, the company profile in Company profile's editor, where
+// outreach goes) and the "You're set" screen; Continue gating; the address (a bare #/setup stays
+// bare, a step that isn't open yet names the one shown); copy buttons; keyboard-only completion;
+// loading, error and stale-session states; saves that outlive the step (and keep their order);
+// cancelling an OAuth wait; the outreach copy following auto-send; the LinkedIn poll stopping on
+// unmount and picking up a sign-in already open; hostile text staying text; and the exported
+// agentPanel working outside the wizard (Settings reuses it).
 //
 // Tests share one server and run in order: the early ones leave the workspace as they found it,
 // "walks all four steps to Home" onboards it, and the later ones build on that.
@@ -37,7 +38,11 @@ const card = (page, kind) => view(page).locator(`.ap-card[data-kind="${kind}"]`)
 const pick = (page, kind) => card(page, kind).locator('.ap-pick');
 const foot = (page) => view(page).locator('.setup-foot');
 const continueBtn = (page) => foot(page).getByRole('button', { name: 'Continue', exact: true });
+const profileBox = (page) => view(page).getByRole('textbox', { name: 'Company profile' });
+// The profile editor's save state (Company profile's editor, in the company step).
+const saveState = (page) => view(page).locator('.pe-status');
 const statusPath = (url) => url.pathname === '/api/status';
+const STOPPED = 'Stopped waiting. If connecting again fails, restart coldtrail and try once more.';
 
 /** GET a token-guarded API path from the test (not the page). */
 async function getJSON(request, server, path) {
@@ -61,6 +66,22 @@ function storeCanonicalToken(server) {
       'token_endpoint = "https://canonical.invalid/oauth/token"\nclient_id = "coldtrail-e2e"\n',
     { mode: 0o600 },
   );
+}
+
+/** Forget the Canonical token again: a workspace that still has to connect Canonical. */
+function removeCanonicalToken(server) {
+  const file = join(server.secretsDir, 'secrets.toml');
+  if (!existsSync(file)) return;
+  writeFileSync(file, readFileSync(file, 'utf8').replace(/\[tokens\.canonical\][^[]*/, ''), { mode: 0o600 });
+}
+
+/** Record the provider saves the page sends, in order. */
+function recordProviderSaves(page) {
+  const saves = [];
+  page.on('request', (req) => {
+    if (req.method() === 'POST' && new URL(req.url()).pathname === '/api/onboarding/provider') saves.push(req.postDataJSON());
+  });
+  return saves;
 }
 
 /**
@@ -303,6 +324,69 @@ test('a model typed just before Continue still saves', async ({ app, page, reque
   expect(res.status()).toBe(200);
 });
 
+test('agent changes save one at a time, in the order made', async ({ app, page, request, server }) => {
+  // A slow model save, then another card: the card's save (provider codex) must not land before
+  // the model's (provider opencode), or the user's last choice would flip back to opencode.
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  const saves = [];
+  await page.route('**/api/onboarding/provider', async (route) => {
+    const body = route.request().postDataJSON();
+    saves.push(body);
+    if ('opencode_model' in body) await held;
+    await route.fallback();
+  });
+  await app.goto('#/setup/agent');
+  const model = view(page).getByRole('combobox', { name: 'Model' });
+  await expect(model).toHaveValue('fake/model-a');
+  await model.fill('custom/racing-model');
+  // Clicking the card commits the typed model first (the field loses focus).
+  await pick(page, 'codex').click();
+  await expect(card(page, 'codex')).toHaveClass(/is-saving/);
+  await expect(pick(page, 'codex')).toHaveAttribute('aria-pressed', 'true');
+  await expect.poll(() => saves.length).toBe(1);
+  expect(saves).toEqual([{ provider: 'opencode', opencode_model: 'custom/racing-model' }]);
+
+  release();
+  await expect(card(page, 'codex')).not.toHaveClass(/is-saving/);
+  await expect(pick(page, 'codex')).toHaveAttribute('aria-pressed', 'true');
+  expect(saves).toEqual([{ provider: 'opencode', opencode_model: 'custom/racing-model' }, { provider: 'codex' }]);
+  const status = await getJSON(request, server, '/api/status');
+  expect(status.provider).toBe('codex');
+  expect(status.opencode_model).toBe('custom/racing-model');
+
+  const res = await request.post(server.apiUrl('/api/onboarding/provider'), {
+    data: { provider: 'opencode', opencode_model: 'fake/model-a' },
+  });
+  expect(res.status()).toBe(200);
+});
+
+test('a failed connection test offers the sign-in command again', async ({ app, page, context, server }) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: server.base });
+  // "Ready" only means an auth file exists; a login that lapsed fails the test.
+  let answer = { ok: false, message: 'opencode: your login expired. Sign in again.' };
+  await page.route('**/api/provider/probe', (route) => route.fulfill({ json: answer }));
+  await app.goto('#/setup/agent');
+  await expect(card(page, 'opencode').locator('.badge')).toHaveText('Ready');
+  const testBox = view(page).locator('.ap-test');
+  await expect(testBox.locator('code')).toHaveCount(0);
+
+  await testBox.getByRole('button', { name: 'Test connection' }).click();
+  await expect(testBox.locator('.ap-test-result')).toHaveText(answer.message);
+  await expect(testBox.locator('code')).toHaveText('opencode auth login');
+  await testBox.getByRole('button', { name: 'Copy “opencode auth login”' }).click();
+  await expect(testBox.getByRole('button', { name: 'Copied' })).toBeVisible();
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe('opencode auth login');
+
+  // A test that passes takes it away again.
+  answer = { ok: true, message: 'opencode is signed in and responding.' };
+  await testBox.getByRole('button', { name: 'Test connection' }).click();
+  await expect(testBox.locator('.ap-test-result')).toHaveText(answer.message);
+  await expect(testBox.locator('code')).toHaveCount(0);
+});
+
 test('your own model: the form checks the URL, saves, tests and switches back', async ({ app, page, request, server }) => {
   const probes = [];
   // The probe would call the endpoint for real (it may be a live local Ollama): answer it here.
@@ -365,13 +449,21 @@ test('your own model: the form checks the URL, saves, tests and switches back', 
 test('walks all four steps to Home', async ({ app, page, request, server }) => {
   const canonicalCalls = [];
   await connectCanonicalLikeOAuth(page, server, canonicalCalls);
+  const providerSaves = recordProviderSaves(page);
   await app.goto('#/setup');
   await expect(stepTitle(page, 'agent')).toBeVisible();
   await expect(page).toHaveURL(hashIs('#/setup'));
 
-  // 1 · Agent: choose opencode, pick a model from its list, test the connection.
+  // 1 · Agent: switch to Codex CLI and back to opencode (each click saves), pick a model from
+  // opencode's list, test the connection.
+  await pick(page, 'codex').click();
+  await expect(pick(page, 'codex')).toHaveAttribute('aria-pressed', 'true');
+  await expect(card(page, 'codex')).not.toHaveClass(/is-saving/);
+  expect((await getJSON(request, server, '/api/status')).provider).toBe('codex');
   await pick(page, 'opencode').click();
   await expect(pick(page, 'opencode')).toHaveAttribute('aria-pressed', 'true');
+  await expect(card(page, 'opencode')).not.toHaveClass(/is-saving/);
+  expect(providerSaves).toEqual([{ provider: 'codex' }, { provider: 'opencode' }]);
   const model = view(page).getByRole('combobox', { name: 'Model' });
   await expect(model).toHaveValue('fake/model-a');
   await model.click();
@@ -410,13 +502,16 @@ test('walks all four steps to Home', async ({ app, page, request, server }) => {
   await expect(stepTitle(page, 'canonical')).toBeVisible();
   await continueBtn(page).click();
 
-  // 3 · Company: the corrected template is there to fill in; it autosaves.
+  // 3 · Company: Company profile's editor, with the corrected template to fill in and the
+  // checklist beside it; it autosaves.
   await expect(page).toHaveURL(hashIs('#/setup/company'));
-  const profile = view(page).getByRole('textbox', { name: 'Company profile' });
+  const profile = profileBox(page);
   await expect(profile).toHaveValue(new RegExp(reEscape(TEMPLATE_CTA)));
+  await expect(saveState(page)).toHaveText('Template · not saved yet');
+  await expect(view(page).getByRole('list', { name: 'Profile checklist' })).toBeVisible();
   await expect(continueBtn(page)).toHaveAttribute('aria-disabled', 'true');
   await profile.fill(PRODUCT_MD);
-  await expect(view(page).locator('.setup-save')).toHaveText('Saved');
+  await expect(saveState(page)).toHaveText('Saved');
   await expect(continueBtn(page)).not.toHaveAttribute('aria-disabled', 'true');
   await continueBtn(page).click();
   expect(readFileSync(join(server.home, 'product.md'), 'utf8')).toBe(PRODUCT_MD);
@@ -476,32 +571,36 @@ test('cannot continue without a provider/profile', async ({ app, page, request, 
   }
   await page.unroute(statusPath);
 
-  // An emptied profile can't continue (and the empty profile is what's saved).
+  // An emptied profile can't continue, and it isn't saved: the last profile stays on disk.
+  const file = join(server.home, 'product.md');
   await app.goto('#/setup/company');
-  const profile = view(page).getByRole('textbox', { name: 'Company profile' });
+  const profile = profileBox(page);
   await expect(profile).toHaveValue(PRODUCT_MD);
   await profile.fill('');
-  await expect(view(page).locator('.setup-save')).toHaveText('Saved');
+  await expect(saveState(page)).toHaveText('Not saved: the profile can’t be empty');
   await expect(continueBtn(page)).toHaveAttribute('aria-disabled', 'true');
   await expect(hint).toHaveText('Write a few lines about your company to continue.');
   await continueBtn(page).click({ force: true });
   await expect(page).toHaveURL(hashIs('#/setup/company'));
   await expect(hint).toHaveClass(/is-error/);
-  expect((await getJSON(request, server, '/api/status')).product_set).toBe(false);
+  expect(readFileSync(file, 'utf8')).toBe(PRODUCT_MD);
 
-  // An untouched template doesn't count either.
+  // An untouched template doesn't count either (an empty product.md shows it, unsaved).
+  writeFileSync(file, '');
   await page.reload();
   await expect(profile).toHaveValue(new RegExp(reEscape(TEMPLATE_CTA)));
+  await expect(saveState(page)).toHaveText('Template · not saved yet');
   await expect(continueBtn(page)).toHaveAttribute('aria-disabled', 'true');
   await expect(hint).toHaveText("Fill in the template with your company's details to continue.");
+  expect((await getJSON(request, server, '/api/status')).product_set).toBe(false);
 
   // Typed into and undone, the template is what's saved, and the workspace counts it as set:
   // Continue agrees with that (and the progress row), with a note that it's still blank.
   const template = await profile.inputValue();
   await profile.fill(`${template}x`);
-  await expect(view(page).locator('.setup-save')).toHaveText('Saved');
+  await expect(saveState(page)).toHaveText('Saved');
   await profile.fill(template);
-  await expect(view(page).locator('.setup-save')).toHaveText('Saved');
+  await expect(saveState(page)).toHaveText('Saved');
   await expect(continueBtn(page)).not.toHaveAttribute('aria-disabled', 'true');
   await expect(hint).toHaveText('This is still the blank template. Drafts stay generic until you fill it in.');
   await expect(hint).not.toHaveClass(/is-error/);
@@ -510,24 +609,41 @@ test('cannot continue without a provider/profile', async ({ app, page, request, 
 
 test('keyboard-only completion', async ({ app, page, request, server }) => {
   await onboard(request, server, { profile: false });
+  // Canonical still to connect, so its button is operated from the keyboard too.
+  removeCanonicalToken(server);
+  const canonicalCalls = [];
+  await connectCanonicalLikeOAuth(page, server, canonicalCalls);
+  const providerSaves = recordProviderSaves(page);
   await app.goto('#/setup/agent');
   await expect(stepTitle(page, 'agent')).toBeVisible();
 
-  // 1 · Agent
+  // 1 · Agent: Space switches to Codex CLI, then back to opencode; each saves.
+  await tabTo(page, pick(page, 'codex'));
+  await page.keyboard.press('Space');
+  await expect(pick(page, 'codex')).toHaveAttribute('aria-pressed', 'true');
+  await expect(card(page, 'codex')).not.toHaveClass(/is-saving/);
   await tabTo(page, pick(page, 'opencode'));
   await page.keyboard.press('Space');
   await expect(pick(page, 'opencode')).toHaveAttribute('aria-pressed', 'true');
+  await expect(card(page, 'opencode')).not.toHaveClass(/is-saving/);
+  expect(providerSaves).toEqual([{ provider: 'codex' }, { provider: 'opencode' }]);
   await tabTo(page, continueBtn(page));
   await page.keyboard.press('Enter');
 
-  // 2 · Canonical (connected earlier): focus lands on the step's title.
+  // 2 · Canonical: focus lands on the step's title; Enter on Connect Canonical connects it.
   await expect(stepTitle(page, 'canonical')).toBeFocused();
+  await expect(continueBtn(page)).toHaveAttribute('aria-disabled', 'true');
+  await tabTo(page, view(page).getByRole('button', { name: 'Connect Canonical' }));
+  await page.keyboard.press('Enter');
+  await expect(view(page).locator('.setup-conn .badge')).toHaveText('Connected');
+  expect(canonicalCalls).toEqual([{}]);
+  await expect(continueBtn(page)).not.toHaveAttribute('aria-disabled', 'true');
   await tabTo(page, continueBtn(page));
   await page.keyboard.press('Enter');
 
   // 3 · Company: replace the template by typing.
   await expect(stepTitle(page, 'company')).toBeFocused();
-  const profile = view(page).getByRole('textbox', { name: 'Company profile' });
+  const profile = profileBox(page);
   await tabTo(page, profile);
   await page.keyboard.press('ControlOrMeta+a');
   await page.keyboard.type('# Fieldnote\n\nWe turn call notes into follow-up plans.');
@@ -559,7 +675,9 @@ test('a profile that fails to load says so and can be retried', async ({ app, pa
   );
   await app.goto('#/setup/company');
   await expect(stepTitle(page, 'company')).toBeVisible();
-  await expect(view(page).getByRole('alert')).toContainText("Couldn't load your profile: product.md is unreadable");
+  const alert = view(page).getByRole('alert');
+  await expect(alert).toContainText('Couldn’t load your profile.');
+  await expect(alert).toContainText('product.md is unreadable');
   // The footer gives the reason Continue waits, not a load that has already ended.
   const hint = foot(page).locator('.setup-hint');
   await expect(hint).toHaveText("Your profile didn't load. Try again above.");
@@ -567,11 +685,114 @@ test('a profile that fails to load says so and can be retried', async ({ app, pa
 
   fail = false;
   await view(page).getByRole('button', { name: 'Try again' }).click();
-  const profile = view(page).getByRole('textbox', { name: 'Company profile' });
+  const profile = profileBox(page);
   await expect(profile).toHaveValue(readFileSync(join(server.home, 'product.md'), 'utf8'));
   await expect(view(page).getByRole('alert')).toHaveCount(0);
   await expect(continueBtn(page)).not.toHaveAttribute('aria-disabled', 'true');
   await expect(hint).toHaveText('');
+});
+
+test('a profile edit made just before leaving is saved', async ({ app, page, request, server }) => {
+  await onboard(request, server);
+  const file = join(server.home, 'product.md');
+  const onDisk = () => readFileSync(file, 'utf8');
+  await app.goto('#/setup/company');
+  const profile = profileBox(page);
+  await expect(profile).toHaveValue(onDisk());
+
+  // Back, well inside the autosave delay: leaving the step saves it.
+  const typedBack = '# Typed then Back\n\nWe turn call notes into follow-up plans.';
+  await profile.fill(typedBack);
+  await foot(page).getByRole('button', { name: 'Back' }).click();
+  await expect(stepTitle(page, 'canonical')).toBeVisible();
+  await expect.poll(onDisk).toBe(typedBack);
+  await continueBtn(page).click();
+  await expect(profile).toHaveValue(typedBack);
+
+  // A progress link does the same.
+  const typedLink = '# Typed then a progress link\n\nWe turn call notes into follow-up plans.';
+  await profile.fill(typedLink);
+  await view(page).getByRole('navigation', { name: 'Setup progress' }).getByRole('link', { name: /Agent/ }).click();
+  await expect(stepTitle(page, 'agent')).toBeVisible();
+  await expect.poll(onDisk).toBe(typedLink);
+
+  // Another screen: the router waits for the save before that screen mounts.
+  await page.evaluate(() => {
+    location.hash = '#/setup/company';
+  });
+  await expect(profile).toHaveValue(typedLink);
+  const typedLeave = '# Typed then leave\n\nWe turn call notes into follow-up plans.';
+  await profile.fill(typedLeave);
+  await page.evaluate(() => {
+    location.hash = '#/home';
+  });
+  await expect(page.locator('.setup')).toHaveCount(0);
+  expect(onDisk()).toBe(typedLeave);
+});
+
+test('a profile save that fails holds Continue until one lands', async ({ app, page, request, server }) => {
+  app.allowConsole(/status of 500/);
+  await onboard(request, server);
+  const file = join(server.home, 'product.md');
+  let failing = true;
+  await page.route('**/api/company', (route) =>
+    failing && route.request().method() === 'POST'
+      ? route.fulfill({ status: 500, contentType: 'text/plain', body: 'disk is full' })
+      : route.fallback(),
+  );
+  await app.goto('#/setup/company');
+  const profile = profileBox(page);
+  await expect(profile).toHaveValue(readFileSync(file, 'utf8'));
+  await profile.fill('# Acme\n\nFirst try.');
+  await expect(saveState(page)).toHaveText('Couldn’t save: disk is full');
+
+  // Continue tries the save once more, and stays while it fails.
+  await continueBtn(page).click();
+  const hint = foot(page).locator('.setup-hint');
+  await expect(hint).toHaveText("Couldn't save your profile: disk is full");
+  await expect(hint).toHaveClass(/is-error/);
+  await expect(page).toHaveURL(hashIs('#/setup/company'));
+
+  // A save that lands afterwards lets it through.
+  failing = false;
+  await profile.fill('# Acme\n\nSecond try.');
+  await expect(saveState(page)).toHaveText('Saved');
+  await continueBtn(page).click();
+  await expect(stepTitle(page, 'destination')).toBeVisible();
+  expect(readFileSync(file, 'utf8')).toBe('# Acme\n\nSecond try.');
+});
+
+test('an action that meets a stale session points at the fix, once', async ({ app, page, request, server }) => {
+  app.allowConsole(/status of 401/);
+  await onboard(request, server);
+  await page.route('**/api/discovery/canonical/connect', (route) => route.fulfill({ status: 401, contentType: 'text/plain', body: 'unauthorized' }));
+  await app.goto('#/setup/canonical');
+  const canonical = view(page).getByRole('region', { name: 'Canonical' });
+  await canonical.getByRole('button', { name: 'Reconnect' }).click();
+  await expect(canonical.locator('.setup-msg')).toHaveText('Reopen coldtrail from your terminal.');
+  await expect(page.locator('.session-banner')).toHaveText(SESSION_EXPIRED);
+  const body = await page.locator('body').innerText();
+  expect(body.split(SESSION_EXPIRED).length - 1).toBe(1);
+});
+
+test('an OAuth wait can be cancelled', async ({ app, page, request, server }) => {
+  await onboard(request, server);
+  // Approval that never comes (the consent tab was closed): the request just hangs.
+  await page.route('**/api/discovery/canonical/connect', () => {});
+  await app.goto('#/setup/canonical');
+  const canonical = view(page).getByRole('region', { name: 'Canonical' });
+  const connect = canonical.getByRole('button', { name: 'Reconnect' });
+  await expect(canonical.getByRole('button', { name: 'Cancel' })).toHaveCount(0);
+  await connect.click();
+  const waiting = canonical.getByRole('button', { name: 'Waiting for approval…' });
+  await expect(waiting).toHaveAttribute('aria-busy', 'true');
+  await canonical.getByRole('button', { name: 'Cancel' }).click();
+  await expect(canonical.locator('.setup-msg')).toHaveText(STOPPED);
+  await expect(connect).toBeFocused();
+  await expect(connect).not.toHaveAttribute('aria-busy', 'true');
+  await expect(canonical.getByRole('button', { name: 'Cancel' })).toHaveCount(0);
+  // Still connected from before: Continue isn't held by the cancelled try.
+  await expect(continueBtn(page)).not.toHaveAttribute('aria-disabled', 'true');
 });
 
 test('a stale first status opens the asked-for step once fresh status arrives', async ({ app, page, request, server }) => {
@@ -620,15 +841,30 @@ test('outreach step connects Gmail with an app password and LinkedIn', async ({ 
     "coldtrail opens each connection request in a LinkedIn window for you to review and send. Connecting opens Chrome at LinkedIn's sign-in page.",
   );
 
-  // Gmail: inline validation, then the (intercepted) app-password check.
+  // Gmail: inline validation, then the (intercepted) app-password check. The message sits right
+  // under the button it answers, above the how-to even when that is open.
+  const apForm = gmail.getByRole('form', { name: 'Connect Gmail with an app password' });
+  const apMsg = apForm.getByRole('status');
+  await gmail.getByText('How to get an app password').click();
   await gmail.getByRole('button', { name: 'Connect Gmail' }).click();
-  await expect(gmail.locator('.setup-msg')).toHaveText('Enter your Gmail address and the app password.');
+  await expect(apMsg).toHaveText('Enter your Gmail address and the app password.');
+  const [msgBox, btnBox, howBox] = await Promise.all([
+    apMsg.boundingBox(),
+    gmail.getByRole('button', { name: 'Connect Gmail' }).boundingBox(),
+    gmail.locator('summary', { hasText: 'How to get an app password' }).boundingBox(),
+  ]);
+  expect(msgBox.y).toBeGreaterThanOrEqual(btnBox.y + btnBox.height);
+  expect(msgBox.y + msgBox.height).toBeLessThanOrEqual(howBox.y);
   await expect(gmail.getByLabel('Gmail address', { exact: true })).toHaveAttribute('aria-invalid', 'true');
+  await expect(gmail.getByLabel('Gmail address', { exact: true })).toHaveAccessibleDescription('Enter your Gmail address and the app password.');
   await expect(app.calls).toEqual([]);
   await gmail.getByLabel('Gmail address', { exact: true }).fill('dee@example.com');
   await gmail.getByLabel('App password', { exact: true }).fill('abcd efgh ijkl mnop');
   await gmail.getByLabel('App password', { exact: true }).press('Enter');
   await expect(gmail.locator('.badge').first()).toHaveText('Connected');
+  await expect(gmail.locator('.setup-conn-msg')).toHaveText('Gmail is connected.');
+  // The form folded away under "Use different credentials"; its message was cleared.
+  await expect(gmail.locator('#setup-gmail-ap-msg')).toHaveText('');
   await expect(gmail).toContainText('coldtrail saves each email as a draft in your Gmail');
   expect(app.calls).toEqual([
     { method: 'POST', path: '/api/destination/gmail/app-password', body: { email: 'dee@example.com', app_password: 'abcd efgh ijkl mnop' } },
@@ -641,7 +877,8 @@ test('outreach step connects Gmail with an app password and LinkedIn', async ({ 
   await gmail.getByText('Use different credentials').click();
   await gmail.getByText('More options').click();
   await gmail.getByRole('button', { name: 'Save and connect' }).click();
-  await expect(gmail.locator('.setup-msg')).toHaveText('Paste your client ID first.');
+  await expect(gmail.getByRole('form', { name: 'Connect Gmail with your own OAuth client' }).getByRole('status')).toHaveText('Paste your client ID first.');
+  await expect(gmail.getByLabel('Client ID', { exact: true })).toBeFocused();
 
   // LinkedIn: the sign-in window never opens here, so the server reports it isn't waiting:
   // the card says the sign-in didn't finish instead of waiting forever.
@@ -734,7 +971,7 @@ test('leaving setup stops the LinkedIn poll', async ({ app, page, request, serve
   const polls = () => page.evaluate(() => window.__liPolls);
   await app.goto('#/setup/destination');
   const linkedin = view(page).getByRole('region', { name: 'LinkedIn' });
-  await linkedin.getByRole('button', { name: 'Connect LinkedIn' }).click();
+  // A sign-in window is open (the server says it's waiting): the card waits for it at once.
   await expect(linkedin.locator('.badge').first()).toHaveText('Waiting for sign-in');
   await page.clock.runFor(2_100);
   await expect.poll(polls).toBeGreaterThanOrEqual(1);
@@ -746,6 +983,34 @@ test('leaving setup stops the LinkedIn poll', async ({ app, page, request, serve
   const before = await polls();
   await page.clock.runFor(20_000);
   expect(await polls()).toBe(before);
+});
+
+test('a LinkedIn sign-in already open is picked up again', async ({ app, page, request, server }) => {
+  await onboard(request, server);
+  let li = { connected: false, reconnect_needed: false, waiting: true };
+  await page.route('**/api/destination/linkedin/status', (route) => route.fulfill({ json: li }));
+  // Left the step while the sign-in window was open, then came back: the card keeps waiting.
+  await app.goto('#/setup/destination');
+  const linkedin = view(page).getByRole('region', { name: 'LinkedIn' });
+  const badge = linkedin.locator('.badge').first();
+  await expect(badge).toHaveText('Waiting for sign-in');
+  await expect(linkedin.locator('.setup-msg')).toContainText('Sign in to LinkedIn in the Chrome window');
+  await expect(linkedin.getByRole('button', { name: 'Connect LinkedIn' })).toHaveCount(0);
+  li = { connected: true, reconnect_needed: false, waiting: false };
+  await expect(badge).toHaveText('Connected', { timeout: 15_000 });
+  await expect(linkedin.locator('.setup-msg')).toHaveText('LinkedIn is connected.');
+
+  // Connect answers "busy" because that window is still open: wait for it, don't call it busy.
+  li = { connected: false, reconnect_needed: false, waiting: false };
+  await page.route('**/api/destination/linkedin/connect', (route) => {
+    li = { ...li, waiting: true };
+    return route.fulfill({ json: { status: 'busy' } });
+  });
+  await page.reload();
+  await linkedin.getByRole('button', { name: 'Connect LinkedIn' }).click();
+  await expect(badge).toHaveText('Waiting for sign-in');
+  await expect(linkedin.locator('.setup-msg')).toContainText('Sign in to LinkedIn in the Chrome window');
+  await expect(linkedin).not.toContainText('Chrome is busy');
 });
 
 test('agentPanel works outside the wizard', async ({ app, page, request, server }) => {
@@ -765,6 +1030,8 @@ test('agentPanel works outside the wizard', async ({ app, page, request, server 
   // No status given: it fetches its own, and loads its own stylesheet.
   await expect(box.locator('.ap-card .ap-name')).toHaveText(['Claude Code', 'Codex CLI', 'opencode', 'Your own model']);
   await expect(page.locator('link[rel="stylesheet"][href="/assets/css/views/setup.css"]')).toHaveCount(1);
+  // It shows once that stylesheet is in, never unstyled.
+  await expect(box.locator('.ap')).toBeVisible();
   expect(await box.locator('.ap-card').first().evaluate((el) => getComputedStyle(el).borderTopLeftRadius)).toBe('8px');
 
   await box.locator('.ap-card[data-kind="codex"] .ap-pick').click();
@@ -846,4 +1113,23 @@ test('every step is accessible in light and dark and fits a phone', async ({ app
     await expectNoSideScroll(page, 390);
   }
   await expectAccessible(page);
+
+  // A footer hint that wraps onto its own line above Continue leaves Back level with Continue.
+  const file = join(server.home, 'product.md');
+  writeFileSync(file, '');
+  try {
+    await app.goto('#/setup/company');
+    await expect(profileBox(page)).toHaveValue(new RegExp(reEscape(TEMPLATE_CTA)));
+    const hint = foot(page).locator('.setup-hint');
+    await expect(hint).toHaveText("Fill in the template with your company's details to continue.");
+    const [backBox, nextBox, hintBox] = await Promise.all([
+      foot(page).getByRole('button', { name: 'Back' }).boundingBox(),
+      continueBtn(page).boundingBox(),
+      hint.boundingBox(),
+    ]);
+    expect(hintBox.y + hintBox.height).toBeLessThanOrEqual(nextBox.y);
+    expect(Math.abs(backBox.y + backBox.height - (nextBox.y + nextBox.height))).toBeLessThanOrEqual(1);
+  } finally {
+    writeFileSync(file, PRODUCT_MD);
+  }
 });

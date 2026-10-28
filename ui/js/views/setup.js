@@ -2,49 +2,32 @@
 // Four steps, then "You're set":
 //   agent        the agent cards, opencode's model, your own model, Test connection (agentPanel)
 //   canonical    Connect Canonical (coldtrail's own OAuth); required
-//   company      the company profile (a plain editor until Task 20 swaps in mountProfileEditor)
+//   company      the company profile: Company profile's own editor and checklist
+//                (mountProfileEditor, starting from its PROFILE_TEMPLATE)
 //   destination  Gmail (app password first, more options folded) and LinkedIn; may be skipped
 // Continue is gated on exactly what `onboarded` needs: a present provider, a Canonical token and
 // a non-empty profile. Each step is a URL, so back/forward and refresh keep the place; a step
-// that needs an earlier one first sends the address (through the router) to that earlier step.
+// that needs an earlier one first rewrites the address (silently) to the step it shows instead.
 // A bare #/setup, where the app sends an unfinished workspace, keeps its address and shows the
 // first step to do (remembered in the history entry, so back/forward return to it).
 //
 // Everything dynamic reaches the DOM through h() (text nodes); nothing here parses HTML.
 // Leaving the screen aborts in-flight reads and stops the LinkedIn poll; saves already sent
-// still land, and a pending profile edit is saved first.
+// still land. A pending profile edit is saved first: the router waits for it (beforeLeave), and
+// moving between steps hands it to the editor's exit save.
 //
 // agentPanel(root, ctx) is exported for Settings → Agent; see its JSDoc below.
 
-import { api } from '../core/api.js';
-import { debounce, fmtNum, h } from '../core/dom.js';
-import { href } from '../core/router.js';
+import { api, SESSION_EXPIRED } from '../core/api.js';
+import { fmtNum, h } from '../core/dom.js';
+import { ensureViewCss, href } from '../core/router.js';
+import { copyText, isBusy, setBusy } from '../core/ui.js';
 import { badge } from '../components/badge.js';
 import { searchSelect } from '../components/searchSelect.js';
+import { wordmark } from '../shell.js';
+import { mountProfileEditor, PROFILE_TEMPLATE } from './company.js';
 
-const CSS_HREF = '/assets/css/views/setup.css';
-const PROFILE_SAVE_MS = 800;
 const LINKEDIN_POLL_MS = 2000;
-
-/** The company profile template: the sections the drafting agent reads, with the CTA in the
- *  `- Link:` form product::cta_link() parses (the old template's bare URL was never picked up). */
-export const PROFILE_TEMPLATE = `# Your company — profile
-
-## What we do
-
-## Who we help
-
-## Pain / value
-
-## Proof / differentiator
-
-## Offer
-
-## Call to Action
-- Link: https://yourproduct.com/?utm_content={slug}
-
-## Voice & sign-off
-`;
 
 const STARTER_PROMPT =
   'Find 10 companies that fit my company profile, find the best person to contact at each, and draft a first email to each of them.';
@@ -68,7 +51,7 @@ const STEPS = [
     id: 'company',
     label: 'Company',
     title: 'Describe your company',
-    desc: 'The agent writes every email and LinkedIn note from this profile and only claims what it says. It stays on this computer.',
+    desc: 'The agent writes every email and LinkedIn note from this profile and only claims what it says. It saves as you type and stays on this computer.',
     required: true,
   },
   {
@@ -94,7 +77,6 @@ const ICONS = {
   chat: ['M4 5h16v11H9l-5 4z'],
   clock: ['M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18z', 'M12 7v5l3 2'],
   arrow: ['M5 12h14', 'M13 6l6 6-6 6'],
-  external: ['M14 4h6v6', 'M20 4l-9 9', 'M18 14v6H4V6h6'],
 };
 
 function icon(name, size = 16) {
@@ -116,8 +98,6 @@ function icon(name, size = 16) {
   );
 }
 
-const spinner = () => h('span', { class: 'su-spin', 'aria-hidden': 'true' });
-
 /**
  * Put a one-line message into `el` (a live region that stays in the DOM): tone '' (neutral),
  * 'ok', 'err' or 'busy'. Text only; '' clears it.
@@ -128,65 +108,30 @@ function say(el, text, tone = '') {
     el.replaceChildren();
     return;
   }
-  const mark = tone === 'ok' ? icon('check', 14) : tone === 'err' ? icon('alert', 14) : tone === 'busy' ? spinner() : null;
+  const mark =
+    tone === 'ok' ? icon('check', 14) : tone === 'err' ? icon('alert', 14) : tone === 'busy' ? h('span', { class: 'spinner', 'aria-hidden': 'true' }) : null;
   el.replaceChildren(...(mark ? [mark] : []), h('span', {}, String(text)));
 }
 
-/**
- * Mark a button busy without disabling it (a disabled button drops focus): it ignores presses
- * while `data-busy` is set and shows `label` meanwhile. Returns a function that restores it.
- */
-function busyButton(btn, label) {
-  const prev = [...btn.childNodes];
-  btn.dataset.busy = 'true';
-  btn.setAttribute('aria-disabled', 'true');
-  btn.setAttribute('aria-busy', 'true');
-  btn.replaceChildren(spinner(), h('span', {}, label));
-  return () => {
-    delete btn.dataset.busy;
-    btn.removeAttribute('aria-disabled');
-    btn.removeAttribute('aria-busy');
-    btn.replaceChildren(...prev);
-  };
-}
-const isBusy = (btn) => btn.dataset.busy === 'true';
-const aborted = (err) => err && err.name === 'AbortError';
-const errText = (err) => (err && err.message) || String(err);
+const aborted = (err) => !!err && err.name === 'AbortError';
 /** A 401: the app's session banner already says so in full, so screens only point at the fix. */
-const staleSession = (err) => !!err && err.status === 401;
+const staleSession = (err) => !!err && (err.status === 401 || err.message === SESSION_EXPIRED);
 const REOPEN = 'Reopen coldtrail from your terminal.';
+/** What went wrong, for a message on the screen (a stale session: only the fix). */
+const why = (err) => (staleSession(err) ? REOPEN : (err && err.message) || String(err));
+/** An OAuth wait the user stopped. The server may still hold the callback port meanwhile. */
+const STOPPED = 'Stopped waiting. If connecting again fails, restart coldtrail and try once more.';
+
+/** An AbortController that also aborts when `parent` does (Cancel inside a step's lifetime). */
+function childController(parent) {
+  const ctl = new AbortController();
+  if (parent.aborted) ctl.abort();
+  else parent.addEventListener('abort', () => ctl.abort(), { once: true });
+  return ctl;
+}
 
 function extLink(url, text) {
   return h('a', { href: url, target: '_blank', rel: 'noopener noreferrer' }, text);
-}
-
-/** Copy to the clipboard: the async API, else a hidden textarea + execCommand. */
-async function copyText(text) {
-  try {
-    await navigator.clipboard.writeText(text);
-    return true;
-  } catch (_) {
-    const active = document.activeElement;
-    const ta = h('textarea', { class: 'sr-only', readonly: true, 'aria-hidden': 'true', tabindex: '-1' });
-    ta.value = text;
-    document.body.append(ta);
-    ta.select();
-    let ok = false;
-    try {
-      ok = document.execCommand('copy');
-    } catch (__) {
-      ok = false;
-    }
-    ta.remove();
-    if (active && active.focus) active.focus({ preventScroll: true });
-    return ok;
-  }
-}
-
-function ensureStylesheet() {
-  if (typeof document === 'undefined') return;
-  if (document.querySelector(`link[rel="stylesheet"][href="${CSS_HREF}"]`)) return;
-  document.head.append(h('link', { rel: 'stylesheet', href: CSS_HREF }));
 }
 
 /** Is the provider coldtrail would run present? (StatusDto has no provider_ready field.) */
@@ -238,7 +183,9 @@ let apUid = 0;
  *   - Your own model: the base URL / model / API key form; Save posts {provider:'openai',
  *     base_url, model, api_key|null} (a blank key keeps the stored one). Choosing the card only
  *     opens the form; the provider switches on Save.
- *   - Test connection: POST /api/provider/probe on the saved provider, result shown inline.
+ *   - Test connection: POST /api/provider/probe on the saved provider, result shown inline; a
+ *     CLI that fails it also gets its sign-in command (its "signed in" state is only a file check).
+ *   Saves go out one at a time, in the order they were made, so the last choice is the one kept.
  *
  * ctx (all optional):
  *   status     the StatusDto (GET /api/status) to render first. Without it the panel shows a
@@ -252,13 +199,13 @@ let apUid = 0;
  *
  * Returns { el, update(status), settled(), destroy() }. update(status) re-renders from a status
  * the host already has (typing in the form and the last test result are kept). settled() →
- * Promise<boolean> waits for the saves already sent (a model typed just before the host moves
+ * Promise<boolean> waits for the saves already made (a model typed just before the host moves
  * on is saved when the field loses focus) and says whether they all landed. destroy() aborts
- * reads and the probe and empties `root`; a save already sent still lands. The panel loads
- * css/views/setup.css itself when the page hasn't.
+ * reads and the probe and empties `root`; a save already made still lands. The panel loads
+ * css/views/setup.css itself (ensureViewCss) and stays invisible until it has.
  */
 export function agentPanel(root, ctx = {}) {
-  ensureStylesheet();
+  const styled = ensureViewCss('setup');
   const uid = `ap-${++apUid}`;
   const ctl = new AbortController();
   const { signal } = ctl;
@@ -272,14 +219,18 @@ export function agentPanel(root, ctx = {}) {
   let probeFor = null; // the provider the shown test result is about
   let destroyed = false;
   const cards = new Map(); // kind → { el, pick, badgeSlot, cmd }
-  // Saves in flight, each → Promise<boolean> (true = it landed). Saves are sent without
-  // `signal`: leaving the panel right after one (Continue, a progress link) must not drop it.
+  // Saves, each → Promise<boolean> (true = it landed). They run one after another in the order
+  // they were made: every save names a provider, so two racing could land out of order and undo
+  // the later choice (a model typed, then another card clicked). Sent without `signal`: leaving
+  // the panel right after one (Continue, a progress link) must not drop it.
   const inflight = new Set();
-  const track = (promise) => {
-    const p = promise.then(
+  let queue = Promise.resolve(true);
+  const track = (send) => {
+    const p = queue.then(send).then(
       (ok) => ok !== false,
       () => false,
     );
+    queue = p;
     inflight.add(p);
     p.then(() => inflight.delete(p));
     return p;
@@ -388,20 +339,25 @@ export function agentPanel(root, ctx = {}) {
   const testBtn = h('button', { type: 'button', class: 'btn btn-secondary', onClick: runProbe }, 'Test connection');
   const testNote = h('p', { class: 'ap-test-note' });
   const testResult = h('p', { class: 'ap-msg ap-test-result', role: 'status' });
-  const testBox = h('div', { class: 'ap-test', hidden: true }, h('div', { class: 'ap-test-row' }, testBtn, testNote), testResult);
+  // A CLI that failed the test: its sign-in command, whatever its auth file says.
+  const testCmd = h('div', { class: 'ap-cmd ap-test-cmd', hidden: true });
+  const testBox = h('div', { class: 'ap-test', hidden: true }, h('div', { class: 'ap-test-row' }, testBtn, testNote), testResult, testCmd);
 
   const details = h('div', { class: 'ap-details', hidden: true }, modelBox, byokForm, testBox);
   const el = h('div', { class: 'ap' }, loading, loadError, grid, recheck_, pickError, details);
+  // Unstyled for a moment on another screen is worse than blank for a moment.
+  el.style.visibility = 'hidden';
+  styled.then(() => el.style.removeProperty('visibility'));
   root.replaceChildren(el);
 
   // ---- Cards ----
 
   const agentOf = (kind) => ((status && status.agents) || []).find((a) => a.kind === kind) || null;
+  const nameOf = (kind) => (kind === OWN ? 'Your own model' : (agentOf(kind) || {}).label || kind);
 
   function buildCard(kind) {
-    const a = agentOf(kind);
     const info = AGENT_INFO[kind] || { desc: '' };
-    const name = kind === OWN ? 'Your own model' : (a && a.label) || kind;
+    const name = nameOf(kind);
     const descId = `${uid}-${kind}-desc`;
     const nameId = `${uid}-${kind}-name`;
     const stateId = `${uid}-${kind}-state`;
@@ -427,8 +383,9 @@ export function agentPanel(root, ctx = {}) {
   }
 
   function commandRow(row, label, command, note) {
-    if (row.dataset.command === command) return;
+    if (row.dataset.command === command && row.dataset.label === label) return;
     row.dataset.command = command;
+    row.dataset.label = label;
     const copyLabel = h('span', {}, 'Copy');
     const btn = h(
       'button',
@@ -502,11 +459,10 @@ export function agentPanel(root, ctx = {}) {
     } else {
       // Labels can change (e.g. a status from a different host); keep the element.
       for (const kind of kinds) {
-        const a = agentOf(kind);
-        const name = kind === OWN ? 'Your own model' : (a && a.label) || kind;
         const c = cards.get(kind);
+        c.name = nameOf(kind);
         const nameEl = c.el.querySelector('.ap-name');
-        if (nameEl.textContent !== name) nameEl.textContent = name;
+        if (nameEl.textContent !== c.name) nameEl.textContent = c.name;
       }
     }
     for (const kind of kinds) renderCard(kind);
@@ -514,6 +470,14 @@ export function agentPanel(root, ctx = {}) {
   }
 
   // ---- Details below the cards ----
+
+  function hideTestCmd() {
+    const copy = testCmd.querySelector('.ap-copy');
+    if (copy) clearTimeout(copy._t);
+    testCmd.hidden = true;
+    testCmd.replaceChildren();
+    delete testCmd.dataset.command;
+  }
 
   function renderDetails() {
     const saved = status.provider;
@@ -546,6 +510,7 @@ export function agentPanel(root, ctx = {}) {
       testNote.textContent = `Sends one tiny request to check that ${label} answers.`;
       if (probeFor !== saved) {
         say(testResult, '');
+        hideTestCmd();
         probeFor = null;
       }
     }
@@ -578,7 +543,7 @@ export function agentPanel(root, ctx = {}) {
       loadError.hidden = false;
       // A stale session: the app's banner explains it, and retrying can't help.
       loadError.replaceChildren(
-        h('p', {}, h('strong', {}, "Couldn't load your agents. "), staleSession(err) ? REOPEN : errText(err)),
+        h('p', {}, h('strong', {}, "Couldn't load your agents. "), why(err)),
         staleSession(err) ? null : h('button', { type: 'button', class: 'btn btn-secondary btn-sm', onClick: load }, 'Try again'),
       );
     }
@@ -586,17 +551,17 @@ export function agentPanel(root, ctx = {}) {
 
   async function recheck() {
     if (isBusy(recheckBtn)) return;
-    const done = busyButton(recheckBtn, 'Checking…');
+    setBusy(recheckBtn, true, { label: 'Checking…' });
     try {
       const fresh = await refresh();
       if (destroyed) return;
       status = fresh;
-      if (view !== OWN) view = status.provider;
+      if (view !== OWN && saving == null) view = status.provider;
       render();
     } catch (err) {
-      if (!destroyed && !aborted(err)) say(pickError, `Couldn't check again: ${errText(err)}`, 'err');
+      if (!destroyed && !aborted(err)) say(pickError, `Couldn't check again: ${why(err)}`, 'err');
     } finally {
-      if (!destroyed) done();
+      if (!destroyed) setBusy(recheckBtn, false);
     }
   }
 
@@ -615,14 +580,15 @@ export function agentPanel(root, ctx = {}) {
       render();
       return;
     }
-    track(saveProvider(kind));
-  }
-
-  async function saveProvider(kind) {
+    // Shown as chosen (and saving) at once; sent once the saves before it have landed.
     const before = view;
     view = kind;
     saving = kind;
     render();
+    track(() => sendProvider(kind, before));
+  }
+
+  async function sendProvider(kind, before) {
     let saved = false;
     try {
       await api.post('/api/onboarding/provider', { provider: kind });
@@ -640,7 +606,7 @@ export function agentPanel(root, ctx = {}) {
       if (!saved) view = before;
       render();
       const name = (cards.get(kind) || {}).name || kind;
-      say(pickError, saved ? `Switched to ${name}, but couldn't re-check your agents: ${errText(err)}` : `Couldn't switch to ${name}: ${errText(err)}`, 'err');
+      say(pickError, saved ? `Switched to ${name}, but couldn't re-check your agents: ${why(err)}` : `Couldn't switch to ${name}: ${why(err)}`, 'err');
     }
     return saved;
   }
@@ -655,7 +621,7 @@ export function agentPanel(root, ctx = {}) {
       models = { state: list.length ? 'ready' : 'empty', list, message: r.message || '' };
     } catch (err) {
       if (destroyed || aborted(err)) return;
-      models = { state: 'error', list: [], message: errText(err) };
+      models = { state: 'error', list: [], message: why(err) };
     }
     modelSelect.setOptions(models.list.map((m) => ({ value: m, label: m })));
     renderModelHint();
@@ -673,13 +639,13 @@ export function agentPanel(root, ctx = {}) {
   }
 
   // A typed model is committed when the field loses focus, which is also what pressing Continue
-  // right away does: the step change must not drop this save (see `inflight`).
+  // (or another card) right away does: the step change must not drop this save (see `track`).
   function saveModel(value) {
-    return track(sendModel(value));
+    say(modelStatus, 'Saving…', 'busy');
+    return track(() => sendModel(value));
   }
 
   async function sendModel(value) {
-    say(modelStatus, 'Saving…', 'busy');
     let saved = false;
     try {
       await api.post('/api/onboarding/provider', { provider: 'opencode', opencode_model: value });
@@ -696,7 +662,7 @@ export function agentPanel(root, ctx = {}) {
         say(modelStatus, 'Model saved', 'ok');
       } else {
         modelSelect.setValue((status && status.opencode_model) || '');
-        say(modelStatus, `Couldn't save the model: ${errText(err)}`, 'err');
+        say(modelStatus, `Couldn't save the model: ${why(err)}`, 'err');
       }
     }
     return saved;
@@ -736,16 +702,16 @@ export function agentPanel(root, ctx = {}) {
       return;
     }
     setBaseError('');
-    track(sendByok(base));
+    say(byokStatus, '');
+    setBusy(byokSave, true, { label: 'Saving…' });
+    const key = keyInput.value.trim();
+    track(() => sendByok({ provider: OWN, base_url: base, model: modelInput.value.trim(), api_key: key || null }));
   }
 
-  async function sendByok(base) {
-    say(byokStatus, '');
-    const done = busyButton(byokSave, 'Saving…');
-    const key = keyInput.value.trim();
+  async function sendByok(body) {
     let saved = false;
     try {
-      await api.post('/api/onboarding/provider', { provider: OWN, base_url: base, model: modelInput.value.trim(), api_key: key || null });
+      await api.post('/api/onboarding/provider', body);
       saved = true;
       keyInput.value = '';
       byokDirty = false;
@@ -753,14 +719,14 @@ export function agentPanel(root, ctx = {}) {
       if (destroyed) return true;
       status = fresh;
       view = OWN;
-      done();
+      setBusy(byokSave, false);
       render();
       say(byokStatus, 'Saved. coldtrail now uses your own model.', 'ok');
       emit('byok', OWN);
     } catch (err) {
       if (destroyed || aborted(err)) return saved;
-      done();
-      say(byokStatus, saved ? 'Saved. coldtrail now uses your own model.' : `Couldn't save: ${errText(err)}`, saved ? 'ok' : 'err');
+      setBusy(byokSave, false);
+      say(byokStatus, saved ? 'Saved. coldtrail now uses your own model.' : `Couldn't save: ${why(err)}`, saved ? 'ok' : 'err');
     }
     return saved;
   }
@@ -769,17 +735,25 @@ export function agentPanel(root, ctx = {}) {
     if (isBusy(testBtn) || !status) return;
     const provider = status.provider;
     probeFor = provider;
-    const done = busyButton(testBtn, 'Testing…');
+    hideTestCmd();
+    setBusy(testBtn, true, { label: 'Testing…' });
     say(testResult, 'Running a quick check. This can take up to a minute.', 'busy');
     try {
       const r = await api.post('/api/provider/probe', {}, { signal });
       if (destroyed || probeFor !== provider) return;
       say(testResult, r.message || (r.ok ? 'It answered.' : "It didn't answer."), r.ok ? 'ok' : 'err');
+      // "Ready" only means an auth file exists: a CLI whose login lapsed fails here, so offer
+      // the way back in.
+      const info = AGENT_INFO[provider];
+      if (!r.ok && provider !== OWN && info && info.login) {
+        commandRow(testCmd, 'Signed out? Sign in again', info.login, info.loginNote);
+        testCmd.hidden = false;
+      }
     } catch (err) {
       if (destroyed || aborted(err)) return;
-      say(testResult, errText(err), 'err');
+      say(testResult, why(err), 'err');
     } finally {
-      if (!destroyed) done();
+      if (!destroyed) setBusy(testBtn, false);
     }
   }
 
@@ -787,10 +761,7 @@ export function agentPanel(root, ctx = {}) {
     if (destroyed) return;
     destroyed = true;
     ctl.abort();
-    for (const c of cards.values()) {
-      const btn = c.cmd.querySelector('.ap-copy');
-      if (btn) clearTimeout(btn._t);
-    }
+    for (const btn of el.querySelectorAll('.ap-copy')) clearTimeout(btn._t);
     root.replaceChildren();
   }
 
@@ -822,21 +793,7 @@ export function agentPanel(root, ctx = {}) {
 
 // ---- The Setup screen ----
 
-let current = null; // the mounted screen's { update(ctx) }
-
-function brand() {
-  return h(
-    'span',
-    { class: 'setup-brand' },
-    h(
-      'svg',
-      { viewBox: '0 0 24 24', width: '22', height: '22', fill: 'none', stroke: 'currentColor', 'stroke-width': '2', 'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'aria-hidden': 'true', focusable: 'false' },
-      h('path', { d: 'M3 17l5-5 4 3 8-9' }),
-      h('circle', { cx: '20', cy: '6', r: '1.5' }),
-    ),
-    h('span', {}, 'coldtrail'),
-  );
-}
+let current = null; // the mounted screen's { update(ctx), beforeLeave() }
 
 function mountSetup(root, ctx) {
   const viewCtl = new AbortController();
@@ -854,7 +811,7 @@ function mountSetup(root, ctx) {
   const page = h(
     'div',
     { class: 'setup' },
-    h('header', { class: 'setup-top' }, brand(), h('span', { class: 'setup-top-sep', 'aria-hidden': 'true' }), h('h1', { class: 'setup-h1' }, 'Setup')),
+    h('header', { class: 'setup-top' }, wordmark(), h('span', { class: 'setup-top-sep', 'aria-hidden': 'true' }), h('h1', { class: 'setup-h1' }, 'Setup')),
     h('div', { class: 'setup-body' }, progress, main),
   );
   root.replaceChildren(page);
@@ -913,19 +870,12 @@ function mountSetup(root, ctx) {
     }
   }
 
-  // Point the address at the step shown, through the router so it remembers the new hash (a
-  // later visit to the same address is then a real change). The router hands the new address
-  // straight back to update(), which leaves it to the show() already under way.
-  let rewriting = false;
+  // Point the address at the step shown. Silent: the router only learns the new hash (so a
+  // later visit to the asked-for address is a real change) and doesn't hand it back to update().
   function setAddress(id) {
     const to = href(['setup', id]);
     if (location.hash === to) return;
-    rewriting = true;
-    try {
-      Promise.resolve(nav.navigate(to, { replace: true })).catch((err) => console.error(err));
-    } finally {
-      rewriting = false;
-    }
+    nav.navigate(to, { replace: true, silent: true });
   }
 
   async function fetchStatus() {
@@ -1043,7 +993,7 @@ function mountSetup(root, ctx) {
           'div',
           { class: 'setup-error-body', role: stale ? null : 'alert' },
           icon('alert', 20),
-          h('div', {}, h('h2', { class: 'setup-error-title' }, "Setup couldn't load"), h('p', {}, stale ? REOPEN : errText(err))),
+          h('div', {}, h('h2', { class: 'setup-error-title' }, "Setup couldn't load"), h('p', {}, why(err))),
         ),
         retry,
       ),
@@ -1075,7 +1025,7 @@ function mountSetup(root, ctx) {
     const back = i > 0 ? h('button', { type: 'button', class: 'btn btn-secondary', onClick: () => go(STEPS[i - 1].id) }, 'Back') : null;
     const card = h(
       'section',
-      { class: 'setup-card', 'aria-labelledby': 'setup-title' },
+      { class: ['setup-card', `setup-card-${id}`], 'aria-labelledby': 'setup-title' },
       h(
         'div',
         { class: 'setup-card-main' },
@@ -1101,7 +1051,7 @@ function mountSetup(root, ctx) {
     }
 
     function refreshGate() {
-      if (!sc.api) return { ok: false, reason: "" };
+      if (!sc.api) return { ok: false, reason: '' };
       const g = sc.api.gate();
       const skipping = !!(sc.api.canSkip && sc.api.canSkip());
       if (skip) skip.hidden = !skipping;
@@ -1130,14 +1080,19 @@ function mountSetup(root, ctx) {
         return;
       }
       busy = true;
-      const done = busyButton(next, 'Continue');
+      setBusy(next, true);
       try {
         if (sc.api.beforeContinue && !(await sc.api.beforeContinue())) return;
         if (scope !== sc) return;
         go(i + 1 < STEPS.length ? STEPS[i + 1].id : 'done');
       } finally {
         busy = false;
-        if (next.isConnected) done();
+        if (next.isConnected) {
+          setBusy(next, false);
+          // The gate may have changed meanwhile; keep the hint (it may hold the reason it stopped).
+          if (sc.api.gate().ok) next.removeAttribute('aria-disabled');
+          else next.setAttribute('aria-disabled', 'true');
+        }
       }
     }
 
@@ -1176,6 +1131,7 @@ function mountSetup(root, ctx) {
         }
         return true;
       },
+      leave: () => panel.settled(),
       onStatus: () => {
         panel.update(status);
         step_.gate();
@@ -1185,9 +1141,41 @@ function mountSetup(root, ctx) {
 
   // ---- Step 2: Canonical ----
 
+  /** A Cancel for an OAuth wait: hidden until `start`, and putting focus back on `btn`. */
+  function waitCancel(btn) {
+    let ctl = null;
+    const cancelBtn = h(
+      'button',
+      {
+        type: 'button',
+        class: 'btn btn-ghost',
+        hidden: true,
+        onClick: () => {
+          if (!ctl) return;
+          if (document.activeElement === cancelBtn) btn.focus({ preventScroll: true });
+          ctl.abort();
+        },
+      },
+      'Cancel',
+    );
+    return {
+      el: cancelBtn,
+      start(parent) {
+        ctl = childController(parent);
+        cancelBtn.hidden = false;
+        return ctl.signal;
+      },
+      end() {
+        ctl = null;
+        cancelBtn.hidden = true;
+      },
+    };
+  }
+
   function canonicalStep(content, sc, step_) {
     const badgeSlot = h('span', { class: 'setup-conn-state' });
     const btn = h('button', { type: 'button', class: 'btn', onClick: connect });
+    const cancel = waitCancel(btn);
     const msg = h('p', { class: 'setup-msg', role: 'status' });
     const note = h('p', { class: 'setup-conn-note' });
     content.append(
@@ -1195,7 +1183,7 @@ function mountSetup(root, ctx) {
         'section',
         { class: 'setup-conn', 'aria-labelledby': 'setup-canonical-title' },
         connHead('search', 'setup-canonical-title', 'Canonical', note, badgeSlot),
-        h('div', { class: 'setup-conn-body' }, h('div', { class: 'setup-row' }, btn), msg),
+        h('div', { class: 'setup-conn-body' }, h('div', { class: 'setup-row' }, btn, cancel.el), msg),
       ),
     );
 
@@ -1213,11 +1201,16 @@ function mountSetup(root, ctx) {
 
     async function connect() {
       if (isBusy(btn)) return;
-      const done = busyButton(btn, 'Waiting for approval…');
+      const wait = cancel.start(sc.ctl.signal);
+      setBusy(btn, true, { label: 'Waiting for approval…' });
       say(msg, "Approve coldtrail in the browser tab that opened. This page updates when you're done.", 'busy');
+      const settle = () => {
+        cancel.end();
+        setBusy(btn, false);
+      };
       try {
-        const r = await api.post('/api/discovery/canonical/connect', {}, { signal: sc.ctl.signal });
-        done();
+        const r = await api.post('/api/discovery/canonical/connect', {}, { signal: wait });
+        settle();
         if (r && r.ok === false) {
           say(msg, r.message || "Couldn't connect to Canonical.", 'err');
         } else {
@@ -1226,10 +1219,12 @@ function mountSetup(root, ctx) {
           await refreshStatus().catch(() => {});
         }
       } catch (err) {
-        if (aborted(err)) return;
-        done();
-        say(msg, errText(err), 'err');
+        if (sc.ctl.signal.aborted) return;
+        settle();
+        if (aborted(err)) say(msg, STOPPED);
+        else say(msg, why(err), 'err');
       }
+      if (scope !== sc) return;
       render();
       renderProgress();
       step_.gate();
@@ -1247,136 +1242,56 @@ function mountSetup(root, ctx) {
 
   // ---- Step 3: company profile ----
 
+  const isTemplate = (doc) => doc.trim() === PROFILE_TEMPLATE.trim();
+
   function companyStep(content, sc, step_) {
-    const saveState = h('span', { class: 'setup-save', role: 'status' });
-    const area = h('textarea', {
-      id: 'setup-profile',
-      class: 'input setup-profile',
-      spellcheck: 'false',
-      rows: '18',
-      'aria-describedby': 'setup-profile-hint',
+    const box = h('div', { class: 'setup-company' });
+    content.append(box);
+    // Company profile's own editor and checklist: it loads product.md (showing the template for
+    // an empty one), saves as you type and never saves a blank profile.
+    const editor = mountProfileEditor(box, {
+      store: store || undefined,
+      onChange: () => step_.gate(),
     });
-    const hint = h('p', { class: 'field-hint', id: 'setup-profile-hint' }, 'Markdown. It saves as you type; refine it any time under Company profile.');
-    const loadingEl = h(
-      'div',
-      { class: 'setup-profile-loading', role: 'status' },
-      h('span', { class: 'sr-only' }, 'Loading your profile…'),
-      [0, 1, 2, 3, 4].map(() => h('span', { class: 'skeleton setup-sk setup-sk-line', 'aria-hidden': 'true' })),
-    );
-    const errorEl = h('div', { class: 'setup-inline-error', role: 'alert', hidden: true });
-    const editor = h(
-      'div',
-      { class: 'field setup-profile-field', hidden: true },
-      h('div', { class: 'setup-profile-head' }, h('label', { class: 'field-label', for: 'setup-profile' }, 'Company profile'), saveState),
-      area,
-      hint,
-    );
-    content.append(loadingEl, errorEl, editor);
+    // Leaving the step hands an edit still waiting to the editor's exit save (the next editor
+    // waits for it); leaving the screen flushes it first (leave(), through beforeLeave).
+    sc.cleanups.push(() => editor.dispose());
 
-    let loaded = false;
-    let loadFailed = false;
-    let saveError = null;
-    let inflight = null;
-    let savedDoc = null; // the text product.md holds, as far as this page knows
-
-    function setSave(state, text = '') {
-      saveState.dataset.state = state;
-      if (state === 'saving') saveState.textContent = 'Saving…';
-      else if (state === 'saved') saveState.textContent = 'Saved';
-      else if (state === 'error') saveState.textContent = `Couldn't save: ${text}`;
-      else saveState.textContent = text;
-    }
-
-    function persist(doc) {
-      setSave('saving');
-      const p = api.post('/api/company', { doc }).then(
-        () => {
-          if (inflight === p) {
-            savedDoc = doc;
-            saveError = null;
-            setSave('saved');
-            step_.gate();
-          }
-        },
-        (err) => {
-          saveError = err;
-          setSave('error', errText(err));
-        },
-      );
-      inflight = p;
-      return p;
-    }
-    const save = debounce(() => persist(area.value), PROFILE_SAVE_MS);
-
-    async function flush() {
-      const pending = save.flush();
-      await (pending || inflight);
-      return !saveError;
-    }
-
-    area.addEventListener('input', () => {
-      saveError = null;
-      setSave('pending', 'Unsaved changes');
-      save();
-      step_.gate();
-    });
-    // Leaving the step (or the screen) saves a pending edit first.
-    sc.cleanups.push(() => save.flush());
-
-    async function loadDoc() {
-      loadingEl.hidden = false;
-      errorEl.hidden = true;
-      editor.hidden = true;
-      loadFailed = false;
-      step_.gate();
-      try {
-        const r = await api.get('/api/company', { signal: sc.ctl.signal });
-        const doc = (r && r.doc) || '';
-        savedDoc = doc;
-        area.value = doc.trim() ? doc : PROFILE_TEMPLATE;
-        setSave('', doc.trim() ? '' : 'Fill in the template');
-        loaded = true;
-        loadingEl.hidden = true;
-        editor.hidden = false;
-      } catch (err) {
-        if (aborted(err)) return;
-        loadFailed = true;
-        loadingEl.hidden = true;
-        errorEl.hidden = false;
-        // A stale session: the app's banner explains it, and retrying can't help.
-        errorEl.replaceChildren(
-          icon('alert', 16),
-          h('p', {}, `Couldn't load your profile: ${staleSession(err) ? REOPEN : errText(err)}`),
-          staleSession(err) ? null : h('button', { type: 'button', class: 'btn btn-secondary btn-sm', onClick: loadDoc }, 'Try again'),
-        );
+    function gate() {
+      const s = editor.state();
+      if (!s.loaded) {
+        return s.status === 'load-error'
+          ? { ok: false, reason: "Your profile didn't load. Try again above." }
+          : { ok: false, reason: 'Loading your profile…' };
       }
-      step_.gate();
+      if (s.empty) return { ok: false, reason: 'Write a few lines about your company to continue.' };
+      if (isTemplate(s.doc)) {
+        // The untouched template doesn't count, unless it's what product.md now holds (typed
+        // into and undone): the workspace then counts it as set, so Continue must agree.
+        if (s.template || s.status !== 'saved') return { ok: false, reason: "Fill in the template with your company's details to continue." };
+        return { ok: true, note: 'This is still the blank template. Drafts stay generic until you fill it in.' };
+      }
+      return { ok: true };
     }
-    loadDoc();
 
     return {
-      gate() {
-        if (loadFailed) return { ok: false, reason: "Your profile didn't load. Try again above." };
-        if (!loaded) return { ok: false, reason: 'Loading your profile…' };
-        if (!area.value.trim()) return { ok: false, reason: 'Write a few lines about your company to continue.' };
-        if (area.value === PROFILE_TEMPLATE) {
-          // The untouched template doesn't count, unless it's what product.md now holds (typed
-          // into and undone): the workspace then counts it as set, so Continue must agree.
-          if (savedDoc !== PROFILE_TEMPLATE) return { ok: false, reason: "Fill in the template with your company's details to continue." };
-          return { ok: true, note: "This is still the blank template. Drafts stay generic until you fill it in." };
-        }
-        return { ok: true };
-      },
+      gate,
       async beforeContinue() {
-        if (!(await flush())) {
-          step_.showError(`Couldn't save your profile: ${errText(saveError)}`);
+        const s = await editor.flush();
+        if (s.status === 'error') {
+          step_.showError(`Couldn't save your profile: ${why({ message: s.error })}`);
+          return false;
+        }
+        const g = gate();
+        if (!g.ok) {
+          step_.showError(g.reason);
           return false;
         }
         try {
           await fetchStatus();
         } catch (err) {
           if (aborted(err)) return false;
-          step_.showError(errText(err));
+          step_.showError(why(err));
           return false;
         }
         renderProgress();
@@ -1386,6 +1301,7 @@ function mountSetup(root, ctx) {
         }
         return true;
       },
+      leave: () => editor.flush(),
     };
   }
 
@@ -1411,19 +1327,27 @@ function mountSetup(root, ctx) {
     return { el, input };
   }
 
+  /** A button row with its message right under it (a live region that stays in the DOM). */
+  function action(id, ...buttons) {
+    const msg = h('p', { class: 'setup-msg', id, role: 'status' });
+    return { el: h('div', { class: 'setup-action' }, h('div', { class: 'setup-row' }, buttons), msg), msg };
+  }
+
   function gmailCard(sc, onChange) {
     const badgeSlot = h('span', { class: 'setup-conn-state' });
     const note = h('p', { class: 'setup-conn-note' });
-    const msg = h('p', { class: 'setup-msg', role: 'status' });
+    // The outcome, on the card itself: a connected card folds its forms away.
+    const msg = h('p', { class: 'setup-msg setup-conn-msg', role: 'status' });
 
     const email = textField('setup-gmail-email', 'Gmail address', { type: 'email', autocomplete: 'email', placeholder: 'you@gmail.com' });
     const pw = textField('setup-gmail-pw', 'App password', { type: 'password', placeholder: '16 characters, spaces are fine' });
     const apBtn = h('button', { type: 'submit', class: 'btn btn-primary' }, 'Connect Gmail');
+    const ap = action('setup-gmail-ap-msg', apBtn);
     const apForm = h(
       'form',
       { class: 'setup-form', novalidate: true, 'aria-label': 'Connect Gmail with an app password', onSubmit: connectAppPassword },
       h('div', { class: 'setup-fields' }, email.el, pw.el),
-      h('div', { class: 'setup-row' }, apBtn),
+      ap.el,
     );
     const howTo = h(
       'details',
@@ -1440,10 +1364,14 @@ function mountSetup(root, ctx) {
     );
 
     const googleBtn = h('button', { type: 'button', class: 'btn btn-secondary', onClick: connectGoogle }, 'Sign in with Google');
-    const googleBlock = h('div', { class: 'setup-more-block' }, h('p', {}, 'Sign in with Google instead of an app password.'), h('div', { class: 'setup-row' }, googleBtn));
+    const googleCancel = waitCancel(googleBtn);
+    const google = action('setup-gmail-google-msg', googleBtn, googleCancel.el);
+    const googleBlock = h('div', { class: 'setup-more-block' }, h('p', {}, 'Sign in with Google instead of an app password.'), google.el);
     const clientId = textField('setup-gmail-client-id', 'Client ID', { type: 'text', placeholder: '….apps.googleusercontent.com' });
     const clientSecret = textField('setup-gmail-client-secret', 'Client secret', { type: 'password', placeholder: 'GOCSPX-…' });
     const byoBtn = h('button', { type: 'submit', class: 'btn btn-secondary' }, 'Save and connect');
+    const byoCancel = waitCancel(byoBtn);
+    const byo = action('setup-gmail-client-msg', byoBtn, byoCancel.el);
     const byoForm = h(
       'form',
       { class: 'setup-form setup-more-block', novalidate: true, 'aria-label': 'Connect Gmail with your own OAuth client', onSubmit: connectOwnClient },
@@ -1456,7 +1384,7 @@ function mountSetup(root, ctx) {
         h('li', {}, 'Create an OAuth client ID of type Desktop app and paste its ID and secret here.'),
       ),
       h('div', { class: 'setup-fields' }, clientId.el, clientSecret.el),
-      h('div', { class: 'setup-row' }, byoBtn),
+      byo.el,
     );
     const more = h('details', { class: 'setup-details' }, h('summary', {}, 'More options'), h('div', { class: 'setup-more' }, googleBlock, byoForm));
     const forms = h('div', { class: 'setup-gmail-forms' }, apForm, howTo, more);
@@ -1470,6 +1398,8 @@ function mountSetup(root, ctx) {
       body,
       msg,
     );
+
+    const clearMessages = () => [msg, ap.msg, google.msg, byo.msg].forEach((m) => say(m, ''));
 
     let shownOn = null;
     function render() {
@@ -1493,15 +1423,23 @@ function mountSetup(root, ctx) {
       }
     }
 
-    function invalid(input, on) {
-      if (on) input.setAttribute('aria-invalid', 'true');
-      else input.removeAttribute('aria-invalid');
+    /** Mark a field invalid (described by its form's message) or valid again. */
+    function invalid(input, on, msgEl) {
+      if (on) {
+        input.setAttribute('aria-invalid', 'true');
+        input.setAttribute('aria-describedby', msgEl.id);
+      } else {
+        input.removeAttribute('aria-invalid');
+        input.removeAttribute('aria-describedby');
+      }
     }
 
     async function connected(text) {
       local.gmail = true;
+      clearMessages();
       say(msg, text, 'ok');
       await refreshStatus().catch(() => {});
+      if (sc.ctl.signal.aborted) return;
       render();
       onChange();
       // The form that had focus folded away under "Use different credentials": land on the card.
@@ -1514,74 +1452,84 @@ function mountSetup(root, ctx) {
       if (isBusy(apBtn)) return;
       const addr = email.input.value.trim();
       const pass = pw.input.value.trim();
-      invalid(email.input, !addr);
-      invalid(pw.input, !pass);
+      invalid(email.input, !addr, ap.msg);
+      invalid(pw.input, !pass, ap.msg);
+      clearMessages();
       if (!addr || !pass) {
-        say(msg, 'Enter your Gmail address and the app password.', 'err');
+        say(ap.msg, 'Enter your Gmail address and the app password.', 'err');
         (addr ? pw.input : email.input).focus();
         return;
       }
-      const done = busyButton(apBtn, 'Checking…');
-      say(msg, 'Checking the app password with Gmail…', 'busy');
+      setBusy(apBtn, true, { label: 'Checking…' });
+      say(ap.msg, 'Checking the app password with Gmail…', 'busy');
       try {
         const r = await api.post('/api/destination/gmail/app-password', { email: addr, app_password: pass }, { signal: sc.ctl.signal });
-        done();
+        setBusy(apBtn, false);
         if (r && r.ok === false) {
-          say(msg, r.message || "Couldn't connect Gmail.", 'err');
+          say(ap.msg, r.message || "Couldn't connect Gmail.", 'err');
           return;
         }
         pw.input.value = '';
         await connected('Gmail is connected.');
       } catch (err) {
         if (aborted(err)) return;
-        done();
-        say(msg, errText(err), 'err');
+        setBusy(apBtn, false);
+        say(ap.msg, why(err), 'err');
       }
     }
 
-    async function oauth(btn) {
-      const done = busyButton(btn, 'Waiting for Google…');
-      say(msg, "Approve coldtrail in the Google tab that opened. This page updates when you're done.", 'busy');
+    async function oauth(btn, out, cancel) {
+      const wait = cancel.start(sc.ctl.signal);
+      setBusy(btn, true, { label: 'Waiting for Google…' });
+      say(out, "Approve coldtrail in the Google tab that opened. This page updates when you're done.", 'busy');
+      const settle = () => {
+        cancel.end();
+        setBusy(btn, false);
+      };
       try {
-        const r = await api.post('/api/destination/gmail/connect', { callback_port: 8765 }, { signal: sc.ctl.signal });
-        done();
+        const r = await api.post('/api/destination/gmail/connect', { callback_port: 8765 }, { signal: wait });
+        settle();
         if (r && r.ok === false) {
-          say(msg, r.message || "Couldn't connect Gmail.", 'err');
+          say(out, r.message || "Couldn't connect Gmail.", 'err');
           return;
         }
         await connected('Gmail is connected.');
       } catch (err) {
-        if (aborted(err)) return;
-        done();
-        say(msg, errText(err), 'err');
+        if (sc.ctl.signal.aborted) return;
+        settle();
+        if (aborted(err)) say(out, STOPPED);
+        else say(out, why(err), 'err');
       }
     }
 
     function connectGoogle() {
-      if (!isBusy(googleBtn)) oauth(googleBtn);
+      if (isBusy(googleBtn)) return;
+      clearMessages();
+      oauth(googleBtn, google.msg, googleCancel);
     }
 
     async function connectOwnClient(e) {
       e.preventDefault();
       if (isBusy(byoBtn)) return;
       const id = clientId.input.value.trim();
-      invalid(clientId.input, !id);
+      invalid(clientId.input, !id, byo.msg);
+      clearMessages();
       if (!id) {
-        say(msg, 'Paste your client ID first.', 'err');
+        say(byo.msg, 'Paste your client ID first.', 'err');
         clientId.input.focus();
         return;
       }
-      const done = busyButton(byoBtn, 'Saving…');
+      setBusy(byoBtn, true, { label: 'Saving…' });
       try {
         await api.post('/api/destination/gmail/client', { client_id: id, client_secret: clientSecret.input.value.trim() }, { signal: sc.ctl.signal });
       } catch (err) {
         if (aborted(err)) return;
-        done();
-        say(msg, errText(err), 'err');
+        setBusy(byoBtn, false);
+        say(byo.msg, why(err), 'err');
         return;
       }
-      done();
-      await oauth(byoBtn);
+      setBusy(byoBtn, false);
+      await oauth(byoBtn, byo.msg, byoCancel);
     }
 
     return { el, render };
@@ -1602,7 +1550,6 @@ function mountSetup(root, ctx) {
     let phase = 'idle'; // idle | starting | waiting
     let timer = null;
     let pollSeq = 0;
-    let restore = null;
 
     function render() {
       const on = linkedinOn();
@@ -1633,14 +1580,16 @@ function mountSetup(root, ctx) {
     function finish() {
       stop();
       phase = 'idle';
-      if (restore) {
-        restore();
-        restore = null;
-      }
+      setBusy(btn, false);
     }
 
     function schedule(seq) {
       timer = setTimeout(() => tick(seq), LINKEDIN_POLL_MS);
+    }
+
+    /** The server's view of the sign-in (null when it can't be read). */
+    function signInState() {
+      return api.get('/api/destination/linkedin/status', { signal: sc.ctl.signal }).catch(() => null);
     }
 
     async function tick(seq) {
@@ -1669,36 +1618,54 @@ function mountSetup(root, ctx) {
       }
     }
 
+    /** A sign-in window is open (just now, or since before this card): wait for it to finish. */
+    function startWaiting() {
+      setBusy(btn, false);
+      phase = 'waiting';
+      say(msg, "Sign in to LinkedIn in the Chrome window that opened. This page updates when you're done.", 'busy');
+      // The button hides while waiting: keep keyboard focus on the card.
+      const hadFocus = document.activeElement === btn;
+      render();
+      if (hadFocus) el.querySelector('.setup-conn-title').focus({ preventScroll: true });
+      stop();
+      schedule(pollSeq);
+    }
+
     async function connect() {
       if (phase !== 'idle' || isBusy(btn)) return;
       phase = 'starting';
-      restore = busyButton(btn, 'Opening Chrome…');
+      setBusy(btn, true, { label: 'Opening Chrome…' });
       say(msg, '');
       try {
         const r = await api.post('/api/destination/linkedin/connect', {}, { signal: sc.ctl.signal });
         if (r && r.status === 'busy') {
+          // Chrome may be busy with this user's own sign-in, started before this page was
+          // left and opened again: then keep waiting for it instead.
+          const s = await signInState();
+          if (sc.ctl.signal.aborted) return;
+          if (s && s.waiting) {
+            startWaiting();
+            return;
+          }
           finish();
           say(msg, 'Chrome is busy with another LinkedIn task. Try again in a moment.', 'err');
           render();
           return;
         }
-        phase = 'waiting';
-        restore();
-        restore = null;
-        say(msg, "Sign in to LinkedIn in the Chrome window that opened. This page updates when you're done.", 'busy');
-        // The button hides while waiting: keep keyboard focus on the card.
-        const hadFocus = document.activeElement === btn;
-        render();
-        if (hadFocus) el.querySelector('.setup-conn-title').focus({ preventScroll: true });
-        stop();
-        schedule(pollSeq);
+        startWaiting();
       } catch (err) {
         if (aborted(err)) return;
         finish();
-        say(msg, errText(err), 'err');
+        say(msg, why(err), 'err');
         render();
       }
     }
+
+    // A sign-in started before (this step was left while it was open) is picked up again.
+    signInState().then((s) => {
+      if (!s || !s.waiting || phase !== 'idle' || sc.ctl.signal.aborted) return;
+      startWaiting();
+    });
 
     sc.cleanups.push(stop);
     return { el, render };
@@ -1745,7 +1712,7 @@ function mountSetup(root, ctx) {
       );
     async function goHome() {
       if (isBusy(homeBtn)) return;
-      busyButton(homeBtn, 'Go to Home');
+      setBusy(homeBtn, true);
       if (store) await store.refresh();
       if (scope !== sc) return;
       nav.navigate('#/home');
@@ -1789,11 +1756,15 @@ function mountSetup(root, ctx) {
   const instance = {
     update(next) {
       if (next.path[0] !== 'setup') return false;
-      // setAddress() fixing the address for the step being shown: keep what was asked for.
-      if (rewriting) return true;
       requested = next.path[1] || '';
       if (status) show(requested, { focus: true });
       return true;
+    },
+    // Leaving the screen: let the shown step finish what it was saving (a profile edit inside the
+    // autosave delay, a model typed just before) before the next screen mounts.
+    beforeLeave() {
+      const leave = scope && scope.api && scope.api.leave;
+      return leave ? leave() : undefined;
     },
   };
   current = instance;
@@ -1827,5 +1798,8 @@ export default {
   mount: mountSetup,
   update(ctx) {
     return current ? current.update(ctx) : false;
+  },
+  beforeLeave(to) {
+    return current ? current.beforeLeave(to) : undefined;
   },
 };

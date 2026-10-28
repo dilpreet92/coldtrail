@@ -24,31 +24,26 @@
    brand bar, edge to edge like it, instead of a box floating above it. */
 #app[data-route="setup"] .session-banner {
   margin: 0;
-  padding: 10px var(--space-8);
+  padding: var(--space-2) var(--space-8);
   border-width: 0 0 1px;
   border-radius: 0;
   background: color-mix(in srgb, var(--warn) 8%, var(--surface));
 }
 
-.setup-brand {
-  display: inline-flex;
-  align-items: center;
-  gap: 10px;
-  color: var(--text);
-  font-size: 15px;
-  font-weight: 600;
-  letter-spacing: -0.01em;
-}
-.setup-brand svg { color: var(--accent); }
+/* The shell's wordmark (a link home); its own padding is pulled back so the mark lines up with
+   the bar's gutter. */
+.setup-top .wordmark { margin-left: calc(-1 * var(--space-2)); }
 .setup-top-sep { width: 1px; height: 20px; background: var(--border-strong); }
 .setup-h1 { font-size: 15px; line-height: 1.4; font-weight: 500; letter-spacing: 0; color: var(--text-2); }
 
+/* Wide enough for the company step's editor with its checklist beside it (company.css puts them
+   side by side from an 860px container: 960 less the card's 2 × 32px padding is 896). */
 .setup-body {
   display: flex;
   flex-direction: column;
   gap: var(--space-6);
   width: 100%;
-  max-width: 760px;
+  max-width: 960px;
   margin: 0 auto;
   padding-top: var(--space-8);
 }
@@ -140,7 +135,7 @@ a.setup-step-link:hover { color: var(--text); background: var(--surface-2); }
 }
 .setup-title { margin-top: var(--space-2); font-size: 22px; line-height: 1.25; letter-spacing: -0.01em; }
 .setup-title:focus { outline: none; }
-.setup-desc { margin-top: var(--space-2); max-width: 64ch; color: var(--text-2); }
+.setup-desc { margin-top: var(--space-2); max-width: 64ch; color: var(--text-2); text-wrap: pretty; }
 
 .setup-content {
   display: flex;
@@ -172,14 +167,12 @@ a.setup-step-link:hover { color: var(--text); background: var(--surface-2); }
 .setup-hint:empty { flex: 0 1 0; }
 .setup-hint.is-error { color: var(--danger); }
 
-/* Continue stays focusable while blocked (aria-disabled), so it keeps its colour on hover; a busy
-   button (a request running) stays at full strength with its spinner. */
+/* Continue stays focusable while blocked (aria-disabled), so it keeps its colour on hover. A busy
+   button (setBusy: a request running) is styled by components.css. */
 .setup .btn-primary[aria-disabled="true"]:hover,
 .ap .btn-primary[aria-disabled="true"]:hover { background: var(--accent); }
 .setup .btn-secondary[aria-disabled="true"]:hover,
 .ap .btn-secondary[aria-disabled="true"]:hover { background: var(--surface); }
-.setup .btn[data-busy="true"],
-.ap .btn[data-busy="true"] { opacity: 1; cursor: progress; }
 
 /* ---- Loading and error ---- */
 
@@ -222,7 +215,7 @@ a.setup-step-link:hover { color: var(--text); background: var(--surface-2); }
 .ap-msg {
   display: flex;
   align-items: flex-start;
-  gap: 6px;
+  gap: var(--space-2);
   font-size: 13px;
   color: var(--text-2);
   overflow-wrap: anywhere;
@@ -230,25 +223,14 @@ a.setup-step-link:hover { color: var(--text); background: var(--surface-2); }
 .setup-msg:not(:empty),
 .ap-msg:not(:empty) { margin-top: var(--space-3); }
 .setup-msg > svg,
-.ap-msg > svg { margin-top: 2px; }
+.ap-msg > svg,
+.setup-msg > .spinner,
+.ap-msg > .spinner { margin-top: 2px; }
 .setup-msg[data-tone="ok"],
 .ap-msg[data-tone="ok"] { color: var(--ok); }
 .setup-msg[data-tone="err"],
 .ap-msg[data-tone="err"] { color: var(--danger); }
 
-.su-spin {
-  display: inline-block;
-  flex: none;
-  width: 12px;
-  height: 12px;
-  margin-top: 3px;
-  border: 2px solid currentColor;
-  border-right-color: transparent;
-  border-radius: 50%;
-  animation: su-spin 0.8s linear infinite;
-}
-.btn .su-spin { margin-top: 0; }
-@keyframes su-spin { to { transform: rotate(360deg); } }
 
 /* ---- Agent panel (.ap) ---- */
 
@@ -261,6 +243,10 @@ a.setup-step-link:hover { color: var(--text); background: var(--surface-2); }
   gap: var(--space-3);
 }
 .ap-skeleton { height: 112px; border-radius: var(--radius-input); }
+/* In the wizard the four cards sit two by two (Settings, wider, fits them in one row). */
+.setup-agent .ap-grid,
+.setup-agent .ap-loading { grid-template-columns: repeat(auto-fill, minmax(max(260px, calc(50% - var(--space-2))), 1fr)); }
+.setup-agent .ap-byok-fields { max-width: 640px; }
 
 .ap-card {
   display: flex;
@@ -306,7 +292,7 @@ a.setup-step-link:hover { color: var(--text); background: var(--surface-2); }
 }
 .ap-card.is-chosen .ap-icon { background: var(--accent-soft); color: var(--accent-ink); }
 
-.ap-text { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; min-width: 0; }
+.ap-text { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-1); min-width: 0; }
 .ap-name { font-size: 15px; font-weight: 600; line-height: 1.35; overflow-wrap: anywhere; }
 .ap-desc { font-size: 13px; color: var(--text-2); }
 .ap-state { display: flex; margin-top: var(--space-2); }
@@ -329,7 +315,7 @@ a.setup-step-link:hover { color: var(--text); background: var(--surface-2); }
   border-radius: 50%;
   background: var(--accent);
 }
-.ap-card.is-saving .ap-radio { border-right-color: transparent; animation: su-spin 0.8s linear infinite; }
+.ap-card.is-saving .ap-radio { border-right-color: transparent; animation: spinner-turn 0.8s linear infinite; }
 .ap-card.is-saving .ap-radio::after { display: none; }
 .ap-card.is-unavailable .ap-radio { border-style: dashed; }
 .ap-card.is-unavailable .ap-icon { color: var(--text-3); }
@@ -376,7 +362,7 @@ a.setup-step-link:hover { color: var(--text); background: var(--surface-2); }
 }
 .ap-details > :not([hidden]) ~ :not([hidden]) { padding-top: var(--space-4); border-top: 1px solid var(--border); }
 
-.ap-model { display: flex; flex-direction: column; gap: 6px; }
+.ap-model { display: flex; flex-direction: column; gap: var(--space-2); }
 .ap-model .search-select { max-width: 420px; }
 .ap-model-foot { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-1) var(--space-3); }
 .ap-model-foot .field-hint { min-width: 0; }
@@ -395,6 +381,15 @@ a.setup-step-link:hover { color: var(--text); background: var(--surface-2); }
 
 .ap-test-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-3); }
 .ap-test-note { flex: 1 1 220px; font-size: 13px; color: var(--text-2); }
+/* A CLI that failed the test: its sign-in command, boxed like the cards' command rows. */
+.ap-test-cmd {
+  max-width: 480px;
+  margin-top: var(--space-3);
+  padding: var(--space-2) var(--space-3) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-input);
+  background: var(--surface);
+}
 
 /* ---- Connection cards (Canonical, Gmail, LinkedIn) ---- */
 
@@ -424,7 +419,7 @@ a.setup-step-link:hover { color: var(--text); background: var(--surface-2); }
 }
 .setup-conn-title { font-size: 15px; line-height: 1.35; }
 .setup-conn-title:focus { outline: none; }
-.setup-conn-note { margin-top: 2px; font-size: 13px; color: var(--text-2); }
+.setup-conn-note { max-width: 80ch; margin-top: 2px; font-size: 13px; color: var(--text-2); text-wrap: pretty; }
 .setup-conn-state { display: flex; }
 
 /* Body lines up under the title, past the icon. */
@@ -434,6 +429,8 @@ a.setup-step-link:hover { color: var(--text); background: var(--surface-2); }
 .setup-conn-body:empty { display: none; }
 
 .setup-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+/* A button row and its message right under it, so what a press did shows next to the button. */
+.setup-action { align-self: stretch; min-width: 0; }
 
 .setup-form { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-3); }
 .setup-form > * { max-width: 100%; }
@@ -443,6 +440,7 @@ a.setup-step-link:hover { color: var(--text); background: var(--surface-2); }
   grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
   gap: var(--space-3);
   width: 100%;
+  max-width: 640px;
 }
 
 .setup-gmail-forms { display: flex; flex-direction: column; gap: var(--space-3); }
@@ -499,27 +497,14 @@ a.setup-step-link:hover { color: var(--text); background: var(--surface-2); }
 }
 .setup-more-block:not([hidden]) + .setup-more-block { padding-top: var(--space-4); border-top: 1px solid var(--border); }
 .setup-more-block > p { font-size: 13px; color: var(--text-2); }
-.setup-more-block > p + .setup-row { margin-top: var(--space-2); }
+.setup-more-block > p + .setup-action { margin-top: var(--space-3); }
 .setup-more .setup-howto { margin-top: 0; }
 /* The "More options" panel nested inside "Use different credentials" doesn't need a second box. */
 .setup-details .setup-details .setup-more { padding: 0; border: 0; background: none; }
 
-/* ---- Company profile ---- */
+/* ---- Company profile (Company profile's editor and checklist, css/views/company.css) ---- */
 
-.setup-profile-field { width: 100%; }
-.setup-profile-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-3); }
-.setup-save { font-size: 12.5px; color: var(--text-2); }
-.setup-save[data-state="saved"] { color: var(--ok); }
-.setup-save[data-state="error"] { color: var(--danger); }
-textarea.setup-profile {
-  min-height: 380px;
-  padding: var(--space-3);
-  font-family: var(--font-mono);
-  font-size: 13px;
-  line-height: 1.6;
-}
-.setup-profile-loading { display: flex; flex-direction: column; gap: 10px; padding: var(--space-2) 0; }
-.setup-profile-loading .setup-sk-line:nth-child(3n) { width: 55%; }
+.setup-company { width: 100%; min-width: 0; }
 
 /* ---- You're set ---- */
 
@@ -557,7 +542,7 @@ textarea.setup-profile {
 }
 .setup-next-item:hover { border-color: var(--border-strong); background: var(--surface-2); }
 .setup-next-icon { background: var(--accent-soft); color: var(--accent-ink); }
-.setup-next-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.setup-next-text { display: flex; flex-direction: column; gap: var(--space-1); min-width: 0; }
 .setup-next-title { font-weight: 600; }
 .setup-next-desc { font-size: 13px; color: var(--text-2); }
 .setup-next-go { display: inline-flex; color: var(--text-3); }
@@ -568,14 +553,15 @@ textarea.setup-profile {
 
 @media (max-width: 899px) {
   .setup-top { margin: calc(-1 * var(--space-4)) calc(-1 * var(--space-4)) 0; padding: 0 var(--space-4); }
-  #app[data-route="setup"] .session-banner { padding: 10px var(--space-4); }
+  #app[data-route="setup"] .session-banner { padding: var(--space-2) var(--space-4); }
   .setup-body { padding-top: var(--space-6); }
 }
 
 @media (max-width: 599px) {
   .setup-body { gap: var(--space-4); }
   .setup-card-main { padding: var(--space-6) var(--space-4) var(--space-4); }
-  .setup-foot { padding: var(--space-3) var(--space-4); }
+  /* The hint wraps onto its own line above Continue: Back stays level with Continue. */
+  .setup-foot { align-items: flex-end; padding: var(--space-3) var(--space-4); }
   .setup-hint { flex-basis: 100%; }
   .setup-loading { padding: var(--space-6) var(--space-4); }
   .setup-error { padding: var(--space-4); }
@@ -589,7 +575,8 @@ textarea.setup-profile {
   .ap-details { padding: var(--space-3); }
   .ap-byok-fields { grid-template-columns: minmax(0, 1fr); }
   .ap-recheck { justify-content: flex-start; }
-  textarea.setup-profile { min-height: 300px; }
+  /* Its label lines up with the question above it (the btn-sm's own side padding pulled back). */
+  .ap-recheck .btn-ghost { margin-left: -10px; }
   /* Only the current step keeps its label on screen; the others keep it for screen readers. */
   .setup-step:not(.is-current) .setup-step-label {
     position: absolute;
