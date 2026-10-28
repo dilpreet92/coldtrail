@@ -11,7 +11,7 @@
 // subscription and that observer, and aborts any request in flight. Run statuses use the shared
 // wording (runStatus, core/format.js), so Home and Schedules name a run the same way.
 
-import { api } from '../core/api.js';
+import { api, errorText } from '../core/api.js';
 import { fmtDate, fmtNum, fmtRelative, h, pluralize, runStatus, toDate } from '../core/dom.js';
 import { href } from '../core/router.js';
 import { badge } from '../components/badge.js';
@@ -89,9 +89,6 @@ const ICONS = {
 
 const isAbort = (err) => err && (err.name === 'AbortError' || err.code === 20);
 
-/** The error's message unless the session banner already says it (a 401). */
-const detailOf = (err) => (err && err.status === 401 ? '' : (err && err.message) || String(err || ''));
-
 const HOUR = 3_600_000;
 
 /**
@@ -140,8 +137,10 @@ function swap(container, nodes) {
   }
 }
 
+/** A source that failed: what failed, why (errorText: the server's message, or on a stale session
+ *  a pointer to the terminal; the shell's banner says the rest once), and a retry. */
 function errorBox(heading, err, onRetry) {
-  const detail = detailOf(err);
+  const detail = errorText(err);
   return h(
     'div',
     { class: 'home-error', role: 'alert' },
@@ -601,20 +600,9 @@ const DESC = {
 
 let current = null;
 
-// A summary this recent is the one on screen already; mounting doesn't fetch it again.
-const FRESH_MS = 3000;
-
-/** How long ago the latest /api/summary answer arrived, from the page's resource timing (the store
- *  doesn't say when it last fetched); Infinity when unknown, so Home then asks for fresh numbers. */
-function summaryAgeMs() {
-  try {
-    const seen = performance.getEntriesByName(new URL('/api/summary', location.href).href, 'resource');
-    const last = seen[seen.length - 1];
-    return last && last.responseEnd > 0 ? performance.now() - last.responseEnd : Infinity;
-  } catch (_) {
-    return Infinity;
-  }
-}
+// A summary that arrived this recently (store.fetchedAt()) is fresh: mounting doesn't fetch it
+// again. On a cold load the router mounts Home right after the store's first fetch.
+export const FRESH_MS = 3000;
 
 function mountHome(root, ctx) {
   const store = ctx.store;
@@ -663,13 +651,25 @@ function mountHome(root, ctx) {
     return w > 0 && w < RUNS_TABLE_MIN;
   };
   let runsWidth = 0;
+  let runsFrame = 0;
+  const cancelRunsFrame = () => {
+    if (runsFrame) cancelAnimationFrame(runsFrame);
+    runsFrame = 0;
+  };
+  // The redraw waits for the next frame: swapping table and cards changes the observed section's
+  // height, and doing that inside the observer's callback is a ResizeObserver loop (a window
+  // error in Chromium on every switch). Only a new width redraws; the height that follows doesn't.
   const runsRo =
     typeof ResizeObserver === 'function'
       ? new ResizeObserver((entries) => {
           const w = Math.round(entries[entries.length - 1].contentRect.width);
           if (gone || w === runsWidth) return;
           runsWidth = w;
-          drawRuns();
+          cancelRunsFrame();
+          runsFrame = requestAnimationFrame(() => {
+            runsFrame = 0;
+            if (!gone) drawRuns();
+          });
         })
       : null;
 
@@ -678,6 +678,7 @@ function mountHome(root, ctx) {
     mode = next;
     for (const k of Object.keys(sigs)) delete sigs[k];
     if (runsRo) runsRo.disconnect();
+    cancelRunsFrame();
     runsWidth = 0;
     desc.textContent = DESC[next] || DESC.dash;
     askAgent.hidden = next !== 'dash';
@@ -763,7 +764,7 @@ function mountHome(root, ctx) {
       const sig = JSON.stringify([narrow, runs.rows.map((r) => [r, fmtRelative(r.started_at)]), upcoming]);
       part('runs', sig, sec.body, () => renderRuns(runs.rows, next, narrow));
     } else if (runs.status === 'error') {
-      part('runs', `error:${detailOf(runs.error)}`, sec.body, () => errorBox("Couldn't load recent runs", runs.error, () => loadRuns({ fromRetry: true })));
+      part('runs', `error:${errorText(runs.error)}`, sec.body, () => errorBox("Couldn't load recent runs", runs.error, () => loadRuns({ fromRetry: true })));
     } else {
       part('runs', 'loading', sec.body, () => loadingRows('Loading recent runs…', 5));
     }
@@ -781,7 +782,7 @@ function mountHome(root, ctx) {
         renderSearches({ queries, total, searches: count, found }, (to) => ctx.nav.navigate(to)),
       );
     } else if (searches.status === 'error') {
-      part('searches', `error:${detailOf(searches.error)}`, sec.body, () => errorBox("Couldn't load top searches", searches.error, () => loadSearches({ fromRetry: true })));
+      part('searches', `error:${errorText(searches.error)}`, sec.body, () => errorBox("Couldn't load top searches", searches.error, () => loadSearches({ fromRetry: true })));
     } else {
       part('searches', 'loading', sec.body, () => loadingRows('Loading top searches…', 6));
     }
@@ -893,15 +894,21 @@ function mountHome(root, ctx) {
     renderSummary(snap.summary, snap.status);
   });
 
-  // Fresh numbers on every visit, unless the store's summary only just arrived: on a cold load the
-  // router mounts Home right after the store's first fetch, and asking again would repeat it.
+  // Fresh numbers on every visit, unless the store's summary only just arrived (asking again would
+  // repeat the fetch it just made). With no summary yet, the store's first load may still be on
+  // its way (boot stops waiting for it after a few seconds): wait for that one rather than queue
+  // a second behind it, and only ask again (to say why) if it came back empty-handed.
   const first = store.get();
   if (first && first.summary) {
     renderSummary(first.summary, first.status);
-    if (summaryAgeMs() > FRESH_MS) loadSummary();
+    if (Date.now() - store.fetchedAt() > FRESH_MS) loadSummary();
   } else {
     setMode('loading');
-    loadSummary();
+    store.ready().then((snap) => {
+      if (gone || summaryShown) return; // the subscription has drawn it already
+      if (snap && snap.summary) renderSummary(snap.summary, snap.status);
+      else loadSummary();
+    });
   }
 
   const instance = {
@@ -910,6 +917,7 @@ function mountHome(root, ctx) {
       gone = true;
       unsubscribe();
       if (runsRo) runsRo.disconnect();
+      cancelRunsFrame();
       for (const ctl of ctls) ctl.abort();
       ctls.clear();
       if (current === instance) current = null;

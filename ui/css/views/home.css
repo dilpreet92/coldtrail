@@ -372,10 +372,12 @@ a.home-ny-alert:hover .home-ny-cta { text-decoration: underline; }
   font-size: 13px;
 }
 
+/* Icon, what failed (and why), the retry on the right; on a phone the retry drops under the text,
+   lined up with it as the needs-you alert's action is. */
 .home-error {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-start;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
   gap: var(--space-3);
   padding: var(--space-3) var(--space-4);
   background: var(--surface);
@@ -383,7 +385,7 @@ a.home-ny-alert:hover .home-ny-cta { text-decoration: underline; }
   border-radius: var(--radius-input);
 }
 .home-error-icon { margin-top: 2px; color: var(--danger); }
-.home-error-text { flex: 1 1 240px; min-width: 0; }
+.home-error-text { min-width: 0; }
 .home-error-title { font-weight: 600; color: var(--text); }
 .home-error-detail {
   margin-top: var(--space-1);
@@ -434,7 +436,8 @@ a.home-ny-alert:hover .home-ny-cta { text-decoration: underline; }
 .home-start-title { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); font-size: 15px; }
 .home-start-done { display: inline-flex; }
 .home-start-body { margin-top: var(--space-1); color: var(--text-2); max-width: 64ch; }
-.home-start-action { justify-self: end; }
+/* One width for every step's action (the widest label's), so they line up as a column. */
+.home-start-action { justify-self: end; min-width: 144px; }
 
 /* ---- Narrower screens ---- */
 
@@ -460,4 +463,7 @@ a.home-ny-alert:hover .home-ny-cta { text-decoration: underline; }
 
   .home-start-step { grid-template-columns: auto minmax(0, 1fr); align-items: start; }
   .home-start-action { grid-column: 2; justify-self: start; }
+
+  .home-error { grid-template-columns: auto minmax(0, 1fr); }
+  .home-error > .btn { grid-column: 2; justify-self: start; }
 }

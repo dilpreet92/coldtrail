@@ -8,7 +8,9 @@
 import { expectAccessible } from '../harness/a11y.mjs';
 import { test, expect } from '../harness/fixtures.mjs';
 import { SEED } from '../harness/seed.mjs';
+import { SESSION_EXPIRED, SESSION_REOPEN } from '../../../ui/js/core/api.js';
 import { fmtDate, fmtNum, fmtRelative, runStatus } from '../../../ui/js/core/format.js';
+import { FRESH_MS, nextRunWhen, runKeys, runNote, searchesCaption } from '../../../ui/js/views/home.js';
 
 const reEscape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const hashIs = (hash) => new RegExp(`${reEscape(hash)}$`);
@@ -72,6 +74,77 @@ const refreshStore = (page) =>
     const { store } = await import('/assets/js/core/store.js');
     await store.refresh();
   });
+
+// Home's pure helpers, run here in Node (no browser, no server): the edges the seeded screens
+// rarely reach.
+test.describe('helpers', () => {
+  const now = new Date(2026, 9, 28, 9, 0); // Oct 28, 09:00 local
+  const at = (ms) => new Date(now.getTime() + ms);
+
+  test('nextRunWhen: relative within 48h, then the date; a late timer is "any minute now"', () => {
+    expect(nextRunWhen(null, now)).toBeNull();
+    expect(nextRunWhen('not a date', now)).toBeNull();
+    // Already due (the timer is late), or under a minute away.
+    expect(nextRunWhen(at(-5 * 60_000).toISOString(), now).text).toBe('any minute now');
+    expect(nextRunWhen(at(59_000).toISOString(), now).text).toBe('any minute now');
+    expect(nextRunWhen(at(60_000).toISOString(), now).text).toBe('in 1m');
+    // The summary's next_at is zone-less local time.
+    const soon = at(5.5 * HOUR);
+    expect(nextRunWhen(localIso(soon), now)).toEqual({
+      text: 'in 5h',
+      datetime: new Date(soon.getFullYear(), soon.getMonth(), soon.getDate(), soon.getHours(), soon.getMinutes()).toISOString(),
+      title: fmtDate(soon, { time: true, now }),
+    });
+    // The 48h boundary: relative up to it, the date and time from it on.
+    expect(nextRunWhen(at(48 * HOUR - 60_000).toISOString(), now).text).toBe('in 47h');
+    expect(nextRunWhen(at(48 * HOUR).toISOString(), now).text).toBe(`on ${fmtDate(at(48 * HOUR), { time: true, now })}`);
+  });
+
+  test("runNote: a failed run's first non-blank line, the whole note for the tooltip", () => {
+    expect(runNote({ status: 'error', note: '\n  Model retired.  \n\nPick another.' })).toEqual({
+      line: 'Model retired.',
+      full: 'Model retired.  \n\nPick another.',
+    });
+    expect(runNote({ status: 'auth_failed', note: 'not signed in' })).toEqual({ line: 'not signed in', full: 'not signed in' });
+    // Nothing to say: an all-blank or missing note, or a run that worked or is still going.
+    for (const r of [
+      { status: 'error', note: ' \n\t\n ' },
+      { status: 'error', note: null },
+      { status: 'error' },
+      { status: 'ok', note: 'x' },
+      { status: 'running', note: 'x' },
+      null,
+    ]) {
+      expect(runNote(r), JSON.stringify(r)).toBeNull();
+    }
+  });
+
+  test('runKeys: one key per run that survives newer runs, unique when two runs share one', () => {
+    const a = { started_at: '2026-10-27 09:00:00', chat_id: 'c1' };
+    const b = { started_at: '2026-10-27 09:00:00', chat_id: null };
+    expect(runKeys([a, b, { ...a }, { ...a }, {}])).toEqual([
+      '2026-10-27 09:00:00|c1',
+      '2026-10-27 09:00:00|',
+      '2026-10-27 09:00:00|c1#1',
+      '2026-10-27 09:00:00|c1#2',
+      '|',
+    ]);
+    // A newer run on top leaves the keys of the runs below it as they were.
+    const newer = { started_at: '2026-10-28 08:00:00', chat_id: 'c9' };
+    expect(runKeys([newer, a, b]).slice(1)).toEqual(runKeys([a, b]));
+  });
+
+  test('searchesCaption: what the top-searches list leaves out', () => {
+    expect(searchesCaption({ shown: 3, searches: 3, total: 40, found: 40 })).toBe('');
+    expect(searchesCaption({ shown: 8, searches: 1200, total: 5000, found: 5000 })).toBe('Showing the top 8 of 1,200 searches.');
+    expect(searchesCaption({ shown: 2, searches: 2, total: 41, found: 40 })).toBe('1 company has no search recorded.');
+    expect(searchesCaption({ shown: 8, searches: 9, total: 2045, found: 45 })).toBe(
+      'Showing the top 8 of 9 searches. 2,000 companies have no search recorded.',
+    );
+    // More found than the total (counts read a moment apart) is nothing to explain.
+    expect(searchesCaption({ shown: 1, searches: 1, total: 4, found: 5 })).toBe('');
+  });
+});
 
 test('numbers match the seed', async ({ app, page, server, request }) => {
   await app.goto('#/home');
@@ -368,6 +441,16 @@ test('errors show in place with a retry', async ({ app, page }) => {
   await expect(searches).toContainText('Invalid column type Null');
   await expect(page.getByRole('table', { name: 'Funnel' })).toBeVisible();
 
+  // Wide, the retry sits on the right; on a phone it drops under the text, lined up with it
+  // (not under the icon).
+  const retry = runs.getByRole('button', { name: 'Try again' });
+  const errTitle = runs.locator('.home-error-title');
+  const titleBox = await errTitle.boundingBox();
+  expect((await retry.boundingBox()).x).toBeGreaterThanOrEqual(titleBox.x + titleBox.width);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect.poll(async () => Math.round((await retry.boundingBox()).x - (await errTitle.boundingBox()).x)).toBe(0);
+  await page.setViewportSize({ width: 1440, height: 900 });
+
   fail.runs = false;
   await runs.getByRole('button', { name: 'Try again' }).click();
   await expect(page.getByRole('table', { name: 'Recent runs' }).locator('tbody tr')).toHaveCount(5);
@@ -379,6 +462,21 @@ test('errors show in place with a retry', async ({ app, page }) => {
   // Focus stays in the section that was retried, on something that still exists.
   await expect(page.getByRole('heading', { name: 'Top searches' })).toBeFocused();
   await expect(page.locator('#view .home-error')).toHaveCount(0);
+});
+
+test('a stale session points to the terminal; the banner says the rest once', async ({ app, page }) => {
+  app.allowConsole(/status of 401/);
+  await page.route('**/api/runs*', (route) => route.fulfill({ status: 401, contentType: 'text/plain', body: 'unauthorized' }));
+  await app.goto('#/home');
+  await homeReady(page);
+
+  const runs = page.getByRole('region', { name: 'Recent runs' });
+  const err = runs.locator('.home-error');
+  await expect(err).toContainText("Couldn't load recent runs");
+  await expect(err.locator('.home-error-detail')).toHaveText(SESSION_REOPEN);
+  // The full sentence is the shell's banner, said once, not repeated in the section.
+  await expect(page.locator('.session-banner')).toHaveText(SESSION_EXPIRED);
+  await expect(page.getByText(SESSION_EXPIRED)).toHaveCount(1);
 });
 
 test('quiet and edge states: nothing needs you, no runs, no sends', async ({ app, page }) => {
@@ -502,13 +600,8 @@ test('updates live from the store and stops when you leave', async ({ app, page 
     }
     await route.fulfill({ response: res, json: s });
   });
-  // A test hook on the shared store (served as is, plus one line): how many subscribers it has,
-  // so a view that forgets to unsubscribe shows up as one too many.
-  await page.route('**/assets/js/core/store.js', async (route) => {
-    const res = await route.fetch();
-    const body = `${await res.text()}\nwindow.__storeSubscribers = () => subscribers.size;\n`;
-    await route.fulfill({ response: res, body });
-  });
+  // The page's clock runs as usual until the test moves it on (to age the store's numbers).
+  await page.clock.install();
   // Count /api/runs and /api/summary fetches in the page: a subscriber's fetch starts
   // synchronously inside store.refresh(), so the counts are exact once refresh() resolves.
   await page.addInitScript(() => {
@@ -522,7 +615,9 @@ test('updates live from the store and stops when you leave', async ({ app, page 
     };
   });
   const fetches = () => page.evaluate(() => ({ ...window.__fetches }));
-  const subscribers = () => page.evaluate(() => window.__storeSubscribers());
+  // The store's test hook: a view that forgets to unsubscribe shows up as one too many.
+  const subscribers = () =>
+    page.evaluate(async () => (await import('/assets/js/core/store.js')).store.subscriberCount());
   await app.goto('#/home');
   await homeReady(page);
   await expect(page.getByRole('table', { name: 'Recent runs' }).locator('tbody tr')).toHaveCount(5);
@@ -553,10 +648,10 @@ test('updates live from the store and stops when you leave', async ({ app, page 
   await expect(page.locator('#view .home')).toHaveCount(0);
   expect((await fetches()).runs).toBe(2);
 
-  // Come back once the store's numbers are no longer fresh (no summary fetch on record): Home
-  // shows them at once, asks for new ones, and subscribes once again.
+  // Come back once the store's numbers are no longer fresh (store.fetchedAt() is more than
+  // FRESH_MS ago): Home shows them at once, asks for new ones, and subscribes once again.
   const before = await fetches();
-  await page.evaluate(() => performance.clearResourceTimings());
+  await page.clock.fastForward(FRESH_MS + 1000);
   await page.goBack();
   await homeReady(page);
   await expect(card(page, /drafts waiting/).locator('.home-ny-num')).toHaveText('7');
@@ -679,6 +774,13 @@ test('recent runs never scroll sideways: a table where it fits, else cards', asy
     runs[0].note = 'word '.repeat(80);
     await route.fulfill({ response: res, json: runs });
   });
+  // Chromium reports a ResizeObserver loop (a redraw inside the observer that resizes what it
+  // observes) only as a window 'error' event, never to the console, so the app fixture can't see
+  // it: collect those here.
+  await page.addInitScript(() => {
+    window.__windowErrors = [];
+    window.addEventListener('error', (e) => window.__windowErrors.push(String(e.message)));
+  });
   await app.goto('#/home');
   await homeReady(page);
   const recent = page.getByRole('region', { name: 'Recent runs' });
@@ -711,6 +813,9 @@ test('recent runs never scroll sideways: a table where it fits, else cards', asy
     const [lb, sb] = [await link.boundingBox(), await recent.boundingBox()];
     expect(lb.x + lb.width, `${width}px: link inside the section`).toBeLessThanOrEqual(sb.x + sb.width + 0.5);
   }
+  // Swapping table and cards changes the section's height; that happens a frame after the
+  // observer fires, so no switch is a ResizeObserver loop.
+  expect(await page.evaluate(() => window.__windowErrors)).toEqual([]);
 });
 
 test('a focused run link keeps focus when a newer run arrives', async ({ app, page }) => {
@@ -826,6 +931,9 @@ test.describe('new workspace', () => {
       '#/schedules',
       '#/settings?tab=connections',
     ]);
+    // The actions line up as one column: the same width, the same left edge.
+    const boxes = await actions.evaluateAll((els) => els.map((a) => a.getBoundingClientRect()).map((r) => [Math.round(r.left), Math.round(r.width)]));
+    expect(new Set(boxes.map(String)).size, JSON.stringify(boxes)).toBe(1);
     // The agent step opens Agent with a starter prompt to send (it is never sent for you).
     await actions.first().click();
     await expect(page.locator('#view h1')).toHaveText('Stub agent');
