@@ -1,0 +1,434 @@
+/* Home (spec §5.2): Needs-you cards, the stat line, funnel + top searches, recent runs; the
+   getting-started list for a new workspace. Tokens only (tokens.css); spacing on the 4px scale.
+   The router keeps a view's stylesheet loaded after you leave it, so every class here starts with
+   `home-` (state modifiers like .is-zero only ever sit on a home- class). */
+
+.home {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+  max-width: 1240px;
+}
+
+.home-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-8);
+  min-width: 0;
+}
+
+/* ---- Sections: a head (title + link) over the content ---- */
+
+.home-section { min-width: 0; }
+
+.home-section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+  min-height: 24px;
+  margin-bottom: var(--space-3);
+}
+
+.home-h2 { font-size: 15px; line-height: 1.4; }
+
+.home-section-link {
+  font-size: 13px;
+  font-weight: 500;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.home-section-link:hover { text-decoration: underline; }
+
+/* Numbers are data: mono, tabular. */
+.home-num,
+.home-ny-num,
+.home-stat-value,
+.home-start-num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-variant-ligatures: none;
+}
+.home-num { font-size: 13px; }
+
+/* ---- Needs you ---- */
+
+/* Counts: one row of up to three equal cards (drafts, follow-ups due, replies). */
+.home-ny-list {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.home-ny-item { display: flex; min-width: 0; }
+
+/* Problems: full-width rows above the counts. */
+.home-ny-alerts {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0 0 var(--space-3);
+  padding: 0;
+  list-style: none;
+}
+.home-ny-alerts:last-child { margin-bottom: 0; }
+
+.home-ny-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  width: 100%;
+  min-width: 0;
+  padding: var(--space-4);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-input);
+  color: var(--text);
+  text-decoration: none;
+}
+a.home-ny-card:hover { border-color: var(--border-strong); background: var(--surface-2); }
+a.home-ny-card:hover .home-ny-cta { text-decoration: underline; }
+
+.home-ny-top {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.home-ny-num {
+  font-size: 22px;
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+}
+.home-ny-label { font-weight: 500; color: var(--text); }
+.home-ny-title { font-weight: 600; line-height: 1.45; }
+
+.home-ny-meta {
+  color: var(--text-2);
+  font-size: 13px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.home-ny-cta {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  margin-top: auto;
+  padding-top: var(--space-2);
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 500;
+  text-underline-offset: 2px;
+}
+
+/* A problem only the human can fix: an amber edge and icon; the title says what it is. */
+.home-ny-alert {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  min-width: 0;
+  min-height: 48px;
+  padding: var(--space-3) var(--space-4);
+  background: var(--surface);
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--border));
+  border-radius: var(--radius-input);
+  color: var(--text);
+  text-decoration: none;
+}
+a.home-ny-alert:hover { border-color: var(--warn); background: var(--surface-2); }
+a.home-ny-alert:hover .home-ny-cta { text-decoration: underline; }
+.home-ny-icon { color: var(--warn); }
+.home-ny-alert-text {
+  display: flex;
+  flex: 1;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: var(--space-2);
+  min-width: 0;
+}
+.home-ny-alert .home-ny-title { font-size: 14px; }
+.home-ny-alert .home-ny-cta { margin-top: 0; padding-top: 0; white-space: nowrap; }
+
+.home-ny-quiet {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-input);
+  color: var(--text-2);
+}
+.home-ny-quiet strong { color: var(--text); font-weight: 600; }
+.home-ny-quiet-icon { margin-top: 1px; color: var(--ok); }
+
+/* Loading placeholders keep the layout's shape. `.home` lifts these over .skeleton's defaults
+   whatever order the stylesheets load in. */
+.home-ny-card-skeleton { gap: var(--space-2); min-height: 112px; }
+.home .home-skel-num { width: 48px; height: 22px; }
+.home .home-skel-line { width: 70%; }
+.home .home-skel-short { width: 40%; }
+
+/* ---- Stat line ---- */
+
+.home-stats {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 1px; /* the seams show the border colour behind the cells */
+  margin: 0;
+  overflow: hidden;
+  background: var(--border);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-input);
+}
+
+.home-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  padding: var(--space-4);
+  background: var(--surface);
+}
+.home-stat-label { font-size: 12.5px; font-weight: 500; color: var(--text-2); }
+.home-stat-value {
+  margin: var(--space-1) 0 0;
+  font-size: 24px;
+  font-weight: 500;
+  line-height: 1.2;
+  letter-spacing: -0.02em;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.home-stat-hint { margin: 0; font-size: 12px; color: var(--text-3); }
+.home-stats-loading .home-stat { gap: var(--space-2); }
+
+/* ---- Funnel and top searches, side by side on wide screens ---- */
+
+.home-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-6);
+  align-items: start;
+}
+
+.home-funnel-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.home-funnel-stage { font-weight: 500; white-space: nowrap; }
+.home-funnel-track {
+  display: block;
+  height: 6px;
+  overflow: hidden;
+  background: var(--surface-2);
+  border-radius: 999px;
+}
+.home-funnel-fill {
+  display: block;
+  height: 100%;
+  min-width: 3px;
+  background: var(--accent);
+  border-radius: 999px;
+}
+.home-funnel-fill.is-zero { min-width: 0; }
+.home-funnel-rate { color: var(--text-2); }
+
+.home-funnel .table th:first-child,
+.home-funnel .table td:first-child { width: 100%; }
+/* Numbers sit on the stage's line, not centred against label + bar. */
+.home-funnel .table td { vertical-align: top; }
+.home-funnel .home-num { display: inline-block; line-height: 20px; }
+
+/* Top searches: a long search ellipsizes (full text in its tooltip). A click anywhere on a row
+   opens Pipeline (the table's row click, so nothing is positioned against the <tr>, which WebKit
+   doesn't support); the search's link is the row's one keyboard stop. */
+.home-searches .table { table-layout: fixed; }
+.home-search-link {
+  display: block;
+  overflow: hidden;
+  color: var(--text);
+  font-weight: 500;
+  text-decoration: none;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.home-searches tr.is-clickable:hover .home-search-link { color: var(--accent); text-decoration: underline; }
+/* The row lights up while its link has the keyboard, as it does under the mouse. */
+.home-searches tr.is-clickable:focus-within td { background: var(--surface-2); }
+
+/* ---- Recent runs ---- */
+
+.home-run-name {
+  display: inline-block;
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
+  font-weight: 500;
+}
+/* A description, not a schedule's name: "Manual run", "Deleted schedule". */
+.home-run-name.is-muted { color: var(--text-2); font-weight: 400; }
+.home-runs .table td a { font-weight: 500; text-decoration: none; white-space: nowrap; }
+.home-runs .table td a:hover { text-decoration: underline; }
+.home-runs time { color: var(--text-2); }
+
+/* On a phone each run is a card (the view swaps the table for this list below 700px). */
+.home-run-cards {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-input);
+}
+.home-run-card {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--space-3) var(--space-4);
+}
+.home-run-card + .home-run-card { border-top: 1px solid var(--border); }
+.home-run-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  min-width: 0;
+}
+.home-run-card-head .home-run-name { max-width: none; min-width: 0; white-space: nowrap; }
+.home-run-card-meta { color: var(--text-2); font-size: 13px; }
+.home-run-card-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  column-gap: var(--space-3);
+  row-gap: var(--space-1);
+}
+.home-run-card-counts { color: var(--text-2); font-size: 13px; }
+.home-run-card-counts .home-num { color: var(--text); }
+.home-run-card-link { font-size: 13px; font-weight: 500; text-decoration: none; white-space: nowrap; }
+.home-run-card-link:hover { text-decoration: underline; }
+
+/* ---- Loading, empty and error states inside a section ---- */
+
+.home-loading {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-input);
+}
+
+.home-empty {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-input);
+  color: var(--text-2);
+}
+
+.home-error {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  background: var(--surface);
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border));
+  border-radius: var(--radius-input);
+}
+.home-error-icon { margin-top: 2px; color: var(--danger); }
+.home-error-text { flex: 1 1 240px; min-width: 0; }
+.home-error-title { font-weight: 600; color: var(--text); }
+.home-error-detail {
+  margin-top: 2px;
+  color: var(--text-2);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+
+/* ---- Getting started (no companies yet) ---- */
+
+.home-start { max-width: 880px; }
+
+.home-start-steps {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-input);
+}
+
+.home-start-step {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-4);
+  padding: var(--space-4);
+}
+.home-start-step + .home-start-step { border-top: 1px solid var(--border); }
+
+.home-start-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--border-strong);
+  border-radius: 50%;
+  color: var(--text-2);
+  font-size: 13px;
+}
+.home-start-step.is-done .home-start-num { border-color: var(--ok); color: var(--ok); }
+
+.home-start-text { min-width: 0; }
+.home-start-title { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); font-size: 15px; }
+.home-start-done { display: inline-flex; }
+.home-start-body { margin-top: 2px; color: var(--text-2); max-width: 64ch; }
+.home-start-action { justify-self: end; }
+
+/* ---- Narrower screens ---- */
+
+@media (max-width: 1199px) {
+  .home-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* The phone breakpoint; home.js's NARROW query matches it. */
+@media (max-width: 699px) {
+  .home-ny-list { grid-template-columns: minmax(0, 1fr); gap: var(--space-2); }
+  .home-ny-card { padding: var(--space-3) var(--space-4); }
+  .home-ny-card-skeleton { min-height: 0; }
+  .home-ny-alert { flex-wrap: wrap; align-items: flex-start; }
+  .home-ny-alert .home-ny-icon { margin-top: 1px; }
+  .home-ny-alert-text { flex-basis: calc(100% - 30px); flex-direction: column; }
+  .home-ny-alert .home-ny-cta { margin-left: 30px; }
+
+  .home-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .home-stats .home-stat:last-child { grid-column: 1 / -1; }
+  .home-stat-value { font-size: 22px; }
+
+  .home-start-step { grid-template-columns: auto minmax(0, 1fr); align-items: start; }
+  .home-start-action { grid-column: 2; justify-self: start; }
+}
