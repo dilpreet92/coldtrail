@@ -239,12 +239,16 @@ test('send all dialog states exact counts', async ({ app, page, server, request 
   await expect(dialog).toBeHidden();
   await expect(sendAll).toBeFocused();
 
-  // Both on: the email cap and LinkedIn's daily/weekly usage bound what goes out today.
+  // Both on: the email cap (less today's sends, which the server reports as
+  // `email_sent_today`) and LinkedIn's daily/weekly usage bound what goes out today.
+  const emailToday = SEED.capUsage.emailToday;
+  expect(st.email_sent_today).toBe(emailToday);
+  const emailUpTo = Math.min(pending, st.daily_send_cap - emailToday);
   status = { auto_send: true, ...LI_AUTO };
   await sendAll.click();
   dialog = page.getByRole('dialog', { name: 'Send all drafts' });
   await expect(dialog.locator('.sendall-email')).toContainText(
-    `Up to ${pending} emails today (cap ${st.daily_send_cap} a day).`,
+    `Up to ${emailUpTo} emails today (cap ${st.daily_send_cap}, ${emailToday} already sent).`,
   );
   await expect(dialog.locator('.sendall-linkedin')).toContainText(
     `Up to ${upTo} of ${sendable} LinkedIn invites today (${today}/${st.linkedin_daily_cap} today, ` +
@@ -256,15 +260,12 @@ test('send all dialog states exact counts', async ({ app, page, server, request 
   await page.keyboard.press('Escape');
   await expect(dialog).toBeHidden();
 
-  // When the status reports today's email sends (`email_sent_today`, not served yet: see
-  // deliver::sent_today), the line counts them against the cap, as spec §5.4 words it.
-  const emailToday = SEED.capUsage.emailToday;
-  const emailUpTo = Math.min(pending, st.daily_send_cap - emailToday);
-  status = { auto_send: true, ...LI_AUTO, email_sent_today: emailToday };
+  // A server that doesn't report today's sends: the line falls back to the plain cap.
+  status = { auto_send: true, ...LI_AUTO, email_sent_today: null };
   await sendAll.click();
   dialog = page.getByRole('dialog', { name: 'Send all drafts' });
   await expect(dialog.locator('.sendall-email')).toContainText(
-    `Up to ${emailUpTo} emails today (cap ${st.daily_send_cap}, ${emailToday} already sent).`,
+    `Up to ${pending} emails today (cap ${st.daily_send_cap} a day).`,
   );
   await page.keyboard.press('Escape');
   await expect(dialog).toBeHidden();

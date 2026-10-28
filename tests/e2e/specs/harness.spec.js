@@ -227,7 +227,8 @@ test('fake opencode turns parse through the real provider code', async ({ server
     { type: 'tool_start', name: '$ coldtrail status', input: { command: 'coldtrail status' } },
     { type: 'tool_end', ok: true },
     { type: 'text', text: `Fake agent reply: ${[...message].slice(0, 40).join('')}` },
-    { type: 'done', ok: true, result: null },
+    // opencode has no result event: the turn's final text becomes the result.
+    { type: 'done', ok: true, result: `Fake agent reply: ${[...message].slice(0, 40).join('')}` },
   ]);
 
   expect(await chatTurn(request, server, 'Please FAIL this turn')).toEqual([
