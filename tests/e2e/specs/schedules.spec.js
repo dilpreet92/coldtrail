@@ -118,17 +118,31 @@ function recordRequests(page, re) {
   return seen;
 }
 
-// Several tests end on another screen (a run opens in Agent). That screen's own stylesheet is its
-// task's business: if it isn't there yet, serve it empty instead of failing these tests on the
-// 404. Schedules' own stylesheet is never stood in for.
-test.beforeEach(async ({ page }) => {
-  await page.route('**/assets/css/views/*.css', async (route) => {
-    if (route.request().url().endsWith('/schedules.css')) return route.continue();
+/** Serve GET /api/schedules with `edit(list)` applied to what the server answered. */
+async function patchSchedules(page, edit) {
+  await page.route('**/api/schedules', async (route) => {
+    if (route.request().method() !== 'GET') return route.continue();
     const res = await route.fetch();
-    if (res.status() === 404) return route.fulfill({ status: 200, contentType: 'text/css', body: '' });
-    return route.fulfill({ response: res });
+    const list = await res.json();
+    edit(list);
+    return route.fulfill({ response: res, json: list });
   });
-});
+}
+
+/** Serve GET /api/summary merged with `patch()` (what is running, what finished last). */
+async function patchSummary(page, patch) {
+  await page.route('**/api/summary*', async (route) => {
+    const res = await route.fetch();
+    await route.fulfill({ response: res, json: { ...(await res.json()), ...patch() } });
+  });
+}
+
+/** Have the shared store poll the summary now (as its 30s timer would). */
+const refreshStore = (page) =>
+  page.evaluate(async () => {
+    const { store } = await import('/assets/js/core/store.js');
+    await store.refresh();
+  });
 
 /** Where an OS timer for schedule `id` would land under `home` if one were installed. */
 function timerFiles(home, id) {
@@ -149,6 +163,29 @@ async function tabTo(page, target, max = 30) {
   await expect(target).toBeFocused();
 }
 
+/**
+ * The run history fits its box at this width (a table when there is room, else one card per
+ * run): it never scrolls sideways, and the first run's status and counts and every View run link
+ * are inside the box and on screen.
+ */
+async function historyFits(page) {
+  const width = page.viewportSize().width;
+  const wrap = page.locator('.sch-history .table-wrap');
+  const [scroll, client] = await wrap.evaluate((el) => [el.scrollWidth, el.clientWidth]);
+  expect(scroll, `run history scrolls sideways at ${width}px`).toBeLessThanOrEqual(client + 1);
+  const box = await wrap.boundingBox();
+  const right = Math.min(width, box.x + box.width);
+  const first = page.getByRole('table', { name: 'Run history' }).locator('tbody tr').first();
+  const views = await page.locator('.sch-history').getByRole('link', { name: /^View run/ }).all();
+  for (const el of [first.locator('.badge'), first.locator('td').nth(7), ...views]) {
+    const b = await el.boundingBox();
+    expect(b.x + b.width, `${await el.textContent()} at ${width}px`).toBeLessThanOrEqual(right + 0.5);
+  }
+}
+
+/** Whether a note is cut short on screen (its clamp hides lines). */
+const clamped = (note) => note.evaluate((el) => el.scrollHeight > el.clientHeight + 1);
+
 test('lists seeded schedules with next run', async ({ app, page, server, request }) => {
   await app.goto('#/schedules');
   await ready(page);
@@ -160,6 +197,8 @@ test('lists seeded schedules with next run', async ({ app, page, server, request
 
   // Lunch Source: daily, the agent decides, on, next run soon, last run failed.
   const lunch = row(page, LUNCH.name);
+  // A name too long for the row is cut short on screen; the tooltip has all of it.
+  await expect(lunch.locator('.sch-name')).toHaveAttribute('title', LUNCH.name);
   await expect(lunch.locator('.sch-cadence')).toHaveText('Daily at 13:00');
   await expect(lunch.locator('.sch-task .badge')).toHaveText('Agent decides');
   await expect(lunch.getByRole('switch', { name: LUNCH.name })).toHaveAttribute('aria-checked', 'true');
@@ -177,7 +216,15 @@ test('lists seeded schedules with next run', async ({ app, page, server, request
   const last = lunch.locator('.sch-last');
   await expect(last.locator('.badge')).toHaveText(STATUS[lastLunch.status]);
   await expect(last.locator('.badge')).toHaveClass(/badge-danger/);
-  await expect(last).toContainText(counts(lastLunch));
+  // It failed before doing anything: the row says why (the server's note), not a line of zeros.
+  const listed = await (await request.get(server.apiUrl('/api/schedules'))).json();
+  const why = listed.find((s) => s.id === LUNCH.id).last_run.note;
+  expect(why).toBeTruthy();
+  await expect(last.locator('.sch-note')).toHaveText(why);
+  await expect(last.locator('.sch-note')).toHaveAttribute('title', why);
+  await expect(last.locator('.sch-counts')).toHaveCount(0);
+  // Not a sign-in problem, so no sign-in link.
+  await expect(last.getByRole('link', { name: 'Sign the agent in again' })).toHaveCount(0);
   // A run with no conversation has nothing to view.
   await expect(last.getByRole('link', { name: /^View run/ })).toHaveCount(0);
 
@@ -192,6 +239,7 @@ test('lists seeded schedules with next run', async ({ app, page, server, request
   const lastWeekly = SEED.runs.filter((r) => r.schedule_name === WEEKLY.name).pop();
   await expect(weekly.locator('.sch-last .badge')).toHaveText(STATUS[lastWeekly.status]);
   await expect(weekly.locator('.sch-last')).toContainText(counts(lastWeekly));
+  await expect(weekly.locator('.sch-last .sch-note')).toHaveCount(0);
 });
 
 test('run history lists the latest runs, newest first', async ({ app, page, server, request }) => {
@@ -206,13 +254,18 @@ test('run history lists the latest runs, newest first', async ({ app, page, serv
   ]);
   await expect(rows.locator('td:nth-child(2)')).toHaveText(newest.map((r) => r.schedule_name ?? 'No schedule'));
   await expect(rows.locator('td:nth-child(3)')).toHaveText(newest.map((r) => TRIGGER[r.trigger]));
-  await expect(rows.locator('td:nth-child(4)')).toHaveText(newest.map((r) => STATUS[r.status]));
+  await expect(rows.locator('td:nth-child(4) .badge')).toHaveText(newest.map((r) => STATUS[r.status]));
   for (const [i, key] of ['sourced', 'enriched', 'drafted', 'sent'].entries()) {
     await expect(rows.locator(`td:nth-child(${5 + i})`)).toHaveText(newest.map((r) => fmtNum(r[key])));
   }
+  // A failed run says why under its status (the newest seeded run failed with a note).
+  const api = await (await request.get(server.apiUrl('/api/runs'))).json();
+  const notes = api.filter((r) => r.note).map((r) => r.note);
+  expect(notes.length).toBeGreaterThan(0);
+  await expect(rows.locator('td:nth-child(4) .sch-note')).toHaveText(notes);
+  await expect(rows.first().locator('.sch-note')).toHaveText(api[0].note);
 
   // Finished: relative within 48h, the absolute time on hover.
-  const api = await (await request.get(server.apiUrl('/api/runs'))).json();
   const first = rows.first().locator('td').first().locator('time');
   await expect(first).toHaveAttribute('title', fmtDate(api[0].started_at, { time: true }));
   await expect(first).toHaveText(fmtRelative(api[0].started_at));
@@ -224,6 +277,98 @@ test('run history lists the latest runs, newest first', async ({ app, page, serv
   await links.first().click();
   await expect(page).toHaveURL(hashIs(`#/agent/${SEED.chats.scheduled.id}`));
   await expect(page.locator('#view h1')).toHaveText('Agent');
+});
+
+test('a failed run says why; only a sign-in failure links to the agent settings', async ({ app, page }) => {
+  // 'error' covers every failure but sign-in (a retired model, a server error, a timeout).
+  const RETIRED = 'Model muse-spark-1.3-contributor-free has been deprecated.';
+  const SIGNED_OUT = 'opencode is not signed in. Run `opencode auth login`, then try again.';
+  await patchSchedules(page, (list) => {
+    for (const s of list) {
+      if (s.id === LUNCH.id) s.last_run = { ...s.last_run, status: 'error', note: RETIRED };
+      if (s.id === WEEKLY.id) s.last_run = { ...s.last_run, status: 'auth_failed', note: SIGNED_OUT };
+    }
+  });
+  await page.route('**/api/runs', async (route) => {
+    const res = await route.fetch();
+    const list = await res.json();
+    list[0] = { ...list[0], status: 'auth_failed', note: SIGNED_OUT };
+    list[1] = { ...list[1], status: 'error', note: `  ${RETIRED}\n  ` };
+    await route.fulfill({ response: res, json: list });
+  });
+  await app.goto('#/schedules');
+  await ready(page);
+
+  const lunch = row(page, LUNCH.name).locator('.sch-last');
+  await expect(lunch.locator('.badge')).toHaveText('Failed');
+  await expect(lunch.locator('.badge')).toHaveClass(/badge-danger/);
+  await expect(lunch.locator('.sch-note')).toHaveText(RETIRED);
+  await expect(lunch.getByRole('link', { name: 'Sign the agent in again' })).toHaveCount(0);
+
+  const weekly = row(page, WEEKLY.name).locator('.sch-last');
+  await expect(weekly.locator('.badge')).toHaveText('Sign-in failed');
+  await expect(weekly.locator('.badge')).toHaveClass(/badge-warn/);
+  await expect(weekly.locator('.sch-note')).toHaveText(SIGNED_OUT);
+  // It got some work done first, so its counts still show.
+  await expect(weekly.locator('.sch-counts')).toBeVisible();
+  const signIn = weekly.getByRole('link', { name: 'Sign the agent in again' });
+  await expect(signIn).toHaveAttribute('href', '#/settings?tab=agent');
+  await expect(page.locator('#view').getByRole('link', { name: 'Sign the agent in again' })).toHaveCount(1);
+
+  // The history says why too (the note trimmed), and keeps the plain status for the rest.
+  const rows = page.getByRole('table', { name: 'Run history' }).locator('tbody tr');
+  await expect(rows.nth(0).locator('.badge')).toHaveText('Sign-in failed');
+  await expect(rows.nth(0).locator('.sch-note')).toHaveText(SIGNED_OUT);
+  await expect(rows.nth(1).locator('.badge')).toHaveText('Failed');
+  await expect(rows.nth(1).locator('.sch-note')).toHaveText(RETIRED);
+  await expect(rows.nth(1).locator('.sch-note')).toHaveAttribute('title', RETIRED);
+  await expect(rows.nth(2).locator('.sch-note')).toHaveCount(0);
+});
+
+test('run history fits laptop widths: a table when there is room, else cards that show the whole note', async ({ app, page }) => {
+  // The widest a run gets: a failed run with a long note, a long name and big counts, and the
+  // same from last year (its date gains the year).
+  const NAME = 'Morning source + draft (EU fintech)';
+  const NOTE = 'opencode run failed: provider returned HTTP 503 Service Unavailable while streaming the first turn; retried 3 times.';
+  const LONG = `${NOTE} The provider said: upstream connect error or disconnect/reset before headers, reset reason: overflow. Try again later.`;
+  const LAST_YEAR = `${new Date().getFullYear() - 1}-12-30 12:42:00`; // SQLite UTC
+  const wide = { status: 'error', note: NOTE, schedule_name: NAME, trigger: 'scheduled', sourced: 1234, enriched: 345, drafted: 120, sent: 25, chat_id: SEED.chats.scheduled.id };
+  await page.route('**/api/runs', async (route) => {
+    const res = await route.fetch();
+    const list = await res.json();
+    list.unshift({ ...list[0], ...wide }, { ...list[0], ...wide, started_at: LAST_YEAR });
+    await route.fulfill({ response: res, json: list });
+  });
+  await patchSchedules(page, (list) => {
+    for (const s of list) if (s.id === LUNCH.id) s.last_run = { ...s.last_run, status: 'error', note: LONG };
+  });
+  await app.goto('#/schedules');
+  await ready(page);
+  const rows = page.getByRole('table', { name: 'Run history' }).locator('tbody tr');
+  await expect(rows.nth(0).locator('.sch-run-name')).toHaveText(NAME);
+  await expect(rows.nth(1).locator('time')).toHaveText(fmtDate(LAST_YEAR, { time: true }));
+  await expect(rows.nth(1).locator('time')).toContainText(`, ${new Date().getFullYear() - 1}, `);
+  const cards = () => rows.first().evaluate((el) => getComputedStyle(el).display === 'flex');
+  const rowNote = row(page, LUNCH.name).locator('.sch-note');
+
+  // 1440 and 1400 (about the narrowest box a table gets) have room for the table; laptop widths
+  // from 1366 down get cards. The table's note is cut to two lines (the tooltip has it); a
+  // card's note shows in full.
+  for (const [width, table] of [[1440, true], [1400, true], [1366, false], [1280, false], [1240, false], [1200, false], [1024, false], [390, false]]) {
+    await page.setViewportSize({ width, height: 900 });
+    await expect.poll(cards, { message: `cards at ${width}px` }).toBe(!table);
+    await historyFits(page);
+    await expect(rows.nth(0).locator('td').nth(8).getByRole('link', { name: /^View run/ })).toBeVisible();
+    expect(await clamped(rows.nth(0).locator('.sch-note')), `note cut short at ${width}px`).toBe(table);
+    await expect(rows.nth(0).locator('.sch-note')).toHaveAttribute('title', NOTE);
+  }
+  // The schedule's own row: three lines beside its columns, all of it once the row stacks.
+  expect(await clamped(rowNote)).toBe(false);
+  await expect(rowNote).toHaveText(LONG);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await expect.poll(() => clamped(rowNote)).toBe(true);
+  await expect(rowNote).toHaveAttribute('title', LONG);
 });
 
 test('shows loading, then an error with a retry, for each source', async ({ app, page }) => {
@@ -346,9 +491,111 @@ test('a failed toggle puts the switch back and says why', async ({ app, page, se
   await ready(page);
   const sw = row(page, LUNCH.name).getByRole('switch', { name: LUNCH.name });
   await sw.click();
-  await expect(page.locator('.toast-err')).toContainText('launchctl bootstrap: Operation not permitted');
+  await expect(page.locator('.toast-err .toast-text')).toHaveText(
+    `Couldn't pause “${LUNCH.name}”: launchctl bootstrap: Operation not permitted`,
+  );
   await expect(sw).toHaveAttribute('aria-checked', 'true');
   expect((await dbRows(server, 'SELECT enabled FROM schedules WHERE id = ?', LUNCH.id))[0].enabled).toBe(1);
+  await expect(row(page, LUNCH.name).locator('.sch-next time')).toBeVisible();
+});
+
+// Leaves Lunch Source enabled, as seeded.
+test('a reload already on its way never undoes what a failed toggle showed', async ({ app, page, server }) => {
+  app.allowConsole(/status of 500/);
+  const enabled = async () => (await dbRows(server, 'SELECT enabled FROM schedules WHERE id = ?', LUNCH.id))[0].enabled;
+  // A run finished (the store's summary has a newer last run), so the screen reloads its list:
+  // that GET is answered with the list as it was (Lunch Source on), but only once released.
+  let hold = false;
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  let fetched;
+  const staleReady = new Promise((resolve) => {
+    fetched = resolve;
+  });
+  await page.route('**/api/schedules', async (route) => {
+    if (route.request().method() !== 'GET' || !hold) return route.continue();
+    hold = false;
+    const res = await route.fetch();
+    const json = await res.json();
+    fetched(route.request());
+    await gate;
+    await route.fulfill({ response: res, json }).catch(() => {}); // the page dropped it: nothing to answer
+  });
+  // Pausing it stores `enabled`, then removing the timer fails (a 500 after the write).
+  await page.route(`**/api/schedules/${LUNCH.id}`, async (route) => {
+    if (route.request().method() !== 'PATCH') return route.continue();
+    const res = await route.fetch();
+    expect(res.status()).toBe(200);
+    return route.fulfill({ status: 500, contentType: 'text/plain', body: 'launchctl bootout: Input/output error' });
+  });
+  await app.goto('#/schedules');
+  await ready(page);
+  const lunch = row(page, LUNCH.name);
+  const sw = lunch.getByRole('switch', { name: LUNCH.name });
+  await expect(sw).toHaveAttribute('aria-checked', 'true');
+
+  await patchSummary(page, () => ({
+    last_run: { started_at: '2099-01-01 00:00:00', status: 'ok', schedule_name: LUNCH.name, chat_id: null, sourced: 1, drafted: 1, sent: 0 },
+  }));
+  hold = true;
+  await refreshStore(page);
+  const stale = await staleReady;
+  const outcome = new Promise((resolve) => {
+    page.on('requestfailed', (r) => r === stale && resolve('dropped'));
+    page.on('requestfinished', (r) => r === stale && resolve('answered'));
+  });
+
+  await sw.click();
+  await expect(page.locator('.toast-err .toast-text')).toHaveText(
+    `“${LUNCH.name}” is paused, but its timer couldn't be removed, so it may still run: launchctl bootout: Input/output error`,
+  );
+  await expect(sw).toHaveAttribute('aria-checked', 'false');
+  // The older reload is dropped once the fresh list is shown, so its answer (Lunch Source on)
+  // never lands.
+  release();
+  expect(await outcome).toBe('dropped');
+  await expect(sw).toHaveAttribute('aria-checked', 'false');
+  await expect(lunch.locator('.sch-next')).toContainText('Paused');
+  expect(await enabled()).toBe(0);
+
+  await page.unroute(`**/api/schedules/${LUNCH.id}`);
+  await sw.click();
+  await expect(sw).toHaveAttribute('aria-checked', 'true');
+  await expect.poll(enabled).toBe(1);
+});
+
+// Leaves Lunch Source enabled, as seeded.
+test('a toggle whose timer step fails shows what was stored', async ({ app, page, server }) => {
+  app.allowConsole(/status of 500/);
+  const enabled = async () => (await dbRows(server, 'SELECT enabled FROM schedules WHERE id = ?', LUNCH.id))[0].enabled;
+  // The server stores `enabled`, then removing the timer fails (a 500 after the write).
+  await page.route(`**/api/schedules/${LUNCH.id}`, async (route) => {
+    if (route.request().method() !== 'PATCH') return route.continue();
+    const res = await route.fetch();
+    expect(res.status()).toBe(200);
+    return route.fulfill({ status: 500, contentType: 'text/plain', body: 'launchctl bootout: Input/output error' });
+  });
+  await app.goto('#/schedules');
+  await ready(page);
+  const lunch = row(page, LUNCH.name);
+  const sw = lunch.getByRole('switch', { name: LUNCH.name });
+  await sw.click();
+  await expect(page.locator('.toast-err .toast-text')).toHaveText(
+    `“${LUNCH.name}” is paused, but its timer couldn't be removed, so it may still run: launchctl bootout: Input/output error`,
+  );
+  // The switch shows what is stored (off), not the state before the press.
+  expect(await enabled()).toBe(0);
+  await expect(sw).toHaveAttribute('aria-checked', 'false');
+  await expect(lunch.locator('.sch-next')).toContainText('Paused');
+  await expect(sw).toBeFocused();
+  await expect(page.locator('#topbar .chip')).toHaveText('No schedule');
+
+  await page.unroute(`**/api/schedules/${LUNCH.id}`);
+  await sw.click();
+  await expect(sw).toHaveAttribute('aria-checked', 'true');
+  await expect.poll(enabled).toBe(1);
 });
 
 // Leaves Lunch Source at 07:45.
@@ -391,6 +638,63 @@ test('edit changes time', async ({ app, page, server }) => {
   await page.reload();
   await ready(page);
   await expect(row(page, LUNCH.name).locator('.sch-cadence')).toHaveText('Daily at 07:45');
+});
+
+// Leaves Lunch Source at 07:45.
+test('an edit whose timer step fails says it was saved and shows it', async ({ app, page, server, request }) => {
+  app.allowConsole(/status of 500/);
+  // The server stores the edit, then installing the timer fails (a 500 after the write).
+  await page.route(`**/api/schedules/${LUNCH.id}`, async (route) => {
+    if (route.request().method() !== 'PATCH') return route.continue();
+    const res = await route.fetch();
+    expect(res.status()).toBe(200);
+    return route.fulfill({ status: 500, contentType: 'text/plain', body: 'launchctl bootstrap: Input/output error' });
+  });
+  try {
+    await app.goto('#/schedules');
+    await ready(page);
+    await openRowMenu(page, LUNCH.name);
+    await page.getByRole('menuitem', { name: 'Edit' }).click();
+    const dialog = page.getByRole('dialog', { name: 'Edit schedule' });
+    await dialog.getByLabel('Time', { exact: true }).fill('08:15');
+    await dialog.getByRole('button', { name: 'Save changes' }).click();
+    await expect(dialog.getByRole('alert')).toHaveText("Saved, but its timer wasn't updated: launchctl bootstrap: Input/output error");
+    // The dialog stays open to try again; the row behind already shows what was stored.
+    await expect(dialog).toBeVisible();
+    await expect(row(page, LUNCH.name).locator('.sch-cadence')).toHaveText('Daily at 08:15');
+    expect(await dbRows(server, 'SELECT time FROM schedules WHERE id = ?', LUNCH.id)).toEqual([{ time: '08:15' }]);
+    await dialog.getByRole('button', { name: 'Cancel' }).click();
+    await expect(dialog).toBeHidden();
+    await expect(row(page, LUNCH.name).locator('.sch-cadence')).toHaveText('Daily at 08:15');
+
+    // A save that failed before anything was stored still says "Couldn't save".
+    await page.unroute(`**/api/schedules/${LUNCH.id}`);
+    await page.route(`**/api/schedules/${LUNCH.id}`, (route) =>
+      route.request().method() === 'PATCH'
+        ? route.fulfill({ status: 500, contentType: 'text/plain', body: 'database is locked' })
+        : route.continue(),
+    );
+    await openRowMenu(page, LUNCH.name);
+    await page.getByRole('menuitem', { name: 'Edit' }).click();
+    await dialog.getByLabel('Time', { exact: true }).fill('11:11');
+    await dialog.getByRole('button', { name: 'Save changes' }).click();
+    await expect(dialog.getByRole('alert')).toHaveText("Couldn't save: database is locked");
+    await expect(row(page, LUNCH.name).locator('.sch-cadence')).toHaveText('Daily at 08:15');
+    await dialog.getByRole('button', { name: 'Cancel' }).click();
+    await expect(dialog).toBeHidden();
+
+    // Saving it unchanged: what is stored matches the form whether or not the write happened, so
+    // the error is never put down to the timer.
+    await openRowMenu(page, LUNCH.name);
+    await page.getByRole('menuitem', { name: 'Edit' }).click();
+    await expect(dialog.getByLabel('Time', { exact: true })).toHaveValue('08:15');
+    await dialog.getByRole('button', { name: 'Save changes' }).click();
+    await expect(dialog.getByRole('alert')).toHaveText("Couldn't save: database is locked");
+    await dialog.getByRole('button', { name: 'Cancel' }).click();
+    await expect(dialog).toBeHidden();
+  } finally {
+    await sendJSON(request, server, 'PATCH', `/api/schedules/${LUNCH.id}`, { time: '07:45' });
+  }
 });
 
 // Adds "Friday fintechs".
@@ -526,15 +830,18 @@ test('a timer error after saving never creates a duplicate', async ({ app, page,
   const dialog = page.getByRole('dialog', { name: 'New schedule' });
   await dialog.getByLabel('Name', { exact: true }).fill('Half saved');
   await dialog.getByRole('button', { name: 'Create schedule' }).click();
-  await expect(dialog.getByRole('alert')).toHaveText(
+  // The row exists, so the dialog now edits it (its title says so): saving again updates
+  // instead of creating.
+  const edit = page.getByRole('dialog', { name: 'Edit schedule' });
+  await expect(edit.getByRole('alert')).toHaveText(
     "Saved, but its timer wasn't installed: launchctl bootstrap: Input/output error",
   );
-  // The row exists, so the dialog now edits it: saving again updates instead of creating.
+  await expect(dialog).toHaveCount(0);
   await expect(row(page, 'Half saved')).toBeVisible();
-  await expect(dialog.getByRole('button', { name: 'Save changes' })).toBeVisible();
+  await expect(edit.getByRole('button', { name: 'Save changes' })).toBeVisible();
   await page.unroute('**/api/schedules');
-  await dialog.getByRole('button', { name: 'Save changes' }).click();
-  await expect(dialog).toBeHidden();
+  await edit.getByRole('button', { name: 'Save changes' }).click();
+  await expect(edit).toBeHidden();
   const rows = await dbRows(server, "SELECT id FROM schedules WHERE name = 'Half saved'");
   expect(rows).toHaveLength(1);
   expect(sent.filter((s) => s.method !== 'GET').map((s) => [s.method, s.path])).toEqual([
@@ -542,6 +849,85 @@ test('a timer error after saving never creates a duplicate', async ({ app, page,
     ['PATCH', `/api/schedules/${rows[0].id}`],
   ]);
   await sendJSON(request, server, 'DELETE', `/api/schedules/${rows[0].id}`);
+});
+
+test('a failed create never takes over an older schedule with the same name', async ({ app, page, server, request }) => {
+  app.allowConsole(/status of 500/);
+  const fields = { name: 'Twin', freq: 'daily', time: '09:00', weekday: null, task_mode: 'agent', prompt: null };
+  const older = await sendJSON(request, server, 'POST', '/api/schedules', { ...fields, enabled: false });
+  let listLoads = 0;
+  let writeRow = false;
+  await page.route('**/api/schedules', async (route) => {
+    const method = route.request().method();
+    // The screen's own list never loads, so it can't know which schedules were there before.
+    if (method === 'GET') {
+      listLoads += 1;
+      return listLoads === 1
+        ? route.fulfill({ status: 500, contentType: 'text/plain', body: 'database is locked' })
+        : route.continue();
+    }
+    if (method !== 'POST') return route.continue();
+    if (writeRow) expect((await route.fetch()).status()).toBe(200);
+    return route.fulfill({ status: 500, contentType: 'text/plain', body: 'launchctl bootstrap: Input/output error' });
+  });
+  const sent = recordRequests(page, /^\/api\/schedules(\/[^/]+)?$/);
+  try {
+    await app.goto('#/schedules');
+    await expect(page.locator('.sch-list').getByRole('alert')).toContainText("Schedules didn't load.");
+    await page.getByRole('button', { name: 'New schedule' }).click();
+    const dialog = page.getByRole('dialog', { name: 'New schedule' });
+    await dialog.getByLabel('Name', { exact: true }).fill(fields.name);
+
+    // Nothing was written: the older "Twin" is not mistaken for this one.
+    await dialog.getByRole('button', { name: 'Create schedule' }).click();
+    await expect(dialog.getByRole('alert')).toHaveText("Couldn't save: launchctl bootstrap: Input/output error");
+    await expect(dialog.getByRole('button', { name: 'Create schedule' })).toBeVisible();
+
+    // The row was written before the timer failed: the dialog goes on editing that new row.
+    writeRow = true;
+    await dialog.getByRole('button', { name: 'Create schedule' }).click();
+    const edit = page.getByRole('dialog', { name: 'Edit schedule' });
+    await expect(edit.getByRole('alert')).toHaveText("Saved, but its timer wasn't installed: launchctl bootstrap: Input/output error");
+    const twins = await dbRows(server, "SELECT id FROM schedules WHERE name = 'Twin'");
+    expect(twins).toHaveLength(2);
+    const newer = twins.find((t) => t.id !== older.id);
+    await edit.getByRole('button', { name: 'Save changes' }).click();
+    await expect(edit).toBeHidden();
+    expect(sent.filter((r) => r.method === 'PATCH').map((r) => r.path)).toEqual([`/api/schedules/${newer.id}`]);
+    // The older one is as it was.
+    expect(await dbRows(server, 'SELECT enabled, time FROM schedules WHERE id = ?', older.id)).toEqual([{ enabled: 0, time: '09:00' }]);
+  } finally {
+    await page.unroute('**/api/schedules');
+    for (const { id } of await dbRows(server, "SELECT id FROM schedules WHERE name = 'Twin'")) {
+      await sendJSON(request, server, 'DELETE', `/api/schedules/${id}`);
+    }
+  }
+});
+
+test('a changed form is not lost to a stray click beside the dialog', async ({ app, page }) => {
+  await app.goto('#/schedules');
+  await ready(page);
+  const newBtn = page.getByRole('button', { name: 'New schedule' });
+  const dialog = page.getByRole('dialog', { name: 'New schedule' });
+  const beside = () => page.locator('.overlay-dialog').click({ position: { x: 8, y: 8 } });
+
+  // Untouched, a click beside it closes it.
+  await newBtn.click();
+  await expect(dialog).toBeVisible();
+  await beside();
+  await expect(dialog).toBeHidden();
+
+  // With something typed, it stays open; Cancel still closes it.
+  await newBtn.click();
+  await dialog.getByRole('radio', { name: 'Custom instruction' }).check();
+  const instruction = dialog.getByLabel('Instruction', { exact: true });
+  await instruction.fill('Source 30 climate startups in Lisbon and draft intros to their founders');
+  await beside();
+  await expect(dialog).toBeVisible();
+  await expect(instruction).toHaveValue('Source 30 climate startups in Lisbon and draft intros to their founders');
+  await dialog.getByRole('button', { name: 'Cancel' }).click();
+  await expect(dialog).toBeHidden();
+  await expect(newBtn).toBeFocused();
 });
 
 test('no plist is written', async ({ app, page, server }) => {
@@ -674,11 +1060,23 @@ test('consequence note reflects auto-send settings', async ({ app, page, server,
     await expect(confirm.getByRole('button', { name: 'Run and allow sends' })).toBeVisible();
     await confirm.getByRole('button', { name: 'Cancel' }).click();
     await expect(confirm).toBeHidden();
-    // A dry run never asks: it can't send.
     expect(runs).toEqual([]);
 
+    // Accepting starts it and opens the run (the server's COLDTRAIL_NO_SEND: nothing goes out).
+    await openRowMenu(page, LUNCH.name);
+    const post = page.waitForRequest((r) => r.method() === 'POST' && r.url().endsWith(`/api/schedules/${LUNCH.id}/run`));
+    const response = page.waitForResponse((r) => r.request().method() === 'POST' && r.url().endsWith(`/api/schedules/${LUNCH.id}/run`));
+    await page.getByRole('menuitem', { name: 'Run now' }).click();
+    await confirm.getByRole('button', { name: 'Run and allow sends' }).click();
+    expect(JSON.parse((await post).postData())).toEqual({ draft_only: false });
+    const { chat_id: chatId } = await (await response).json();
+    await expect(page).toHaveURL(hashIs(`#/agent/${chatId}`));
+    await expect
+      .poll(() => dbRows(server, 'SELECT trigger FROM scheduled_runs WHERE chat_id = ?', chatId), { timeout: 60_000 })
+      .toEqual([{ trigger: 'manual' }]);
+
     await setEmail(false);
-    await page.reload();
+    await app.goto('#/schedules');
     await ready(page);
     dialog = await note();
     await expect(dialog.locator('.sch-consequence')).toContainText(
@@ -724,6 +1122,15 @@ test('dry run opens the run conversation', async ({ app, page, server }) => {
 });
 
 test('run now with auto-send off starts at once and opens the run', async ({ app, page, server }) => {
+  // Hold the start, to see the row while it is starting.
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  await page.route(`**/api/schedules/${LUNCH.id}/run`, async (route) => {
+    await gate;
+    await route.continue();
+  });
   await app.goto('#/schedules');
   await ready(page);
   await openRowMenu(page, LUNCH.name);
@@ -732,6 +1139,13 @@ test('run now with auto-send off starts at once and opens the run', async ({ app
   await page.getByRole('menuitem', { name: 'Run now' }).click();
   expect(JSON.parse((await post).postData())).toEqual({ draft_only: false });
   await expect(page.getByRole('alertdialog')).toHaveCount(0);
+  // While it starts, the row's ⋯ button is busy (a spinner) and ignores presses.
+  const menuBtn = row(page, LUNCH.name).getByRole('button', { name: `Actions for ${LUNCH.name}` });
+  await expect(menuBtn).toHaveAttribute('aria-busy', 'true');
+  await expect(menuBtn.locator('.spinner')).toBeVisible();
+  await menuBtn.click({ force: true });
+  await expect(page.getByRole('menu')).toHaveCount(0);
+  release();
   const { chat_id: chatId } = await (await response).json();
   await expect(page).toHaveURL(hashIs(`#/agent/${chatId}`));
   await expect
@@ -752,6 +1166,13 @@ test('a live run shows on its row, and a finished one refreshes the screen', asy
   await expect(last.locator('.badge')).toHaveText('Running');
   await expect(last.getByRole('link', { name: /^Watch the run/ })).toHaveAttribute('href', `#/agent/${SEED.chats.scheduled.id}`);
   await expect(page.locator('.sch-row .badge', { hasText: 'Running' })).toHaveCount(1);
+  // A second run of the same schedule can't be started on top of it.
+  await openRowMenu(page, LUNCH.name);
+  await expect(page.getByRole('menuitem', { name: 'Run now' })).toBeDisabled();
+  await expect(page.getByRole('menuitem', { name: 'Dry run' })).toBeDisabled();
+  await expect(page.getByRole('menuitem', { name: 'Edit' })).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('menu')).toHaveCount(0);
 
   // The run ends: no running chat, a newer last run. The screen reloads its lists by itself.
   const reloaded = page.waitForRequest((r) => new URL(r.url()).pathname === '/api/runs');
@@ -766,6 +1187,101 @@ test('a live run shows on its row, and a finished one refreshes the screen', asy
   await reloaded;
   await expect(last.locator('.badge')).not.toHaveText('Running');
   await expect(last.getByRole('link', { name: /^Watch the run/ })).toHaveCount(0);
+  await openRowMenu(page, LUNCH.name);
+  await expect(page.getByRole('menuitem', { name: 'Run now' })).toBeEnabled();
+  await expect(page.getByRole('menuitem', { name: 'Dry run' })).toBeEnabled();
+  await page.keyboard.press('Escape');
+});
+
+test('closing a dialog after the list was rebuilt puts focus back on the row', async ({ app, page }) => {
+  let patch = {};
+  await patchSummary(page, () => patch);
+  await app.goto('#/schedules');
+  await ready(page);
+  const menuBtn = row(page, LUNCH.name).getByRole('button', { name: `Actions for ${LUNCH.name}` });
+  const drawn = await menuBtn.elementHandle();
+  await openRowMenu(page, LUNCH.name);
+  await page.getByRole('menuitem', { name: 'Edit' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Edit schedule' });
+  await expect(dialog).toBeVisible();
+
+  // A run finishes meanwhile: the screen reloads its lists, which rebuilds every row.
+  patch = { last_run: { started_at: '2099-01-02 00:00:00', status: 'ok', schedule_name: LUNCH.name, chat_id: null, sourced: 2, drafted: 1, sent: 0 } };
+  await refreshStore(page);
+  await expect.poll(() => drawn.evaluate((el) => el.isConnected)).toBe(false);
+  await page.keyboard.press('Escape');
+  await expect(dialog).toBeHidden();
+  await expect(menuBtn).toBeFocused();
+
+  // The same for a confirm (Delete, then Cancel).
+  const before = await menuBtn.elementHandle();
+  await openRowMenu(page, LUNCH.name);
+  await page.getByRole('menuitem', { name: 'Delete' }).click();
+  const confirm = page.getByRole('alertdialog');
+  await expect(confirm).toBeVisible();
+  patch = { last_run: { ...patch.last_run, started_at: '2099-01-03 00:00:00' } };
+  await refreshStore(page);
+  await expect.poll(() => before.evaluate((el) => el.isConnected)).toBe(false);
+  await confirm.getByRole('button', { name: 'Cancel' }).click();
+  await expect(confirm).toBeHidden();
+  await expect(menuBtn).toBeFocused();
+});
+
+test('?new=1 opens the dialog after a row menu was used, and never stacks a second one', async ({ app, page }) => {
+  await app.goto('#/schedules');
+  await ready(page);
+  const setHash = (hash) => page.evaluate((h) => { location.hash = h; }, hash);
+  const dialogs = page.getByRole('dialog');
+
+  await openRowMenu(page, LUNCH.name);
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('menu')).toHaveCount(0);
+  await setHash('#/schedules?new=1');
+  await expect(page).toHaveURL(hashIs('#/schedules'));
+  await expect(page.getByRole('dialog', { name: 'New schedule' })).toBeVisible();
+
+  // Already open: the flag is dropped and no second dialog opens.
+  await setHash('#/schedules?new=1');
+  await expect(page).toHaveURL(hashIs('#/schedules'));
+  await expect(dialogs).toHaveCount(1);
+  await page.keyboard.press('Escape');
+  await expect(dialogs).toHaveCount(0);
+
+  // With a row menu open, the menu gives way to the dialog.
+  await openRowMenu(page, LUNCH.name);
+  await setHash('#/schedules?new=1');
+  await expect(page.getByRole('dialog', { name: 'New schedule' })).toBeVisible();
+  await expect(page.getByRole('menu')).toHaveCount(0);
+  await expect(page.getByRole('dialog').getByLabel('Name', { exact: true })).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(dialogs).toHaveCount(0);
+});
+
+test('relative times stay current while the screen is open', async ({ app, page }) => {
+  await page.clock.install();
+  // A weekly schedule three days out (its next run is a date, not "in …"), last run 5½ min ago.
+  const now = new Date();
+  const far = {
+    id: 'e2e-far-weekly', name: 'Far off', enabled: true, freq: 'weekly', time: '10:00',
+    weekday: (now.getDay() + 3) % 7, task_mode: 'agent', prompt: null,
+    last_run: {
+      started_at: new Date(now.getTime() - 5.5 * 60_000).toISOString(), status: 'ok',
+      sourced: 3, enriched: 2, drafted: 1, sent: 0, chat_id: null, note: null,
+    },
+  };
+  await patchSchedules(page, (list) => list.push(far));
+  await app.goto('#/schedules');
+  await ready(page);
+  const r = row(page, far.name);
+  const label = runLabel(nextRuns(far, 1, now)[0]);
+  await expect(r.locator('.sch-next time')).toHaveText(label);
+  await expect(r.locator('.sch-last time')).toHaveText('5m ago');
+
+  // The 30s ticker moves the relative times on, and redraws the next run cleanly.
+  await page.clock.runFor(60_000);
+  await expect(r.locator('.sch-last time')).toHaveText('6m ago');
+  await expect(r.locator('.sch-next time')).toHaveText(label);
+  await expect(r.locator('.sch-next .sch-cell-body')).toHaveText(label);
 });
 
 test('keyboard only: create, open the menu, delete', async ({ app, page, server }) => {
@@ -917,9 +1433,12 @@ test('leaving the screen stops its timers and drops late answers', async ({ app,
 });
 
 test('schedules are accessible in light and dark, and fit 390px', async ({ app, page }) => {
+  // The run history fits its box at each width (laptop widths with the widest runs: the test
+  // above), so a run's status and counts never sit off to the side.
   await page.emulateMedia({ colorScheme: 'light' });
   await app.goto('#/schedules');
   await ready(page);
+  await historyFits(page);
   await expectAccessible(page);
   await page.emulateMedia({ colorScheme: 'dark' });
   await expectAccessible(page);
@@ -940,9 +1459,13 @@ test('schedules are accessible in light and dark, and fit 390px', async ({ app, 
   await page.keyboard.press('Escape');
 
   const sideScroll = () => page.evaluate(() => document.documentElement.scrollWidth);
+  await page.setViewportSize({ width: 1024, height: 768 });
+  await ready(page);
+  await historyFits(page);
   await page.setViewportSize({ width: 390, height: 844 });
   await ready(page);
   expect(await sideScroll()).toBeLessThanOrEqual(390);
+  await historyFits(page);
   // Every row's controls stay on screen.
   for (const sw of await page.getByRole('switch').all()) {
     const box = await sw.boundingBox();

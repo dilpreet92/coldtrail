@@ -40,8 +40,8 @@
   position: relative;
   grid-template-areas: 'toggle main next last actions';
   align-items: start;
-  padding-top: 14px;
-  padding-bottom: 14px;
+  padding-top: var(--space-4);
+  padding-bottom: var(--space-4);
   border-bottom: 1px solid var(--border);
 }
 .sch-row:last-child { border-bottom: 0; }
@@ -85,7 +85,7 @@
 }
 
 .sch-cell { min-width: 0; }
-.sch-cell-body { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; min-width: 0; }
+.sch-cell-body { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-1); min-width: 0; }
 
 /* The column header names the cells on wide screens; the per-cell label is for screen readers
    there, and becomes visible when the row stacks. */
@@ -108,6 +108,21 @@
 
 .sch-last-top { display: inline-flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
 .sch-counts { color: var(--text-2); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+
+/* Why a run failed (the server's note): up to three lines beside the columns, the tooltip has
+   the rest. Stacked rows and history cards (narrow, touch) show all of it. */
+.sch-note {
+  display: -webkit-box;
+  max-width: 48ch;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  color: var(--text-2);
+  font-size: 12.5px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
 .sch-count { white-space: nowrap; }
 .sch-links { display: flex; flex-wrap: wrap; gap: var(--space-1) var(--space-3); font-size: 12.5px; }
 
@@ -116,7 +131,9 @@
 
 .sch-menu-btn { width: 32px; height: 32px; color: var(--text-2); }
 .sch-menu-btn[aria-expanded='true'] { background: var(--surface-2); color: var(--text); }
-.sch-menu-btn[aria-busy='true'] { cursor: progress; opacity: 0.6; }
+.sch-menu-btn[aria-busy='true'] { cursor: progress; }
+/* Busy (a run is starting): the spinner stands in for the dots. */
+.sch-menu-btn[aria-busy='true'] > svg { display: none; }
 
 @container sch-list (max-width: 719px) {
   .sch-list-head { display: none; }
@@ -154,6 +171,8 @@
 
   .sch-actions { margin-top: -8px; }
   .sch-menu-btn { width: 40px; height: 40px; }
+  /* Stacked (phones, touch): the whole note, as no tooltip can be opened here. */
+  .sch-note { display: block; max-width: none; overflow: visible; -webkit-line-clamp: none; line-clamp: none; }
 }
 
 /* ---- Placeholders: loading skeleton, error, empty ---- */
@@ -218,14 +237,107 @@
 }
 .sch-history-empty svg { color: var(--text-3); }
 
-/* Positioned, so the visually hidden text in its cells (".sr-only" is absolute) stays inside
-   the sideways-scrolling box instead of widening the page. */
-.sch-history .table-wrap { position: relative; }
+.sch-history-body { container: sch-history / inline-size; }
 .sch-history .table th.align-right,
 .sch-history .table td.align-right { padding-left: var(--space-2); }
-.sch-history .table td { font-variant-numeric: tabular-nums; }
+/* A failed run's note makes its row taller: every cell starts on the first line. */
+.sch-history .table td { font-variant-numeric: tabular-nums; vertical-align: top; }
 .sch-history time { font-size: 13px; }
-.sch-run-name { font-weight: 500; }
+/* A long schedule name is cut short (the tooltip has it) so the run's numbers stay in view. */
+.sch-run-name {
+  display: inline-block;
+  max-width: 28ch;
+  overflow: hidden;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
+  white-space: nowrap;
+}
+.sch-run-status { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-1); min-width: 22ch; }
+.sch-run-status .sch-note { max-width: 40ch; -webkit-line-clamp: 2; line-clamp: 2; }
+
+/* Narrower than the table can need (about 1100px: a 28ch name, a failed run's note, a date from
+   last year), one card per run instead of a table to scroll sideways. A card shows the whole
+   note: cards are what touch screens get, where no tooltip can be opened.
+     Lunch Source
+     Oct 26, 16:15 · Scheduled
+     [Failed] why it failed
+     41 sourced · 19 enriched · 16 drafted · 0 sent
+     View run */
+@container sch-history (max-width: 1099px) {
+  .sch-history .table,
+  .sch-history .table tbody { display: block; }
+  .sch-history .table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+  }
+  .sch-history .table tbody tr {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    row-gap: var(--space-1);
+    padding: var(--space-3) var(--space-4);
+    border-bottom: 1px solid var(--border);
+  }
+  .sch-history .table tbody tr:last-child { border-bottom: 0; }
+  .sch-history .table tbody td,
+  .sch-history .table tbody td.align-right {
+    display: block;
+    padding: 0;
+    border: 0;
+    text-align: left;
+  }
+  .sch-history .table td.sch-c-schedule_name { order: 1; flex: 1 1 100%; min-width: 0; }
+  .sch-history .table td.sch-c-schedule_name .sch-run-name { max-width: 100%; }
+  .sch-history .table td.sch-c-started_at { order: 2; }
+  .sch-history .table td.sch-c-trigger { order: 3; }
+  .sch-history .table td.sch-c-started_at,
+  .sch-history .table td.sch-c-trigger { color: var(--text-3); font-size: 12.5px; }
+  .sch-history .table td.sch-c-started_at time { font-family: inherit; font-size: 12.5px; }
+  /* Each `content: … / ''` (no alt text for assistive tech) follows a plain one for browsers
+     without alt text (Safari < 17.4, Firefox < 128), which drop the whole declaration. */
+  .sch-history .table td.sch-c-trigger::before { content: '·'; content: '·' / ''; margin: 0 var(--space-1); }
+  .sch-history .table td.sch-c-status { order: 4; flex: 1 1 100%; margin-top: var(--space-1); }
+  .sch-history .table td.sch-c-status .sch-run-status { min-width: 0; }
+  .sch-history .table td.sch-c-status .sch-note { display: block; max-width: none; overflow: visible; -webkit-line-clamp: none; line-clamp: none; }
+  /* The counts read as a line, as on a schedule's row; the labels are for the eye only (the
+     column headers name them for assistive tech). */
+  .sch-history .table td.sch-c-num {
+    order: 5;
+    margin-right: var(--space-1);
+    color: var(--text-2);
+    font-size: 12.5px;
+    white-space: nowrap;
+  }
+  .sch-history .table td.sch-c-num .num { font-family: inherit; }
+  /* "\a0 " is a no-break space (the space after a CSS escape ends it and is dropped). */
+  .sch-history .table td.sch-c-sourced::after { content: '\a0 sourced\a0 ·'; content: '\a0 sourced\a0 ·' / ''; }
+  .sch-history .table td.sch-c-enriched::after { content: '\a0 enriched\a0 ·'; content: '\a0 enriched\a0 ·' / ''; }
+  .sch-history .table td.sch-c-drafted::after { content: '\a0 drafted\a0 ·'; content: '\a0 drafted\a0 ·' / ''; }
+  .sch-history .table td.sch-c-sent::after { content: '\a0 sent'; content: '\a0 sent' / ''; }
+  .sch-history .table td.sch-c-view { order: 6; flex: 1 1 100%; font-size: 12.5px; }
+  .sch-history .table td.sch-c-view:empty { display: none; }
+}
+
+/* Room for two lines per run:
+     Lunch Source                                        Oct 26, 16:15 · Scheduled
+     [Succeeded]  41 sourced · 19 enriched · 16 drafted · 0 sent           View run
+   (a failed run's note sits beside its badge, and its counts go on a third line). */
+@container sch-history (min-width: 600px) and (max-width: 1099px) {
+  .sch-history .table tbody tr::after { content: ''; order: 4; flex-basis: 100%; }
+  .sch-history .table td.sch-c-schedule_name { flex: 1 1 0; margin-right: var(--space-3); }
+  .sch-history .table td.sch-c-status { order: 5; flex: 0 1 auto; min-width: 0; margin: 0 var(--space-3) 0 0; }
+  .sch-history .table td.sch-c-status .sch-run-status { flex-direction: row; align-items: baseline; gap: var(--space-2); }
+  .sch-history .table td.sch-c-status .badge { flex: none; }
+  /* With a note, the counts start their own line rather than break up beside it. */
+  .sch-history .table tbody tr:has(.sch-note) td.sch-c-status { flex-basis: 100%; margin-right: 0; }
+  .sch-history .table td.sch-c-num { order: 6; }
+  .sch-history .table td.sch-c-view { order: 7; flex: none; margin-left: auto; padding-left: var(--space-3); }
+}
 
 /* ---- Create / edit dialog ---- */
 
@@ -273,7 +385,7 @@
   display: inline-flex;
   align-items: center;
   min-height: 30px;
-  padding: 0 14px;
+  padding: 0 var(--space-3);
   border-radius: var(--radius-control);
   color: var(--text-2);
   font-weight: 500;
@@ -291,12 +403,12 @@
 .sch-select {
   -webkit-appearance: none;
   appearance: none;
-  padding-right: 34px;
+  padding-right: calc(var(--space-3) + 16px + var(--space-2)); /* clear of the chevron */
   cursor: pointer;
 }
 .sch-select-chevron {
   position: absolute;
-  right: 10px;
+  right: var(--space-3);
   display: inline-flex;
   color: var(--text-3);
   pointer-events: none;
@@ -307,8 +419,8 @@
 .sch-choice {
   display: flex;
   align-items: flex-start;
-  gap: 10px;
-  padding: 10px var(--space-3);
+  gap: var(--space-2);
+  padding: var(--space-3);
   background: var(--surface);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-input);
@@ -325,7 +437,7 @@
 .sch-field-prompt textarea { min-height: 76px; }
 
 /* Next 3 runs */
-.sch-preview-box { display: flex; flex-direction: column; gap: 6px; }
+.sch-preview-box { display: flex; flex-direction: column; gap: var(--space-2); }
 .sch-preview {
   margin: 0;
   padding: 0;
@@ -338,7 +450,7 @@
   align-items: baseline;
   justify-content: space-between;
   gap: var(--space-3);
-  padding: 7px var(--space-3);
+  padding: var(--space-2) var(--space-3);
   border-bottom: 1px solid var(--border);
 }
 .sch-preview li:last-child { border-bottom: 0; }
@@ -350,8 +462,8 @@
 .sch-consequence {
   display: flex;
   align-items: flex-start;
-  gap: 10px;
-  padding: 10px var(--space-3);
+  gap: var(--space-2);
+  padding: var(--space-3);
   background: var(--surface-2);
   border: 1px solid var(--border);
   border-radius: var(--radius-input);

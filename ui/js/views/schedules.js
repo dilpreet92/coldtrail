@@ -6,13 +6,17 @@
 // Data: GET /api/schedules, /api/runs and /api/status, each loaded (and failing) on its own.
 // No polling of its own: the shared store's 30s summary tells it when a run finished (last_run
 // changes) or is running, and a 30s ticker keeps the relative times fresh. Unmount aborts
-// requests, stops the ticker, unsubscribes and closes any dialog or menu this screen opened.
+// requests (and, through the same signal, any dialog or confirm this screen opened), closes its
+// row menu, stops the ticker and unsubscribes.
+// The server writes a schedule's row before it installs or removes the OS timer, so a 500 from
+// a save or a toggle may come after the change was stored: the screen then reloads the list and
+// says what was saved and what wasn't.
 // Every dynamic string goes through h() (text nodes); nothing here builds HTML.
 
 import { api } from '../core/api.js';
-import { fmtDate, fmtNum, fmtRelative, h, pluralize, toDate } from '../core/dom.js';
+import { fmtDate, fmtNum, fmtRelative, h, pluralize, runStatus, toDate } from '../core/dom.js';
 import { href } from '../core/router.js';
-import { openDialog, openMenu, toast } from '../core/ui.js';
+import { confirmDialog, openDialog, openMenu, setBusy, toast } from '../core/ui.js';
 import { badge } from '../components/badge.js';
 import { emptyState } from '../components/emptyState.js';
 import { switchEl } from '../components/switch.js';
@@ -29,11 +33,7 @@ const DEFAULT_EMAIL_CAP = 20;
 const DEFAULT_LINKEDIN_CAP = 15;
 
 const TRIGGERS = { scheduled: 'Scheduled', manual: 'Manual', dry: 'Dry run' };
-const RUN_STATUS = {
-  ok: ['Succeeded', 'ok'],
-  error: ['Failed', 'danger'],
-  auth_failed: ['Sign-in failed', 'warn'],
-};
+const COUNTS = ['sourced', 'enriched', 'drafted', 'sent'];
 
 const LINKEDIN_CAVEAT =
   'LinkedIn invites only go out if this computer is awake and unlocked and LinkedIn is connected ' +
@@ -133,6 +133,29 @@ const listOf = (v, key) => (Array.isArray(v) ? v : (v && Array.isArray(v[key]) &
 const nameOf = (s) => (s.name && s.name.trim() ? s.name : 'Untitled schedule');
 const quoted = (s) => `“${nameOf(s)}”`;
 const enc = encodeURIComponent;
+const errText = (err) => (err && err.message) || String(err);
+/** Replace an element's children with `content` (nested arrays; null/false skipped, as h() does). */
+const fill = (el, content) => el.replaceChildren(...[content].flat(Infinity).filter((c) => c != null && c !== false));
+
+/** Why a run failed, as the server recorded it (scheduled_runs.note), or null. */
+function failureNote(run) {
+  if (!run || run.status === 'ok' || typeof run.note !== 'string') return null;
+  const note = run.note.trim();
+  return note || null;
+}
+
+/** Whether a stored schedule has the fields a save sent (`body`: the create/edit request). */
+function matchesSave(stored, body) {
+  if (!stored || !body) return false;
+  return (
+    stored.name === body.name &&
+    stored.freq === body.freq &&
+    stored.time === body.time &&
+    stored.task_mode === body.task_mode &&
+    (body.freq !== 'weekly' || Number(stored.weekday) === Number(body.weekday)) &&
+    (body.task_mode !== 'custom' || (stored.prompt || '') === (body.prompt || ''))
+  );
+}
 
 let uid = 0;
 
@@ -175,7 +198,9 @@ function mountSchedules(root, ctx) {
   let errSchedules = null;
   let errRuns = null;
   const ctls = { schedules: null, runs: null, status: null };
-  const overlays = new Set(); // dialogs and menus this screen opened
+  // Aborted on unmount: closes this screen's dialogs and confirms (and resolves a confirm false).
+  const life = new AbortController();
+  let menu = null; // the row menu last opened here (only one menu is ever open)
   const rowRefs = new Map(); // id → { s, nextCell, lastCell, row, menuBtn }
   const busyRows = new Set();
   let lastRunKey = runKey(store.get().summary);
@@ -310,6 +335,12 @@ function mountSchedules(root, ctx) {
 
   // ---- Schedule rows ----
 
+  /** The control on screen now with this data-focus-key (rows are rebuilt on every reload). */
+  function byKey(key) {
+    if (!key) return null;
+    return [...root.querySelectorAll('[data-focus-key]')].find((el) => el.dataset.focusKey === key) || null;
+  }
+
   // Re-rendering replaces rows; put focus back on the same control (by data-focus-key), or on
   // New schedule when that control is gone (a deleted row, the empty state's button).
   function keepFocus(fn) {
@@ -318,14 +349,22 @@ function mountSchedules(root, ctx) {
     const inList = at && listBox.contains(at);
     fn();
     if (!alive) return;
-    if (key) {
-      const again = [...root.querySelectorAll('[data-focus-key]')].find((el) => el.dataset.focusKey === key);
-      if (again) {
-        again.focus({ preventScroll: true });
-        return;
-      }
+    const again = byKey(key);
+    if (again) {
+      again.focus({ preventScroll: true });
+      return;
     }
     if (inList && !listBox.contains(document.activeElement)) newBtn.focus({ preventScroll: true });
+  }
+
+  // An overlay gives focus back to the control that opened it. When the list was rebuilt while
+  // it was open (a run finished, a reload), that control is gone and focus fell back to the
+  // page: put it on the control's replacement (same data-focus-key), else on New schedule.
+  function refocus(opener) {
+    if (!alive || !opener || opener.isConnected) return;
+    const at = document.activeElement;
+    if (at && at !== document.body && at.id !== 'view') return;
+    (byKey(opener.dataset && opener.dataset.focusKey) || newBtn).focus({ preventScroll: true });
   }
 
   function errorBlock(what, err, retry) {
@@ -444,8 +483,11 @@ function mountSchedules(root, ctx) {
     }
     const lr = s.last_run;
     if (!lr) return [h('span', { class: 'sch-none' }, 'No runs yet')];
-    const [label, tone] = RUN_STATUS[lr.status] || [lr.status || 'Unknown', 'neutral'];
+    const [label, tone] = runStatus(lr.status);
     const when = toDate(lr.started_at);
+    const note = failureNote(lr);
+    // A run that failed before doing anything says why instead of "0 sourced · 0 enriched …".
+    const idle = COUNTS.every((k) => !Number(lr[k]));
     const out = [
       h(
         'span',
@@ -453,15 +495,18 @@ function mountSchedules(root, ctx) {
         badge(label, tone),
         when ? h('time', { class: 'sch-sub', datetime: when.toISOString(), title: fmtDate(when, { time: true }) }, fmtRelative(when)) : null,
       ),
-      h(
-        'span',
-        { class: 'sch-counts' },
-        // Each "N label ·" pair stays on one line, so a wrap never starts a line with "·".
-        ['sourced', 'enriched', 'drafted', 'sent'].map((k, i, all) => [
-          i ? ' ' : null,
-          h('span', { class: 'sch-count' }, `${fmtNum(lr[k])} ${k}${i < all.length - 1 ? ' ·' : ''}`),
-        ]),
-      ),
+      note ? h('p', { class: 'sch-note', title: note }, note) : null,
+      note && idle
+        ? null
+        : h(
+          'span',
+          { class: 'sch-counts' },
+          // Each "N label ·" pair stays on one line, so a wrap never starts a line with "·".
+          COUNTS.map((k, i, all) => [
+            i ? ' ' : null,
+            h('span', { class: 'sch-count' }, `${fmtNum(lr[k])} ${k}${i < all.length - 1 ? ' ·' : ''}`),
+          ]),
+        ),
     ];
     const links = [];
     if (lr.chat_id) {
@@ -510,7 +555,8 @@ function mountSchedules(root, ctx) {
       h(
         'div',
         { class: 'sch-main' },
-        h('div', { class: 'sch-name' }, nameOf(s)),
+        // A long name is cut short on screen; the tooltip has all of it.
+        h('div', { class: 'sch-name', title: nameOf(s) }, nameOf(s)),
         h('div', { class: 'sch-meta' }, h('span', { class: 'sch-cadence' }, cadenceLabel(s)), taskBits(s)),
       ),
       nextCell,
@@ -527,14 +573,14 @@ function mountSchedules(root, ctx) {
     const { s } = ref;
     ref.row.classList.toggle('is-paused', !s.enabled);
     ref.sw.setChecked(!!s.enabled);
-    ref.nextCell.lastChild.replaceChildren(...nextContent(s));
-    ref.lastCell.lastChild.replaceChildren(...lastContent(s));
+    fill(ref.nextCell.lastChild, nextContent(s));
+    fill(ref.lastCell.lastChild, lastContent(s));
   }
 
   // Keep "in 3h" / "2h ago" current. The next-run cell holds nothing focusable, so it is
   // rebuilt (the next run moves on once its slot passes); elsewhere only the text changes.
   function tick() {
-    for (const { s, nextCell } of rowRefs.values()) nextCell.lastChild.replaceChildren(...nextContent(s));
+    for (const { s, nextCell } of rowRefs.values()) fill(nextCell.lastChild, nextContent(s));
     for (const t of root.querySelectorAll('.sch-last time[datetime], .sch-history time[datetime]')) {
       const d = toDate(t.getAttribute('datetime'));
       if (d) t.textContent = fmtRelative(d);
@@ -543,8 +589,47 @@ function mountSchedules(root, ctx) {
 
   // ---- Actions ----
 
+  /** GET /api/schedules outside the screen's own loader → the list, or null when it failed. */
+  function fetchList() {
+    return api.get('/api/schedules', { signal: life.signal }).then((v) => listOf(v, 'schedules'), () => null);
+  }
+
+  /** Show `fresh` (a list just read) as the screen's list. A reload already on its way (e.g. the
+   *  store's, when a run finished) was asked before it, so its answer must not replace it. */
+  function adopt(fresh) {
+    if (!alive || !fresh) return;
+    if (ctls.schedules) {
+      ctls.schedules.abort();
+      ctls.schedules = null;
+    }
+    schedules = fresh;
+    errSchedules = null;
+    keepFocus(renderList);
+  }
+
   async function toggle(s, on) {
-    await api.patch(`/api/schedules/${enc(s.id)}`, { enabled: on });
+    try {
+      await api.patch(`/api/schedules/${enc(s.id)}`, { enabled: on });
+    } catch (err) {
+      if (!alive || (err && err.status === 401)) throw err;
+      // The row may already say `on` (the timer step failed after it was written): show what
+      // is stored rather than leave the switch saying the opposite.
+      const fresh = await fetchList();
+      adopt(fresh);
+      const stored = fresh && fresh.find((x) => x.id === s.id);
+      if (alive && stored && !!stored.enabled === on) {
+        store.refresh();
+        toast(
+          on
+            ? `${quoted(s)} is on, but its timer couldn't be installed, so it won't run yet: ${errText(err)}`
+            : `${quoted(s)} is paused, but its timer couldn't be removed, so it may still run: ${errText(err)}`,
+          'err',
+        );
+        return true;
+      }
+      // Nothing changed: the switch goes back and shows this.
+      throw new Error(`Couldn't ${on ? 'turn on' : 'pause'} ${quoted(s)}: ${errText(err)}`);
+    }
     if (!alive) return true;
     // The response's last_run is always null: keep the one on screen.
     s.enabled = on;
@@ -555,56 +640,38 @@ function mountSchedules(root, ctx) {
     return true;
   }
 
-  function track(handle) {
-    overlays.add(handle);
-    return handle;
-  }
-
   function rowMenu(s, btn) {
-    const m = openMenu(btn, [
-      { label: 'Run now', onSelect: () => start(s, btn, { dry: false }) },
-      { label: 'Dry run', onSelect: () => start(s, btn, { dry: true }) },
-      { label: 'Edit', onSelect: () => openEditor(s, btn) },
-      { label: 'Delete', danger: true, onSelect: () => remove(s, btn) },
+    // The list may have been reloaded since this row was drawn: act on the latest copy.
+    const cur = () => (schedules || []).find((x) => x.id === s.id) || s;
+    // A run of this schedule is going on: a second one at once would race it.
+    const live = isRunning(s);
+    menu = openMenu(btn, [
+      { label: 'Run now', disabled: live, onSelect: () => start(cur(), btn, { dry: false }) },
+      { label: 'Dry run', disabled: live, onSelect: () => start(cur(), btn, { dry: true }) },
+      { label: 'Edit', onSelect: () => openEditor(cur(), btn) },
+      { label: 'Delete', danger: true, onSelect: () => remove(cur(), btn) },
     ]);
-    track(m);
   }
 
-  /** A confirm (alertdialog) this screen owns, so leaving the screen closes it. */
-  function ask({ title: t, body, confirmText, danger = false, opener }) {
-    return new Promise((resolve) => {
-      let yes = false;
-      let dlg = null;
-      dlg = openDialog({
-        title: t,
-        content: body,
-        role: 'alertdialog',
-        opener,
-        actions: [
-          { label: 'Cancel', kind: 'secondary', autofocus: danger },
-          { label: confirmText, kind: danger ? 'danger' : 'primary', autofocus: !danger, onClick: () => { yes = true; } },
-        ],
-        onClose: () => {
-          overlays.delete(dlg);
-          resolve(yes && alive);
-        },
-      });
-      track(dlg);
-    });
+  /** A confirm tied to this screen: leaving it closes the confirm, which then answers false. */
+  async function ask(opts) {
+    const ok = await confirmDialog({ ...opts, signal: life.signal });
+    refocus(opts.opener);
+    return ok && alive;
   }
 
-  // Run now / Dry run. One at a time per row (the button is busy until the run has started).
+  // Run now / Dry run. One at a time per row (the ⋯ button is busy until the run has started).
   async function start(s, btn, { dry }) {
     if (busyRows.has(s.id)) return;
     busyRows.add(s.id);
-    btn.setAttribute('aria-busy', 'true');
+    setBusy(btn, true);
     try {
       if (!dry) {
         // Ask with fresh settings: what this run may send is decided when it runs. A dry run
         // never asks: it can't send.
         let st = null;
         try {
-          st = await api.get('/api/status');
+          st = await api.get('/api/status', { signal: life.signal });
         } catch (_) {
           st = null;
         }
@@ -632,10 +699,10 @@ function mountSchedules(root, ctx) {
       toast(dry ? `Dry run of ${quoted(s)} started. It only writes drafts.` : `${quoted(s)} is running.`, 'info');
       nav.navigate(href(['agent', res.chat_id]));
     } catch (err) {
-      if (alive) toast((err && err.message) || String(err), 'err');
+      if (alive && !(err && err.name === 'AbortError')) toast(errText(err), 'err');
     } finally {
       busyRows.delete(s.id);
-      btn.removeAttribute('aria-busy');
+      setBusy(btn, false);
     }
   }
 
@@ -651,7 +718,7 @@ function mountSchedules(root, ctx) {
     try {
       await api.del(`/api/schedules/${enc(s.id)}`);
     } catch (err) {
-      if (alive) toast((err && err.message) || String(err), 'err');
+      if (alive) toast(errText(err), 'err');
       return;
     }
     if (!alive) return;
@@ -670,6 +737,9 @@ function mountSchedules(root, ctx) {
     const n = ++uid;
     const id = (k) => `sch-${k}-${n}`;
     let saved = null; // { schedule, created } once a save succeeded
+    // What is stored for editId as far as this dialog knows (the row it opened, or the one a
+    // failed create left): a failed edit that sent just this can't show it was written.
+    let base = s;
 
     const field = (label, control, { hint, key } = {}) => {
       const err = h('p', { class: 'field-error', id: id(`${key}-err`), hidden: true });
@@ -861,27 +931,52 @@ function mountSchedules(root, ctx) {
         task_mode: mode,
         prompt: mode === 'custom' ? prompt : null,
       };
+      const shown = (msg) => Object.assign(new Error(msg), { shown: true });
       try {
         if (editId) {
-          const res = await api.patch(`/api/schedules/${enc(editId)}`, body);
-          saved = { schedule: res, created: !s };
+          try {
+            const res = await api.patch(`/api/schedules/${enc(editId)}`, body);
+            saved = { schedule: res, created: !s };
+          } catch (err) {
+            // A timer error comes after the row was written: show what is stored now. Only a
+            // change that is now stored says "Saved": a save of what was stored already can't
+            // tell a failed write (e.g. "database is locked") from a failed timer step.
+            if (err && err.status >= 500 && alive) {
+              const fresh = await fetchList();
+              adopt(fresh);
+              store.refresh();
+              const stored = fresh && fresh.find((x) => x.id === editId);
+              const changed = !matchesSave(base, body);
+              if (stored) base = stored;
+              if (changed && matchesSave(stored, body)) {
+                throw shown(`Saved, but its timer wasn't updated: ${errText(err)}`);
+              }
+            }
+            throw err;
+          }
         } else {
-          const before = new Set((schedules || []).map((x) => x.id));
+          // The ids that exist just before this save, read fresh (the screen's list may be
+          // missing or out of date), so a row the failed save left behind can be told apart.
+          const listed = await fetchList();
+          const before = listed || schedules ? new Set((listed || schedules).map((x) => x.id)) : null;
+          if (!alive) return false;
           try {
             const res = await api.post('/api/schedules', { ...body, enabled: true });
             saved = { schedule: res, created: true };
           } catch (err) {
             // The server writes the row before installing its timer: if that row exists now,
             // keep editing it so saving again can't create a duplicate.
-            if (err && err.status >= 500) {
-              const fresh = await api.get('/api/schedules').catch(() => null);
-              const added = listOf(fresh, 'schedules').find((x) => !before.has(x.id) && x.name === name);
+            if (err && err.status >= 500 && before && alive) {
+              const fresh = await fetchList();
+              const added = (fresh || []).filter((x) => !before.has(x.id) && matchesSave(x, body)).pop();
               if (added && alive) {
                 editId = added.id;
-                schedules = listOf(fresh, 'schedules');
-                keepFocus(renderList);
+                base = added;
+                adopt(fresh);
+                store.refresh();
+                dlg.el.querySelector('.dialog-title').textContent = 'Edit schedule';
                 saveBtn.textContent = 'Save changes';
-                throw Object.assign(new Error(`Saved, but its timer wasn't installed: ${err.message}`), { shown: true });
+                throw shown(`Saved, but its timer wasn't installed: ${errText(err)}`);
               }
             }
             throw err;
@@ -889,7 +984,7 @@ function mountSchedules(root, ctx) {
         }
       } catch (err) {
         if (!alive) return false;
-        formError.textContent = err && err.shown ? err.message : `Couldn't save: ${(err && err.message) || err}`;
+        formError.textContent = err && err.shown ? err.message : `Couldn't save: ${errText(err)}`;
         formError.hidden = false;
         return false;
       }
@@ -908,23 +1003,38 @@ function mountSchedules(root, ctx) {
     });
 
     sync();
-    let dlg = null;
-    dlg = openDialog({
+    // What the form holds, to tell whether anything was typed or changed since it opened.
+    const snapshot = () => JSON.stringify([nameIn.value, freq(), daySel.value, timeIn.value, task(), promptIn.value]);
+    const pristine = snapshot();
+    const dlg = openDialog({
       title: s ? 'Edit schedule' : 'New schedule',
       content: form,
       opener,
+      signal: life.signal,
       actions: [
         { label: 'Cancel', kind: 'secondary' },
         { label: s ? 'Save changes' : 'Create schedule', kind: 'primary', onClick: save },
       ],
       onClose: () => {
-        overlays.delete(dlg);
+        refocus(opener);
         if (saved && alive) afterSave(saved);
       },
     });
-    track(dlg);
     dlg.el.classList.add('sch-dialog');
     const saveBtn = dlg.el.querySelector('.dialog-actions .btn-primary');
+    // A stray click beside the dialog doesn't throw away what was typed (a long instruction):
+    // once the form has changed, only Cancel, Close or Esc close it. This listener runs before
+    // the backdrop's own (a capture listener on the target fires first).
+    const backdrop = dlg.el.parentElement;
+    if (backdrop) {
+      backdrop.addEventListener(
+        'click',
+        (e) => {
+          if (e.target === backdrop && snapshot() !== pristine) e.stopImmediatePropagation();
+        },
+        true,
+      );
+    }
   }
 
   // Runs once the dialog has closed and focus is back on its opener, so re-rendering the list
@@ -974,6 +1084,10 @@ function mountSchedules(root, ctx) {
         label: 'Run history',
         rows: runs,
         rowKey: (r) => `${r.started_at}|${r.chat_id || ''}|${r.schedule_name || ''}`,
+        // Narrow screens lay each run out as a card (schedules.css): explicit roles keep it a
+        // table for assistive tech, and a class per column places each cell.
+        roles: true,
+        cellClass: (col) => [`sch-c-${col.key}`, COUNTS.includes(col.key) && 'sch-c-num'],
         columns: [
           {
             key: 'started_at',
@@ -988,16 +1102,20 @@ function mountSchedules(root, ctx) {
             key: 'schedule_name',
             label: 'Schedule',
             nowrap: true,
-            render: (r) => (r.schedule_name ? h('span', { class: 'sch-run-name' }, r.schedule_name) : h('span', { class: 'text-3' }, 'No schedule')),
+            render: (r) =>
+              r.schedule_name
+                ? h('span', { class: 'sch-run-name', title: r.schedule_name }, r.schedule_name)
+                : h('span', { class: 'text-3' }, 'No schedule'),
           },
           { key: 'trigger', label: 'Trigger', nowrap: true, render: (r) => TRIGGERS[r.trigger] || (r.trigger ? r.trigger : '—') },
           {
             key: 'status',
             label: 'Status',
-            nowrap: true,
             render: (r) => {
-              const [label, tone] = RUN_STATUS[r.status] || [r.status || 'Unknown', 'neutral'];
-              return badge(label, tone);
+              const [label, tone] = runStatus(r.status);
+              const note = failureNote(r);
+              if (!note) return badge(label, tone);
+              return h('div', { class: 'sch-run-status' }, badge(label, tone), h('p', { class: 'sch-note', title: note }, note));
             },
           },
           num('sourced', 'Sourced'),
@@ -1052,24 +1170,22 @@ function mountSchedules(root, ctx) {
 
   const self = {
     update(next) {
-      if (next.query && next.query.new) {
-        nav.setQuery({ new: null });
-        if (![...overlays].length) openEditor(null, newBtn);
-      }
+      if (!(next.query && next.query.new)) return;
+      // Drop the flag from the address (so back/refresh don't reopen it) without routing again.
+      nav.setQuery({ new: null }, { silent: true });
+      // Never stack it on a dialog that is already open (this one, a confirm, a drawer).
+      if (document.querySelector('#overlays [data-overlay="dialog"], #overlays [data-overlay="drawer"]')) return;
+      if (menu) menu.close();
+      openEditor(null, newBtn);
     },
     unmount() {
       alive = false;
       clearInterval(ticker);
       unsubscribe();
       for (const ctl of Object.values(ctls)) if (ctl) ctl.abort();
-      for (const o of [...overlays]) {
-        try {
-          o.close();
-        } catch (_) {
-          /* already closed */
-        }
-      }
-      overlays.clear();
+      life.abort(); // closes this screen's dialogs and confirms
+      if (menu) menu.close(); // a no-op once it has closed
+      menu = null;
     },
   };
   // ?new=1 (e.g. from Home or the setup finish screen) opens the dialog once the screen is up.
