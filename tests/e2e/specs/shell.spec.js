@@ -1,12 +1,12 @@
 // The app shell (spec §4) and the shared components every screen builds on: grouped sidebar with
 // live counts and connection dots, hash routing with back/forward, ⌘K search, the schedule chip,
-// theme, the phone-width menu, the stale-session banner, and the redirect into setup for a new
-// workspace. The views here are still placeholders; Phase 3 replaces them.
+// theme, the phone-width menu, the stale-session banner, and the redirect into setup for a
+// workspace that was never set up.
 import { expectAccessible } from '../harness/a11y.mjs';
 import { test, expect } from '../harness/fixtures.mjs';
 import { COMPANIES, SEED } from '../harness/seed.mjs';
 import { SESSION_EXPIRED } from '../../../ui/js/core/api.js';
-import { fmtDate, fmtNum } from '../../../ui/js/core/format.js';
+import { fmtDate, fmtNum, fmtRelative } from '../../../ui/js/core/format.js';
 
 const reEscape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const hashIs = (hash) => new RegExp(`${reEscape(hash)}$`);
@@ -72,6 +72,9 @@ test('nav shows grouped items with seeded counts', async ({ app, page }) => {
   // Colour is never the only signal: a state that isn't fine says so in words.
   await expect(conns.nth(2).locator('.conn-state')).toHaveText('Connect');
   await expect(conns.nth(0)).toHaveAccessibleName('Agent · opencode: ready');
+  // The spoken name starts with the words on screen (WCAG 2.5.3, label in name).
+  await expect(conns.nth(2)).toHaveAccessibleName('Gmail: Connect');
+  await expect(conns.nth(1)).toHaveAccessibleName('Canonical: connected');
 });
 
 test('connection dots turn amber for problems only the human can fix', async ({ app, page }) => {
@@ -88,8 +91,25 @@ test('connection dots turn amber for problems only the human can fix', async ({ 
   const conns = page.locator('#nav .conn');
   await expect(conns.nth(0)).toHaveAttribute('data-state', 'warn');
   await expect(conns.nth(0).locator('.conn-state')).toHaveText('Not installed');
+  await expect(conns.nth(0)).toHaveAccessibleName('Agent · opencode: Not installed');
   await expect(conns.nth(3)).toHaveAttribute('data-state', 'warn');
   await expect(conns.nth(3).locator('.conn-state')).toHaveText('Reconnect');
+  await expect(conns.nth(3)).toHaveAccessibleName('LinkedIn: Reconnect');
+});
+
+test('connection link names start with their visible words', async ({ app, page }) => {
+  await page.route('**/api/status*', async (route) => {
+    const res = await route.fetch();
+    const status = await res.json();
+    status.agents = status.agents.map((a) => (a.kind === 'opencode' ? { ...a, present: true, authed: false } : a));
+    await route.fulfill({ response: res, json: status });
+  });
+  await app.goto('#/home');
+  await shellReady(page);
+  const agent = page.locator('#nav .conn').nth(0);
+  await expect(agent.locator('.conn-state')).toHaveText('Sign in');
+  await expect(agent).toHaveAccessibleName('Agent · opencode: Sign in');
+  await expect(agent).toHaveAttribute('title', 'Agent · opencode: Sign in');
 });
 
 test('deep link #/pipeline loads Pipeline and back/forward works', async ({ app, page }) => {
@@ -104,10 +124,13 @@ test('deep link #/pipeline loads Pipeline and back/forward works', async ({ app,
   expect(new URL(page.url()).search).toBe('');
   expect(new URL(page.url()).hash).toBe('#/pipeline');
 
+  // Drafts opens its first draft (the seed has some), rewriting #/drafts to #/drafts/<domain>
+  // in place once its list has loaded: wait for that before taking the address back and forth.
   await nav.getByRole('link', { name: /^Drafts\b/ }).click();
-  await expect(page).toHaveURL(hashIs('#/drafts'));
+  await expect(page).toHaveURL(/#\/drafts\/[^/?#]+$/);
   await expect(h1).toHaveText('Drafts');
   await expect(current).toHaveText('Drafts');
+  const draftsHash = new URL(page.url()).hash;
 
   await page.goBack();
   await expect(page).toHaveURL(hashIs('#/pipeline'));
@@ -115,8 +138,9 @@ test('deep link #/pipeline loads Pipeline and back/forward works', async ({ app,
   await expect(current).toHaveText('Pipeline');
 
   await page.goForward();
-  await expect(page).toHaveURL(hashIs('#/drafts'));
+  await expect(page).toHaveURL(hashIs(draftsHash));
   await expect(h1).toHaveText('Drafts');
+  await expect(current).toHaveText('Drafts');
 
   // Refresh keeps the screen; an item route highlights its section.
   await page.goto(page.url().replace(/#.*$/, '#/pipeline/acme.example?q=a%20b'));
@@ -221,7 +245,14 @@ test('schedule chip shows next Lunch Source run', async ({ app, page, server, re
   expect(summary.next_schedule.name).toBe(SEED.schedules.lunch.name);
   await app.goto('#/home');
   const chip = page.locator('#topbar .chip');
-  await expect(chip).toHaveText(/^Lunch Source · next (in \d+[mh]|.+)$/);
+  // "<name> · next <relative>": a daily run is always within 48h, so it counts down ("in 3h").
+  await expect(chip).toHaveText(/^Lunch Source · next in \d+[mh]$/);
+  const text = await chip.textContent();
+  const now = Date.now();
+  const nextAt = summary.next_schedule.next_at;
+  // Rendered a moment ago: allow a minute or hour boundary in between.
+  const expected = [-120, -60, 0, 60].map((s) => `Lunch Source · next ${fmtRelative(nextAt, new Date(now + s * 1000))}`);
+  expect(expected).toContain(text);
   await expect(chip).toHaveAttribute('href', '#/schedules');
   await expect(chip).toHaveAttribute('title', `Next run ${fmtDate(summary.next_schedule.next_at, { time: true })}`);
   await chip.click();
@@ -359,6 +390,75 @@ test('shell is accessible', async ({ app, page }) => {
   await expectAccessible(page);
   await page.emulateMedia({ colorScheme: 'light' });
   await expectAccessible(page);
+});
+
+test('⌘K from inside a drawer or dialog closes it and focuses search', async ({ app, page }) => {
+  await app.goto('#/home');
+  await shellReady(page);
+  const search = page.getByRole('combobox', { name: 'Search' });
+  for (const kind of ['drawer', 'dialog']) {
+    await page.evaluate(async (k) => {
+      const ui = await import('/assets/js/core/ui.js');
+      if (k === 'drawer') ui.openDrawer({ title: 'Acme', content: 'Company details' });
+      else ui.openDialog({ title: 'Send all?', content: 'Sends 12 emails.', actions: [{ label: 'Cancel' }] });
+    }, kind);
+    await expect(page.locator('[data-overlay]')).toHaveCount(1);
+    await page.keyboard.press('ControlOrMeta+k');
+    await expect(page.locator('[data-overlay]')).toHaveCount(0);
+    await expect(search).toBeFocused();
+    await search.blur();
+  }
+
+  // Setup hides the top bar: ⌘K has nothing to focus there, so it leaves the dialog (and the
+  // browser's own shortcut) alone.
+  await app.goto('#/setup');
+  await expect(page.locator('#app')).toHaveAttribute('data-route', 'setup');
+  await expect(page.locator('#view h1')).toBeVisible();
+  await page.evaluate(async () => {
+    const ui = await import('/assets/js/core/ui.js');
+    ui.openDialog({ title: 'Skip this step?', content: 'You can finish it later.', actions: [{ label: 'Cancel' }] });
+    window.__prevented = null;
+    document.addEventListener('keydown', (e) => { if (e.key === 'k') setTimeout(() => { window.__prevented = e.defaultPrevented; }); });
+  });
+  await expect(page.locator('[data-overlay]')).toHaveCount(1);
+  await page.keyboard.press('ControlOrMeta+k');
+  await expect.poll(() => page.evaluate(() => window.__prevented)).toBe(false);
+  await expect(page.locator('[data-overlay]')).toHaveCount(1);
+});
+
+test('a screen that failed to load is tried again from its nav link', async ({ app, page }) => {
+  app.allowConsole(/kaboom/);
+  // Follow-ups whose mount fails until window.__ok is set.
+  await page.route('**/assets/js/views/followups.js', (route) =>
+    route.fulfill({
+      contentType: 'text/javascript',
+      body: `export default { title: 'Follow-ups', mount(root) {
+        if (!window.__ok) throw new Error('kaboom');
+        const h = document.createElement('h1'); h.textContent = 'Follow-ups'; root.append(h);
+      } };`,
+    }),
+  );
+  await app.goto('#/home');
+  await shellReady(page);
+  const link = page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: /^Follow-ups\b/ });
+  await link.click();
+  await expect(page.locator('#view h1')).toHaveText("This screen didn't load");
+  await expect(page.locator('#view')).toContainText('kaboom');
+  await page.evaluate(() => { window.__ok = true; });
+  await link.click();
+  await expect(page.locator('#view h1')).toHaveText('Follow-ups');
+  await expect(page).toHaveURL(hashIs('#/followups'));
+});
+
+test('the shell exports its wordmark for full-page screens', async ({ app, page }) => {
+  await app.goto('#/home');
+  await shellReady(page);
+  const mark = await page.evaluate(async () => {
+    const { wordmark } = await import('/assets/js/shell.js');
+    const a = wordmark();
+    return { tag: a.tagName, cls: a.className, href: a.getAttribute('href'), text: a.textContent, svg: !!a.querySelector('svg[aria-hidden="true"]') };
+  });
+  expect(mark).toEqual({ tag: 'A', cls: 'wordmark', href: '#/home', text: 'coldtrail', svg: true });
 });
 
 test.describe('components', () => {
@@ -602,6 +702,298 @@ test.describe('components', () => {
     expect(await top('#ld-list')).toBeLessThan(await top('#ld-detail'));
   });
 
+  test('empty state takes a heading level; table rows can skip the tab stop and carry roles and cell classes', async ({ app, page }) => {
+    await app.goto('#/home');
+    await sandbox(page, async (box) => {
+      const { emptyState } = await import('/assets/js/components/emptyState.js');
+      const { table } = await import('/assets/js/components/table.js');
+      const inDrawer = emptyState({ title: 'No contacts yet', level: 3 });
+      inDrawer.id = 'es-3';
+      const plain = emptyState({ title: 'Nothing yet', level: 9 });
+      plain.id = 'es-2';
+      const t = table({
+        label: 'Runs',
+        rowKey: 'id',
+        rowFocus: false,
+        roles: true,
+        cellClass: (col, row) => (row ? `c-${col.key}` : `h-${col.key}`),
+        rows: [{ id: 'r1', name: 'Lunch Source' }],
+        columns: [
+          { key: 'name', label: 'Schedule' },
+          { key: 'go', label: 'Open', render: (r) => {
+            const a = document.createElement('a');
+            a.href = '#/home?run=' + r.id;
+            a.textContent = 'View run';
+            return a;
+          } },
+        ],
+        onRowClick: (row) => window.__calls.push('row ' + row.id),
+      });
+      t.id = 'tbl';
+      box.append(inDrawer, plain, t);
+    });
+    await expect(page.locator('#es-3 h3.empty-title')).toHaveText('No contacts yet');
+    await expect(page.locator('#es-2 h2.empty-title')).toHaveText('Nothing yet');
+    const t = page.locator('#tbl');
+    const row = t.locator('tbody tr');
+    await expect(row).not.toHaveAttribute('tabindex', /.*/);
+    await expect(row).toHaveClass(/is-clickable/);
+    await row.locator('td').first().click();
+    expect(await calls(page)).toEqual(['row r1']);
+    // The link is the keyboard stop.
+    await expect(row.getByRole('link', { name: 'View run' })).toHaveAttribute('href', '#/home?run=r1');
+    await expect(t.locator('table')).toHaveAttribute('role', 'table');
+    await expect(t.locator('thead')).toHaveAttribute('role', 'rowgroup');
+    await expect(t.locator('tbody')).toHaveAttribute('role', 'rowgroup');
+    await expect(row).toHaveAttribute('role', 'row');
+    await expect(t.locator('th').first()).toHaveAttribute('role', 'columnheader');
+    await expect(t.locator('td').first()).toHaveAttribute('role', 'cell');
+    await expect(t.locator('th').first()).toHaveClass(/h-name/);
+    await expect(t.locator('td').nth(1)).toHaveClass(/c-go/);
+    // Default tables keep their rows as tab stops and add no roles.
+    await sandbox(page, async (box) => {
+      const { table } = await import('/assets/js/components/table.js');
+      box.append(table({ rowKey: 'id', rows: [{ id: 'a' }], columns: [{ key: 'id', label: 'Id' }], onRowClick() {} }));
+    });
+    await expect(page.locator('#sandbox tbody tr')).toHaveAttribute('tabindex', '0');
+    await expect(page.locator('#sandbox table')).not.toHaveAttribute('role', /.*/);
+  });
+
+  test('text hidden in a sideways-scrolling table stays inside it on a phone', async ({ app, page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await app.goto('#/home');
+    await sandbox(page, async (box) => {
+      const { table } = await import('/assets/js/components/table.js');
+      const t = table({
+        label: 'Run history',
+        rowKey: 'id',
+        rows: [{ id: 'r1' }, { id: 'r2' }],
+        columns: [
+          { key: 'a', label: 'When', render: () => 'Oct 27, 13:00 and a long cell' },
+          { key: 'b', label: 'What', render: () => 'A long description of what the run did today' },
+          { key: 'c', label: 'Open', render: (r) => {
+            const s = document.createElement('span');
+            s.className = 'sr-only';
+            s.textContent = 'View run ' + r.id + ' with a long hidden label for screen readers';
+            return s;
+          } },
+        ],
+      });
+      t.querySelector('table').style.minWidth = '760px';
+      box.append(t);
+    });
+    await expect(page.locator('#sandbox .table-wrap')).toHaveCSS('position', 'relative');
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+  });
+
+  test('a switch with confirm asks before it flips', async ({ app, page }) => {
+    await app.goto('#/home');
+    await sandbox(page, async (box) => {
+      const { switchEl } = await import('/assets/js/components/switch.js');
+      box.append(switchEl({
+        checked: false,
+        label: 'Auto-send LinkedIn',
+        confirm: (next) => {
+          window.__calls.push('ask ' + next);
+          if (!next) return true; // only turning it on asks
+          return new Promise((r) => { window.__answer = r; });
+        },
+        onChange: (on) => { window.__calls.push(on); },
+      }));
+    });
+    const sw = page.getByRole('switch', { name: 'Auto-send LinkedIn' });
+    await sw.click();
+    // Still off while it asks, and busy.
+    await expect(sw).toHaveAttribute('aria-busy', 'true');
+    await expect(sw).toHaveAttribute('aria-checked', 'false');
+    await sw.click(); // ignored while asking
+    await page.evaluate(() => window.__answer(false));
+    await expect(sw).not.toHaveAttribute('aria-busy', 'true');
+    await expect(sw).toHaveAttribute('aria-checked', 'false');
+    expect(await calls(page)).toEqual(['ask true']);
+
+    await sw.click();
+    await page.evaluate(() => window.__answer(true));
+    await expect(sw).toHaveAttribute('aria-checked', 'true');
+    await sw.click(); // turning off: confirm says yes at once
+    await expect(sw).toHaveAttribute('aria-checked', 'false');
+    expect(await calls(page)).toEqual(['ask true', 'ask true', true, 'ask false', false]);
+  });
+
+  test('tabs keep the chosen tab in view, fade the edge with more, and count numeric ids', async ({ app, page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await app.goto('#/home');
+    await sandbox(page, async (box) => {
+      const { tabs } = await import('/assets/js/components/tabs.js');
+      const t = tabs({
+        label: 'Sections',
+        items: [1, 2, 3, 4, 5, 6, 7, 8].map((n) => ({ id: n, label: 'Section number ' + n, count: n === 3 ? 1 : null })),
+        active: 1,
+        onChange: (id) => window.__calls.push(id),
+      });
+      window.__tabs = t;
+      box.append(t);
+    });
+    const list = page.getByRole('tablist', { name: 'Sections' });
+    const tab = (n) => list.getByRole('tab', { name: new RegExp(`^Section number ${n}\\b`) });
+    await page.evaluate(() => window.__tabs.setCounts({ 3: 1200, 5: 7 }));
+    await expect(tab(3).locator('.tab-count')).toHaveText('1,200');
+    await expect(tab(5).locator('.tab-count')).toHaveText('7');
+    await expect(list).toHaveAttribute('data-more', 'end');
+
+    const inView = (n) =>
+      tab(n).evaluate((b) => {
+        const l = b.parentElement.getBoundingClientRect();
+        const r = b.getBoundingClientRect();
+        return r.left >= l.left - 1 && r.right <= l.right + 1;
+      });
+    expect(await inView(8)).toBe(false);
+    await page.evaluate(() => window.__tabs.setActive(8));
+    await expect(tab(8)).toHaveAttribute('aria-selected', 'true');
+    await expect.poll(() => inView(8)).toBe(true);
+    await expect(list).toHaveAttribute('data-more', 'start');
+    // Keyboard selection scrolls too.
+    await tab(8).focus();
+    await page.keyboard.press('Home');
+    await expect.poll(() => inView(1)).toBe(true);
+    expect(await calls(page)).toEqual([1]);
+    await expect(list).toHaveAttribute('data-more', 'end');
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+  });
+
+  test('search select can be disabled later and opens under its input, inside the viewport', async ({ app, page }) => {
+    await page.setViewportSize({ width: 1000, height: 700 });
+    await app.goto('#/home');
+    await page.addStyleTag({ content: '#sandbox .wide .ss-list { right: auto; width: max-content; }' });
+    await sandbox(page, async (box) => {
+      const { searchSelect } = await import('/assets/js/components/searchSelect.js');
+      const long = (n) => 'A very long saved search that runs well past the edge of the screen number ' + n;
+      const top = searchSelect({ label: 'Model', options: [{ value: 'a', label: 'fake/model-a' }], onChange() {} });
+      top.id = 'ss-top';
+      top.classList.add('wide');
+      top.style.cssText = 'position: fixed; top: 80px; right: 16px; width: 220px';
+      top.setAttribute('data-x', '1');
+      top.querySelector('input').setAttribute('data-x', '1');
+      const options = Array.from({ length: 12 }, (_, i) => ({ value: 'q' + i, label: long(i) }));
+      top.setOptions(options);
+      const low = searchSelect({ label: 'Sourced by', options, value: '', onChange() {} });
+      low.id = 'ss-low';
+      low.style.cssText = 'position: fixed; bottom: 16px; left: 16px; width: 260px';
+      window.__ss = top;
+      box.append(top, low);
+    });
+    const vw = 1000;
+    const vh = 700;
+    const rect = (sel) => page.locator(sel).evaluate((el) => el.getBoundingClientRect().toJSON());
+
+    const model = page.getByRole('combobox', { name: 'Model' });
+    await model.click();
+    const listTop = page.getByRole('listbox', { name: 'Model' });
+    await expect(listTop).toBeVisible();
+    const input = await rect('#ss-top input');
+    const lb = await listTop.evaluate((el) => el.getBoundingClientRect().toJSON());
+    expect(Math.abs(lb.top - input.bottom)).toBeLessThanOrEqual(8); // under the input, not the label
+    expect(lb.right).toBeLessThanOrEqual(vw);
+    expect(lb.left).toBeGreaterThanOrEqual(0);
+    await page.keyboard.press('Escape');
+
+    // Near the bottom of the screen it opens upwards.
+    const source = page.getByRole('combobox', { name: 'Sourced by' });
+    await source.click();
+    const listLow = page.getByRole('listbox', { name: 'Sourced by' });
+    await expect(listLow).toBeVisible();
+    const lowInput = await rect('#ss-low input');
+    const lb2 = await listLow.evaluate((el) => el.getBoundingClientRect().toJSON());
+    expect(lb2.bottom).toBeLessThanOrEqual(lowInput.top);
+    expect(lb2.top).toBeGreaterThanOrEqual(0);
+    expect(lb2.bottom).toBeLessThanOrEqual(vh);
+    await page.keyboard.press('Escape');
+
+    // Disabled after it was built: no typing, no clear button, and back again.
+    await page.evaluate(() => { window.__ss.setValue('a'); window.__ss.setDisabled(true); });
+    await expect(model).toBeDisabled();
+    await expect(page.locator('#ss-top').getByRole('button', { name: 'Clear Model' })).toBeHidden();
+    await page.evaluate(() => window.__ss.setDisabled(false));
+    await expect(model).toBeEnabled();
+    await expect(page.locator('#ss-top').getByRole('button', { name: 'Clear Model' })).toBeVisible();
+  });
+
+  test('busy buttons ignore presses but stay legible, with a spinner', async ({ app, page }) => {
+    await app.goto('#/home');
+    await sandbox(page, async (box) => {
+      const { setBusy } = await import('/assets/js/core/ui.js');
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'btn btn-primary';
+      b.textContent = 'Save';
+      b.addEventListener('click', () => window.__calls.push('click'));
+      const off = document.createElement('button');
+      off.type = 'button';
+      off.className = 'btn btn-primary';
+      off.textContent = 'Off';
+      off.disabled = true;
+      window.__busy = (on) => setBusy(b, on, { label: 'Saving…' });
+      box.append(b, off);
+    });
+    const save = page.locator('#sandbox .btn').first();
+    await save.click();
+    await page.evaluate(() => window.__busy(true));
+    await expect(save).toHaveText('Saving…');
+    await expect(save).toHaveAttribute('aria-busy', 'true');
+    await expect(save).toHaveAttribute('aria-disabled', 'true');
+    await save.click({ force: true }); // Playwright itself won't press an aria-disabled button
+    await save.focus();
+    await page.keyboard.press('Enter');
+    expect(await calls(page)).toEqual(['click']);
+    await expect(save).toBeFocused();
+    await expect(save).toHaveCSS('opacity', '1');
+    await expect(page.locator('#sandbox .btn').nth(1)).toHaveCSS('opacity', '0.55');
+    const spinner = save.locator('.spinner');
+    await expect(spinner).toBeVisible();
+    expect(await spinner.evaluate((el) => getComputedStyle(el).animationName)).not.toBe('none');
+    await page.evaluate(() => window.__busy(false));
+    await expect(save).toHaveText('Save');
+    await save.click();
+    expect(await calls(page)).toEqual(['click', 'click']);
+  });
+
+  test('a busy button keeps its resting colours on hover, whatever its variant', async ({ app, page }) => {
+    await app.goto('#/home');
+    await sandbox(page, async (box) => {
+      const { setBusy } = await import('/assets/js/core/ui.js');
+      for (const v of ['primary', 'secondary', 'danger', 'ghost']) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = `btn btn-${v}`;
+        b.textContent = v;
+        box.append(b);
+        setBusy(b, true);
+      }
+      const idle = document.createElement('button');
+      idle.type = 'button';
+      idle.className = 'btn btn-primary';
+      idle.textContent = 'idle';
+      box.append(idle);
+    });
+    const btns = page.locator('#sandbox .btn');
+    await expect(btns).toHaveCount(5);
+    const colours = (b) => b.evaluate((el) => [getComputedStyle(el).backgroundColor, getComputedStyle(el).color]);
+    for (let i = 0; i < 4; i++) {
+      const b = btns.nth(i);
+      await page.mouse.move(0, 0);
+      const rest = await colours(b);
+      await b.hover({ force: true });
+      expect(await b.evaluate((el) => el.matches(':hover'))).toBe(true);
+      expect(await colours(b), await b.textContent()).toEqual(rest);
+    }
+    // Not busy: hover still shows.
+    const idle = btns.nth(4);
+    await page.mouse.move(0, 0);
+    const rest = await colours(idle);
+    await idle.hover();
+    expect(await colours(idle)).not.toEqual(rest);
+  });
+
   test('components are accessible in light and dark', async ({ app, page }) => {
     await page.emulateMedia({ colorScheme: 'light' });
     await app.goto('#/home');
@@ -633,21 +1025,77 @@ test.describe('components', () => {
   });
 });
 
+test('a workspace that was set up before is never sent back to setup', async ({ app, page }) => {
+  // The Canonical token lapsed: the server no longer counts the workspace as onboarded.
+  await page.route('**/api/status*', async (route) => {
+    const res = await route.fetch();
+    await route.fulfill({ response: res, json: { ...(await res.json()), onboarded: false, discovery_connected: false } });
+  });
+  await app.goto('#/pipeline');
+  await expect(page.locator('#view h1')).toHaveText('Pipeline');
+  await page.evaluate(() => { location.hash = '#/followups'; });
+  await expect(page.locator('#view h1')).toHaveText('Follow-ups');
+  await expect(page).toHaveURL(hashIs('#/followups'));
+  // The shell's connection dot is where reconnecting starts.
+  await expect(page.locator('#nav .conn').nth(1)).toHaveAccessibleName('Canonical: Connect');
+});
+
+// A record of every #view heading shown, to prove a screen never flashed.
+async function recordHeadings(page) {
+  await page.addInitScript(() => {
+    window.__headings = [];
+    new MutationObserver(() => {
+      const h1 = document.querySelector('#view h1');
+      const t = h1 && h1.textContent;
+      if (t && window.__headings[window.__headings.length - 1] !== t) window.__headings.push(t);
+    }).observe(document, { subtree: true, childList: true, characterData: true });
+  });
+}
+
 // Last: a different seed restarts the server.
 test.describe('empty workspace', () => {
   test.use({ seed: 'empty' });
 
   test('empty workspace redirects to setup', async ({ app, page }) => {
+    await recordHeadings(page);
+    // A slow server after the first status: a screen that loads before the check could flash.
+    let statusCalls = 0;
+    await page.route('**/api/status*', async (route) => {
+      if (statusCalls++ > 0) await new Promise((r) => setTimeout(r, 700));
+      await route.continue();
+    });
+    const draftLoads = [];
+    page.on('request', (r) => {
+      if (new URL(r.url()).pathname.startsWith('/api/drafts')) draftLoads.push(r.url());
+    });
+    const setupUrl = /#\/setup(\/[a-z]+)?$/;
     await app.goto('#/pipeline');
-    await expect(page).toHaveURL(hashIs('#/setup'));
+    await expect(page).toHaveURL(setupUrl);
     await expect(page.locator('#view h1')).toHaveText('Setup');
     // Setup is a full page: no sidebar, no top bar.
     await expect(page.locator('#nav')).toBeHidden();
     await expect(page.locator('#topbar')).toBeHidden();
-    // Leaving setup before it's done comes back to it.
+    // Leaving setup before it's done comes back to it, without the other screen ever showing.
     await page.evaluate(() => { location.hash = '#/drafts'; });
-    await expect(page).toHaveURL(hashIs('#/setup'));
+    await expect(page).toHaveURL(setupUrl);
     await expect(page.locator('#view h1')).toHaveText('Setup');
+    await page.evaluate(() => { location.hash = '#/home'; });
+    await expect(page).toHaveURL(setupUrl);
+    await expect(page.locator('#view h1')).toHaveText('Setup');
+    expect(await page.evaluate(() => window.__headings)).toEqual(['Setup']);
+    expect(draftLoads).toEqual([]);
     await expectAccessible(page);
+  });
+
+  test('a workspace with companies but no profile yet is not sent to setup', async ({ app, page }) => {
+    // Never set up means no company profile and no companies: data from before is a used workspace.
+    await page.route('**/api/summary*', async (route) => {
+      const res = await route.fetch();
+      const summary = await res.json();
+      await route.fulfill({ response: res, json: { ...summary, counts: { ...summary.counts, companies: 3 } } });
+    });
+    await app.goto('#/pipeline');
+    await expect(page.locator('#view h1')).toHaveText('Pipeline');
+    await expect(page).toHaveURL(hashIs('#/pipeline'));
   });
 });

@@ -23,11 +23,14 @@ export function initToken() {
   history.replaceState(history.state, '', u.pathname + u.search + u.hash);
 }
 
-/** The session token: captured at boot, else the cookie, else "". */
+/**
+ * The session token: the ct_token cookie (shared by every tab, and rewritten when coldtrail is
+ * reopened after a server restart, so streams use the credential fetch() sends), else the one
+ * captured at boot, else "".
+ */
 export function token() {
-  if (bootToken) return bootToken;
-  const m = document.cookie.match(/(?:^|;\s*)ct_token=([^;]+)/);
-  return m ? m[1] : '';
+  const m = String(document.cookie || '').match(/(?:^|;\s*)ct_token=([^;]+)/);
+  return m ? m[1] : bootToken;
 }
 
 function sessionExpired() {
@@ -42,8 +45,10 @@ function fail(message, status) {
   return err;
 }
 
-async function getJSON(path, { signal } = {}) {
-  const r = await fetch(path, { credentials: 'same-origin', signal });
+async function getJSON(path, { signal, keepalive } = {}) {
+  const init = { credentials: 'same-origin', signal };
+  if (keepalive) init.keepalive = true;
+  const r = await fetch(path, init);
   if (r.status === 401) {
     sessionExpired();
     throw fail(SESSION_EXPIRED, 401);
@@ -55,8 +60,9 @@ async function getJSON(path, { signal } = {}) {
 // Error responses are plain text (ApiErr → 500, axum rejections → 4xx), so read the body once
 // and surface `message` from JSON, else the raw text, else the status text. A 200 with
 // {ok:false,message} is returned as-is: callers check `ok` themselves.
-async function send(method, path, body, { signal } = {}) {
+async function send(method, path, body, { signal, keepalive } = {}) {
   const init = { method, credentials: 'same-origin', signal };
+  if (keepalive) init.keepalive = true;
   if (method !== 'DELETE') {
     init.headers = { 'content-type': 'application/json' };
     init.body = JSON.stringify(body || {});
@@ -78,10 +84,11 @@ async function send(method, path, body, { signal } = {}) {
 }
 
 /**
- * get(path, {signal}) → parsed JSON. post(path, body, {signal}), patch(path, body) send JSON
- * (an empty object when body is missing); del(path) sends no body. All throw Error(message)
- * with `.status` on failure, and SESSION_EXPIRED on 401 (after firing the window event
- * `coldtrail:session-expired` once per page).
+ * get(path, opts) → parsed JSON. post(path, body, opts), patch(path, body, opts) send JSON (an
+ * empty object when body is missing); del(path, opts) sends no body. opts: { signal, keepalive }
+ * (keepalive: the request outlives the page, for a save sent as the tab closes; browsers cap
+ * keepalive bodies at 64 KiB in total). All throw Error(message) with `.status` on failure, and
+ * SESSION_EXPIRED on 401 (after firing the window event `coldtrail:session-expired` once per page).
  */
 export const api = {
   get: getJSON,
@@ -92,10 +99,11 @@ export const api = {
 
 /**
  * Open an EventSource on `path` (with `t=<token>` appended) and hand each JSON `message` event
- * to onEvent. Any error closes it for good (no auto-reconnect into a finished run) and calls
- * onError once. close() is idempotent; nothing is delivered after it.
+ * to onEvent. onOpen runs once it is connected (the server has the stream). Any error closes it
+ * for good (no auto-reconnect into a finished run) and calls onError once. close() is
+ * idempotent; nothing is delivered after it.
  */
-export function openStream(path, { onEvent, onError } = {}) {
+export function openStream(path, { onEvent, onError, onOpen } = {}) {
   const t = token();
   const url = t ? `${path}${path.includes('?') ? '&' : '?'}t=${encodeURIComponent(t)}` : path;
   const es = new EventSource(url);
@@ -104,6 +112,10 @@ export function openStream(path, { onEvent, onError } = {}) {
     if (closed) return;
     closed = true;
     es.close();
+  };
+  es.onopen = () => {
+    if (closed || !onOpen) return;
+    onOpen();
   };
   es.onmessage = (m) => {
     if (closed) return;

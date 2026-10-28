@@ -1,5 +1,6 @@
 // Pure formatting helpers (no DOM): escaping, numbers, dates, plurals. Copy rules, spec §5.10:
-// thousands separators; dates "Oct 9" / "Oct 9, 13:00"; relative within 48h.
+// thousands separators; dates "Oct 9" / "Oct 9, 13:00"; relative within 48h, both ways. Plus the
+// shared run-status wording.
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 const DASH = '—';
@@ -86,4 +87,24 @@ export function truncate(s, n) {
 export function safeUrl(u) {
   const s = u == null ? '' : String(u).trim();
   return /^https?:\/\/[^\s/]/i.test(s) ? s : '';
+}
+
+/**
+ * How every screen names a run's status (scheduled_runs.status, summary.last_run.status): status →
+ * [label, badge tone]. Read it through runStatus(), which also covers anything else.
+ */
+export const RUN_STATUS = Object.freeze(
+  Object.assign(Object.create(null), {
+    ok: Object.freeze(['Succeeded', 'ok']),
+    error: Object.freeze(['Failed', 'danger']),
+    auth_failed: Object.freeze(['Sign-in failed', 'warn']),
+    running: Object.freeze(['Running', 'accent']),
+  }),
+);
+
+/** [label, tone] for a run status; one it doesn't know shows as it is, in a neutral tone. */
+export function runStatus(status) {
+  const s = status == null ? '' : String(status);
+  if (Object.prototype.hasOwnProperty.call(RUN_STATUS, s)) return RUN_STATUS[s];
+  return [s || 'Unknown', 'neutral'];
 }

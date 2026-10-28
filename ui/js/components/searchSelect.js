@@ -2,11 +2,15 @@
 // stays in the input and aria-activedescendant names the active option). A click or ArrowDown
 // opens it; typing filters labels and values case-insensitively; Enter picks the active option,
 // else the only/first match, else (with `freeText`) what was typed; Esc closes and puts back the
-// chosen label. Options are text, never HTML.
+// chosen label. Options are text, never HTML. The list opens under the input (above it when
+// there is more room there) and stays inside the viewport: the room it has is set on the
+// component as --ss-room-x / --ss-room-y, and .ss-up marks it opening upwards.
 
 import { fmtNum, h } from '../core/dom.js';
 
 const MAX_SHOWN = 200;
+const LIST_MAX = 280; // px, the list's height when there is room (components.css)
+const EDGE = 8; // px kept clear of the viewport's edges
 let uid = 0;
 
 function svg(d, size = 16) {
@@ -30,8 +34,8 @@ export function filterOptions(options, text) {
  * searchSelect({ options: [{ value, label?, count? }], value, placeholder?, label, onChange(value),
  * freeText = false, hideLabel = false, clearable = true, disabled = false }) → el.
  * onChange runs when the chosen value changes ('' when cleared). With freeText, leaving the field
- * also keeps what was typed. Methods: el.setOptions(options), el.setValue(value) (no onChange);
- * el.input is the combobox.
+ * also keeps what was typed. Methods: el.setOptions(options), el.setValue(value) (no onChange),
+ * el.setDisabled(bool); el.input is the combobox.
  */
 export function searchSelect({
   options = [],
@@ -42,8 +46,9 @@ export function searchSelect({
   freeText = false,
   hideLabel = false,
   clearable = true,
-  disabled = false,
+  disabled: initiallyDisabled = false,
 }) {
+  let disabled = !!initiallyDisabled;
   const id = `ss-${++uid}`;
   let opts = options.slice();
   let current = value == null ? '' : String(value);
@@ -73,7 +78,9 @@ export function searchSelect({
   const chevron = h('span', { class: 'ss-chevron' }, svg('M6 9l6 6 6-6'));
   const listbox = h('ul', { class: 'ss-list', role: 'listbox', id: `${id}-list`, 'aria-labelledby': `${id}-label`, hidden: true });
   const empty = h('div', { class: 'ss-empty', hidden: true });
-  const el = h('div', { class: 'search-select' }, labelEl, h('div', { class: 'ss-control' }, input, clearBtn, chevron), listbox, empty);
+  // The popup lives in the control, so it lines up with the input whatever the label does.
+  const control = h('div', { class: 'ss-control' }, input, clearBtn, chevron, listbox, empty);
+  const el = h('div', { class: 'search-select' }, labelEl, control);
 
   const optionFor = (v) => opts.find((o) => String(o.value) === v);
   const displayOf = (v) => {
@@ -85,6 +92,37 @@ export function searchSelect({
   function showValue() {
     input.value = displayOf(current);
     clearBtn.hidden = !clearable || current === '' || disabled;
+  }
+
+  // Open downwards unless the room below is short and there is more above; tell the CSS how much
+  // room there is so the list never runs off screen.
+  function place() {
+    if (listbox.hidden && empty.hidden) return;
+    const r = control.getBoundingClientRect();
+    const vw = document.documentElement.clientWidth;
+    const vh = document.documentElement.clientHeight;
+    const below = vh - r.bottom - EDGE;
+    const above = r.top - EDGE;
+    const up = below < Math.min(LIST_MAX, 160) && above > below;
+    el.classList.toggle('ss-up', up);
+    el.style.setProperty('--ss-room-y', `${Math.max(0, Math.floor((up ? above : below) - 4))}px`);
+    el.style.setProperty('--ss-room-x', `${Math.max(Math.floor(r.width), Math.floor(vw - r.left - EDGE))}px`);
+  }
+
+  function onViewport() {
+    if (!el.isConnected) {
+      listen(false);
+      return;
+    }
+    place();
+  }
+  let listening = false;
+  function listen(on) {
+    if (on === listening) return;
+    listening = on;
+    const fn = on ? 'addEventListener' : 'removeEventListener';
+    window[fn]('resize', onViewport);
+    window[fn]('scroll', onViewport, true);
   }
 
   function render() {
@@ -111,6 +149,8 @@ export function searchSelect({
     empty.hidden = !open || shown.length > 0;
     if (!shown.length) empty.textContent = freeText && typed ? `Press Enter to use “${typed}”` : 'No matches';
     input.setAttribute('aria-expanded', visible ? 'true' : 'false');
+    listen(open);
+    place();
     if (active >= 0 && shown[active]) {
       input.setAttribute('aria-activedescendant', `${id}-opt-${active}`);
       const li = listbox.children[active];
@@ -211,6 +251,12 @@ export function searchSelect({
   };
   el.setValue = (v) => {
     current = v == null ? '' : String(v);
+    showValue();
+  };
+  el.setDisabled = (on) => {
+    disabled = !!on;
+    input.disabled = disabled;
+    if (disabled) close();
     showValue();
   };
   el.input = input;

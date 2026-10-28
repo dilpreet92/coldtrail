@@ -382,6 +382,47 @@ test('sends are blocked', async ({ server, request }) => {
   expect(readFileSync(join(server.home, 'config.toml'), 'utf8')).not.toContain('daily_send_cap');
 });
 
+test('server.query waits out a write lock instead of failing', async ({ server }) => {
+  // A read that lands while the server writes (right after an agent turn or a run) gets SQLite's
+  // "database is locked" at once unless the connection has a busy timeout.
+  expect(server.query('PRAGMA busy_timeout')).toEqual([{ timeout: 5000 }]);
+  expect(server.query('SELECT count(*) AS n FROM companies')).toEqual([{ n: SEED.counts.companies }]);
+});
+
+test('a route handler still running when the test ends does not fail it', async ({ app, page }) => {
+  // A smoke guard, not a proof: it passes with or without the fixture's unrouteAll (the race it
+  // guards against is timing-dependent); the next test proves the routes are removed. End the
+  // test while a status request sits in its handler between route.fetch() and reading the
+  // response: the app fixture unroutes on the way out and ignores what such a handler throws once
+  // the page is gone ("Response has been disposed").
+  let fetched;
+  const inHandler = new Promise((r) => { fetched = r; });
+  await page.route('**/api/status*', async (route) => {
+    const res = await route.fetch();
+    fetched();
+    await new Promise((r) => setTimeout(r, 500));
+    await route.fulfill({ response: res, json: { ...(await res.json()) } });
+  });
+  await app.goto('#/home');
+  await inHandler;
+});
+
+// A `page` override's teardown runs after the app fixture's (app depends on page), while the page
+// is still open: there, a route the test left behind must no longer answer.
+const afterApp = test.extend({
+  page: async ({ page }, use) => {
+    await use(page);
+    const body = await page.evaluate(() => fetch('/__unroute-probe').then((r) => r.text()));
+    expect(body, 'a route the test left behind still answers after the app fixture').not.toBe('routed-probe');
+  },
+});
+
+afterApp('the app fixture removes the routes a test left behind', async ({ app, page }) => {
+  await page.route('**/__unroute-probe', (route) => route.fulfill({ status: 200, body: 'routed-probe' }));
+  await app.goto('#/home');
+  expect(await page.evaluate(() => fetch('/__unroute-probe').then((r) => r.text()))).toBe('routed-probe');
+});
+
 test('side-effect routes are intercepted and never reach the server', async ({ page, server }) => {
   // Registered first, so it runs last: any /api call the intercepts don't answer is aborted
   // here, and a broken pattern fails this test instead of launching Chrome or an OAuth flow.

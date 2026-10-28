@@ -1,17 +1,19 @@
-// Feedback and overlays (spec §4): toasts, confirm/dialog, drawer, menu. Overlays live in
-// #overlays, stack (Esc closes the top one), trap Tab inside, make the app behind a modal inert,
-// and give focus back to whatever opened them: the `opener` option when given (a menu's anchor),
-// else the element focused at open, else #view. Pass `opener` when the triggering control is
-// known: WebKit does not focus a clicked button, so a mouse-opened overlay sees <body> focused.
-// Every open overlay carries [data-overlay], which keys.js checks so page shortcuts stay off
-// while one is open.
+// Feedback and overlays (spec §4): toasts, confirm/dialog, drawer, menu, plus busy buttons and
+// copy-to-clipboard. Overlays live in #overlays, stack (Esc closes the top one), trap Tab inside,
+// make the app behind a modal inert, and give focus back to whatever opened them: the `opener`
+// option when given (a menu's anchor), else the element focused at open, else #view. Pass
+// `opener` when the triggering control is known: WebKit does not focus a clicked button, so a
+// mouse-opened overlay sees <body> focused. Dialogs, confirms and drawers take an AbortSignal
+// (`signal`) that closes them, so a view can tie them to its own lifetime. Every open overlay
+// carries [data-overlay], which keys.js checks so page shortcuts stay off while one is open (⌘K
+// closes the top one with closeTopOverlay() instead).
 //
 // Class hooks for components.css: .overlay (.overlay-dialog | .overlay-drawer: the backdrop),
 // .dialog > .dialog-head (.dialog-title, .overlay-close) + .dialog-body + .dialog-actions
 // (.btn.btn-<kind>); .drawer > .drawer-head (.drawer-title, .overlay-close) + .drawer-body;
 // .menu > .menu-item (.menu-item-danger), positioned inline; .toast.toast-<info|ok|err> >
 // .toast-text + .toast-close (multi-line text needs white-space: pre-line); .icon-btn;
-// html.has-overlay while a modal is open.
+// html.has-overlay while a modal is open; .spinner inside a .btn[aria-busy="true"] (setBusy).
 
 import { h } from './dom.js';
 
@@ -235,6 +237,26 @@ function pushOverlay({ el, panel, modal, kind, anchor = null, opener = null, onK
   return entry;
 }
 
+// Close an overlay when `signal` aborts, as a code close ('api'). Returns the listener's remover.
+function closeOnAbort(signal, close) {
+  if (!signal) return () => {};
+  if (signal.aborted) {
+    close('api');
+    return () => {};
+  }
+  const onAbort = () => close('api');
+  signal.addEventListener('abort', onAbort, { once: true });
+  return () => signal.removeEventListener('abort', onAbort);
+}
+
+/** Close the overlay on top as Esc would (reason 'escape'). → whether one was open. */
+export function closeTopOverlay(reason = 'escape') {
+  const top = stack[stack.length - 1];
+  if (!top) return false;
+  top.close(reason);
+  return true;
+}
+
 function closeButton(onClick) {
   return h('button', { type: 'button', class: 'icon-btn overlay-close', 'aria-label': 'Close', onClick }, icon(CLOSE_ICON));
 }
@@ -297,22 +319,23 @@ export function toast(text, kind = 'info') {
 
 /**
  * openDialog({ title, content, actions: [{ label, kind = 'secondary', onClick?, autofocus? }],
- * onClose?(reason), opener? }) → { close, el }. An action without onClick just closes.
+ * onClose?(reason), opener?, signal? }) → { close, el }. An action without onClick just closes.
  * Otherwise the dialog closes after onClick unless it returns (or resolves to) false; while a
  * returned Promise is pending the buttons are disabled, and if it rejects the dialog stays open
  * and its message is shown as an error toast. Initial focus: [data-autofocus] / [autofocus],
- * else the first field in the body, else the first action.
+ * else the first field in the body, else the first action. Aborting `signal` closes it ('api').
  */
-export function openDialog({ title, content, actions = [], onClose, role = 'dialog', opener = null }) {
+export function openDialog({ title, content, actions = [], onClose, role = 'dialog', opener = null, signal = null }) {
   const titleId = nextId('dialog-title');
   const bodyId = nextId('dialog-body');
   let entry;
+  let unlisten = () => {};
   const handle = { close: (reason = 'api') => entry.close(reason) };
 
   const buttons = actions.map((a) =>
     h('button', { type: 'button', class: `btn btn-${a.kind || 'secondary'}`, 'data-autofocus': a.autofocus ? '' : null }, a.label),
   );
-  const setBusy = (busy) => {
+  const setActionsBusy = (busy) => {
     // Disabling the focused button would drop focus to <body>; keep it in the dialog.
     if (busy && buttons.includes(document.activeElement)) panel.focus({ preventScroll: true });
     for (const b of buttons) b.disabled = busy;
@@ -328,17 +351,17 @@ export function openDialog({ title, content, actions = [], onClose, role = 'dial
       try {
         result = a.onClick(handle);
         if (result && typeof result.then === 'function') {
-          setBusy(true);
+          setActionsBusy(true);
           result = await result;
         }
       } catch (err) {
         if (entry.closed) return;
-        setBusy(false);
+        setActionsBusy(false);
         toast((err && err.message) || String(err), 'err');
         return;
       }
       if (entry.closed) return;
-      setBusy(false);
+      setActionsBusy(false);
       if (result !== false) entry.close('action');
     });
   });
@@ -365,27 +388,37 @@ export function openDialog({ title, content, actions = [], onClose, role = 'dial
     modal: true,
     kind: 'dialog',
     opener,
-    onClose,
+    onClose: (reason) => {
+      unlisten();
+      if (onClose) onClose(reason);
+    },
     initialFocus: () =>
       panel.querySelector('[data-autofocus],[autofocus]') || tabbables(body)[0] || buttons[0] || null,
   });
   closeOnBackdrop(backdrop, entry.close);
+  unlisten = closeOnAbort(signal, entry.close);
   return { close: handle.close, el: panel };
 }
 
 /**
  * confirmDialog({ title, body, confirmText = 'Confirm', cancelText = 'Cancel', danger = false,
- * opener? }) → Promise<boolean>: true only when the confirm button is pressed. Danger dialogs
- * focus Cancel.
+ * opener?, signal? }) → Promise<boolean>: true only when the confirm button is pressed. Danger
+ * dialogs focus Cancel. Aborting `signal` (e.g. the view's, on unmount) closes it with false;
+ * an already aborted one never opens.
  */
-export function confirmDialog({ title, body, confirmText = 'Confirm', cancelText = 'Cancel', danger = false, opener = null }) {
+export function confirmDialog({ title, body, confirmText = 'Confirm', cancelText = 'Cancel', danger = false, opener = null, signal = null }) {
   return new Promise((resolve) => {
+    if (signal && signal.aborted) {
+      resolve(false);
+      return;
+    }
     let confirmed = false;
     openDialog({
       title,
       content: body,
       role: 'alertdialog',
       opener,
+      signal,
       actions: [
         { label: cancelText, kind: 'secondary', autofocus: danger },
         { label: confirmText, kind: danger ? 'danger' : 'primary', autofocus: !danger, onClick: () => { confirmed = true; } },
@@ -396,13 +429,15 @@ export function confirmDialog({ title, body, confirmText = 'Confirm', cancelText
 }
 
 /**
- * openDrawer({ title, content, onClose?(reason), opener? }) → { close, el, body, setTitle }. A
- * right-side modal panel; reason is 'escape' | 'backdrop' | 'button' | 'api' (close() from
- * code), so a route-driven drawer can update the URL only for user closes.
+ * openDrawer({ title, content, onClose?(reason), opener?, signal? }) → { close, el, body,
+ * setTitle }. A right-side modal panel; reason is 'escape' | 'backdrop' | 'button' | 'api'
+ * (close() from code, or `signal` aborting), so a route-driven drawer can update the URL only
+ * for user closes.
  */
-export function openDrawer({ title, content, onClose, opener = null }) {
+export function openDrawer({ title, content, onClose, opener = null, signal = null }) {
   const titleId = nextId('drawer-title');
   let entry;
+  let unlisten = () => {};
   const heading = h('h2', { class: 'drawer-title', id: titleId }, title);
   const body = h('div', { class: 'drawer-body' }, toNodes(content));
   const panel = h(
@@ -418,10 +453,14 @@ export function openDrawer({ title, content, onClose, opener = null }) {
     modal: true,
     kind: 'drawer',
     opener,
-    onClose,
+    onClose: (reason) => {
+      unlisten();
+      if (onClose) onClose(reason);
+    },
     initialFocus: () => panel.querySelector('[data-autofocus],[autofocus]'),
   });
   closeOnBackdrop(backdrop, entry.close);
+  unlisten = closeOnAbort(signal, entry.close);
   return {
     close: (reason = 'api') => entry.close(reason),
     el: panel,
@@ -515,4 +554,99 @@ export function openMenu(anchor, items) {
     },
   });
   return { close: () => entry.close('api') };
+}
+
+// ---- Busy buttons ----
+
+const busyState = new WeakMap(); // button → { nodes, ariaDisabled } from before it was busy
+const pressGuarded = new WeakSet();
+
+/** True while setBusy(button, true) is in effect. */
+export function isBusy(button) {
+  return !!button && button.getAttribute('aria-busy') === 'true';
+}
+
+/**
+ * setBusy(button, on, { label }?) marks a button busy without disabling it (a disabled button
+ * drops focus to <body>): aria-busy + aria-disabled, a leading .spinner, and presses ignored until
+ * setBusy(button, false) puts back what it showed before (and its own aria-disabled). `label`
+ * replaces the text meanwhile ("Saving…"). components.css keeps a busy .btn at full strength,
+ * unlike a disabled one.
+ */
+export function setBusy(button, on, { label } = {}) {
+  if (!button) return;
+  if (!pressGuarded.has(button)) {
+    pressGuarded.add(button);
+    // Capture listeners on the target run before its own click handlers.
+    button.addEventListener(
+      'click',
+      (e) => {
+        if (!isBusy(button)) return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+      },
+      true,
+    );
+  }
+  if (on) {
+    let state = busyState.get(button);
+    if (!state) {
+      state = { nodes: [...button.childNodes], ariaDisabled: button.getAttribute('aria-disabled') };
+      busyState.set(button, state);
+    }
+    button.setAttribute('aria-busy', 'true');
+    button.setAttribute('aria-disabled', 'true');
+    const spinner = h('span', { class: 'spinner', 'aria-hidden': 'true' });
+    if (label != null) button.replaceChildren(spinner, h('span', {}, String(label)));
+    else button.replaceChildren(spinner, ...state.nodes);
+    return;
+  }
+  const state = busyState.get(button);
+  if (!state) return;
+  busyState.delete(button);
+  button.removeAttribute('aria-busy');
+  if (state.ariaDisabled == null) button.removeAttribute('aria-disabled');
+  else button.setAttribute('aria-disabled', state.ariaDisabled);
+  button.replaceChildren(...state.nodes);
+}
+
+// ---- Clipboard ----
+
+/**
+ * copyText(text) → Promise<boolean>: whether it reached the clipboard. The Clipboard API, else a
+ * hidden textarea + execCommand('copy') (placed in the open overlay, if any, since the app behind
+ * a modal is inert); focus goes back where it was.
+ */
+export async function copyText(text) {
+  const value = text == null ? '' : String(text);
+  try {
+    if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(value);
+      return true;
+    }
+  } catch (_) {
+    /* denied or unavailable: try the fallback */
+  }
+  const active = document.activeElement;
+  const top = stack[stack.length - 1];
+  const ta = h('textarea', { class: 'sr-only', readonly: true, 'aria-hidden': 'true', tabindex: '-1' });
+  ta.value = value;
+  (top ? top.panel : document.body).append(ta);
+  let ok = false;
+  try {
+    ta.focus({ preventScroll: true });
+    ta.select();
+    ok = document.execCommand('copy') === true;
+  } catch (_) {
+    ok = false;
+  }
+  ta.remove();
+  if (active && active !== document.body && typeof active.focus === 'function') {
+    try {
+      active.focus({ preventScroll: true });
+    } catch (_) {
+      /* not focusable */
+    }
+  }
+  return ok;
 }

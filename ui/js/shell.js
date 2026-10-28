@@ -5,7 +5,7 @@
 
 import { api, SESSION_EXPIRED } from './core/api.js';
 import { debounce, fmtDate, fmtNum, fmtRelative, h, pluralize } from './core/dom.js';
-import { bindKeys } from './core/keys.js';
+import { bindKeys, clearOverlay } from './core/keys.js';
 import { href } from './core/router.js';
 
 const SECTIONS = [
@@ -51,7 +51,9 @@ const ICONS = {
   alert: ['M12 3l9.5 17h-19L12 3z', 'M12 10v4', 'M12 17.5v.01'],
 };
 
-function wordmark() {
+/** The coldtrail wordmark: a link home with the logo mark (a logo, so its own 2px stroke) and the
+ *  name. For full-page screens without the sidebar (Setup) too. */
+export function wordmark() {
   return h(
     'a',
     { class: 'wordmark', href: '#/home' },
@@ -68,6 +70,8 @@ function wordmark() {
 /**
  * Each connection as the sidebar footer shows it: state ok (green) | warn (amber: only the human
  * can fix it) | none (grey: not set up), a visible word for anything but ok, and a spoken state.
+ * The spoken state of anything but ok is its visible word, so the link's name ("Gmail: Connect")
+ * starts with what is on screen (WCAG 2.5.3); ok has no word and says "ready" / "connected".
  */
 export function connections(status, summary) {
   if (!status) return [];
@@ -79,26 +83,26 @@ export function connections(status, summary) {
   if (status.provider === 'openai') {
     agent = status.base_url
       ? { label: 'Agent · Your own model', state: 'ok', spoken: 'ready' }
-      : { label: 'Agent · Your own model', state: 'none', word: 'Set up', spoken: 'not set up' };
+      : { label: 'Agent · Your own model', state: 'none', word: 'Set up', spoken: 'Set up' };
   } else {
     const a = (status.agents || []).find((x) => x.kind === status.provider);
     const label = `Agent · ${a ? a.label : status.provider || 'none'}`;
     if (!a || !a.present || attention.has('provider_missing')) {
-      agent = { label, state: 'warn', word: 'Not installed', spoken: 'not installed' };
+      agent = { label, state: 'warn', word: 'Not installed', spoken: 'Not installed' };
     } else if (!a.authed) {
-      agent = { label, state: 'warn', word: 'Sign in', spoken: 'not signed in' };
+      agent = { label, state: 'warn', word: 'Sign in', spoken: 'Sign in' };
     } else {
       agent = { label, state: 'ok', spoken: 'ready' };
     }
   }
   agent.tab = agents;
 
-  const linked = (on) => (on ? { state: 'ok', spoken: 'connected' } : { state: 'none', word: 'Connect', spoken: 'not connected' });
+  const linked = (on) => (on ? { state: 'ok', spoken: 'connected' } : { state: 'none', word: 'Connect', spoken: 'Connect' });
   const canonical = { label: 'Canonical', tab: conns, ...linked(status.discovery_connected && !attention.has('canonical_disconnected')) };
   const gmail = { label: 'Gmail', tab: conns, ...linked(status.destination_connected) };
   const linkedin =
     status.linkedin_reconnect_needed || attention.has('linkedin_reconnect')
-      ? { label: 'LinkedIn', tab: conns, state: 'warn', word: 'Reconnect', spoken: 'reconnect needed' }
+      ? { label: 'LinkedIn', tab: conns, state: 'warn', word: 'Reconnect', spoken: 'Reconnect' }
       : { label: 'LinkedIn', tab: conns, ...linked(status.linkedin_connected) };
   return [agent, canonical, gmail, linkedin];
 }
@@ -159,7 +163,7 @@ export function mountShell({ store, navigate }) {
               : null;
             const a = h(
               'a',
-              { class: 'nav-item', href: `#/${item.route}`, 'data-route': item.route, onClick: () => closeNav({ restore: false }) },
+              { class: 'nav-item', href: `#/${item.route}`, 'data-route': item.route, onClick: (e) => onNavClick(e, a) },
               h('span', { class: 'nav-label' }, item.label),
               count,
             );
@@ -170,6 +174,14 @@ export function mountShell({ store, navigate }) {
       );
     }),
   );
+  // A plain click on the link to the screen on show reloads a screen that failed to load (the
+  // router only retries then; the browser fires no hashchange for the same address).
+  function onNavClick(e, a) {
+    closeNav({ restore: false });
+    if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    if (a.getAttribute('href') === location.hash) navigate(location.hash);
+  }
+
   const conns = h('ul', { class: 'nav-conns', 'aria-label': 'Connections' });
   const closeBtn = h('button', { type: 'button', class: 'icon-btn nav-close', 'aria-label': 'Close menu', onClick: () => closeNav() }, icon(ICONS.close));
   aside.replaceChildren(h('div', { class: 'nav-head' }, wordmark(), closeBtn), navEl, conns);
@@ -473,6 +485,7 @@ export function mountShell({ store, navigate }) {
   bindKeys({
     'mod+k': () => {
       if (topbar.offsetParent === null) return false; // hidden (setup): leave the key alone
+      if (!clearOverlay()) return true; // closed one of several overlays; the next press goes on
       closeNav({ restore: false });
       input.focus();
       input.select();

@@ -1,10 +1,15 @@
 /* Shared components (design spec §2, §4, §6). Screen-specific styles belong in
-   css/views/<name>.css, not here. Use tokens.css values only: no new colors, radii or spacing.
+   css/views/<name>.css, not here. Use tokens.css values: no new colors, and radii / spacing from
+   the §2 scales (6/8/12 and 4/8/12/16/24/32). Deliberate exceptions: pills (999px radius, the
+   kbd's 4px), 1–2px hairline gaps, the empty state's 40px breathing room, and the paddings inside
+   inputs, buttons, tabs and list rows (6/7/10/14/20px), tuned so those controls land on the
+   36/40px heights and the tab spacing of the design.
 
    Classes views use directly (the rest are set by js/shell.js, js/core/ui.js and
    js/components/*):
      .page-head > .page-head-text (h1 + .page-desc) + .page-actions; .page-tools (tabs/filters row)
-     .btn + .btn-primary | .btn-secondary | .btn-danger | .btn-ghost, .btn-sm; .icon-btn
+     .btn + .btn-primary | .btn-secondary | .btn-danger | .btn-ghost, .btn-sm; .icon-btn;
+     .btn[aria-busy="true"] with a .spinner (core/ui.js setBusy); .spinner on its own
      .field > .field-label + .input + .field-hint / .field-error; .input on input/select/textarea
      .card; .kbd; .skeleton; .is-selected on a table row */
 
@@ -57,7 +62,7 @@
   align-items: center;
   gap: 10px;
   min-height: 36px;
-  padding: 7px var(--space-2);
+  padding: var(--space-1) var(--space-2);
   border-radius: var(--radius-control);
   color: var(--text-2);
   text-decoration: none;
@@ -98,7 +103,7 @@
   align-items: center;
   gap: var(--space-2);
   min-height: 32px;
-  padding: 4px var(--space-2);
+  padding: var(--space-1) var(--space-2);
   border-radius: var(--radius-control);
   color: var(--text-2);
   font-size: 12.5px;
@@ -246,7 +251,7 @@
   max-width: 40%;
   min-height: 32px;
   margin-left: auto;
-  padding: 4px 12px;
+  padding: var(--space-1) var(--space-3);
   border: 1px solid var(--border);
   border-radius: 999px;
   color: var(--text-2);
@@ -339,18 +344,37 @@
 }
 .btn:disabled,
 .btn[aria-disabled="true"] { opacity: 0.55; cursor: default; }
+/* Busy is not disabled: the button stays legible, says what is happening and keeps focus. It
+   keeps its resting colours on hover: the variants' hover rules skip it with a selector-list
+   :not(), which keeps their specificity (0,3,0) so a view's own hover rule still wins. */
+.btn[aria-busy="true"] { opacity: 1; cursor: progress; }
+
+/* A small spinning ring in the current text colour (busy buttons, inline progress). With
+   reduced motion it stands still (base.css). */
+.spinner {
+  display: inline-block;
+  flex: none;
+  width: 14px;
+  height: 14px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: spinner-turn 0.8s linear infinite;
+}
+
+@keyframes spinner-turn { to { transform: rotate(360deg); } }
 
 .btn-primary { background: var(--accent); color: var(--on-accent); }
-.btn-primary:not(:disabled):hover { background: var(--accent-ink); }
+.btn-primary:not(:disabled, [aria-busy="true"]):hover { background: var(--accent-ink); }
 
 .btn-secondary { background: var(--surface); color: var(--text); border-color: var(--border-strong); }
-.btn-secondary:not(:disabled):hover { background: var(--surface-2); }
+.btn-secondary:not(:disabled, [aria-busy="true"]):hover { background: var(--surface-2); }
 
 .btn-danger { background: var(--danger); color: var(--on-accent); }
-.btn-danger:not(:disabled):hover { background: color-mix(in srgb, var(--danger) 85%, var(--text)); }
+.btn-danger:not(:disabled, [aria-busy="true"]):hover { background: color-mix(in srgb, var(--danger) 85%, var(--text)); }
 
 .btn-ghost { background: transparent; color: var(--text-2); }
-.btn-ghost:not(:disabled):hover { background: var(--surface-2); color: var(--text); }
+.btn-ghost:not(:disabled, [aria-busy="true"]):hover { background: var(--surface-2); color: var(--text); }
 
 .btn-sm { min-height: 32px; padding: var(--space-1) 10px; font-size: 13px; }
 
@@ -451,6 +475,21 @@ textarea.input { min-height: 80px; line-height: 1.5; }
 .tab[aria-selected="true"] { color: var(--text); box-shadow: inset 0 -2px 0 var(--accent); }
 .tab:focus-visible { outline-offset: -2px; }
 
+/* Tabs that scroll sideways fade out at the edge with more of them (tabs.js sets data-more). The
+   mask only uses the gradient's alpha. */
+.tabs[data-more="start"] {
+  -webkit-mask-image: linear-gradient(to right, transparent, #000 var(--space-6));
+  mask-image: linear-gradient(to right, transparent, #000 var(--space-6));
+}
+.tabs[data-more="end"] {
+  -webkit-mask-image: linear-gradient(to left, transparent, #000 var(--space-6));
+  mask-image: linear-gradient(to left, transparent, #000 var(--space-6));
+}
+.tabs[data-more="start end"] {
+  -webkit-mask-image: linear-gradient(to right, transparent, #000 var(--space-6), #000 calc(100% - var(--space-6)), transparent);
+  mask-image: linear-gradient(to right, transparent, #000 var(--space-6), #000 calc(100% - var(--space-6)), transparent);
+}
+
 .tab-count {
   font-family: var(--font-mono);
   font-size: 12px;
@@ -462,6 +501,7 @@ textarea.input { min-height: 80px; line-height: 1.5; }
 /* ---- Table ---- */
 
 .table-wrap {
+  position: relative; /* keeps absolutely placed cell content (.sr-only) inside the scroll box */
   overflow: auto;
   background: var(--surface);
   border: 1px solid var(--border);
@@ -532,6 +572,8 @@ textarea.input { min-height: 80px; line-height: 1.5; }
 .ss-clear { position: absolute; right: 30px; width: 28px; height: 28px; }
 .ss-chevron { position: absolute; right: 10px; display: inline-flex; color: var(--text-3); pointer-events: none; }
 
+/* The popup hangs off .ss-control (the input), above it with .ss-up; searchSelect.js sets the room
+   it has in the viewport. */
 .ss-list,
 .ss-empty {
   position: absolute;
@@ -539,13 +581,16 @@ textarea.input { min-height: 80px; line-height: 1.5; }
   left: 0;
   right: 0;
   z-index: 30;
+  max-width: var(--ss-room-x, none);
   margin: var(--space-1) 0 0;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-input);
   box-shadow: var(--shadow-overlay);
 }
-.ss-list { max-height: 280px; overflow: auto; padding: var(--space-1); list-style: none; }
+.ss-list { max-height: min(280px, var(--ss-room-y, 280px)); overflow: auto; padding: var(--space-1); list-style: none; }
+.search-select.ss-up .ss-list,
+.search-select.ss-up .ss-empty { top: auto; bottom: 100%; margin: 0 0 var(--space-1); }
 .ss-empty { padding: 10px var(--space-3); color: var(--text-2); }
 
 .ss-option {

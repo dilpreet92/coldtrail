@@ -276,6 +276,19 @@ test('base.css: body ground and type, focus ring, sidebar width', () => {
   assert.match(resolve(app.decls.get('grid-template-columns') || ''), /^232px /);
 });
 
+test('base.css: heading scale (spec §2: page titles 22px/600, section titles 15–16px/600)', () => {
+  const rules = cssRules(read('css/base.css'));
+  const heading = (tag) =>
+    rules.find((r) => !r.parents.length && r.selector.split(/\s*,\s*/).includes(tag) && r.decls.has('font-size'));
+  for (const [tag, size] of [['h1', '22px'], ['h2', '16px'], ['h3', '15px']]) {
+    const r = heading(tag);
+    assert.ok(r, `${tag} rule`);
+    assert.equal(r.decls.get('font-size'), size, `${tag} font-size`);
+    assert.equal(r.decls.get('font-weight'), '600', `${tag} font-weight`);
+    assert.ok(r.selector.split(/\s*,\s*/).includes(`.${tag}`), `.${tag} shares the ${tag} rule`);
+  }
+});
+
 test('components.css exists (filled in by the component task)', () => {
   assert.ok(existsSync(join(UI, 'css/components.css')));
 });

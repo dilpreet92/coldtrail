@@ -57,6 +57,8 @@ const CLEANUP_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'];
 // Marks this module's signal handlers, so they don't count each other as "someone else handles it".
 const OWN_HANDLER = Symbol.for('coldtrail.e2e.server-cleanup');
 const START_TIMEOUT_MS = 20_000;
+// How long server.query() waits for a lock the server holds.
+const QUERY_BUSY_MS = 5_000;
 const OUTPUT_LIMIT = 64 * 1024;
 
 const CONFIG_TOML = 'agent = "opencode"\nopencode_model = "fake/model-a"\n';
@@ -199,10 +201,15 @@ export async function startServer({ seed = 'full', bin = DEFAULT_BIN } = {}) {
       apiUrl(path) {
         return `${base}${path}${path.includes('?') ? '&' : '?'}t=${encodeURIComponent(token)}`;
       },
-      /** Rows from a read-only query against the workspace DB (for asserting server-side state). */
+      /**
+       * Rows from a read-only query against the workspace DB (for asserting server-side state).
+       * While the server holds a write lock (an agent turn or a run finishing) it waits up to 5s
+       * for it, rather than throwing "database is locked".
+       */
       query(sql, ...params) {
         const db = new DatabaseSync(join(home, 'outreach.db'), { readOnly: true });
         try {
+          db.exec(`PRAGMA busy_timeout = ${QUERY_BUSY_MS}`);
           return db.prepare(sql).all(...params).map((row) => ({ ...row }));
         } finally {
           db.close();

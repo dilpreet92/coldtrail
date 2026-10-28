@@ -4,7 +4,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { esc, fmtNum, fmtDate, fmtRelative, pluralize, truncate, safeUrl } from '../../ui/js/core/format.js';
+import { esc, fmtNum, fmtDate, fmtRelative, pluralize, truncate, safeUrl, RUN_STATUS, runStatus } from '../../ui/js/core/format.js';
 
 const iso = (...parts) => new Date(...parts).toISOString();
 
@@ -67,6 +67,9 @@ test('fmtRelative: just now, minutes, hours both ways, then a dated fallback', (
   assert.equal(fmtRelative(at(-2 * HOUR), now), '2h ago');
   assert.equal(fmtRelative(at(3 * HOUR), now), 'in 3h');
   assert.equal(fmtRelative(at(10 * MIN), now), 'in 10m');
+  assert.equal(fmtRelative(at(25 * MIN + 30_000), now), 'in 25m', 'future times count down too');
+  assert.equal(fmtRelative(at(25 * HOUR), now), 'in 25h');
+  assert.equal(fmtRelative(at(47 * HOUR + 59 * MIN), now), 'in 47h', 'future: relative within 48h');
   assert.equal(fmtRelative(at(-47 * HOUR), now), '47h ago', 'relative within 48h');
   const old = at(-3 * 24 * HOUR);
   assert.equal(fmtRelative(old, now), fmtDate(old, { time: true, now }));
@@ -100,4 +103,21 @@ test('safeUrl keeps http(s) links only', () => {
   assert.equal(safeUrl('data:text/html,<b>'), '');
   assert.equal(safeUrl('//evil.example'), '');
   assert.equal(safeUrl(null), '');
+});
+
+test('RUN_STATUS: one wording and tone per run status, with a neutral fallback', () => {
+  assert.deepEqual({ ...RUN_STATUS }, {
+    ok: ['Succeeded', 'ok'],
+    error: ['Failed', 'danger'],
+    auth_failed: ['Sign-in failed', 'warn'],
+    running: ['Running', 'accent'],
+  });
+  assert.ok(Object.isFrozen(RUN_STATUS), 'shared, so nobody edits it');
+  assert.deepEqual(runStatus('ok'), ['Succeeded', 'ok']);
+  assert.deepEqual(runStatus('auth_failed'), ['Sign-in failed', 'warn']);
+  assert.deepEqual(runStatus('cancelled'), ['cancelled', 'neutral'], 'an unknown status shows as it is');
+  assert.deepEqual(runStatus(''), ['Unknown', 'neutral']);
+  assert.deepEqual(runStatus(null), ['Unknown', 'neutral']);
+  assert.deepEqual(runStatus('constructor'), ['constructor', 'neutral'], 'no prototype lookups');
+  assert.equal(RUN_STATUS.toString, undefined);
 });

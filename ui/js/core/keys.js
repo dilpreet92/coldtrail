@@ -1,9 +1,17 @@
 // Keyboard shortcuts (spec §4, §5.4): ⌘K / Ctrl+K, J/K, Enter, Esc, ⌘/Ctrl+Enter. Plain keys are
 // ignored while the user is typing, and every key is ignored while an overlay (dialog, drawer,
-// menu) is open: the overlay owns the keyboard then.
+// menu) is open: the overlay owns the keyboard then. The exception is ⌘K / Ctrl+K (global
+// search): its handler still runs and decides. If it can act it calls clearOverlay() first, which
+// closes the overlay on top as Esc would; if it can't (Setup hides the search) it returns false
+// and the overlay and the browser's own shortcut are left alone. Only one bindKeys map (the
+// shell's) should bind mod+k.
+
+import { closeTopOverlay } from './ui.js';
 
 // Shortcuts that still work from inside a text field.
 const WHILE_TYPING = new Set(['mod+k', 'escape', 'mod+enter']);
+// Shortcuts whose handler runs even while an overlay is open (it calls clearOverlay() itself).
+const OVER_OVERLAYS = new Set(['mod+k']);
 const TEXT_TAGS = new Set(['INPUT', 'TEXTAREA', 'SELECT']);
 const CONTROL_TAGS = new Set(['BUTTON', 'A', 'SUMMARY']);
 const CONTROL_ROLES = new Set(['button', 'link', 'switch', 'tab', 'menuitem', 'option', 'checkbox', 'radio', 'combobox']);
@@ -36,8 +44,20 @@ function isControl(target) {
 }
 
 /**
+ * For a mod+k handler that is going to act: close the overlay on top as Esc would → true when no
+ * overlay is left open (go on), false while another is still open (stop and return true: the
+ * next press closes that one). With nothing open it just returns true.
+ */
+export function clearOverlay() {
+  if (!document.querySelector('[data-overlay]')) return true;
+  closeTopOverlay('escape');
+  return !document.querySelector('[data-overlay]');
+}
+
+/**
  * bindKeys({ 'mod+k': fn, j: fn, k: fn, escape: fn, enter: fn, 'mod+enter': fn }) → unbind.
- * fn(event) runs and the event is consumed (preventDefault) unless fn returns false.
+ * fn(event) runs and the event is consumed (preventDefault) unless fn returns false. While an
+ * overlay is open only mod+k runs, and its fn deals with the overlay (see clearOverlay).
  */
 export function bindKeys(map) {
   const handlers = new Map(Object.entries(map).map(([k, fn]) => [normalize(k), fn]));
@@ -48,7 +68,7 @@ export function bindKeys(map) {
     if (!fn) return;
     if (isTyping(e.target) && !WHILE_TYPING.has(combo)) return;
     if (combo === 'enter' && isControl(e.target)) return;
-    if (document.querySelector('[data-overlay]')) return;
+    if (!OVER_OVERLAYS.has(combo) && document.querySelector('[data-overlay]')) return;
     if (fn(e) !== false) e.preventDefault();
   };
   document.addEventListener('keydown', onKeydown);

@@ -207,6 +207,41 @@ test('401 throws SESSION_EXPIRED and fires coldtrail:session-expired once', asyn
   });
 });
 
+test('api helpers pass keepalive through for saves sent as the page goes away', async () => {
+  const fetch = fakeFetch(() => Response.json({ ok: true }));
+  await withGlobals({ fetch, window: new EventTarget() }, async () => {
+    await api.post('/x', { a: 1 }, { keepalive: true });
+    assert.equal(fetch.calls.at(-1).init.keepalive, true);
+    await api.patch('/x', {}, { keepalive: true });
+    assert.equal(fetch.calls.at(-1).init.keepalive, true);
+    await api.del('/x', { keepalive: true });
+    assert.equal(fetch.calls.at(-1).init.keepalive, true);
+    await api.get('/x', { keepalive: true });
+    assert.equal(fetch.calls.at(-1).init.keepalive, true);
+    await api.post('/x', {});
+    assert.ok(!('keepalive' in fetch.calls.at(-1).init), 'off unless asked for');
+  });
+});
+
+test('openStream calls onOpen once the stream is connected', async () => {
+  const sources = [];
+  class FakeEventSource {
+    constructor(url) { this.url = url; sources.push(this); }
+    close() { this.closed = true; }
+  }
+  await withGlobals({ document: { cookie: '' }, EventSource: FakeEventSource }, () => {
+    let opened = 0;
+    const s = openStream('/api/chat/stream?run=r2', { onOpen: () => opened++ });
+    sources[0].onopen();
+    assert.equal(opened, 1);
+    s.close();
+    sources[0].onopen();
+    assert.equal(opened, 1, 'nothing after close');
+    openStream('/api/x'); // onOpen is optional
+    sources[1].onopen?.();
+  });
+});
+
 test('initToken moves ?t= into the cookie and keeps the hash; openStream appends it', async () => {
   const cookies = [];
   const replaced = [];
@@ -215,9 +250,15 @@ test('initToken moves ?t= into the cookie and keeps the hash; openStream appends
     constructor(url) { this.url = url; this.closed = 0; sources.push(this); }
     close() { this.closed++; }
   }
+  const jar = new Map([['other', '1'], ['ct_token', 'from-cookie']]);
   const doc = {
-    get cookie() { return 'other=1; ct_token=from-cookie'; },
-    set cookie(v) { cookies.push(v); },
+    get cookie() { return [...jar].map(([k, v]) => `${k}=${v}`).join('; '); },
+    set cookie(v) {
+      cookies.push(v);
+      const [pair] = v.split(';');
+      const eq = pair.indexOf('=');
+      jar.set(pair.slice(0, eq), pair.slice(eq + 1));
+    },
   };
   await withGlobals({ document: doc, EventSource: FakeEventSource, location: { href: 'http://127.0.0.1:7777/?t=tok123&x=1#/pipeline?q=a%20b' }, history: { state: null, replaceState: (_s, _t, url) => replaced.push(url) } }, async () => {
     assert.equal(token(), 'from-cookie', 'before boot the cookie is used');
@@ -247,6 +288,15 @@ test('initToken moves ?t= into the cookie and keeps the hash; openStream appends
 
     openStream('/api/x', {});
     assert.equal(sources[1].url, '/api/x?t=tok123');
+
+    // The server restarted and a fresh tab rewrote the shared cookie: streams follow the cookie,
+    // like fetch does.
+    jar.set('ct_token', 'tok456');
+    assert.equal(token(), 'tok456', 'the current cookie wins over the boot token');
+    openStream('/api/x', {});
+    assert.equal(sources[2].url, '/api/x?t=tok456');
+    jar.delete('ct_token');
+    assert.equal(token(), 'tok123', 'no cookie: the boot token');
   });
 
   // No ?t=: nothing is written.
@@ -413,9 +463,11 @@ test('bindKeys: ignored while typing except mod+k / escape / mod+enter', async (
     press('j', body, { defaultPrevented: true });
     overlay = {};
     press('j');
+    press('Escape', input);
+    assert.deepEqual(hits, [], 'shifted, already-handled, and behind-an-overlay keys are ignored');
     press('k', input, { metaKey: true });
     overlay = null;
-    assert.deepEqual(hits, [], 'shifted, already-handled, and behind-an-overlay keys are ignored');
+    assert.deepEqual(hits, ['mod+k'], 'mod+k reaches its handler over an overlay (the handler deals with it)');
 
     unbind();
     assert.equal(listener, null);

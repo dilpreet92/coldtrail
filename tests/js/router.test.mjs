@@ -1,9 +1,13 @@
 // Hash router (ui/js/core/router.js): parse/href round-trips, plus the mount / update / unmount
 // lifecycle against a small fake browser (location, history, document, window).
 
-import { test } from 'node:test';
+import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseHash, href, navigate, setQuery, startRouter } from '../../ui/js/core/router.js';
+import { parseHash, href, navigate, setQuery, startRouter, ensureViewCss } from '../../ui/js/core/router.js';
+
+const flush = async (n = 10) => {
+  for (let i = 0; i < n; i++) await new Promise((r) => setImmediate(r));
+};
 
 test('parseHash / href round-trip a deep link with an encoded query', () => {
   const r = parseHash('#/pipeline/acme.com?q=a%20b&page=2');
@@ -39,12 +43,17 @@ test('path segments and query values are decoded and re-encoded', () => {
 // ---- lifecycle against a fake browser ----
 
 class FakeEl {
-  constructor(tag, env) { this.tag = tag; this.env = env; this.attrs = {}; this.children = []; }
+  constructor(tag, env) { this.tag = tag; this.env = env; this.attrs = {}; this.children = []; this.listeners = {}; this.sheet = null; }
   setAttribute(k, v) { this.attrs[k] = String(v); }
   getAttribute(k) { return this.attrs[k] ?? null; }
   hasAttribute(k) { return k in this.attrs; }
   removeAttribute(k) { delete this.attrs[k]; }
-  addEventListener() {}
+  addEventListener(t, f) { (this.listeners[t] ||= []).push(f); }
+  removeEventListener(t, f) { this.listeners[t] = (this.listeners[t] || []).filter((x) => x !== f); }
+  fire(t) {
+    if (t === 'load') this.sheet = {};
+    for (const f of [...(this.listeners[t] || [])]) f({ type: t });
+  }
   append(...n) { this.children.push(...n); }
   replaceChildren(...n) { this.children = n; }
   querySelector(sel) {
@@ -60,8 +69,9 @@ class FakeEl {
   focus() { this.env.focused = this; }
 }
 
-function fakeBrowser(hash = '') {
-  const env = { pushes: 0, replaces: 0, listeners: {}, focused: null, links: [] };
+/** cssMode: 'load' (a stylesheet loads right after it is added) | 'manual' (the test fires it). */
+function fakeBrowser(hash = '', { cssMode = 'load' } = {}) {
+  const env = { pushes: 0, replaces: 0, listeners: {}, focused: null, links: [], scrolls: 0 };
   const loc = { hash };
   env.location = loc;
   env.go = (h) => { // what the browser does on back/forward or a typed hash
@@ -78,11 +88,17 @@ function fakeBrowser(hash = '') {
     window: {
       addEventListener(t, f) { (env.listeners[t] ||= []).push(f); },
       removeEventListener(t, f) { env.listeners[t] = (env.listeners[t] || []).filter((x) => x !== f); },
-      scrollTo() {},
+      scrollTo() { env.scrolls++; },
     },
     document: {
       title: '',
-      head: { append: (el) => env.links.push(el) },
+      head: {
+        append: (el) => {
+          env.links.push(el);
+          if (cssMode === 'load') setImmediate(() => el.fire('load'));
+        },
+      },
+      querySelectorAll: (sel) => (sel === 'link[rel="stylesheet"]' ? env.links.filter((l) => l.attrs.rel === 'stylesheet') : []),
       createElement: (tag) => new FakeEl(tag, env),
       createTextNode: (s) => String(s),
     },
@@ -105,11 +121,12 @@ function fakeBrowser(hash = '') {
 const seen = { ctx: null }; // the ctx of the latest mount
 
 /** A view module that records its lifecycle into `log`. */
-function view(name, log, { css = false, update } = {}) {
+function view(name, log, { css = false, update, ...extra } = {}) {
   return {
     default: {
       title: name[0].toUpperCase() + name.slice(1),
       css,
+      ...extra,
       mount(root, ctx) {
         log.push(['mount', name, ctx.path.join('/'), { ...ctx.query }]);
         seen.ctx = ctx;
@@ -234,6 +251,377 @@ test('a view whose mount throws shows an error instead of a blank screen', async
     assert.equal(errors.length, 1);
   } finally {
     console.error = origError;
+    router?.stop();
+    env.restore();
+  }
+});
+
+test('a view mounts only once its stylesheet has loaded, failed, or 1.5s passed', async () => {
+  const env = fakeBrowser('', { cssMode: 'manual' });
+  const log = [];
+  mock.timers.enable({ apis: ['setTimeout'] });
+  let router;
+  try {
+    router = startRouter({
+      routes: {
+        home: async () => view('home', log),
+        styled: async () => view('styled', log, { css: true }),
+        broken: async () => view('broken', log, { css: true }),
+        slowcss: async () => view('slowcss', log, { css: true }),
+      },
+      root: env.root,
+      store: {},
+    });
+    await router.ready;
+    log.length = 0;
+
+    const p1 = navigate('#/styled');
+    await flush();
+    assert.deepEqual(log, [], 'the old screen stays while the stylesheet loads');
+    const link = env.links.at(-1);
+    assert.equal(link.attrs.href, '/assets/css/views/styled.css');
+    link.fire('load');
+    await p1;
+    assert.deepEqual(log, [['unmount', 'home'], ['mount', 'styled', 'styled', {}]]);
+
+    log.length = 0;
+    const p2 = navigate('#/broken');
+    await flush();
+    assert.deepEqual(log, []);
+    env.links.at(-1).fire('error'); // a missing stylesheet doesn't keep the screen out
+    await p2;
+    assert.deepEqual(log, [['unmount', 'styled'], ['mount', 'broken', 'broken', {}]]);
+
+    log.length = 0;
+    const p3 = navigate('#/slowcss');
+    await flush();
+    mock.timers.tick(1499);
+    await flush();
+    assert.deepEqual(log, []);
+    mock.timers.tick(1);
+    await p3;
+    assert.deepEqual(log, [['unmount', 'broken'], ['mount', 'slowcss', 'slowcss', {}]], 'capped at 1.5s');
+
+    // A stylesheet that already settled is not waited for again.
+    log.length = 0;
+    await navigate('#/styled');
+    assert.deepEqual(log, [['unmount', 'slowcss'], ['mount', 'styled', 'styled', {}]]);
+    assert.equal(env.links.filter((l) => l.attrs.href === '/assets/css/views/styled.css').length, 1);
+  } finally {
+    router?.stop();
+    mock.timers.reset();
+    env.restore();
+  }
+});
+
+test('ensureViewCss adds one link per view and reuses a link a view added itself', async () => {
+  const env = fakeBrowser('', { cssMode: 'manual' });
+  try {
+    const a = ensureViewCss('reused-a');
+    assert.equal(ensureViewCss('reused-a'), a, 'one load per view');
+    assert.deepEqual(env.links.map((l) => [l.attrs.rel, l.attrs.href]), [['stylesheet', '/assets/css/views/reused-a.css']]);
+    let settled = false;
+    a.then(() => { settled = true; });
+    await flush();
+    assert.equal(settled, false);
+    env.links[0].fire('load');
+    await flush();
+    assert.equal(settled, true);
+
+    // A view module reused elsewhere already added (and loaded) its stylesheet.
+    const own = env.document.createElement('link');
+    own.setAttribute('rel', 'stylesheet');
+    own.setAttribute('href', '/assets/css/views/reused-b.css');
+    own.sheet = {};
+    env.links.push(own);
+    await ensureViewCss('reused-b');
+    assert.equal(env.links.length, 2, 'no duplicate link');
+
+    // Added but still loading: waits for it.
+    const pending = env.document.createElement('link');
+    pending.setAttribute('rel', 'stylesheet');
+    pending.setAttribute('href', '/assets/css/views/reused-c.css');
+    env.links.push(pending);
+    let done = false;
+    ensureViewCss('reused-c').then(() => { done = true; });
+    await flush();
+    assert.equal(done, false);
+    pending.fire('load');
+    await flush();
+    assert.equal(done, true);
+    assert.equal(env.links.length, 3);
+  } finally {
+    env.restore();
+  }
+});
+
+test('navigate({ silent: true }) rewrites the address without re-dispatching the view', async () => {
+  const env = fakeBrowser('#/setup');
+  const log = [];
+  let router;
+  try {
+    router = startRouter({
+      routes: { home: async () => view('home', log), setup: async () => view('setup', log, { update: () => true }) },
+      root: env.root,
+      store: {},
+    });
+    await router.ready;
+    log.length = 0;
+    await navigate('#/setup/agent', { replace: true, silent: true });
+    assert.equal(env.location.hash, '#/setup/agent');
+    assert.equal(env.replaces, 1);
+    assert.deepEqual(log, [], 'neither update() nor mount()');
+    // The router knows the new address: going there again is a no-op, a real change is not.
+    await navigate('#/setup/agent');
+    assert.deepEqual(log, []);
+    await setQuery({ x: '1' }, { silent: true });
+    assert.equal(env.location.hash, '#/setup/agent?x=1');
+    assert.deepEqual(log, []);
+    env.go('#/setup/company');
+    await router.idle();
+    assert.deepEqual(log, [['update', 'setup', 'setup/company', {}]]);
+    log.length = 0;
+    await navigate('#/setup/done', { silent: true });
+    assert.equal(env.pushes, 1, 'pushes unless replace');
+    assert.deepEqual(log, []);
+  } finally {
+    router?.stop();
+    env.restore();
+  }
+});
+
+test('beforeLeave() runs before unmount on a route change, awaited up to 1.5s', async () => {
+  const env = fakeBrowser('#/editor');
+  const log = [];
+  let release;
+  let mode = 'wait';
+  const warnings = [];
+  const origWarn = console.warn;
+  console.warn = (...a) => warnings.push(a);
+  mock.timers.enable({ apis: ['setTimeout'] });
+  let router;
+  try {
+    const editor = view('editor', log, {
+      update: (ctx) => ctx.query.keep === '1',
+      beforeLeave(to) {
+        log.push(['beforeLeave', 'editor', to.name, to.path.join('/')]);
+        if (mode === 'wait') return new Promise((r) => { release = () => { log.push(['saved']); r(); }; });
+        if (mode === 'hang') return new Promise(() => {});
+        if (mode === 'reject') return Promise.reject(new Error('save failed'));
+        throw new Error('bug');
+      },
+    });
+    router = startRouter({
+      routes: { home: async () => view('home', log), editor: async () => editor },
+      root: env.root,
+      store: {},
+    });
+    await router.ready;
+    log.length = 0;
+
+    // Kept by update(): not leaving, so no beforeLeave.
+    await navigate('#/editor?keep=1');
+    assert.deepEqual(log, [['update', 'editor', 'editor', { keep: '1' }]]);
+
+    log.length = 0;
+    const p = navigate('#/home');
+    await flush();
+    assert.deepEqual(log, [['beforeLeave', 'editor', 'home', 'home']]);
+    release();
+    await p;
+    assert.deepEqual(log.slice(1), [['saved'], ['unmount', 'editor'], ['mount', 'home', 'home', {}]]);
+
+    // update() saying no (a remount of the same view) is leaving too.
+    await navigate('#/editor');
+    log.length = 0;
+    mode = 'hang';
+    const p2 = navigate('#/editor/x');
+    await flush();
+    assert.deepEqual(log, [['update', 'editor', 'editor/x', {}], ['beforeLeave', 'editor', 'editor', 'editor/x']]);
+    mock.timers.tick(1500);
+    await p2;
+    assert.deepEqual(log.slice(2), [['unmount', 'editor'], ['mount', 'editor', 'editor/x', {}]], 'a hung hook is capped');
+
+    for (const m of ['reject', 'throw']) {
+      mode = m;
+      log.length = 0;
+      await navigate('#/home');
+      assert.deepEqual(log.slice(1), [['unmount', 'editor'], ['mount', 'home', 'home', {}]], `${m}: still leaves`);
+      await navigate('#/editor');
+    }
+    assert.equal(warnings.length, 2, 'failures are reported as warnings, not errors');
+  } finally {
+    console.warn = origWarn;
+    router?.stop();
+    mock.timers.reset();
+    env.restore();
+  }
+});
+
+test('a view with autofocus: false keeps the heading from taking focus', async () => {
+  const env = fakeBrowser('#/composer');
+  let router;
+  try {
+    router = startRouter({
+      routes: { home: async () => view('home', []), composer: async () => view('composer', [], { autofocus: false }) },
+      root: env.root,
+      store: {},
+    });
+    await router.ready;
+    assert.equal(env.focused, null);
+    assert.equal(env.scrolls, 1, 'still scrolled to the top');
+    await navigate('#/home');
+    assert.equal(env.focused?.tag, 'h1');
+  } finally {
+    router?.stop();
+    env.restore();
+  }
+});
+
+test('navigating to the current address after a failed load or mount retries', async () => {
+  const env = fakeBrowser('#/flaky');
+  const log = [];
+  const origError = console.error;
+  console.error = () => {};
+  let imports = 0;
+  let mounts = 0;
+  let router;
+  try {
+    router = startRouter({
+      routes: {
+        home: async () => view('home', log),
+        flaky: async () => {
+          if (++imports === 1) throw new Error('import failed');
+          return { default: { title: 'Flaky', mount(root) { if (++mounts === 1) throw new Error('mount failed'); root.append('ok'); } } };
+        },
+      },
+      root: env.root,
+      store: {},
+    });
+    await router.ready;
+    assert.match(env.root.textContent, /import failed/);
+    await navigate('#/flaky');
+    assert.equal(imports, 2, 'the import is retried');
+    assert.match(env.root.textContent, /mount failed/);
+    await navigate('#/flaky');
+    assert.equal(mounts, 2, 'the mount is retried');
+    assert.equal(env.root.textContent, 'ok');
+    await navigate('#/flaky');
+    assert.equal(mounts, 2, 'a screen that loaded is not reloaded');
+  } finally {
+    console.error = origError;
+    router?.stop();
+    env.restore();
+  }
+});
+
+test('a failed mount is retried even when the view has update() (it is remounted, not updated)', async () => {
+  const env = fakeBrowser('#/home');
+  const origError = console.error;
+  console.error = () => {};
+  const mounts = { sync: 0, async: 0 };
+  const updates = { sync: 0, async: 0 };
+  // Like home.js: update() always keeps the DOM. The first mount throws (sync) or rejects (async).
+  const flaky = (kind) => async () => ({
+    default: {
+      title: kind,
+      mount(root) {
+        const n = ++mounts[kind];
+        if (kind === 'sync') {
+          if (n === 1) throw new Error('mount failed');
+          root.append('ok');
+          return undefined;
+        }
+        return n === 1 ? Promise.reject(new Error('async mount failed')) : (root.append('ok'), Promise.resolve(() => {}));
+      },
+      update: () => {
+        updates[kind]++;
+        return true;
+      },
+    },
+  });
+  let router;
+  try {
+    router = startRouter({ routes: { home: flaky('sync'), other: flaky('async') }, root: env.root, store: {} });
+    await router.ready;
+    assert.match(env.root.textContent, /mount failed/);
+    await navigate('#/home');
+    assert.equal(mounts.sync, 2, 'the failed screen is mounted again');
+    assert.equal(updates.sync, 0, 'not updated in place');
+    assert.equal(env.root.textContent, 'ok');
+    await navigate('#/home?x=1');
+    assert.equal(updates.sync, 1, 'a screen that loaded updates in place again');
+    assert.equal(mounts.sync, 2);
+
+    await navigate('#/other');
+    await flush();
+    assert.match(env.root.textContent, /async mount failed/);
+    await navigate('#/other');
+    await flush();
+    assert.equal(mounts.async, 2, 'a rejected async mount is retried');
+    assert.equal(updates.async, 0);
+    assert.equal(env.root.textContent, 'ok');
+  } finally {
+    console.error = origError;
+    router?.stop();
+    env.restore();
+  }
+});
+
+test('redirect() can send a route elsewhere before the view loads', async () => {
+  const env = fakeBrowser('#/drafts');
+  const log = [];
+  let needsSetup = true;
+  let asyncCheck = null;
+  let router;
+  try {
+    router = startRouter({
+      routes: {
+        home: async () => view('home', log),
+        drafts: async () => view('drafts', log, { update: () => true }),
+        setup: async () => view('setup', log),
+        loop: async () => view('loop', log),
+      },
+      root: env.root,
+      store: {},
+      redirect: ({ name }) => {
+        log.push(['redirect', name]);
+        if (name === 'loop') return '#/loop?again=1';
+        if (name === 'setup' || !needsSetup) return null;
+        if (asyncCheck) return asyncCheck.then(() => (needsSetup ? '#/setup' : null));
+        return '#/setup';
+      },
+    });
+    await router.ready;
+    assert.equal(env.location.hash, '#/setup');
+    assert.deepEqual(log, [['redirect', 'drafts'], ['redirect', 'setup'], ['mount', 'setup', 'setup', {}]], 'drafts never loads');
+
+    // An async answer: the current screen stays until it comes, and the target never flashes.
+    log.length = 0;
+    let answer;
+    asyncCheck = new Promise((r) => { answer = r; });
+    const p = navigate('#/drafts');
+    await flush();
+    assert.deepEqual(log, [['redirect', 'drafts']]);
+    needsSetup = false;
+    answer();
+    await p;
+    assert.equal(env.location.hash, '#/drafts');
+    assert.deepEqual(log.slice(1), [['unmount', 'setup'], ['mount', 'drafts', 'drafts', {}]]);
+
+    // In-place updates with a synchronous answer stay synchronous.
+    log.length = 0;
+    asyncCheck = null;
+    navigate('#/drafts/a.com');
+    assert.deepEqual(log, [['redirect', 'drafts'], ['update', 'drafts', 'drafts/a.com', {}]]);
+    await router.idle();
+
+    // A redirect that keeps redirecting stops instead of looping.
+    log.length = 0;
+    await navigate('#/loop');
+    assert.equal(env.location.hash, '#/loop?again=1');
+    assert.equal(log.filter((l) => l[0] === 'mount').length, 1);
+  } finally {
     router?.stop();
     env.restore();
   }

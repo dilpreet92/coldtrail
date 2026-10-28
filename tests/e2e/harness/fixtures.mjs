@@ -12,7 +12,9 @@
 //
 // `app` opens the app for one test with the side-effect intercepts installed, and fails the test
 // on any console.error or uncaught page error (allow-list one with `app.allowConsole(/regex/)`;
-// `app.problems()` lists the ones that would fail it so far).
+// `app.problems()` lists the ones that would fail it so far). On the way out it removes every
+// route, ignoring what a handler still running then throws (a spec's async `route.fetch` handler
+// can be cut off by the page closing: "Response has been disposed").
 import { test as base, expect } from '@playwright/test';
 
 import { interceptSideEffects } from './intercept.mjs';
@@ -69,6 +71,7 @@ export const test = base.extend({
       problems: unexpected,
     });
 
+    await page.unrouteAll({ behavior: 'ignoreErrors' });
     expect(unexpected(), 'console errors or uncaught page errors during the test').toEqual([]);
   },
 });
