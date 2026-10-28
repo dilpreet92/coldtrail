@@ -32,6 +32,40 @@ pub fn custom_brief(instruction: &str) -> String {
     )
 }
 
+/// Record a run that never started because the provider check before it failed, and clear
+/// the pre-created chat's running flag. Only a failure that looks like a sign-in problem is
+/// `auth_failed` (the UI sends the user to sign the agent in again); anything else — a
+/// deprecated model, a provider outage, a timeout — is a plain `error`. Either way the
+/// provider's message is the run's note.
+fn record_probe_failure(
+    note: &str,
+    precreated: Option<&str>,
+    schedule_id: Option<&str>,
+    trigger: &str,
+) {
+    let status = if crate::probe::looks_like_auth(note) {
+        crate::logf::log(&format!(
+            "scheduled run skipped: provider not signed in ({note})"
+        ));
+        "auth_failed"
+    } else {
+        crate::logf::log(&format!(
+            "scheduled run skipped: provider check failed ({note})"
+        ));
+        "error"
+    };
+    let z = crate::db::Counts {
+        companies: 0,
+        contacts: 0,
+        outreach: 0,
+        sent_today: 0,
+    };
+    let _ = crate::db::record_run(status, z, z, precreated, Some(note), schedule_id, trigger);
+    if let Some(id) = precreated {
+        let _ = crate::db::set_chat_running(id, false);
+    }
+}
+
 /// One unattended cycle, optionally attributed to a schedule and tagged with the trigger that
 /// started it ("manual", "cron", "dry", ...). `chat_id`, when given, is a chat the caller
 /// (the web run-now endpoint) already pre-created so its UI can open it and watch progress land
@@ -40,7 +74,7 @@ pub fn custom_brief(instruction: &str) -> String {
 pub async fn run(schedule_id: Option<&str>, trigger: &str, chat_id: Option<&str>) -> Result<()> {
     // The web run-now endpoint pre-creates the chat and marks it running=1 BEFORE spawning this
     // subprocess, so its UI can open the chat and poll for live progress. If we abort below
-    // before reaching the point where `running` is normally cleared (the auth-gate / workspace
+    // before reaching the point where `running` is normally cleared (the provider and workspace
     // checks all happen before that), we must clear it ourselves or the pre-created chat is
     // stuck "running" forever with zero messages and the UI polls it indefinitely.
     let precreated = chat_id;
@@ -60,61 +94,21 @@ pub async fn run(schedule_id: Option<&str>, trigger: &str, chat_id: Option<&str>
     }
     let backend = resolve();
 
-    // Auth gate first — a doomed turn helps no one. Record + bail cleanly if not signed in.
-    match crate::probe::probe(&backend).await {
-        crate::probe::Outcome::Ok => {}
-        crate::probe::Outcome::Failed(m) => {
-            crate::logf::log(&format!(
-                "scheduled run skipped: provider not signed in ({m})"
-            ));
-            let z = crate::db::Counts {
-                companies: 0,
-                contacts: 0,
-                outreach: 0,
-                sent_today: 0,
-            };
-            let _ = crate::db::record_run(
-                "auth_failed",
-                z,
-                z,
-                precreated,
-                Some(&m),
-                schedule_id,
-                trigger,
-            );
-            if let Some(id) = precreated {
-                let _ = crate::db::set_chat_running(id, false);
-            }
-            if draft_only {
-                std::env::remove_var("COLDTRAIL_NO_SEND");
-            }
-            return Ok(());
-        }
+    // Provider check first — a doomed turn helps no one. Record + bail cleanly if the provider
+    // can't answer (not signed in, a deprecated model, an outage, ...).
+    let failure = match crate::probe::probe(&backend).await {
+        crate::probe::Outcome::Ok => None,
+        crate::probe::Outcome::Failed(m) => Some(m),
         crate::probe::Outcome::TimedOut => {
-            crate::logf::log("scheduled run skipped: provider auth probe timed out");
-            let z = crate::db::Counts {
-                companies: 0,
-                contacts: 0,
-                outreach: 0,
-                sent_today: 0,
-            };
-            let _ = crate::db::record_run(
-                "auth_failed",
-                z,
-                z,
-                precreated,
-                Some("auth probe timed out"),
-                schedule_id,
-                trigger,
-            );
-            if let Some(id) = precreated {
-                let _ = crate::db::set_chat_running(id, false);
-            }
-            if draft_only {
-                std::env::remove_var("COLDTRAIL_NO_SEND");
-            }
-            return Ok(());
+            Some("the agent didn't answer a test prompt within 60 seconds".to_string())
         }
+    };
+    if let Some(note) = failure {
+        record_probe_failure(&note, precreated, schedule_id, trigger);
+        if draft_only {
+            std::env::remove_var("COLDTRAIL_NO_SEND");
+        }
+        return Ok(());
     }
 
     let home = match crate::home::workspace() {
@@ -489,6 +483,77 @@ mod tests {
             )
             .unwrap();
         assert_eq!(running, 0);
+
+        std::env::remove_var("COLDTRAIL_HOME");
+    }
+
+    /// A mock backend whose /chat/completions always answers `code` with `body`.
+    async fn failing_backend(code: u16, body: &'static str) -> String {
+        use axum::{routing::post, Router};
+        let status = axum::http::StatusCode::from_u16(code).unwrap();
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |_b: String| async move { (status, body) }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// The provider check before a run only records `auth_failed` when the failure looks like
+    /// a sign-in problem. Anything else — a deprecated model, a provider-side 500 (the two
+    /// real failures that were shown as "Sign-in failed") — is a plain `error` whose note
+    /// carries the provider's message.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn probe_failure_is_auth_failed_only_for_sign_in_problems() {
+        let _g = crate::testutil::env_guard();
+        let home = std::env::temp_dir().join("ct-run-probe-classify");
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("COLDTRAIL_HOME", &home);
+        crate::db::init().unwrap();
+
+        let cases: [(u16, &'static str, &str, &str); 5] = [
+            (
+                400,
+                "Model muse-spark-1.3-contributor-free has been deprecated.",
+                "error",
+                "has been deprecated",
+            ),
+            (
+                500,
+                "Unexpected server error. Check server logs for details.",
+                "error",
+                "Unexpected server error",
+            ),
+            (401, "Unauthorized", "auth_failed", "401"),
+            (403, "forbidden", "auth_failed", "403"),
+            (
+                400,
+                "Invalid API key provided",
+                "auth_failed",
+                "Invalid API key",
+            ),
+        ];
+        for (code, body, status, note) in cases {
+            let base = failing_backend(code, body).await;
+            crate::config::save(&crate::config::Config {
+                agent: Some("openai".into()),
+                provider: Some(crate::config::Provider {
+                    base_url: Some(base),
+                    model: Some("m".into()),
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+            run(None, "scheduled", None).await.unwrap();
+            let r = crate::db::last_run().unwrap().unwrap();
+            assert_eq!(r.status, status, "{code} {body}");
+            let got = r.note.unwrap_or_default();
+            assert!(got.contains(note), "{code} {body}: note {got:?}");
+            assert!(r.chat_id.is_none()); // the run never started
+        }
 
         std::env::remove_var("COLDTRAIL_HOME");
     }

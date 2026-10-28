@@ -78,6 +78,7 @@ pub async fn status() -> Result<Json<StatusDto>, ApiErr> {
         daily_send_cap: cfg
             .daily_send_cap
             .unwrap_or(crate::config::DEFAULT_DAILY_SEND_CAP),
+        email_sent_today: crate::deliver::sent_today(),
         osint: crate::osint::status(),
         gmail_client_configured: crate::oauth::google_client().is_some(),
         gcloud_available: crate::gcloud::available(),
@@ -415,7 +416,10 @@ pub async fn set_message(Json(req): Json<TomlReq>) -> Result<Json<MsgResp>, ApiE
 }
 
 pub async fn set_contacted(Json(req): Json<TomlReq>) -> Result<Json<MsgResp>, ApiErr> {
-    crate::seed::parse(&req.toml).map_err(|e| anyhow::anyhow!("invalid contacted.toml: {e}"))?;
+    // The root cause is the TOML parser's error, which names the line and column; the outer
+    // context alone ("not valid TOML") would leave the user guessing where.
+    crate::seed::parse(&req.toml)
+        .map_err(|e| anyhow::anyhow!("invalid contacted.toml: {}", e.root_cause()))?;
     std::fs::write(crate::home::path("contacted.toml")?, &req.toml)?;
     Ok(Json(MsgResp::ok()))
 }
@@ -479,6 +483,70 @@ mod tests {
             assert_eq!(s.opencode_model.as_deref(), Some("opencode/grok-code"));
             std::fs::write(dir.join("config.toml"), "agent = \"opencode\"\n").unwrap();
             assert_eq!(rt.block_on(status()).unwrap().0.opencode_model, None);
+        });
+    }
+
+    /// `email_sent_today` counts today's email sends only (the warmup cap's count), beside the
+    /// LinkedIn counters: not yesterday's, not LinkedIn invites, not unsent drafts.
+    #[test]
+    fn status_reports_email_sent_today() {
+        crate::testutil::with_home("ct-web-onboarding-email-today", |_| {
+            crate::home::workspace().unwrap();
+            crate::db::init().unwrap();
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            assert_eq!(rt.block_on(status()).unwrap().0.email_sent_today, 0);
+            crate::db::open()
+                .unwrap()
+                .execute_batch(
+                    "INSERT INTO companies (domain) VALUES ('a.com'), ('b.com'), ('c.com'), \
+                     ('d.com'), ('e.com'); \
+                     INSERT INTO outreach (domain, channel, status, sent_at) VALUES \
+                     ('a.com','email','sent',datetime('now')), \
+                     ('b.com',NULL,'sent',datetime('now')), \
+                     ('c.com','email','sent',datetime('now','-2 days')), \
+                     ('d.com','linkedin','sent',datetime('now')); \
+                     INSERT INTO outreach (domain, channel, status) VALUES ('e.com','email','draft_pending');",
+                )
+                .unwrap();
+            let s = rt.block_on(status()).unwrap().0;
+            assert_eq!(s.email_sent_today, 2);
+            assert_eq!(s.linkedin_sent_today, 1);
+            let v = serde_json::to_value(&s).unwrap();
+            assert_eq!(v["email_sent_today"], 2);
+        });
+    }
+
+    /// Invalid TOML is a 500 whose body carries the parser's location, so the Company profile
+    /// screen can say where the mistake is; the file on disk is left alone.
+    #[test]
+    fn set_contacted_error_names_the_line() {
+        use tower::ServiceExt;
+        crate::testutil::with_home("ct-web-onboarding-contacted-invalid", |_| {
+            crate::home::workspace().unwrap();
+            let before = std::fs::read_to_string(crate::home::path("contacted.toml").unwrap()).ok();
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/onboarding/contacted?t=secret-tok")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"toml": "\"ok.com\" = { status = \"sent\" }\nnot a domain\n"})
+                        .to_string(),
+                ))
+                .unwrap();
+            let app = crate::web::router(crate::web::tests::state());
+            let resp = rt.block_on(app.oneshot(req)).unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+            let body = rt
+                .block_on(axum::body::to_bytes(resp.into_body(), usize::MAX))
+                .unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(body.starts_with("invalid contacted.toml"), "{body}");
+            assert!(body.contains("line 2"), "{body}");
+            assert_eq!(
+                std::fs::read_to_string(crate::home::path("contacted.toml").unwrap()).ok(),
+                before
+            );
         });
     }
 

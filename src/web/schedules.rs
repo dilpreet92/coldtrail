@@ -20,6 +20,8 @@ pub struct LastRunDto {
     pub drafted: i64,
     pub sent: i64,
     pub chat_id: Option<String>,
+    /// Why the run failed, when recorded (see `RunDto::note`).
+    pub note: Option<String>,
 }
 
 impl From<crate::db::RunRow> for LastRunDto {
@@ -32,6 +34,7 @@ impl From<crate::db::RunRow> for LastRunDto {
             drafted: r.drafted,
             sent: r.sent,
             chat_id: r.chat_id,
+            note: r.note,
         }
     }
 }
@@ -104,6 +107,10 @@ pub struct RunDto {
     pub chat_id: Option<String>,
     pub trigger: Option<String>,
     pub schedule_name: Option<String>,
+    /// Why the run failed, when recorded: for a run that never started, the provider's own
+    /// message from the check before it (`auth_failed` = it looked like a sign-in problem;
+    /// `error` = anything else, e.g. a deprecated model or a provider outage).
+    pub note: Option<String>,
 }
 
 impl From<crate::db::RunRow> for RunDto {
@@ -118,6 +125,7 @@ impl From<crate::db::RunRow> for RunDto {
             chat_id: r.chat_id,
             trigger: r.trigger,
             schedule_name: r.schedule_name,
+            note: r.note,
         }
     }
 }
@@ -291,5 +299,55 @@ mod tests {
         assert!(validate("daily", "09:00", "custom", None).is_err()); // custom needs a prompt
         assert!(validate("daily", "09:00", "custom", Some("  ")).is_err()); // blank prompt
         assert!(validate("daily", "09:00", "bogus", None).is_err()); // bad task_mode
+    }
+
+    /// A run's note — why it failed, e.g. the provider's own message when the check before the
+    /// run failed — reaches both run lists, so the UI can say what went wrong.
+    #[test]
+    fn runs_and_schedules_carry_the_run_note() {
+        use tower::ServiceExt;
+        crate::testutil::with_home("ct-web-schedules-note", |_| {
+            crate::db::init().unwrap();
+            crate::db::upsert_schedule(&crate::db::Schedule {
+                id: "s1".into(),
+                name: "Lunch".into(),
+                enabled: true,
+                freq: "daily".into(),
+                time: "13:00".into(),
+                weekday: None,
+                task_mode: "agent".into(),
+                prompt: None,
+            })
+            .unwrap();
+            let z = crate::db::Counts {
+                companies: 0,
+                contacts: 0,
+                outreach: 0,
+                sent_today: 0,
+            };
+            let note = "Model muse-spark-1.3-contributor-free has been deprecated.";
+            crate::db::record_run("error", z, z, None, Some(note), Some("s1"), "scheduled")
+                .unwrap();
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let get = |uri: &str| -> serde_json::Value {
+                let app = crate::web::router(crate::web::tests::state());
+                let req = axum::http::Request::builder()
+                    .uri(format!("{uri}?t=secret-tok"))
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                let resp = rt.block_on(app.oneshot(req)).unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+                let b = rt
+                    .block_on(axum::body::to_bytes(resp.into_body(), usize::MAX))
+                    .unwrap();
+                serde_json::from_slice(&b).unwrap()
+            };
+            let runs = get("/api/runs");
+            assert_eq!(runs[0]["status"], "error");
+            assert_eq!(runs[0]["note"], note);
+            let schedules = get("/api/schedules");
+            assert_eq!(schedules[0]["last_run"]["status"], "error");
+            assert_eq!(schedules[0]["last_run"]["note"], note);
+        });
     }
 }

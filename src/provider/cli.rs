@@ -61,19 +61,23 @@ pub fn claude_args(session_id: &str, first_turn: bool, msg: &str, tools: &Tools)
 /// (the common one: the CLI's login token expired and headless mode can't re-auth). `cli` is the
 /// display name, `relogin` the command to run. Returns None for non-auth errors.
 fn auth_hint(raw: &str, cli: &str, relogin: &str) -> Option<String> {
-    let low = raw.to_lowercase();
-    let is_auth = low.contains("authentication_error")
-        || low.contains("oauth access token has expired")
-        || low.contains("re-authenticate")
-        || low.contains("401 unauthorized")
-        || (low.contains("\"status\":401") || low.contains("error: 401"))
-        || low.contains("\"statuscode\":401");
-    is_auth.then(|| {
+    is_expired_login(raw).then(|| {
         format!(
             "{cli} needs to sign in again — its login expired. In a terminal run `{relogin}` and \
              complete sign-in, then re-check in Settings and resend."
         )
     })
+}
+
+/// Does a raw agent error look like the CLI's login expired (the cases `auth_hint` rewrites)?
+pub(crate) fn is_expired_login(raw: &str) -> bool {
+    let low = raw.to_lowercase();
+    low.contains("authentication_error")
+        || low.contains("oauth access token has expired")
+        || low.contains("re-authenticate")
+        || low.contains("401 unauthorized")
+        || (low.contains("\"status\":401") || low.contains("error: 401"))
+        || low.contains("\"statuscode\":401")
 }
 
 /// Parse one line of Claude's stream-json output into zero or more events.
@@ -328,7 +332,8 @@ pub const OPENCODE_ENV: [(&str, &str); 3] = [
 ];
 
 /// Map one line of `opencode run --format json` to zero or more events. There's no terminal
-/// "result" event — the turn ends when the process exits (see `stream_child`).
+/// "result" event — the turn ends when the process exits, and `stream_child` supplies the
+/// `Done` (with the final text as its result).
 fn parse_opencode_line(line: &str) -> Vec<AgentEvent> {
     let v: Value = match serde_json::from_str(line.trim()) {
         Ok(v) => v,
@@ -527,6 +532,37 @@ async fn run_claude(
     stream_child(child, "claude", parse_stream_line, tx).await
 }
 
+/// The turn's final assistant text: the last run of `Text` events, where the first text after
+/// a tool call starts a new run. It becomes `Done.result` for backends whose terminal event
+/// carries no result (codex's `turn.completed`, opencode's clean exit), so the result means
+/// what claude's does — the final reply, e.g. the follow-up check's one-line summary.
+#[derive(Default)]
+struct FinalText {
+    text: String,
+    after_tool: bool,
+}
+
+impl FinalText {
+    fn see(&mut self, ev: &AgentEvent) {
+        match ev {
+            AgentEvent::Text { text } => {
+                if self.after_tool {
+                    self.text.clear();
+                    self.after_tool = false;
+                }
+                self.text.push_str(text);
+            }
+            AgentEvent::ToolStart { .. } | AgentEvent::ToolEnd { .. } => self.after_tool = true,
+            _ => {}
+        }
+    }
+
+    /// The trimmed text, or None when the turn said nothing.
+    fn result(&self) -> Option<String> {
+        Some(self.text.trim().to_string()).filter(|t| !t.is_empty())
+    }
+}
+
 /// Stream a spawned agent child's stdout (JSONL) through `parse`, forwarding events to `tx`.
 /// Kills the child on browser disconnect, captures stderr, and synthesizes a terminal Done
 /// when the child ends without one. Returns true iff the turn finished ok.
@@ -568,6 +604,7 @@ async fn stream_child(
     let mut saw_done = false;
     let mut done_ok = false;
     let mut disconnected = false;
+    let mut final_text = FinalText::default();
 
     loop {
         tokio::select! {
@@ -576,10 +613,15 @@ async fn stream_child(
             line = lines.next_line() => {
                 match line {
                     Ok(Some(line)) => {
-                        for ev in parse(&line) {
-                            if let AgentEvent::Done { ok, .. } = &ev {
+                        for mut ev in parse(&line) {
+                            final_text.see(&ev);
+                            if let AgentEvent::Done { ok, result } = &mut ev {
                                 saw_done = true;
                                 done_ok = *ok;
+                                // codex's `turn.completed` carries no text of its own.
+                                if *ok && result.is_none() {
+                                    *result = final_text.result();
+                                }
                             }
                             if tx.send(ev).await.is_err() { disconnected = true; break; }
                         }
@@ -624,7 +666,7 @@ async fn stream_child(
         let _ = tx
             .send(AgentEvent::Done {
                 ok: true,
-                result: None,
+                result: final_text.result(),
             })
             .await;
         return true;
@@ -805,6 +847,14 @@ mod tests {
     }
 
     async fn stream_sh(script: &str) -> (bool, Vec<AgentEvent>) {
+        stream_sh_as(script, "opencode", parse_opencode_line).await
+    }
+
+    async fn stream_sh_as(
+        script: &str,
+        label: &str,
+        parse: fn(&str) -> Vec<AgentEvent>,
+    ) -> (bool, Vec<AgentEvent>) {
         let child = Command::new("sh")
             .args(["-c", script])
             .stdin(Stdio::null())
@@ -812,13 +862,19 @@ mod tests {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        let ok = stream_child(child, "opencode", parse_opencode_line, tx).await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let ok = stream_child(child, label, parse, tx).await;
         let mut evs = vec![];
         while let Ok(e) = rx.try_recv() {
             evs.push(e);
         }
         (ok, evs)
+    }
+
+    /// `printf` script that prints each JSONL line on its own line.
+    fn print_lines(lines: &[&str]) -> String {
+        let quoted: Vec<String> = lines.iter().map(|l| format!("'{l}'")).collect();
+        format!("printf '%s\\n' {}", quoted.join(" "))
     }
 
     #[tokio::test]
@@ -834,9 +890,67 @@ mod tests {
                 },
                 AgentEvent::Done {
                     ok: true,
-                    result: None
+                    result: Some("all done".into())
                 }
             ]
+        );
+    }
+
+    /// opencode has no result event, so the turn's final assistant text (the last text after
+    /// its tool calls, like claude's `result`) becomes `Done.result` — what the follow-up
+    /// endpoints return as their message.
+    #[tokio::test]
+    async fn opencode_done_result_is_the_final_text() {
+        let script = print_lines(&[
+            r#"{"type":"step_start","sessionID":"ses_1","part":{"type":"step-start"}}"#,
+            r#"{"type":"text","sessionID":"ses_1","part":{"type":"text","text":"Checking Gmail."}}"#,
+            r#"{"type":"tool_use","part":{"type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"coldtrail mark a.com replied"},"metadata":{"exit":0}}}}"#,
+            r#"{"type":"step_finish","part":{"type":"step-finish","reason":"tool-calls"}}"#,
+            r#"{"type":"step_start","sessionID":"ses_1","part":{"type":"step-start"}}"#,
+            r#"{"type":"text","sessionID":"ses_1","part":{"type":"text","text":"1 replied, "}}"#,
+            r#"{"type":"text","sessionID":"ses_1","part":{"type":"text","text":"0 bounced."}}"#,
+            r#"{"type":"step_finish","part":{"type":"step-finish","reason":"stop"}}"#,
+        ]);
+        let (ok, evs) = stream_sh(&script).await;
+        assert!(ok);
+        assert_eq!(
+            evs.last(),
+            Some(&AgentEvent::Done {
+                ok: true,
+                result: Some("1 replied, 0 bounced.".into())
+            })
+        );
+        // A turn that said nothing has no result.
+        let (ok, evs) = stream_sh("true").await;
+        assert!(ok);
+        assert_eq!(
+            evs,
+            vec![AgentEvent::Done {
+                ok: true,
+                result: None
+            }]
+        );
+    }
+
+    /// codex's `turn.completed` carries no text either; its last agent message is the result.
+    #[tokio::test]
+    async fn codex_done_result_is_the_final_message() {
+        let script = print_lines(&[
+            r#"{"type":"thread.started","thread_id":"t1"}"#,
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"Looking."}}"#,
+            r#"{"type":"item.started","item":{"type":"command_execution","command":"coldtrail status"}}"#,
+            r#"{"type":"item.completed","item":{"type":"command_execution","exit_code":0}}"#,
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"Nothing replied yet."}}"#,
+            r#"{"type":"turn.completed","usage":{}}"#,
+        ]);
+        let (ok, evs) = stream_sh_as(&script, "codex", parse_codex_line).await;
+        assert!(ok);
+        assert_eq!(
+            evs.last(),
+            Some(&AgentEvent::Done {
+                ok: true,
+                result: Some("Nothing replied yet.".into())
+            })
         );
     }
 

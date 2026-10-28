@@ -34,6 +34,9 @@ pub struct StatusDto {
     pub auto_send: bool,
     /// The per-day auto-send cap in effect.
     pub daily_send_cap: u32,
+    /// Emails sent today (email channel, incl. a legacy NULL one) — what `daily_send_cap`
+    /// counts against (Drafts email stats line).
+    pub email_sent_today: u32,
     /// OSINT enrichment tooling (theHarvester) detection + install-ability.
     pub osint: crate::osint::OsintStatus,
     /// coldtrail's own Google client is configured (COLDTRAIL_GOOGLE_CLIENT_ID/SECRET).
@@ -87,6 +90,9 @@ pub struct AutoSendReq {
 pub struct DraftEditReq {
     pub subject: Option<String>,
     pub body: Option<String>,
+    /// "email" | "linkedin": edit only that channel's reviewable draft. Absent = every
+    /// reviewable row for the domain (the original contract); any other value is a 400.
+    pub channel: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -261,6 +267,9 @@ pub struct LastRun {
     pub sourced: i64,
     pub drafted: i64,
     pub sent: i64,
+    /// Why the run failed, when recorded: for a run that never started, the provider's own
+    /// message from the check before it (e.g. a deprecated model, an expired login).
+    pub note: Option<String>,
 }
 
 impl From<crate::db::RunRow> for LastRun {
@@ -273,6 +282,7 @@ impl From<crate::db::RunRow> for LastRun {
             sourced: r.sourced,
             drafted: r.drafted,
             sent: r.sent,
+            note: r.note,
         }
     }
 }
@@ -323,6 +333,10 @@ pub struct DraftDto {
     pub channel: String,
     /// Why automatic LinkedIn sending skips this draft (None = still queued for auto-send).
     pub auto_skip: Option<String>,
+    /// The draft's contact's name (email or LinkedIn-only contact alike); None if unknown.
+    pub contact_name: Option<String>,
+    /// The company's name; None if unknown (the UI falls back to `domain`).
+    pub company_name: Option<String>,
 }
 
 #[derive(Deserialize)]

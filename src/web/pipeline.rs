@@ -73,22 +73,37 @@ pub async fn mark_touch(
     Ok(Json(MsgResp::ok()))
 }
 
-/// Edit a draft's subject/body before sending (only reviewable drafts).
+/// Edit a draft's subject/body before sending (only reviewable drafts). With `channel` only that
+/// channel's reviewable rows change (a legacy NULL channel is email), so saving a LinkedIn note
+/// never touches the same company's email draft; without it every reviewable row for the domain
+/// does, as before.
 pub async fn save_draft(
     Path(domain): Path<String>,
     Json(req): Json<DraftEditReq>,
-) -> Result<Json<MsgResp>, ApiErr> {
+) -> Result<Response, ApiErr> {
+    if req
+        .channel
+        .as_deref()
+        .is_some_and(|ch| !matches!(ch, "email" | "linkedin"))
+    {
+        return Ok((StatusCode::BAD_REQUEST, "channel must be email or linkedin").into_response());
+    }
     let domain = domain.to_lowercase();
     let c = crate::db::open()?;
     let n = c.execute(
         "UPDATE outreach SET subject = COALESCE(?2, subject), body = COALESCE(?3, body) \
-         WHERE domain = ?1 AND status IN ('draft_pending','drafted')",
-        params![domain, req.subject, req.body],
+         WHERE domain = ?1 AND status IN ('draft_pending','drafted') \
+           AND (?4 IS NULL OR COALESCE(channel,'email') = ?4)",
+        params![domain, req.subject, req.body, req.channel],
     )?;
     if n == 0 {
-        return Err(anyhow::anyhow!("no editable draft for {domain}").into());
+        let what = match &req.channel {
+            Some(ch) => format!("{ch} draft"),
+            None => "draft".into(),
+        };
+        return Err(anyhow::anyhow!("no editable {what} for {domain}").into());
     }
-    Ok(Json(MsgResp::ok()))
+    Ok(Json(MsgResp::ok()).into_response())
 }
 
 #[derive(Deserialize)]
@@ -448,11 +463,14 @@ pub async fn drafts() -> Result<Json<Vec<DraftDto>>, ApiErr> {
         // Drafts is a work queue — only rows still awaiting action. Once a draft is
         // sent/replied/bounced it leaves this list (it lives on in Overview / Follow-ups).
         // `to` is the contact email for the email channel, or the contact's linkedin_url for
-        // the linkedin channel — same recipient rule as `deliver::reviewable`.
+        // the linkedin channel — same recipient rule as `deliver::reviewable`. A blank contact
+        // or company name reads as unknown (null).
         "SELECT o.domain, COALESCE(o.channel,'email'), \
                 CASE WHEN COALESCE(o.channel,'email')='linkedin' THEN k.linkedin_url ELSE k.email END, \
-                o.subject, o.body, o.status, o.gmail_draft_id, o.auto_skip \
+                o.subject, o.body, o.status, o.gmail_draft_id, o.auto_skip, \
+                NULLIF(TRIM(k.founder_name),''), NULLIF(TRIM(co.name),'') \
          FROM outreach o LEFT JOIN contacts k ON k.id = o.contact_id \
+         LEFT JOIN companies co ON co.domain = o.domain \
          WHERE o.status IN ('draft_pending','drafted') \
          ORDER BY o.created_at DESC",
     )?;
@@ -467,6 +485,8 @@ pub async fn drafts() -> Result<Json<Vec<DraftDto>>, ApiErr> {
                 status: r.get(5)?,
                 gmail_draft_id: r.get(6)?,
                 auto_skip: r.get(7)?,
+                contact_name: r.get(8)?,
+                company_name: r.get(9)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -666,15 +686,29 @@ mod tests {
 
     /// `method uri` through the real router, with the session token added to the query string.
     fn call(method: &str, uri: &str) -> (axum::http::StatusCode, String) {
+        call_with(method, uri, None)
+    }
+
+    /// `call` with an optional JSON request body.
+    fn call_with(
+        method: &str,
+        uri: &str,
+        json: Option<serde_json::Value>,
+    ) -> (axum::http::StatusCode, String) {
         use tower::ServiceExt;
         let rt = tokio::runtime::Runtime::new().unwrap();
         let app = crate::web::router(crate::web::tests::state());
         let sep = if uri.contains('?') { '&' } else { '?' };
-        let req = axum::http::Request::builder()
+        let builder = axum::http::Request::builder()
             .method(method)
-            .uri(format!("{uri}{sep}t=secret-tok"))
-            .body(axum::body::Body::empty())
-            .unwrap();
+            .uri(format!("{uri}{sep}t=secret-tok"));
+        let req = match json {
+            Some(v) => builder
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(v.to_string())),
+            None => builder.body(axum::body::Body::empty()),
+        }
+        .unwrap();
         let resp = rt.block_on(app.oneshot(req)).unwrap();
         let status = resp.status();
         let body = rt
@@ -827,6 +861,48 @@ mod tests {
         });
     }
 
+    /// Each draft names its contact and company for the Drafts list — for a LinkedIn-only
+    /// contact (no email) as much as an emailed one. Unknown or blank names are null.
+    #[test]
+    fn drafts_name_the_contact_and_company() {
+        crate::testutil::with_home("ct-web-pipeline-drafts-names", |_| {
+            seed(
+                "INSERT INTO companies (domain, name) VALUES ('acme.com','Acme'), \
+                 ('beta.com','Beta Inc'), ('anon.com',NULL); \
+                 INSERT INTO contacts (domain, founder_name, linkedin_url) VALUES \
+                 ('acme.com','Jane Doe','https://www.linkedin.com/in/janedoe'); \
+                 INSERT INTO contacts (domain, founder_name, email) VALUES \
+                 ('beta.com','Bob Ray','bob@beta.com'); \
+                 INSERT INTO outreach (domain, contact_id, channel, body, status) VALUES \
+                 ('acme.com',(SELECT id FROM contacts WHERE domain='acme.com'),'linkedin','Hi Jane','draft_pending'), \
+                 ('beta.com',(SELECT id FROM contacts WHERE domain='beta.com'),'email','Hi Bob','drafted'), \
+                 ('anon.com',NULL,'email','Hi','draft_pending'); \
+                 INSERT INTO companies (domain, name) VALUES ('blank.com','  '); \
+                 INSERT INTO contacts (domain, founder_name, email) VALUES \
+                 ('blank.com','','x@blank.com'); \
+                 INSERT INTO outreach (domain, contact_id, channel, body, status) VALUES \
+                 ('blank.com',(SELECT id FROM contacts WHERE domain='blank.com'),'email','Hi','draft_pending');",
+            );
+            let (status, body) = call("GET", "/api/drafts");
+            assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+            let rows: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+            let by = |d: &str| rows.iter().find(|r| r["domain"] == d).unwrap().clone();
+            let li = by("acme.com");
+            assert_eq!(li["channel"], "linkedin");
+            assert_eq!(li["contact_name"], "Jane Doe");
+            assert_eq!(li["company_name"], "Acme");
+            let email = by("beta.com");
+            assert_eq!(email["contact_name"], "Bob Ray");
+            assert_eq!(email["company_name"], "Beta Inc");
+            let anon = by("anon.com");
+            assert_eq!(anon["contact_name"], serde_json::Value::Null);
+            assert_eq!(anon["company_name"], serde_json::Value::Null);
+            let blank = by("blank.com");
+            assert_eq!(blank["contact_name"], serde_json::Value::Null);
+            assert_eq!(blank["company_name"], serde_json::Value::Null);
+        });
+    }
+
     /// A LinkedIn draft parked out of auto-send still shows in Drafts (the human can send it by
     /// hand) and carries the reason, so the UI can say why it was skipped.
     #[test]
@@ -960,6 +1036,127 @@ mod tests {
                 rows(&[("email", "sent"), ("linkedin", "draft_pending")])
             );
             assert_eq!(status_of("acme.com"), "sent");
+        });
+    }
+
+    /// (channel, subject, body) of every outreach row for `domain`, oldest first.
+    fn texts_of(domain: &str) -> Vec<(String, Option<String>, Option<String>)> {
+        crate::db::open()
+            .unwrap()
+            .prepare(
+                "SELECT COALESCE(channel,'email'), subject, body FROM outreach WHERE domain = ?1 \
+                 ORDER BY id",
+            )
+            .unwrap()
+            .query_map([domain], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    fn text(
+        ch: &str,
+        subject: Option<&str>,
+        body: &str,
+    ) -> (String, Option<String>, Option<String>) {
+        (ch.into(), subject.map(Into::into), Some(body.into()))
+    }
+
+    /// Saving with a `channel` edits only that channel's reviewable draft (a legacy NULL channel
+    /// is email), so autosaving a LinkedIn note can't overwrite the same company's email. Sent
+    /// history is never edited.
+    #[test]
+    fn save_draft_with_channel_edits_only_that_channel() {
+        crate::testutil::with_home("ct-web-pipeline-save-channel", |_| {
+            seed(
+                "INSERT INTO companies (domain, status) VALUES ('acme.com','drafted'); \
+                 INSERT INTO outreach (domain, channel, subject, body, status) VALUES \
+                 ('acme.com','email','Hi','email body','draft_pending'), \
+                 ('acme.com','linkedin','','note','draft_pending'), \
+                 ('acme.com','linkedin','','old note','sent'), \
+                 ('acme.com',NULL,'Legacy','legacy body','drafted');",
+            );
+            let (status, body) = call_with(
+                "POST",
+                "/api/drafts/ACME.com",
+                Some(serde_json::json!({"body": "new note", "channel": "linkedin"})),
+            );
+            assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+            assert_eq!(
+                texts_of("acme.com"),
+                [
+                    text("email", Some("Hi"), "email body"),
+                    text("linkedin", Some(""), "new note"),
+                    text("linkedin", Some(""), "old note"),
+                    text("email", Some("Legacy"), "legacy body"),
+                ]
+            );
+
+            let (status, body) = call_with(
+                "POST",
+                "/api/drafts/acme.com",
+                Some(
+                    serde_json::json!({"subject": "Hello", "body": "new email", "channel": "email"}),
+                ),
+            );
+            assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+            assert_eq!(
+                texts_of("acme.com"),
+                [
+                    text("email", Some("Hello"), "new email"),
+                    text("linkedin", Some(""), "new note"),
+                    text("linkedin", Some(""), "old note"),
+                    text("email", Some("Hello"), "new email"),
+                ]
+            );
+        });
+    }
+
+    /// Without a `channel` the save keeps its original contract: every reviewable row for the
+    /// domain. A channel with nothing reviewable is an error; an unknown channel is a 400.
+    #[test]
+    fn save_draft_without_channel_keeps_editing_every_reviewable_row() {
+        crate::testutil::with_home("ct-web-pipeline-save-nochannel", |_| {
+            seed(
+                "INSERT INTO companies (domain, status) VALUES ('acme.com','drafted'); \
+                 INSERT INTO outreach (domain, channel, subject, body, status) VALUES \
+                 ('acme.com','email','Hi','email body','draft_pending'), \
+                 ('acme.com','linkedin','','old note','sent');",
+            );
+            let (status, body) = call_with(
+                "POST",
+                "/api/drafts/acme.com",
+                Some(serde_json::json!({"body": "both"})),
+            );
+            assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+            assert_eq!(
+                texts_of("acme.com"),
+                [
+                    text("email", Some("Hi"), "both"),
+                    text("linkedin", Some(""), "old note"),
+                ]
+            );
+
+            let (status, body) = call_with(
+                "POST",
+                "/api/drafts/acme.com",
+                Some(serde_json::json!({"body": "x", "channel": "linkedin"})),
+            );
+            assert_eq!(
+                status,
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "{body}"
+            );
+            assert_eq!(body, "no editable linkedin draft for acme.com");
+
+            let (status, body) = call_with(
+                "POST",
+                "/api/drafts/acme.com",
+                Some(serde_json::json!({"body": "x", "channel": "sms"})),
+            );
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body, "channel must be email or linkedin");
+            assert_eq!(texts_of("acme.com")[0], text("email", Some("Hi"), "both"));
         });
     }
 

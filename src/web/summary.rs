@@ -174,11 +174,25 @@ fn attention(h: &Health, last_run: Option<&crate::db::RunRow>) -> Vec<Attention>
         let message = if r.status == "auth_failed" {
             format!("{which} didn't start because the agent couldn't sign in")
         } else {
-            format!("{which} ended with an error")
+            match r.note.as_deref().and_then(note_summary) {
+                Some(why) => format!("{which} ended with an error: {why}"),
+                None => format!("{which} ended with an error"),
+            }
         };
         add("last_run_failed", message, "#/schedules");
     }
     out
+}
+
+/// A run note fit for one line on Home: its first non-blank line, cut to 200 chars.
+fn note_summary(note: &str) -> Option<String> {
+    const MAX: usize = 200;
+    let line = note.lines().map(str::trim).find(|l| !l.is_empty())?;
+    if line.chars().count() <= MAX {
+        return Some(line.to_string());
+    }
+    let cut: String = line.chars().take(MAX).collect();
+    Some(format!("{}…", cut.trim_end()))
 }
 
 /// The enabled schedule whose next slot comes first (the oldest schedule wins a tie).
@@ -503,6 +517,43 @@ mod tests {
             );
             assert_eq!(s.attention[0].message, "Codex CLI isn't installed");
             assert!(s.attention.iter().all(|a| !a.message.is_empty()));
+        });
+    }
+
+    /// A failed run's note (e.g. the provider's message when the check before the run failed)
+    /// is on `last_run` and in the attention message, first line only and kept short; a run
+    /// without a note keeps the plain wording.
+    #[test]
+    fn summary_failed_run_says_why() {
+        crate::testutil::with_home("ct-web-summary-run-note", |_| {
+            let c = seed("");
+            let z = crate::db::Counts {
+                companies: 0,
+                contacts: 0,
+                outreach: 0,
+                sent_today: 0,
+            };
+            let note = "Model muse-spark-1.3-contributor-free has been deprecated.";
+            crate::db::record_run("error", z, z, None, Some(note), None, "scheduled").unwrap();
+            let s = build(&c, &healthy(), wed(10, 0)).unwrap();
+            assert_eq!(s.last_run.as_ref().unwrap().note.as_deref(), Some(note));
+            assert_eq!(kinds(&s), [("last_run_failed", "#/schedules")]);
+            assert_eq!(
+                s.attention[0].message,
+                format!("The last run ended with an error: {note}")
+            );
+
+            let long = format!("{}\nstack line 2\nstack line 3", "x".repeat(400));
+            crate::db::record_run("error", z, z, None, Some(&long), None, "scheduled").unwrap();
+            let s = build(&c, &healthy(), wed(10, 0)).unwrap();
+            let m = &s.attention[0].message;
+            assert!(!m.contains('\n') && !m.contains("stack"), "{m}");
+            assert!(m.chars().count() < 260 && m.ends_with('…'), "{m}");
+
+            crate::db::record_run("error", z, z, None, None, None, "manual").unwrap();
+            let s = build(&c, &healthy(), wed(10, 0)).unwrap();
+            assert_eq!(s.last_run.as_ref().unwrap().note, None);
+            assert_eq!(s.attention[0].message, "The last run ended with an error");
         });
     }
 

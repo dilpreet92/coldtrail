@@ -2,11 +2,34 @@
 //! tests pure sign-in, not MCP init. Used by onboarding ("Test connection") and scheduled runs.
 use crate::provider::cli::Tools;
 use crate::provider::{run_turn, AgentEvent, Backend};
+use regex::Regex;
+use std::sync::OnceLock;
 
 pub enum Outcome {
     Ok,
     Failed(String),
     TimedOut,
+}
+
+/// Does a failed probe's message look like a sign-in problem (expired login, bad or missing API
+/// key, HTTP 401/403) rather than anything else the provider can fail with (a deprecated
+/// model, a server error)? Scheduled runs record only these as `auth_failed`. Extends the
+/// expired-login check `provider::cli` rewrites into its re-login hint, whose own wording
+/// ("sign in again", "auth login") matches too.
+pub fn looks_like_auth(msg: &str) -> bool {
+    static WORDS: OnceLock<Regex> = OnceLock::new();
+    static CODES: OnceLock<Regex> = OnceLock::new();
+    let words = WORDS.get_or_init(|| {
+        Regex::new(
+            r"(?i)\b(?:unauthori[sz]ed|unauthenticated|authenticat|not\s+(?:logged|signed)\s+in|log[\s-]?in\b|sign[\s-]?in\b|forbidden|api[\s_-]*key)",
+        )
+        .expect("auth words regex")
+    });
+    // A bare 401/403 status, not part of a longer number, version or name ("gpt-4013", "401.5s").
+    let codes = CODES.get_or_init(|| {
+        Regex::new(r"(?:^|[^\w.\-])(?:401|403)(?:$|[^\w.\-])").expect("auth codes regex")
+    });
+    crate::provider::cli::is_expired_login(msg) || words.is_match(msg) || codes.is_match(msg)
 }
 
 pub async fn probe(backend: &Backend) -> Outcome {
@@ -79,6 +102,39 @@ mod tests {
             api_key: None,
         };
         assert!(matches!(probe(&b).await, Outcome::Ok));
+    }
+
+    #[test]
+    fn auth_failures_are_told_apart_from_other_errors() {
+        for m in [
+            // what auth_hint turns an expired CLI login into
+            "opencode needs to sign in again — its login expired. In a terminal run \
+             `opencode auth login` and complete sign-in, then re-check in Settings and resend.",
+            "model returned 401 Unauthorized: {\"error\":\"bad token\"}",
+            "model returned 403 Forbidden: ",
+            r#"{"name":"APIError","data":{"message":"nope","statusCode":401}}"#,
+            r#"{"status":403,"message":"denied"}"#,
+            "HTTP 401",
+            "Not logged in · Please run /login",
+            "Invalid API key · Fix external API key",
+            "Incorrect API key provided: sk-…",
+            "authentication_error: OAuth access token has expired",
+            "Authentication failed for provider anthropic",
+            "unauthorized",
+        ] {
+            assert!(looks_like_auth(m), "{m}");
+        }
+        for m in [
+            "Model muse-spark-1.3-contributor-free has been deprecated.",
+            "Unexpected server error. Check server logs for details.",
+            "model returned 500 Internal Server Error: boom",
+            "could not reach the model at http://localhost:11434/v1/chat/completions: refused",
+            "the provider didn't respond — check the log",
+            "model gpt-4013 is overloaded (code 4031)",
+            "rate limited: retry after 401.5s",
+        ] {
+            assert!(!looks_like_auth(m), "{m}");
+        }
     }
 
     #[tokio::test]
