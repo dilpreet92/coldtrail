@@ -10,6 +10,11 @@
 .pe,
 .ac { container-type: inline-size; }
 
+/* The display rules below would otherwise beat the hidden attribute wherever base.css's
+   `[hidden] { display: none !important }` isn't loaded (the editor mounted on another page). */
+.pe [hidden],
+.ac [hidden] { display: none !important; }
+
 .cp-grid {
   /* Editor heights. Narrow: leave room to see the panel below. Wide: fill the screen under the
      page header (top bar, title, tabs, file bar) without scrolling the page. */
@@ -88,7 +93,10 @@
   resize: vertical;
 }
 .pe-text { height: var(--pe-h); }
-.ac-text { height: var(--ac-h); border-radius: 0; }
+/* --ac-extra-h: what the card shows besides the text (a rejected save's reason, the restored-draft
+   notice), set by company.js; the text box gives that up so the card keeps the height it was
+   sized to. min-height above is the floor. */
+.ac-text { height: calc(var(--ac-h) - var(--ac-extra-h, 0px)); border-radius: 0; }
 /* While loading, the placeholder takes the editor's height so nothing jumps when it arrives. */
 .pe-main[data-state="loading"] .pe-body { height: var(--pe-h); overflow: hidden; }
 .pe-text::placeholder,
@@ -131,6 +139,7 @@
 .pe-status[data-state="empty"] { color: var(--warn); }
 .pe-status[data-state="error"],
 .pe-status[data-state="load-error"] { color: var(--danger); }
+.ac-state[data-state="saved"] .pe-status-icon { color: var(--ok); }
 .ac-state[data-state="dirty"] { color: var(--warn); }
 
 /* A failed or refused save shows its whole reason (no tooltip-only text): the message follows
@@ -152,8 +161,9 @@
 .pe-main:is([data-state="error"], [data-state="empty"]) .pe-status-icon { margin-top: 2px; }
 .cp-bar-end .btn { flex: none; }
 
-/* A call to action still on the template's example site: every LinkedIn note would end with it.
-   Beside the file name, so it's seen while typing; selects the link in the editor. */
+/* A call to action still on the template's example site: until it's replaced, LinkedIn notes go
+   out without a link. Beside the file name, so it's seen while typing; selects the link in the
+   editor. */
 .pe-flag {
   display: inline-flex;
   flex: none;
@@ -185,8 +195,10 @@
   .pe-flag-short { display: none; }
 }
 
-/* Text restored from an editor that closed before it was saved, with a way back. */
-.pe-restored {
+/* Text restored from an editor that closed before it was saved (or from an unsaved Already
+   contacted list), with a way back. Under the file bar on both tabs. */
+.pe-restored,
+.ac-restored {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -274,9 +286,8 @@
 
 .pe-item {
   display: grid;
-  grid-template-columns: 16px minmax(0, 1fr) auto;
+  grid-template-columns: 16px minmax(0, 1fr);
   column-gap: 10px;
-  row-gap: var(--space-2);
   padding: var(--space-3) 0;
   border-top: 1px solid var(--border);
 }
@@ -288,7 +299,15 @@
 .pe-item[data-state="warn"] .pe-item-icon { color: var(--warn); }
 
 .pe-item-text { grid-column: 2; min-width: 0; }
-.pe-item-label { font-weight: 500; }
+/* The label's line: the label, and "+ Add" at its end when the section is missing. The hint
+   below it has the panel's whole width. */
+.pe-item-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+.pe-item-label { min-width: 0; font-weight: 500; }
 .pe-item-hint {
   margin-top: 2px;
   color: var(--text-2);
@@ -302,14 +321,13 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.pe-item-fix { grid-column: 2 / -1; justify-self: start; }
-/* "+ Add" sits beside the label; pulled into the row's padding so it doesn't make it taller. */
+.pe-item-fix { margin-top: var(--space-2); }
+/* "+ Add" pulled into the label line's leading and the panel's padding, so the row is no taller
+   and its text lines up with the panel's right edge. */
 .pe-item-add {
-  grid-column: 3;
-  grid-row: 1;
-  align-self: start;
+  flex: none;
   gap: var(--space-1);
-  margin: -6px -10px 0 0;
+  margin: -6px -10px -6px 0;
   padding: var(--space-1) 10px;
   color: var(--accent);
 }
@@ -348,32 +366,31 @@
 
 /* ---- Already contacted footer: messages left, Save right ---- */
 
+/* A rejected save takes the first row, full width (its snippet needs the room); then messages
+   and the hint, with Save at the end of their row. */
 .ac-foot {
-  display: flex;
-  align-items: center;
-  gap: var(--space-3);
-  padding: var(--space-3) var(--space-4);
-  border-top: 1px solid var(--border);
-}
-.ac-feedback {
-  display: flex;
-  flex: 1;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-}
-.ac-msg { color: var(--text); font-size: 12.5px; overflow-wrap: anywhere; }
-.ac-msg:empty { display: none; }
-/* Unsaved text kept from an earlier visit, with a way back to the saved file. */
-.ac-restored {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  column-gap: var(--space-2);
-  color: var(--warn);
-  font-size: 12.5px;
+  gap: var(--space-2) var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border-top: 1px solid var(--border);
 }
-.ac-restored[hidden] { display: none; }
+.ac-error-box { flex: 1 0 100%; min-width: 0; }
+/* No gap here: the save message's live region stays in the page while empty (so screen readers
+   announce what is put in it), and empty it must take no room. */
+.ac-feedback {
+  display: flex;
+  flex: 1 1 0;
+  flex-direction: column;
+  min-width: 0;
+}
+/* A phone: the messages get the width, and Save goes below them at the end. */
+@container (max-width: 519px) {
+  .ac-feedback { flex-basis: 100%; }
+  .ac-foot .ac-save { margin-left: auto; }
+}
+.ac-msg { color: var(--text); font-size: 12.5px; overflow-wrap: anywhere; }
 /* An inline text action (Discard), so it lines up with the sentence when it wraps on a phone. */
 .cp-text-btn {
   display: inline-flex;
@@ -389,5 +406,34 @@
   cursor: pointer;
 }
 .cp-text-btn:hover { color: var(--accent); }
-.ac-error { overflow-wrap: anywhere; }
+/* A rejected save: the reason, then the parser's snippet exactly as printed (its "^" marks a
+   column, so it keeps its spaces and a fixed-width font), then "Go to line N". */
+.ac-error { font-weight: 500; overflow-wrap: anywhere; }
+.ac-error-more {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-1);
+  margin-top: var(--space-2);
+}
+/* The parser prints a few lines; long ones wrap rather than scroll (no scroll box to reach). */
+.ac-error-snippet {
+  align-self: stretch;
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid color-mix(in srgb, var(--danger) 30%, var(--border));
+  border-radius: var(--radius-control);
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  tab-size: 4;
+}
+.ac-error-goto { font-size: 12.5px; }
+
 .ac-foot .btn { flex: none; }
+/* Nothing to save: dimmed (components.css), and no hover change either. */
+.ac-foot .btn-primary[aria-disabled="true"]:not([aria-busy="true"]):hover { background: var(--accent); }

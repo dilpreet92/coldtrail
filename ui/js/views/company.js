@@ -6,27 +6,32 @@
 // LinkedIn note path will really pick up. Already contacted: contacted.toml, validated by the
 // server on save; plain domains (one per line) are turned into entries first.
 //
-// `mountProfileEditor` is exported for the Setup wizard's company step: it assumes nothing about
-// the page around it (it loads its own stylesheet) and cleans up when its root leaves the
-// document or when dispose() is called.
+// `mountProfileEditor` is exported for the Setup wizard's company step, with PROFILE_TEMPLATE:
+// it needs only the app's tokens and base styles around it (it loads its own stylesheet), and
+// cleans up when its root leaves the document or when dispose() is called.
 
 import { api } from '../core/api.js';
 import { debounce, h, pluralize } from '../core/dom.js';
+import { ensureViewCss } from '../core/router.js';
 import { store as sharedStore } from '../core/store.js';
+import { setBusy } from '../core/ui.js';
 import { tabs } from '../components/tabs.js';
 
 const TITLE = 'Company profile';
-const CSS_HREF = '/assets/css/views/company.css';
 const SAVE_DELAY_MS = 600;
+/** How long a new editor waits for the previous one's exit save before it loads the file. */
+const EXIT_SAVE_WAIT_MS = 3000;
 
-/** The example link the template ships with; still present means "not your link yet". */
+/** The example link the template ships with. product::cta_link() ignores it (any scheme, port or
+ *  subdomain of EXAMPLE_HOST), so until it is replaced LinkedIn notes go out without a link. */
 export const EXAMPLE_LINK = 'https://yourproduct.com/?utm_content={slug}';
 const EXAMPLE_HOST = 'yourproduct.com';
 
 /**
- * What an empty profile starts from (shown, not saved, until the user edits it). One heading per
- * checklist section, and the call to action in the one format `product::cta_link()` reads:
- * a `- Link:` list item under `## Call to Action` (a bare URL line there is never picked up).
+ * The one company profile template (the Setup wizard uses it too). What an empty profile starts
+ * from: shown, not saved, until the user edits it. One heading per checklist section, and the call
+ * to action in the one format `product::cta_link()` reads: a `- Link:` list item under
+ * `## Call to Action` (a bare URL line there is never picked up).
  */
 export const PROFILE_TEMPLATE = `# <Your company> — profile
 
@@ -73,22 +78,37 @@ const CTA = {
 const PLACEHOLDER = /^(?:[-*+]\s+)?(?:[^:[\]]{1,40}:\s*)?\[[^\]]*\]$/;
 const COMMENT = /^<!--.*-->$/;
 const BARE_URL = /^<?(https?:\/\/\S+?)>?$/i;
+/** A link line in another list style ("* Link: …", "+ Link: …"): cta_link() skips it. */
+const OTHER_LINK_LINE = /^[*+]\s*link:\s*(\S.*)$/i;
 
-const isHeading = (t) => t.startsWith('#');
+/** A markdown heading: one to six "#" and then a space or nothing, so "#1 rated on G2" is text.
+ *  (The call-to-action check alone uses product.rs's looser rule, see ctaItem.) */
+const isHeading = (t) => /^#{1,6}(?:\s|$)/.test(t);
 const headingText = (t) => t.replace(/^#+/, '').trim();
 const isContent = (line) => {
   const t = line.trim();
   return t !== '' && !isHeading(t) && !PLACEHOLDER.test(t) && !COMMENT.test(t);
 };
 
-/** product.rs `link_line_value`: `- Link: <value>` → value; a blank or "[…]" value → null;
- *  any other line → undefined. */
+/** product.rs `link_line_value`, before its example-link test: `- Link: <value>` → value; a
+ *  blank or "[…]" value → null; any other line → undefined. */
 function linkLineValue(t) {
   if (!t.startsWith('-')) return undefined;
   const rest = t.slice(1).trimStart();
   if (rest.length < 5 || rest.slice(0, 5).toLowerCase() !== 'link:') return undefined;
   const value = rest.slice(5).trim();
   return value === '' || value.startsWith('[') ? null : value;
+}
+
+/** product.rs `is_example_link`: the template's example site, with any scheme, port, user or
+ *  subdomain ("notyourproduct.com" is someone's real site). */
+function isExampleLink(value) {
+  let v = String(value).replace(/^<+/, '');
+  const scheme = v.indexOf('://');
+  if (scheme >= 0) v = v.slice(scheme + 3);
+  const authority = v.split(/[/?#>]/)[0];
+  const host = authority.split('@').pop().split(':')[0].replace(/\.+$/, '').toLowerCase();
+  return host === EXAMPLE_HOST || host.endsWith(`.${EXAMPLE_HOST}`);
 }
 
 function sectionItem(s, lines, heads) {
@@ -107,19 +127,20 @@ function sectionItem(s, lines, heads) {
   return { ...base, state: 'missing', fix: { kind: 'append' } };
 }
 
-// Mirrors product.rs `parse_cta_link`: any line starting with "#" is a heading; the section is
-// the lines after a heading equal (ignoring ASCII case) to "call to action"; the first valid
-// `- Link:` value in it wins.
+// Mirrors product.rs `parse_cta_link`: any line starting with "#" is a heading (no space needed);
+// the section is the lines after a heading equal (ignoring ASCII case) to "call to action"; the
+// first `- Link:` value in it that is neither "[placeholder]" text nor the example link wins.
 function ctaItem(lines) {
   const base = { id: CTA.id, label: CTA.label, hint: CTA.hint, heading: CTA.heading };
   let inSection = false;
   let headingLine = -1;
   let near = null;
-  let bare = null;
+  let misformed = null; // a link the parser skips: a bare URL, or "* Link:" / "+ Link:"
   let placeholder = null;
+  let example = null;
   for (let i = 0; i < lines.length; i++) {
     const t = lines[i].trim();
-    if (isHeading(t)) {
+    if (t.startsWith('#')) {
       const text = headingText(t);
       inSection = text.toLowerCase() === 'call to action';
       if (inSection && headingLine < 0) headingLine = i;
@@ -131,21 +152,34 @@ function ctaItem(lines) {
     if (value === null) {
       if (!placeholder) placeholder = { line: i, text: t.slice(t.toLowerCase().indexOf('link:') + 5).trim() };
     } else if (value !== undefined) {
+      if (isExampleLink(value)) {
+        if (!example) example = { line: i, text: value };
+        continue;
+      }
+      // cta_link() takes it as it is; a note can only open it as a web link.
       if (!/^https?:\/\//i.test(value)) {
         return { ...base, state: 'warn', link: value, hint: 'The link should start with https:// or http:// so it opens from a note.', fix: { kind: 'select-link', line: i, text: value } };
       }
-      if (value.toLowerCase().includes(EXAMPLE_HOST)) {
-        return { ...base, state: 'warn', example: true, link: value, hint: 'LinkedIn notes end with this example link until you replace it with your own; keep {slug} for tracking.', fix: { kind: 'select-link', line: i, text: value } };
-      }
       return { ...base, state: 'done', link: value };
-    } else if (!bare) {
-      const m = t.match(BARE_URL);
-      if (m) bare = { line: i, url: m[1] };
+    } else if (!misformed) {
+      const m = t.match(OTHER_LINK_LINE) || t.match(BARE_URL);
+      if (m) misformed = { line: i, url: m[1].trim(), bare: !OTHER_LINK_LINE.test(t) };
     }
   }
   if (headingLine >= 0) {
-    if (bare) {
-      return { ...base, state: 'warn', hint: 'Start the line with “- Link:”. A bare URL isn’t used in LinkedIn notes.', fix: { kind: 'link-line', line: bare.line, url: bare.url } };
+    if (misformed) {
+      const why = misformed.bare ? 'A bare URL isn’t used in LinkedIn notes.' : 'Only a line starting with “-” is used in LinkedIn notes.';
+      return { ...base, state: 'warn', hint: `Start the line with “- Link:”. ${why}`, fix: { kind: 'link-line', line: misformed.line, url: misformed.url } };
+    }
+    if (example) {
+      return {
+        ...base,
+        state: 'warn',
+        example: true,
+        link: example.text,
+        hint: 'Replace the example link with your real URL (keep {slug} to tag each company). Until then, LinkedIn notes go out without a link.',
+        fix: { kind: 'select-link', line: example.line, text: example.text },
+      };
     }
     if (placeholder) {
       const fix = placeholder.text ? { kind: 'select-link', line: placeholder.line, text: placeholder.text } : undefined;
@@ -166,9 +200,10 @@ function ctaItem(lines) {
  * is level 1, is its title rather than a section if it names no section, only sections that later
  * headings name too ("# Acme Product" above "## What we do"), or holds nothing but subsections
  * ("# Acme product profile" above "## What it does"); in a profile written all in level-1
- * headings, "# What we do" is the section. The call to action counts only with a
- * `- Link: http(s)://…` line under a heading that reads exactly "Call to Action"; `example` marks
- * one still pointing at the template's example site.
+ * headings, "# What we do" is the section. Headings need a space after their "#"s, as in
+ * markdown. The call to action counts only with a `- Link: http(s)://…` line under a heading that
+ * reads exactly "Call to Action", read the way product::cta_link() reads it: the template's
+ * example link doesn't count (`example` marks a profile whose only link is that one).
  * @param {string} doc
  * @returns {{ items: Array<{ id: string, label: string, state: 'done'|'empty'|'missing'|'warn',
  *   hint: string, heading: string, found?: string, link?: string, example?: boolean,
@@ -220,11 +255,28 @@ function icon(name, size = 16) {
   );
 }
 
-/** Load this view's stylesheet when the editor is mounted outside the Company route. */
-function ensureCss() {
-  if (typeof document === 'undefined') return;
-  const has = [...document.querySelectorAll('link[rel="stylesheet"]')].some((l) => l.getAttribute('href') === CSS_HREF);
-  if (!has) document.head.append(h('link', { rel: 'stylesheet', href: CSS_HREF }));
+/** Settles when `promise` does or after `ms`, whichever comes first; never rejects. */
+function settled(promise, ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    Promise.resolve(promise).then(
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+    );
+  });
+}
+
+/** A notice that screen readers announce when it appears: a live region that stays in the page
+ *  (empty takes no space) and gets the notice put in or taken out. */
+function liveNotice(cls) {
+  const region = h('div', { class: `cp-live ${cls}-live`, role: 'status' });
+  return { region, show: (node) => region.replaceChildren(node), hide: () => region.replaceChildren() };
 }
 
 /** A textarea's value always uses "\n"; compare the server's text the same way. */
@@ -280,6 +332,9 @@ function replaceRange(ta, start, end, text, select = null) {
 /** Profile text an editor was closed with before the server had it; the next editor offers it
  *  back unless the file has it by then. */
 let profileDraft = null;
+/** The save a closing editor started (settles, never rejects): the next editor loads after it,
+ *  so it neither reads the file from before that save nor offers back text that just landed. */
+let exitSave = null;
 
 const STATUS_TEXT = {
   loading: 'Loading…',
@@ -288,7 +343,7 @@ const STATUS_TEXT = {
   saving: 'Saving…',
   dirty: 'Unsaved changes',
   saved: 'Saved',
-  empty: "Not saved: the profile can't be empty",
+  empty: 'Not saved: the profile can’t be empty',
 };
 const STATUS_ICON = { saved: 'check', error: 'error', empty: 'warn', 'load-error': 'error' };
 
@@ -297,14 +352,16 @@ const STATUS_ICON = { saved: 'check', error: 'error', empty: 'warn', 'load-error
  * (600ms after typing stops, ⌘S / Ctrl+S saves at once) with a save indicator, and the section
  * checklist beside it. An empty profile shows PROFILE_TEMPLATE, unsaved until the user edits it.
  * It never saves before the profile has loaded, and never saves a blank profile (an empty
- * product.md would send the workspace back to setup). Works on any page: it adds its own
- * stylesheet, and needs only the session cookie.
+ * product.md would send the workspace back to setup). Works on any page of the app (it needs the
+ * app's tokens and base styles, and the session cookie): it adds its own stylesheet and stays
+ * invisible until that has loaded.
  *
  * Cleanup: removing `root` (or the editor) from the document, or calling dispose(), saves any
  * edit the server doesn't have yet (one waiting, or one whose save failed), aborts loads and
  * removes every listener and timer. After that onChange stops. Until that last save lands, the
- * text is kept in memory: the next editor mounted on this page restores it (and saves it) if the
- * file still lacks it, with a notice and a Discard. Closing or reloading the tab sends unsaved
+ * text is kept in memory: the next editor mounted on this page waits for that save (up to 3s),
+ * then restores the text (and saves it) if the file still lacks it, with a notice and a Discard.
+ * Closing or reloading the tab sends unsaved
  * text with a keepalive request; when the text is too big for one (over 60 KiB) or the last save
  * failed, the browser asks before leaving instead.
  *
@@ -316,8 +373,8 @@ const STATUS_ICON = { saved: 'check', error: 'error', empty: 'warn', 'load-error
  * @returns {{ el: HTMLElement, ready: Promise<ProfileState>, state(): ProfileState,
  *   flush(): Promise<ProfileState>, focus(): void, dispose(): void }}
  *   ready resolves once the profile has loaded (after a retry if the first load fails) or the
- *   editor is disposed; it never rejects. flush() saves now and resolves when every save has settled. dispose() also removes
- *   the editor from `root`.
+ *   editor is disposed; it never rejects. flush() saves now and resolves when every save has
+ *   settled (a view's beforeLeave can await it). dispose() also removes the editor from `root`.
  *
  * @typedef {{ doc: string, loaded: boolean, empty: boolean, template: boolean, persisted: boolean,
  *   status: 'loading'|'load-error'|'template'|'saving'|'dirty'|'saved'|'error'|'empty',
@@ -326,7 +383,6 @@ const STATUS_ICON = { saved: 'check', error: 'error', empty: 'warn', 'load-error
  *   `persisted`: the server holds a non-blank profile (what /api/status calls product_set).
  */
 export function mountProfileEditor(root, { onChange, store = sharedStore } = {}) {
-  ensureCss();
   const id = `pe-${++uid}`;
   const ac = new AbortController();
   let disposed = false;
@@ -365,8 +421,8 @@ export function mountProfileEditor(root, { onChange, store = sharedStore } = {})
     {
       type: 'button',
       class: 'pe-flag',
-      'aria-label': 'Replace example link: LinkedIn notes end with it until you do',
-      title: 'LinkedIn notes end with the example link until you replace it',
+      'aria-label': 'Replace example link: LinkedIn notes go out without a link until you do',
+      title: 'LinkedIn notes go out without a link until you replace the example link',
       onClick: () => applyFix(CTA.id, 'select-link'),
     },
     icon('warn', 14),
@@ -377,7 +433,7 @@ export function mountProfileEditor(root, { onChange, store = sharedStore } = {})
   let restoredFrom = null; // what the file held when a restored draft replaced it
   const discardBtn = h('button', { type: 'button', class: 'cp-text-btn', onClick: () => discardRestored() }, 'Discard');
   const restored = h('p', { class: 'pe-restored' }, h('span', {}, 'Your unsaved changes from earlier are back.'), discardBtn);
-  restored.hidden = true;
+  const restoredNotice = liveNotice('pe-restored');
   const skeleton = skeletonLines([38, 0, 22, 64, 0, 26, 71, 58, 0, 30, 49]);
   const loadError = h('div', { class: 'pe-load-error cp-load-error', role: 'alert' });
   loadError.hidden = true;
@@ -392,7 +448,7 @@ export function mountProfileEditor(root, { onChange, store = sharedStore } = {})
       flagBtn,
       h('span', { class: 'cp-bar-end' }, statusEl, retryBtn),
     ),
-    restored,
+    restoredNotice.region,
     h('div', { class: 'pe-body' }, skeleton, loadError, ta),
   );
 
@@ -414,6 +470,9 @@ export function mountProfileEditor(root, { onChange, store = sharedStore } = {})
   );
 
   const el = h('div', { class: 'pe' }, h('div', { class: 'cp-grid' }, main, aside));
+  // Unstyled for a moment outside the Company route (the Setup wizard) is worse than a blank one.
+  el.style.visibility = 'hidden';
+  const styled = ensureViewCss('company').then(() => el.style.removeProperty('visibility'));
   root.append(el);
 
   // ---- state ----------------------------------------------------------------------------
@@ -457,7 +516,7 @@ export function mountProfileEditor(root, { onChange, store = sharedStore } = {})
     status = computeStatus();
     statusEl.dataset.state = status;
     main.dataset.state = status;
-    const text = status === 'error' ? `Couldn't save: ${(lastError && lastError.message) || lastError}` : STATUS_TEXT[status];
+    const text = status === 'error' ? `Couldn’t save: ${(lastError && lastError.message) || lastError}` : STATUS_TEXT[status];
     if (statusText.textContent !== text) statusText.textContent = text;
     if (status === 'empty') statusEl.title = 'An empty profile would send coldtrail back to setup, so the last saved version is kept.';
     else if (status === 'error') statusEl.title = text;
@@ -506,7 +565,7 @@ export function mountProfileEditor(root, { onChange, store = sharedStore } = {})
     'link-line': () => ['Fix link line', 'Fix link line'],
     'insert-link': () => ['Add link line', 'Add link line'],
     rename: () => ['Rename heading', 'Rename heading'],
-    'select-link': () => ['Edit link', 'Edit link'],
+    'select-link': (it) => (it.example ? ['Replace link', 'Replace link'] : ['Edit link', 'Edit link']),
   };
   const STATE_WORD = { done: 'Done', empty: 'Empty', missing: 'Missing', warn: 'Needs a fix' };
 
@@ -536,14 +595,16 @@ export function mountProfileEditor(root, { onChange, store = sharedStore } = {})
         }
         const fixKind = it.fix && it.fix.kind;
         const [text, label] = fixKind ? FIX_LABEL[fixKind](it) : [];
-        let fixBtn = null;
-        if (fixKind === 'append') {
-          // A light suggestion: a compact "+ Add" beside the label.
-          fixBtn = h('button', { type: 'button', class: 'btn btn-ghost btn-sm pe-item-add', 'aria-label': label, onClick: () => applyFix(it.id, fixKind) }, icon('plus', 14), text);
-        } else if (fixKind) {
-          // A real problem: the fix sits under its explanation.
-          fixBtn = h('button', { type: 'button', class: 'btn btn-secondary btn-sm pe-item-fix', onClick: () => applyFix(it.id, fixKind) }, text);
-        }
+        // A light suggestion: a compact "+ Add" at the end of the label's line, leaving the hint
+        // the panel's full width. A real problem: the fix sits under its explanation.
+        const addBtn =
+          fixKind === 'append'
+            ? h('button', { type: 'button', class: 'btn btn-ghost btn-sm pe-item-add', 'aria-label': label, onClick: () => applyFix(it.id, fixKind) }, icon('plus', 14), text)
+            : null;
+        const fixBtn =
+          fixKind && fixKind !== 'append'
+            ? h('button', { type: 'button', class: 'btn btn-secondary btn-sm pe-item-fix', onClick: () => applyFix(it.id, fixKind) }, text)
+            : null;
         return h(
           'li',
           { class: 'pe-item', 'data-section': it.id, 'data-state': it.state },
@@ -551,10 +612,10 @@ export function mountProfileEditor(root, { onChange, store = sharedStore } = {})
           h(
             'div',
             { class: 'pe-item-text' },
-            h('span', { class: 'pe-item-label' }, it.label, h('span', { class: 'sr-only' }, `: ${STATE_WORD[it.state]}`)),
+            h('div', { class: 'pe-item-head' }, h('span', { class: 'pe-item-label' }, it.label, h('span', { class: 'sr-only' }, `: ${STATE_WORD[it.state]}`)), addBtn),
             detail,
+            fixBtn,
           ),
-          fixBtn,
         );
       }),
     );
@@ -567,7 +628,8 @@ export function mountProfileEditor(root, { onChange, store = sharedStore } = {})
   }
 
   // Once the profile is really in use (not the untouched template), a call to action still on
-  // the example site is flagged in the file bar too: every LinkedIn note would end with it.
+  // the example site is flagged in the file bar too: until it's replaced, LinkedIn notes go out
+  // without a link.
   function renderFlag() {
     const cta = analysis.items.find((it) => it.id === CTA.id);
     flagBtn.hidden = !(loaded && !template && cta && cta.example);
@@ -643,7 +705,7 @@ export function mountProfileEditor(root, { onChange, store = sharedStore } = {})
     template = !doc.trim();
     ta.value = template ? PROFILE_TEMPLATE : doc;
     // Text an earlier editor couldn't save as it closed comes back (and saves), unless the file
-    // has it by now.
+    // has it by now (load() waited for that editor's last save).
     const draft = profileDraft;
     profileDraft = null;
     if (draft && !same(draft.doc, doc)) {
@@ -652,7 +714,7 @@ export function mountProfileEditor(root, { onChange, store = sharedStore } = {})
       discardBtn.hidden = restoredFrom === null;
       template = false;
       ta.value = draft.doc;
-      restored.hidden = false;
+      restoredNotice.show(restored);
       pending = true;
       queueSave();
     }
@@ -675,7 +737,7 @@ export function mountProfileEditor(root, { onChange, store = sharedStore } = {})
     if (restoredFrom === null) return;
     const doc = restoredFrom;
     restoredFrom = null;
-    restored.hidden = true;
+    restoredNotice.hide();
     replaceRange(ta, 0, ta.value.length, doc, [0, 0]);
   }
 
@@ -686,32 +748,36 @@ export function mountProfileEditor(root, { onChange, store = sharedStore } = {})
     checkNote.hidden = true;
     loadError.hidden = true;
     renderStatus();
-    api.get('/api/company', { signal: ac.signal }).then(
-      (res) => {
+    // An editor closed just before this one may still be saving: read the file once that save
+    // has landed (or failed: then its text comes back), not before.
+    const before = exitSave ? settled(exitSave, EXIT_SAVE_WAIT_MS) : null;
+    Promise.resolve(before)
+      .then(() => (disposed ? null : api.get('/api/company', { signal: ac.signal })))
+      .then((res) => {
         if (!disposed) show(lf(res && res.doc));
-      },
-      (err) => {
-        if (disposed || (err && err.name === 'AbortError')) return;
-        status = 'load-error';
-        skeleton.hidden = true;
-        checkSkeleton.hidden = true;
-        checkNote.hidden = false;
-        loadError.replaceChildren(
-          h('span', { class: 'cp-load-error-icon' }, icon('error', 18)),
-          h(
-            'div',
-            { class: 'cp-load-error-text' },
-            h('p', { class: 'cp-load-error-title' }, "Couldn't load your profile."),
-            h('p', { class: 'cp-load-error-detail' }, (err && err.message) || String(err)),
-            h('p', { class: 'cp-load-error-detail' }, 'Nothing was changed. Editing stays off until it loads, so the saved profile isn’t overwritten.'),
-          ),
-          h('button', { type: 'button', class: 'btn btn-secondary', onClick: load }, 'Try again'),
-        );
-        loadError.hidden = false;
-        renderStatus();
-        emit();
-      },
+      }, loadFailed);
+  }
+
+  function loadFailed(err) {
+    if (disposed || (err && err.name === 'AbortError')) return;
+    status = 'load-error';
+    skeleton.hidden = true;
+    checkSkeleton.hidden = true;
+    checkNote.hidden = false;
+    loadError.replaceChildren(
+      h('span', { class: 'cp-load-error-icon' }, icon('error', 18)),
+      h(
+        'div',
+        { class: 'cp-load-error-text' },
+        h('p', { class: 'cp-load-error-title' }, 'Couldn’t load your profile.'),
+        h('p', { class: 'cp-load-error-detail' }, (err && err.message) || String(err)),
+        h('p', { class: 'cp-load-error-detail' }, 'Nothing was changed. Editing stays off until it loads, so the saved profile isn’t overwritten.'),
+      ),
+      h('button', { type: 'button', class: 'btn btn-secondary', onClick: load }, 'Try again'),
     );
+    loadError.hidden = false;
+    renderStatus();
+    emit();
   }
 
   // Coming back to the tab: pick up edits made elsewhere (another tab, the agent) unless there
@@ -799,16 +865,18 @@ export function mountProfileEditor(root, { onChange, store = sharedStore } = {})
     if (disposed) return;
     // Leaving with text the server doesn't have yet (a save waiting, running or failed): save it
     // now. No question can be asked here, so until that save lands the text is also kept for the
-    // next editor, which puts it back if the file still lacks it.
+    // next editor, which waits for this save and puts the text back only if it failed.
     const doc = loaded && !template ? ta.value : '';
     if (doc.trim() && (pending || inflight || lastError || !same(doc, persisted))) {
       queueSave.cancel();
       pending = false;
       const draft = { doc };
       profileDraft = draft;
-      saveNow().then(() => {
+      const saving = saveNow().then(() => {
         if (!lastError && profileDraft === draft) profileDraft = null;
+        if (exitSave === saving) exitSave = null;
       });
+      exitSave = saving;
     }
     disposed = true;
     queueSave.cancel();
@@ -829,7 +897,11 @@ export function mountProfileEditor(root, { onChange, store = sharedStore } = {})
     ready,
     state,
     flush,
-    focus: () => ta.focus(),
+    // An invisible textarea can't take focus: wait for the stylesheet if it's still coming.
+    focus: () => {
+      if (el.style.visibility) styled.then(() => ta.focus());
+      else ta.focus();
+    },
     dispose,
   };
 }
@@ -864,7 +936,9 @@ function lineDomains(line) {
  * judge. Domains already listed (or repeated) are dropped and counted in `skipped`. Entries made
  * from lines below a `[table]` header move up above it: there they would be keys of that table,
  * which the parser accepts and seeding then ignores.
- * @returns {{ text: string, added: number, skipped: number }}
+ * @returns {{ text: string, added: number, skipped: number, from: number[] }} `from[k]`: the line
+ *   of `raw` that line k of `text` came from (-1 for a blank line put between moved entries), so
+ *   a parse error's line number can be found in what the user typed.
  */
 export function normalizeContacted(raw) {
   const lines = String(raw ?? '').split('\n');
@@ -878,19 +952,24 @@ export function normalizeContacted(raw) {
   let skipped = 0;
   let headerAt = -1; // where the first header landed in `out`
   const out = [];
+  const from = [];
   const hoisted = [];
+  const hoistedFrom = [];
   lines.forEach((line, i) => {
     if (i === firstHeader) headerAt = out.length;
     const domains = lineDomains(line);
     if (!domains) {
       out.push(line);
+      from.push(i);
       return;
     }
     const fresh = domains.filter((d) => !known.has(d) && known.add(d));
     added += fresh.length;
     skipped += domains.length - fresh.length;
     const entries = fresh.map((d) => `"${d}" = { status = "sent" }`);
-    (firstHeader >= 0 && i > firstHeader ? hoisted : out).push(...entries);
+    const hoist = firstHeader >= 0 && i > firstHeader;
+    (hoist ? hoisted : out).push(...entries);
+    (hoist ? hoistedFrom : from).push(...entries.map(() => i));
   });
   if (hoisted.length) {
     // Just after the last top-level line: above the header's own comments and blank lines.
@@ -898,11 +977,35 @@ export function normalizeContacted(raw) {
     while (at > 0 && isComment(out[at - 1])) at--;
     while (at > 0 && !out[at - 1].trim()) at--;
     const block = [...hoisted];
-    if (at > 0 && isComment(out[at - 1])) block.unshift(''); // keep the file's header comment apart
-    if (at === headerAt || out[at].trim()) block.push('');
+    const blockFrom = [...hoistedFrom];
+    if (at > 0 && isComment(out[at - 1])) {
+      block.unshift(''); // keep the file's header comment apart
+      blockFrom.unshift(-1);
+    }
+    if (at === headerAt || out[at].trim()) {
+      block.push('');
+      blockFrom.push(-1);
+    }
     out.splice(at, 0, ...block);
+    from.splice(at, 0, ...blockFrom);
   }
-  return { text: out.join('\n'), added, skipped };
+  return { text: out.join('\n'), added, skipped, from };
+}
+
+/** The TOML parser's snippet ("  |", "4 | text", "  |     ^") with line `from` shown as line
+ *  `to`; the gutter is re-padded to the new number's width so the "^" still lines up. A snippet
+ *  in another shape is left as it is. */
+function renumber(snippet, from, to) {
+  const lines = snippet.split('\n');
+  const at = lines.findIndex((l) => l.startsWith(`${from} | `));
+  if (at < 0) return snippet;
+  const gutter = `${' '.repeat(from.length + 1)}|`;
+  return lines
+    .map((l, i) => {
+      if (i === at) return to + l.slice(from.length);
+      return l.startsWith(gutter) ? ' '.repeat(to.length + 1) + l.slice(from.length + 1) : l;
+    })
+    .join('\n');
 }
 
 /** Entries in a contacted.toml: top-level `key = …` lines plus `[table]` headers. */
@@ -939,8 +1042,15 @@ function mountContacted(root) {
   let busy = false;
   let disposed = false;
 
-  const errorEl = h('p', { class: 'field-error ac-error', id: `${id}-error` });
-  errorEl.hidden = true;
+  // A rejected save: the server's reason (an alert, so it's heard even though focus stays on
+  // Save), then the parser's snippet as it printed it, and a way to the line it names.
+  const errorEl = h('p', { class: 'field-error ac-error', id: `${id}-error`, role: 'alert' });
+  const errorSnippet = h('pre', { class: 'ac-error-snippet' });
+  const gotoBtn = h('button', { type: 'button', class: 'cp-text-btn ac-error-goto', onClick: () => gotoError() });
+  const errorMore = h('div', { class: 'ac-error-more' }, errorSnippet, gotoBtn);
+  const errorBox = h('div', { class: 'ac-error-box' }, errorEl, errorMore);
+  for (const node of [errorBox, errorEl, errorMore]) node.hidden = true;
+  let errorAt = null; // { line, col } the rejected text's parse error points at, in the textarea
   const hintId = `${id}-hint`;
   const ta = h('textarea', {
     class: 'ac-text',
@@ -952,16 +1062,22 @@ function mountContacted(root) {
     placeholder: 'acme.com\nbeta.io',
   });
   ta.hidden = true;
-  const stateEl = h('span', { class: 'ac-state' });
+  // Like the profile's save state: an icon once it's saved, the words always.
+  const stateIcon = h('span', { class: 'pe-status-icon' });
+  const stateText = h('span', { class: 'ac-state-text' });
+  const stateEl = h('span', { class: 'ac-state' }, stateIcon, stateText);
   const msg = h('p', { class: 'ac-msg', role: 'status' });
   const discardBtn = h('button', { type: 'button', class: 'cp-text-btn', onClick: () => discard() }, 'Discard');
   const restored = h('p', { class: 'ac-restored' }, h('span', {}, 'Your unsaved changes from earlier are back.'), discardBtn);
-  restored.hidden = true;
-  const saveBtn = h('button', { type: 'button', class: 'btn btn-primary', disabled: true, onClick: () => save() }, 'Save');
+  const restoredNotice = liveNotice('ac-restored');
+  // aria-disabled rather than disabled while there's nothing to save, so focus stays on it after a
+  // save (a disabled button drops focus to the page).
+  const saveBtn = h('button', { type: 'button', class: 'btn btn-primary ac-save', 'aria-disabled': 'true', onClick: () => save() }, 'Save');
   const foot = h(
     'div',
     { class: 'ac-foot' },
-    h('div', { class: 'ac-feedback' }, errorEl, restored, msg, h('p', { class: 'field-hint', id: hintId }, 'One domain per line, or contacted.toml entries.')),
+    errorBox,
+    h('div', { class: 'ac-feedback' }, msg, h('p', { class: 'field-hint', id: hintId }, 'One domain per line, or contacted.toml entries.')),
     saveBtn,
   );
   foot.hidden = true;
@@ -969,6 +1085,9 @@ function mountContacted(root) {
   const loadError = h('div', { class: 'ac-load-error cp-load-error', role: 'alert' });
   loadError.hidden = true;
 
+  // The restored-draft notice sits under the file bar, as on the profile tab: its live region is
+  // on screen from the start (the footer stays hidden until the list loads), so the notice put in
+  // it on load is announced.
   const main = h(
     'div',
     { class: 'ac-main cp-card' },
@@ -978,6 +1097,7 @@ function mountContacted(root) {
       h('span', { class: 'cp-file' }, icon('file', 14), h('span', { class: 'mono' }, 'contacted.toml')),
       h('span', { class: 'cp-bar-end' }, stateEl),
     ),
+    restoredNotice.region,
     h('div', { class: 'ac-body' }, skeleton, loadError, ta),
     foot,
   );
@@ -997,36 +1117,105 @@ function mountContacted(root) {
   const el = h('div', { class: 'ac' }, h('div', { class: 'cp-grid' }, main, help));
   root.append(el);
 
-  function setInvalid(message) {
-    errorEl.textContent = message || '';
-    errorEl.hidden = !message;
-    if (message) {
-      ta.setAttribute('aria-invalid', 'true');
-      ta.setAttribute('aria-describedby', `${errorEl.id} ${hintId}`);
-    } else {
-      ta.removeAttribute('aria-invalid');
-      ta.setAttribute('aria-describedby', hintId);
+  // The card is sized to fill the screen. What shows up around the text box (a rejected save's
+  // reason above Save, the restored-draft notice) takes its height from the box, down to the
+  // box's minimum, so the card still fits and Save stays in view. Kept up to date as they come,
+  // go and re-wrap when the window is resized.
+  function fit() {
+    const error = errorBox.hidden ? 0 : errorBox.getBoundingClientRect().height + (parseFloat(getComputedStyle(foot).rowGap) || 0);
+    const extra = Math.ceil(restoredNotice.region.getBoundingClientRect().height + error);
+    main.style.setProperty('--ac-extra-h', `${extra}px`);
+  }
+  const resized = typeof ResizeObserver === 'function' ? new ResizeObserver(() => fit()) : null;
+  if (resized) for (const node of [errorBox, restoredNotice.region]) resized.observe(node);
+
+  function clearError() {
+    errorEl.replaceChildren();
+    errorSnippet.replaceChildren();
+    for (const node of [errorBox, errorEl, errorMore]) node.hidden = true;
+    errorAt = null;
+    ta.removeAttribute('aria-invalid');
+    ta.setAttribute('aria-describedby', hintId);
+    fit();
+  }
+
+  /** The server's reason for refusing `result.text` (normalizeContacted's output): the first line
+   *  in words; the rest ("  |", "2 | …", "  |  ^", what the parser expected) kept as printed,
+   *  except that a line number is given as the line in the text as typed. */
+  function showError(message, result) {
+    const [head, ...rest] = String(message).replace(/\s+$/, '').split('\n');
+    let first = head;
+    let snippet = rest.join('\n');
+    errorAt = locate(head, result);
+    if (errorAt && errorAt.line !== errorAt.sent) {
+      // Domain lines above it became several entries (or moved): the parser counted lines of
+      // text the user never sees. Give the line as typed, so the reason, its snippet and "Go to
+      // line" all name the line the textarea shows.
+      const n = String(errorAt.line + 1);
+      first = head.replace(/\bline \d+, column \d+/, errorAt.exact ? `line ${n}, column ${errorAt.col + 1}` : `line ${n}`);
+      snippet = renumber(snippet, String(errorAt.sent + 1), n);
     }
+    errorSnippet.textContent = snippet;
+    errorSnippet.hidden = !snippet;
+    gotoBtn.textContent = errorAt ? `Go to line ${errorAt.line + 1}` : '';
+    gotoBtn.hidden = !errorAt;
+    errorMore.hidden = !snippet && !errorAt;
+    errorEl.textContent = `Not saved: ${first}`;
+    errorEl.hidden = false;
+    errorBox.hidden = false;
+    ta.setAttribute('aria-invalid', 'true');
+    ta.setAttribute('aria-describedby', `${errorEl.id} ${hintId}`);
+    fit();
+    // Where the text box can't give up enough (a short window, a phone, a box made taller by
+    // hand), bring the reason and Save into view: focus stays on Save.
+    foot.scrollIntoView({ block: 'nearest' });
+  }
+
+  /** "… at line N, column M" in the text that was sent → that place in the text as typed (domain
+   *  lines become entries, and may move, before sending). The column only holds on a line that
+   *  was sent unchanged (`exact`). `sent`: the line in the text that was sent. */
+  function locate(message, result) {
+    const m = /\bline (\d+), column (\d+)/.exec(message);
+    if (!m) return null;
+    const k = Number(m[1]) - 1;
+    const line = result.from[k];
+    if (line == null || line < 0) return null;
+    const exact = result.text.split('\n')[k] === ta.value.split('\n')[line];
+    return { line, sent: k, exact, col: exact ? Math.max(0, Number(m[2]) - 1) : 0 };
+  }
+
+  function gotoError() {
+    if (!errorAt) return;
+    const v = ta.value;
+    const at = Math.min(lineStart(v, errorAt.line) + errorAt.col, lineEnd(v, errorAt.line));
+    ta.focus();
+    ta.setSelectionRange(at, at);
   }
 
   const isDirty = () => saved !== null && ta.value !== saved;
 
   function renderState() {
     const dirty = isDirty();
-    saveBtn.disabled = busy || !dirty;
-    stateEl.textContent = busy ? 'Saving…' : dirty ? 'Unsaved changes' : saved !== null ? 'Saved' : '';
-    stateEl.dataset.state = busy ? 'saving' : dirty ? 'dirty' : 'saved';
-    if (!dirty) restored.hidden = true;
+    if (!busy) {
+      if (dirty) saveBtn.removeAttribute('aria-disabled');
+      else saveBtn.setAttribute('aria-disabled', 'true');
+    }
+    const state = busy ? 'saving' : dirty ? 'dirty' : saved !== null ? 'saved' : 'loading';
+    stateText.textContent = { saving: 'Saving…', dirty: 'Unsaved changes', saved: 'Saved', loading: '' }[state];
+    stateIcon.replaceChildren(state === 'saved' ? icon('check', 14) : '');
+    stateEl.dataset.state = state;
+    if (!dirty) restoredNotice.hide();
   }
 
   async function save() {
-    if (busy || saved === null) return;
+    if (busy || !isDirty()) return;
     const result = normalizeContacted(ta.value);
     const { text } = result;
     busy = true;
     ta.readOnly = true;
+    setBusy(saveBtn, true);
     msg.replaceChildren();
-    setInvalid('');
+    clearError();
     renderState();
     try {
       await api.post('/api/onboarding/contacted', { toml: text });
@@ -1037,24 +1226,25 @@ function mountContacted(root) {
       msg.replaceChildren(savedMessage(result, n), ...(n ? [' Run ', code('coldtrail seed'), ' to load them into the pipeline.'] : []));
     } catch (err) {
       if (disposed) return;
-      setInvalid(`Not saved: ${(err && err.message) || err}`);
+      showError((err && err.message) || String(err), result);
     } finally {
       busy = false;
       ta.readOnly = false;
+      setBusy(saveBtn, false);
       if (!disposed) renderState();
     }
   }
 
   function discard() {
     ta.value = saved;
-    setInvalid('');
+    clearError();
     msg.replaceChildren();
     renderState();
     ta.focus();
   }
 
   ta.addEventListener('input', () => {
-    if (!errorEl.hidden) setInvalid('');
+    if (!errorEl.hidden) clearError();
     if (msg.firstChild) msg.replaceChildren();
     renderState();
   });
@@ -1069,7 +1259,7 @@ function mountContacted(root) {
   ta.addEventListener('keydown', (e) => {
     if (!isSave(e)) return;
     e.preventDefault();
-    if (!saveBtn.disabled) save();
+    save();
   });
 
   function load() {
@@ -1078,14 +1268,15 @@ function mountContacted(root) {
     api.get('/api/onboarding/files', { signal: ac.signal }).then(
       (res) => {
         if (disposed) return;
-        saved = String((res && res.contacted) || '');
+        // The textarea turns "\r\n" into "\n": compare the file's text the same way.
+        saved = lf(res && res.contacted);
         ta.value = saved;
         // Edits left unsaved on an earlier visit come back, unless the file already has them.
         const draft = contactedDraft;
         contactedDraft = null;
         if (draft !== null && draft !== saved && normalizeContacted(draft).text !== saved) {
           ta.value = draft;
-          restored.hidden = false;
+          restoredNotice.show(restored);
         }
         skeleton.hidden = true;
         ta.hidden = false;
@@ -1100,7 +1291,7 @@ function mountContacted(root) {
           h(
             'div',
             { class: 'cp-load-error-text' },
-            h('p', { class: 'cp-load-error-title' }, "Couldn't load the list."),
+            h('p', { class: 'cp-load-error-title' }, 'Couldn’t load the list.'),
             h('p', { class: 'cp-load-error-detail' }, (err && err.message) || String(err)),
           ),
           h('button', { type: 'button', class: 'btn btn-secondary', onClick: load }, 'Try again'),
@@ -1119,6 +1310,7 @@ function mountContacted(root) {
       if (saved !== null) contactedDraft = isDirty() ? ta.value : null;
       disposed = true;
       ac.abort();
+      if (resized) resized.disconnect();
       window.removeEventListener('beforeunload', onBeforeUnload);
     },
   };
@@ -1138,7 +1330,7 @@ const TAB_DESC = {
   contacted: 'Companies you’ve already reached. Once loaded with coldtrail seed, sourcing skips them. The list stays on this machine and saves when you press Save.',
 };
 
-let active = null; // the mounted view: { setTab }
+let active = null; // the mounted view: { setTab, flush }
 
 export default {
   title: TITLE,
@@ -1181,7 +1373,7 @@ export default {
     }
     setTab(tabOf(ctx.query));
 
-    const me = { setTab };
+    const me = { setTab, flush: () => editor.flush() };
     active = me;
     return () => {
       if (active === me) active = null;
@@ -1193,5 +1385,10 @@ export default {
     if (!active || ctx.path[0] !== 'company') return false;
     active.setTab(tabOf(ctx.query));
     return true;
+  },
+  // Leaving the screen: the router waits (up to 1.5s) for an edit inside the autosave delay to be
+  // saved before the next screen mounts. Unmounting still saves anything left after that.
+  beforeLeave() {
+    return active ? active.flush() : undefined;
   },
 };

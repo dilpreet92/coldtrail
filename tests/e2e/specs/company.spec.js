@@ -133,14 +133,50 @@ test('autosave persists after reload', async ({ app, page, server }) => {
   await expect(saveStatus(page)).toHaveText('Saved');
 });
 
-test('an edit made just before leaving the screen is still saved', async ({ app, page, server }) => {
+test('an edit made just before leaving the screen is saved before the next screen shows', async ({ app, page, server }) => {
   await stubView(page, 'home', 'Home');
+  // A slow disk: the save takes half a second.
+  await page.route('**/api/company', async (route) => {
+    if (route.request().method() === 'POST') await new Promise((resolve) => setTimeout(resolve, 500));
+    return route.fallback();
+  });
   await openProfile(app, page);
-  // One input event, then leave inside the debounce window: unmounting flushes the save.
+  // One input event, then leave inside the debounce window: the router's beforeLeave flushes the
+  // save, and the next screen mounts once it has landed.
   await editor(page).fill(`${PRODUCT_MD}\nLeft in a hurry.`);
   await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: /^Home\b/ }).click();
+  await expect(page.locator('#view h1')).toHaveText('Home');
   await expect(page).toHaveURL(hashIs('#/home'));
-  await expect.poll(() => productOnDisk(server)).toBe(`${PRODUCT_MD}\nLeft in a hurry.`);
+  expect(productOnDisk(server)).toBe(`${PRODUCT_MD}\nLeft in a hurry.`);
+});
+
+test('coming straight back while the last save is still landing shows the saved text, no restore notice', async ({ app, page, server }) => {
+  await stubView(page, 'home', 'Home');
+  // Slower than the router waits for beforeLeave (1.5s): the closing editor's own save carries it.
+  await page.route('**/api/company', async (route) => {
+    if (route.request().method() === 'POST') await new Promise((resolve) => setTimeout(resolve, 2200));
+    return route.fallback();
+  });
+  await openProfile(app, page);
+  const typed = `${PRODUCT_MD}\nSaved on the way out.`;
+  await editor(page).fill(typed);
+  await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: /^Home\b/ }).click();
+  await expect(page.locator('#view h1')).toHaveText('Home');
+  expect(productOnDisk(server)).toBe(PRODUCT_MD); // still on its way
+  await page.evaluate(() => {
+    window.__sawRestored = false;
+    new MutationObserver(() => {
+      if (document.querySelector('.pe-restored')) window.__sawRestored = true;
+    }).observe(document.body, { childList: true, subtree: true });
+  });
+  await page.goBack();
+  await expect(page.locator('#view h1')).toHaveText('Company profile');
+  // The new editor reads the file once that save has landed: the text is simply saved.
+  await expect(editor(page)).toHaveValue(typed);
+  await expect(saveStatus(page)).toHaveText('Saved');
+  expect(productOnDisk(server)).toBe(typed);
+  await expect(page.locator('.pe-restored')).toBeHidden();
+  expect(await page.evaluate(() => window.__sawRestored)).toBe(false);
 });
 
 test('an edit made just before closing or reloading the tab is still saved', async ({ app, page, server }) => {
@@ -197,7 +233,10 @@ test('checklist ticks sections as typed', async ({ app, page, server }) => {
 
   await typeAtEnd(page, '## Who we help\nSeed-stage founders who sell.\n\n');
   await expect(item(page, 'audience')).toHaveAttribute('data-state', 'done');
-  await typeAtEnd(page, '## Pain\nLeads go cold.\n\n## Proof\n40 design partners.\n\n');
+  await typeAtEnd(page, '## Pain\nLeads go cold.\n\n## Proof\n');
+  await expect(item(page, 'proof')).toHaveAttribute('data-state', 'empty');
+  // A markdown heading needs a space after its "#"s: "#1 rated…" is the section's text.
+  await typeAtEnd(page, '#1 rated on G2 for call notes.\n\n');
   await expect(item(page, 'pain')).toHaveAttribute('data-state', 'done');
   await expect(item(page, 'proof')).toHaveAttribute('data-state', 'done');
   // Bracketed placeholder text is not content.
@@ -282,18 +321,20 @@ test('CTA without - Link: stays unticked with a hint', async ({ app, page, serve
   await expect(cta).toContainText('Add a “- Link:” line');
   await cta.getByRole('button', { name: 'Add link line' }).click();
   await expect(editor(page)).toHaveValue(`# Acme\n\n## Call to Action\n- Link: ${EXAMPLE_LINK}\n\n## Voice\nShort.\n`);
-  // The example link is not the user's: still unticked until it's replaced.
+  // The example link is not the user's (cta_link() ignores it): unticked until it's replaced.
   await expect(cta).toHaveAttribute('data-state', 'warn');
-  await expect(cta).toContainText('LinkedIn notes end with this example link until you replace it');
+  await expect(cta).toContainText('Replace the example link with your real URL');
+  await expect(cta).toContainText('Until then, LinkedIn notes go out without a link.');
+  await expect(cta.getByRole('button', { name: 'Replace link' })).toBeVisible();
   // The line was added with the example site selected.
   await expect(editor(page)).toBeFocused();
   expect(await selectedText(page)).toBe('yourproduct.com');
 
-  // The example link is flagged beside the file name too, since notes would end with it; the
-  // flag selects the link, ready to type over.
+  // The example link is flagged beside the file name too, since notes go out without a link
+  // until it's replaced; the flag selects the link, ready to type over.
   const flag = page.getByRole('button', { name: /^Replace example link/ });
   await expect(flag).toBeVisible();
-  await expect(flag).toHaveAccessibleName('Replace example link: LinkedIn notes end with it until you do');
+  await expect(flag).toHaveAccessibleName('Replace example link: LinkedIn notes go out without a link until you do');
   await expect(flag).toHaveText('Replace example link', { useInnerText: true });
   await flag.click();
   await expect(editor(page)).toBeFocused();
@@ -302,6 +343,30 @@ test('CTA without - Link: stays unticked with a hint', async ({ app, page, serve
   await expect(cta).toHaveAttribute('data-state', 'done');
   await expect(flag).toBeHidden();
   await expect.poll(() => productOnDisk(server)).toBe('# Acme\n\n## Call to Action\n- Link: https://acme.example/?utm_content={slug}\n\n## Voice\nShort.\n');
+
+  // As cta_link() reads it: the example is skipped and a real link after it counts; only the
+  // example's own host (and its subdomains) is the example.
+  await editor(page).fill(`## Call to Action\n- Link: ${EXAMPLE_LINK}\n- Link: https://acme.example/?utm_content={slug}\n`);
+  await expect(cta).toHaveAttribute('data-state', 'done');
+  await expect(cta).toContainText('https://acme.example/?utm_content={slug}');
+  await expect(flag).toBeHidden();
+  await editor(page).fill('## Call to Action\n- Link: https://go.YourProduct.com:8443/x\n');
+  await expect(cta).toHaveAttribute('data-state', 'warn');
+  await expect(flag).toBeVisible();
+  await editor(page).fill('## Call to Action\n- Link: https://notyourproduct.com/?utm_content={slug}\n');
+  await expect(cta).toHaveAttribute('data-state', 'done');
+
+  // A "* Link:" or "+ Link:" line is skipped like a bare URL; the fix makes it a "- Link:" line.
+  await editor(page).fill('# Acme\n\n## Call to Action\n* Link: https://acme.example/\n');
+  await expect(cta).toHaveAttribute('data-state', 'warn');
+  await expect(cta).toContainText('Start the line with “- Link:”');
+  await cta.getByRole('button', { name: 'Fix link line' }).click();
+  await expect(editor(page)).toHaveValue('# Acme\n\n## Call to Action\n- Link: https://acme.example/\n');
+  await expect(cta).toHaveAttribute('data-state', 'done');
+  await editor(page).fill('## Call to Action\n+ link:   https://acme.example/b\n');
+  await cta.getByRole('button', { name: 'Fix link line' }).click();
+  await expect(editor(page)).toHaveValue('## Call to Action\n- Link: https://acme.example/b\n');
+  await expect(cta).toHaveAttribute('data-state', 'done');
 
   // A placeholder value, and a heading that isn't exactly "Call to Action", don't count either.
   await editor(page).fill('## Call to Action\n- Link: [add your link]\n');
@@ -359,9 +424,9 @@ test('checklist fixes apply to the text as it is now, after lines are added abov
   expect(await selectedText(page)).toBe('yourproduct.com');
   await expect.poll(() => productOnDisk(server)).toBe(added);
 
-  // "Edit link" selects the link itself.
+  // "Replace link" selects the example link itself.
   await typeAfter(page, 'To shops in Leeds.', '\nAnd online.');
-  await cta.getByRole('button', { name: 'Edit link' }).click();
+  await cta.getByRole('button', { name: 'Replace link' }).click();
   await expect(editor(page)).toBeFocused();
   expect(await selectedText(page)).toBe(EXAMPLE_LINK);
 });
@@ -389,7 +454,7 @@ test('an edit whose save failed is saved on leaving, or kept for the next visit'
   // The save fails once and the user leaves without typing again: leaving saves it.
   const first = `${PRODUCT_MD}\nFirst try.`;
   await editor(page).fill(first);
-  await expect(saveStatus(page)).toContainText("Couldn't save: disk full");
+  await expect(saveStatus(page)).toContainText('Couldn’t save: disk full');
   await leave();
   await expect.poll(() => productOnDisk(server)).toBe(first);
   await comeBack();
@@ -397,18 +462,20 @@ test('an edit whose save failed is saved on leaving, or kept for the next visit'
   await expect(saveStatus(page)).toHaveText('Saved');
   await expect(restored).toBeHidden();
 
-  // Saving still fails on the way out: the text waits in memory, comes back on the next visit
-  // and is saved then.
-  failures = 2;
+  // Saving still fails on the way out (the autosave, the router's beforeLeave flush and the
+  // unmount's own try): the text waits in memory, comes back on the next visit and is saved then.
+  failures = 3;
   const second = `${first}\nSecond try.`;
   await editor(page).fill(second);
-  await expect(saveStatus(page)).toContainText("Couldn't save: disk full");
+  await expect(saveStatus(page)).toContainText('Couldn’t save: disk full');
   await leave();
   await expect.poll(() => failures).toBe(0);
   expect(productOnDisk(server)).toBe(first);
   await comeBack();
   await expect(editor(page)).toHaveValue(second);
   await expect(restored).toHaveText(/^Your unsaved changes from earlier are back\./);
+  // Announced: the notice arrives in a live region.
+  await expect(page.getByRole('status').filter({ has: restored })).toBeVisible();
   await expect.poll(() => productOnDisk(server)).toBe(second);
   await expect(saveStatus(page)).toHaveText('Saved');
   await expectAccessible(page);
@@ -468,7 +535,8 @@ test('empty profile shows the corrected template', async ({ app, page, server })
   await expect.poll(() => productOnDisk(server)).toContain('## What we do\nWe turn notes into plans.');
   expect(productOnDisk(server)).toContain(`## Call to Action\n- Link: ${EXAMPLE_LINK}`);
   await expect(saveStatus(page)).toHaveText('Saved');
-  // Now notes really would end with the example link: the file bar says so.
+  // The saved call to action is still the example, so notes go out without a link: the file bar
+  // says so now.
   await expect(flag).toBeVisible();
 });
 
@@ -477,10 +545,10 @@ test('a blank profile is never saved', async ({ app, page, server }) => {
   await openProfile(app, page);
   const saves = recordSaves(page);
   await editor(page).fill('  \n');
-  await expect(saveStatus(page)).toHaveText("Not saved: the profile can't be empty");
+  await expect(saveStatus(page)).toHaveText('Not saved: the profile can’t be empty');
   await expect(progress(page)).toHaveText('0 of 6 covered');
   await editor(page).press('ControlOrMeta+s');
-  await expect(saveStatus(page)).toHaveText("Not saved: the profile can't be empty");
+  await expect(saveStatus(page)).toHaveText('Not saved: the profile can’t be empty');
 
   // The next real edit is the first thing that reaches the server.
   await editor(page).fill('# Back again\n');
@@ -531,7 +599,7 @@ test('loading, load errors and save errors', async ({ app, page, server }) => {
   // Load error: the message and a retry, and still nothing to type into (no blind overwrite).
   release();
   const loadError = page.locator('.pe-load-error');
-  await expect(loadError).toContainText("Couldn't load your profile");
+  await expect(loadError).toContainText('Couldn’t load your profile');
   await expect(loadError).toContainText('disk unavailable');
   await expect(editor(page)).toBeHidden();
   await loadError.getByRole('button', { name: 'Try again' }).click();
@@ -540,7 +608,7 @@ test('loading, load errors and save errors', async ({ app, page, server }) => {
 
   // Save error: shown in the status with a retry; the text is kept.
   await editor(page).fill(`${PRODUCT_MD}\nNew line.`);
-  await expect(saveStatus(page)).toContainText("Couldn't save: disk full");
+  await expect(saveStatus(page)).toContainText('Couldn’t save: disk full');
   await expect(editor(page)).toHaveValue(`${PRODUCT_MD}\nNew line.`);
   expect(productOnDisk(server)).toBe(PRODUCT_MD);
   // The whole reason is on screen, clear of the file name, on a laptop and on a phone.
@@ -600,6 +668,15 @@ test('hostile profile text renders as text', async ({ app, page, request, server
 
 test('already contacted saves and rejects invalid input', async ({ app, page, server }) => {
   app.allowConsole(/status of 500/);
+  // Hold the first save, to see it in progress.
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  await page.route('**/api/onboarding/contacted', async (route) => {
+    await gate;
+    return route.fallback();
+  });
   await app.goto('#/company?tab=contacted');
   await expect(page.getByRole('tab', { name: 'Already contacted' })).toHaveAttribute('aria-selected', 'true');
   const box = contactedBox(page);
@@ -611,7 +688,15 @@ test('already contacted saves and rejects invalid input', async ({ app, page, se
   await box.fill('acme.example\nhttps://www.Beta.example/about\nacme.example, gamma.example\n');
   await expect(save).toBeEnabled();
   await expect(page.locator('.ac-state')).toHaveText('Unsaved changes');
-  await save.click();
+  await save.focus();
+  await page.keyboard.press('Enter');
+  // While it saves: busy (a spinner, presses ignored), focus kept, the text read-only.
+  await expect(save).toHaveAttribute('aria-busy', 'true');
+  await expect(save.locator('.spinner')).toBeVisible();
+  await expect(save).toBeFocused();
+  await expect(page.locator('.ac-state')).toHaveText('Saving…');
+  await expect(box).not.toBeEditable();
+  release();
   const saved =
     '"acme.example" = { status = "sent" }\n"beta.example" = { status = "sent" }\n' +
     '"gamma.example" = { status = "sent" }\n';
@@ -619,7 +704,12 @@ test('already contacted saves and rejects invalid input', async ({ app, page, se
   await expect(page.locator('.ac-msg')).toHaveText(`Saved: 3 domains added, 1 already listed. The list has 3 domains.${seedHint}`);
   await expect(box).toHaveValue(saved);
   expect(contactedOnDisk(server)).toBe(saved);
+  // Nothing left to save: dimmed, but still focused (a disabled button would drop focus).
   await expect(save).toBeDisabled();
+  await expect(save).not.toHaveAttribute('aria-busy', 'true');
+  await expect(save).toBeFocused();
+  await page.keyboard.press('Enter'); // does nothing
+  await expect(page.locator('.ac-msg')).toHaveText(`Saved: 3 domains added, 1 already listed. The list has 3 domains.${seedHint}`);
 
   // Domains pasted under existing TOML entries join them; ones already listed are skipped, and
   // the message says so rather than counting them as saved.
@@ -639,22 +729,103 @@ test('already contacted saves and rejects invalid input', async ({ app, page, se
   await expect(box).toHaveValue(hoisted);
   expect(contactedOnDisk(server)).toBe(hoisted);
 
-  // Invalid input: the server's reason inline, the field marked, the file untouched.
+  // Invalid input: the server's reason inline (announced), the parser's snippet as printed, the
+  // field marked, the file untouched.
   await box.fill('"broken = {\nnot a domain\n');
   await save.click();
   const error = page.locator('.ac-error');
-  await expect(error).toHaveText(/^Not saved: invalid contacted\.toml/);
+  await expect(error).toHaveText('Not saved: invalid contacted.toml: TOML parse error at line 1, column 12');
+  await expect(page.locator('.ac-main').getByRole('alert')).toHaveText('Not saved: invalid contacted.toml: TOML parse error at line 1, column 12');
+  const snippet = page.locator('.ac-error-snippet');
+  await expect(snippet).toBeVisible();
+  expect(await snippet.textContent()).toBe('  |\n1 | "broken = {\n  |            ^\ninvalid basic string');
+  expect(await snippet.evaluate((el) => [getComputedStyle(el).whiteSpace, getComputedStyle(el).fontFamily])).toEqual([
+    'pre-wrap',
+    expect.stringContaining('Geist Mono'),
+  ]);
   await expect(box).toHaveAttribute('aria-invalid', 'true');
   await expect(box).toHaveAttribute('aria-describedby', new RegExp(await error.getAttribute('id')));
   expect(contactedOnDisk(server)).toBe(hoisted);
+  // "Go to line" puts the caret where the parser stopped.
+  await page.getByRole('button', { name: 'Go to line 1' }).click();
+  await expect(box).toBeFocused();
+  expect(await box.evaluate((el) => [el.selectionStart, el.selectionEnd])).toEqual([11, 11]);
+
+  // Domains become entries before sending, so the parser counts lines of text that isn't on
+  // screen (line 4 here). The reason, its snippet and "Go to line" all give the line as typed.
+  const typed = 'acme.example\nbeta.example, gamma.example\n"broken = {\n';
+  await box.fill(typed);
+  await save.click();
+  await expect(error).toHaveText('Not saved: invalid contacted.toml: TOML parse error at line 3, column 12');
+  expect(await snippet.textContent()).toBe('  |\n3 | "broken = {\n  |            ^\ninvalid basic string');
+  await page.getByRole('button', { name: 'Go to line 3' }).click();
+  const at = typed.indexOf('"broken = {') + '"broken = {'.length;
+  expect(await box.evaluate((el) => [el.selectionStart, el.selectionEnd])).toEqual([at, at]);
+  await expect(box).toHaveValue(typed);
+  // Line 10 as sent is line 9 as typed: the snippet's gutter narrows, and its "^" still lines up.
+  const nine = `a.example, b.example\n${'# note\n'.repeat(7)}"broken = {\n`;
+  await box.fill(nine);
+  await save.click();
+  await expect(error).toHaveText('Not saved: invalid contacted.toml: TOML parse error at line 9, column 12');
+  expect(await snippet.textContent()).toBe('  |\n9 | "broken = {\n  |            ^\ninvalid basic string');
+  await expect(page.getByRole('button', { name: 'Go to line 9' })).toBeVisible();
+  await box.fill(typed);
+  await save.click();
+  await expect(error).toContainText('line 3, column 12');
   // Editing clears the error.
   await box.press('End');
   await page.keyboard.type(' ');
   await expect(error).toBeHidden();
+  await expect(snippet).toBeHidden();
   await expect(box).not.toHaveAttribute('aria-invalid', 'true');
 
   await page.reload(); // the "leave with unsaved changes?" question is accepted
   await expect(contactedBox(page)).toHaveValue(hoisted);
+});
+
+test('a rejected save keeps its reason, the snippet and Save on screen', async ({ app, page }) => {
+  app.allowConsole(/status of 500/);
+  await app.goto('#/company?tab=contacted');
+  const box = contactedBox(page);
+  await expect(box).toHaveValue(CONTACTED_TEMPLATE);
+  const save = page.getByRole('button', { name: 'Save', exact: true });
+  const error = page.locator('.ac-error');
+  const snippet = page.locator('.ac-error-snippet');
+  const goto = page.getByRole('button', { name: /^Go to line/ });
+  /** Where the file bar sits against the sticky top bar, and how tall the text box is. */
+  const layout = () =>
+    page.evaluate(() => ({
+      barTop: document.querySelector('.ac-main .cp-bar').getBoundingClientRect().top,
+      topbar: document.getElementById('topbar').getBoundingClientRect().bottom,
+      text: document.querySelector('.ac-text').getBoundingClientRect().height,
+    }));
+  // Laptop screens the card fills (it shrinks its text box to make room), a short window (the
+  // page scrolls to the error instead) and a phone.
+  for (const [width, height, fits] of [[1440, 900, true], [1024, 768, true], [1280, 560, false], [390, 844, false]]) {
+    await page.setViewportSize({ width, height });
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await box.fill('acme.example\n"broken = {\n');
+    const before = await layout();
+    await save.focus();
+    await page.keyboard.press('Enter');
+    await expect(error).toBeVisible();
+    await expect(save).toBeFocused();
+    for (const [name, node] of [['Save', save], ['snippet', snippet], ['Go to line', goto], ['reason', error]]) {
+      await expect(node, `${name} at ${width}x${height}`).toBeInViewport({ ratio: 1 });
+    }
+    if (fits) {
+      // Still one screen: the file bar hasn't gone under the top bar.
+      const after = await layout();
+      expect(after.barTop, `file bar at ${width}x${height}`).toBeGreaterThanOrEqual(after.topbar);
+      expect(after.text).toBeLessThan(before.text);
+      expect(after.text).toBeGreaterThanOrEqual(240);
+    }
+    // Typing clears the error, and the text box gets its height back.
+    await box.press('End');
+    await page.keyboard.type(' ');
+    await expect(error).toBeHidden();
+    expect((await layout()).text).toBe(before.text);
+  }
 });
 
 test('already contacted keeps unsaved edits when you leave, and asks before a close', async ({ app, page, server }) => {
@@ -674,8 +845,29 @@ test('already contacted keeps unsaved edits when you leave, and asks before a cl
   // No autosave here, and nothing to save it on the way out: the text waits for the next visit.
   const draft = `${CONTACTED_TEMPLATE}kept.example\n`;
   await box.fill(draft);
+  // The notice's live region is on screen, empty, before the list loads and the notice goes in,
+  // so screen readers announce it (a region shown together with its text may not be).
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  await page.route('**/api/onboarding/files', async (route) => {
+    await gate;
+    return route.fallback();
+  });
   await leaveAndReturn();
+  await expect(page.locator('.ac-main .skeleton').first()).toBeVisible();
+  const region = page.locator('.ac-restored-live');
+  await expect(region).toHaveAttribute('role', 'status');
+  await expect(region).toBeEmpty();
+  expect(await region.evaluate((el) => el.checkVisibility())).toBe(true);
+  release();
+  await page.unroute('**/api/onboarding/files');
   await expect(box).toHaveValue(draft);
+  await expect(region).toContainText('Your unsaved changes from earlier are back.');
+  // The notice's height comes out of the text box: the card still fits the screen.
+  await expect(save).toBeInViewport({ ratio: 1 });
+  expect(await page.evaluate(() => document.documentElement.scrollHeight)).toBeLessThanOrEqual(900);
   await expect(restored).toHaveText(/Your unsaved changes from earlier are back\./);
   await expect(page.locator('.ac-state')).toHaveText('Unsaved changes');
   await expect(save).toBeEnabled();
@@ -714,6 +906,25 @@ test('already contacted keeps unsaved edits when you leave, and asks before a cl
   await expect(contactedBox(page)).toHaveValue(savedText);
 });
 
+test('a contacted.toml with Windows line endings loads as saved', async ({ app, page, request, server }) => {
+  await stubView(page, 'home', 'Home');
+  const crlf = CONTACTED_TEMPLATE.replace(/\n/g, '\r\n');
+  await post(request, server, '/api/onboarding/contacted', { toml: crlf });
+  await app.goto('#/company?tab=contacted');
+  const box = contactedBox(page);
+  await expect(box).toHaveValue(CONTACTED_TEMPLATE);
+  await expect(page.locator('.ac-state')).toHaveText('Saved');
+  await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeDisabled();
+  // Nothing is kept as "unsaved" on the way out, so nothing comes back.
+  await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: /^Home\b/ }).click();
+  await expect(page.locator('#view h1')).toHaveText('Home');
+  await page.goBack();
+  await expect(box).toHaveValue(CONTACTED_TEMPLATE);
+  await expect(page.locator('.ac-restored')).toBeHidden();
+  await expect(page.locator('.ac-state')).toHaveText('Saved');
+  expect(contactedOnDisk(server)).toBe(crlf);
+});
+
 test('already contacted: loading and load error', async ({ app, page }) => {
   app.allowConsole(/status of 500/);
   let release;
@@ -737,7 +948,7 @@ test('already contacted: loading and load error', async ({ app, page }) => {
   await expect(contactedBox(page)).toBeHidden();
   release();
   const loadError = page.locator('.ac-load-error');
-  await expect(loadError).toContainText("Couldn't load the list");
+  await expect(loadError).toContainText('Couldn’t load the list');
   await expect(loadError).toContainText('cannot read contacted.toml');
   await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeHidden();
   await loadError.getByRole('button', { name: 'Try again' }).click();
@@ -804,6 +1015,13 @@ test('mountProfileEditor works standalone and cleans up', async ({ app, page, se
   });
   await expect(page.locator('link[href="/assets/css/views/company.css"]')).toHaveCount(1);
   await expect(editor(page)).toHaveValue(PRODUCT_MD);
+  await expect(editor(page)).toBeVisible();
+  // No app stylesheet here, so no `[hidden] { display: none !important }` from base.css: what is
+  // hidden stays hidden all the same.
+  for (const hidden of ['.pe-flag', '.cp-skeleton', '.cp-load-error', '.pe-check-note', '.pe-main .btn']) {
+    await expect(page.locator(hidden).first(), hidden).toBeHidden();
+  }
+  await expect(page.locator('.pe-restored')).toBeHidden();
   expect((await page.evaluate(() => window.__changes)).at(-1)).toEqual({ doc: PRODUCT_MD, status: 'saved', done: 6, persisted: true });
 
   // onChange follows typing; flush() saves now and resolves once the server has it.
