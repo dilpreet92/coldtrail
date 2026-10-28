@@ -293,6 +293,199 @@ test('dialog, confirm and drawer close when their signal aborts (a view unmounti
   });
 });
 
+/** The first element under `root` (depth first) whose class list has `cls`. */
+function byClass(root, cls) {
+  const walk = (el) => {
+    if (String(el.attrs.class || '').split(' ').includes(cls)) return el;
+    for (const c of el.children) {
+      const hit = c instanceof El && walk(c);
+      if (hit) return hit;
+    }
+    return null;
+  };
+  return walk(root);
+}
+
+function click(el) {
+  el.dispatchEvent(new Event('mousedown'));
+  el.dispatchEvent(new Event('click'));
+}
+
+test('beforeClose(reason) can keep a dialog or drawer open; actions, signal and force skip it', async () => {
+  const { doc, win, trigger } = fakeDom();
+  await withGlobals({ document: doc, window: win }, async () => {
+    for (const open of [openDialog, openDrawer]) {
+      const asked = [];
+      const closed = [];
+      let allow = false;
+      const handle = open({
+        title: 'Edit schedule',
+        content: 'x',
+        actions: [{ label: 'Cancel' }],
+        opener: trigger,
+        beforeClose: (reason) => {
+          asked.push(reason);
+          return allow;
+        },
+        onClose: (reason) => closed.push(reason),
+      });
+      const backdrop = doc.querySelector('[data-overlay]');
+      click(backdrop);
+      pressEscape(doc);
+      click(byClass(backdrop, 'overlay-close'));
+      handle.close();
+      assert.equal(closeTopOverlay(), true, 'there was one to ask');
+      assert.deepEqual(asked, ['backdrop', 'escape', 'button', 'api', 'escape'], open.name);
+      assert.deepEqual(closed, [], 'still open');
+      assert.ok(doc.querySelector('[data-overlay]'));
+
+      // A yes closes it, with the reason it was asked about; focus goes back as usual.
+      allow = true;
+      click(backdrop);
+      assert.deepEqual(closed, ['backdrop']);
+      assert.equal(doc.querySelector('[data-overlay]'), null);
+      assert.equal(doc.activeElement, trigger);
+
+      // force: true skips the question.
+      allow = false;
+      asked.length = 0;
+      const h2 = open({ title: 'T', content: 'x', beforeClose: (r) => { asked.push(r); return false; }, onClose: (r) => closed.push(r) });
+      h2.close('api', { force: true });
+      assert.deepEqual(asked, []);
+      assert.deepEqual(closed.at(-1), 'api');
+      assert.equal(doc.querySelector('[data-overlay]'), null);
+
+      // A signal abort always closes (the owner is going away).
+      const ctl = new AbortController();
+      open({ title: 'T', content: 'x', signal: ctl.signal, beforeClose: (r) => { asked.push(r); return false; }, onClose: (r) => closed.push(r) });
+      ctl.abort();
+      assert.deepEqual(asked, []);
+      assert.equal(closed.at(-1), 'api');
+      assert.equal(doc.querySelector('[data-overlay]'), null);
+    }
+
+    // A dialog's action buttons close it without asking: their onClick decides.
+    const asked = [];
+    const closed = [];
+    openDialog({
+      title: 'T',
+      content: 'x',
+      actions: [{ label: 'Cancel' }, { label: 'Save', kind: 'primary', onClick: () => true }],
+      beforeClose: (r) => { asked.push(r); return false; },
+      onClose: (r) => closed.push(r),
+    });
+    click(byClass(doc.querySelector('[data-overlay]'), 'btn-secondary'));
+    assert.deepEqual(asked, []);
+    assert.deepEqual(closed, ['action']);
+    assert.equal(doc.querySelector('[data-overlay]'), null);
+  });
+});
+
+test('beforeClose may answer with a Promise; other closes wait; a broken guard never traps', async () => {
+  const { doc, win, trigger } = fakeDom();
+  const warn = console.warn;
+  const warned = [];
+  console.warn = (...a) => warned.push(a);
+  try {
+    await withGlobals({ document: doc, window: win }, async () => {
+      let answer;
+      const asked = [];
+      const closed = [];
+      openDialog({
+        title: 'T',
+        content: 'x',
+        opener: trigger,
+        beforeClose: (r) => {
+          asked.push(r);
+          return new Promise((resolve) => { answer = resolve; });
+        },
+        onClose: (r) => closed.push(r),
+      });
+      pressEscape(doc);
+      pressEscape(doc);
+      click(doc.querySelector('[data-overlay]'));
+      assert.deepEqual(asked, ['escape'], 'asked once while the answer is pending');
+      answer(false);
+      await new Promise((r) => setImmediate(r));
+      assert.deepEqual(closed, []);
+      assert.ok(doc.querySelector('[data-overlay]'), 'a false answer keeps it open');
+
+      click(doc.querySelector('[data-overlay]'));
+      assert.deepEqual(asked, ['escape', 'backdrop'], 'asked again once answered');
+      answer(true);
+      await new Promise((r) => setImmediate(r));
+      assert.deepEqual(closed, ['backdrop']);
+      assert.equal(doc.querySelector('[data-overlay]'), null);
+      assert.equal(doc.activeElement, trigger);
+
+      // A guard that throws, or rejects, only warns: the drawer still closes.
+      openDrawer({ title: 'T', content: 'x', beforeClose: () => { throw new Error('guard bug'); }, onClose: (r) => closed.push(r) });
+      pressEscape(doc);
+      assert.equal(closed.at(-1), 'escape');
+      openDrawer({ title: 'T', content: 'x', beforeClose: () => Promise.reject(new Error('guard rejected')), onClose: (r) => closed.push(r) });
+      pressEscape(doc);
+      await new Promise((r) => setImmediate(r));
+      assert.deepEqual(closed.slice(-2), ['escape', 'escape']);
+      assert.equal(doc.querySelector('[data-overlay]'), null);
+      assert.deepEqual(warned.map((w) => w[0].message), ['guard bug', 'guard rejected']);
+
+      // Without beforeClose nothing changes: undefined answers count as yes too.
+      openDialog({ title: 'T', content: 'x', beforeClose: () => undefined, onClose: (r) => closed.push(r) });
+      pressEscape(doc);
+      assert.equal(closed.at(-1), 'escape');
+    });
+  } finally {
+    console.warn = warn;
+  }
+});
+
+test('openMenu takes a signal that closes it and an onClose(reason) callback', async () => {
+  const { doc, win, trigger, other } = fakeDom();
+  await withGlobals({ document: doc, window: win }, () => {
+    const reasons = [];
+    const order = [];
+    const ctl = new AbortController();
+    openMenu(trigger, [{ label: 'Edit', onSelect: () => order.push('select') }], {
+      signal: ctl.signal,
+      onClose: (r) => { reasons.push(r); order.push(`close:${r}`); },
+    });
+    assert.ok(doc.querySelector('[data-overlay]'));
+    ctl.abort();
+    assert.deepEqual(reasons, ['api']);
+    assert.equal(doc.querySelector('[data-overlay]'), null);
+    assert.equal(trigger.attrs['aria-expanded'], 'false');
+    assert.equal(doc.activeElement, trigger, 'focus back on the anchor');
+
+    // An aborted signal never opens it.
+    const none = openMenu(trigger, [{ label: 'Edit' }], { signal: ctl.signal, onClose: (r) => reasons.push(r) });
+    assert.equal(doc.querySelector('[data-overlay]'), null);
+    none.close();
+    assert.deepEqual(reasons, ['api'], 'nothing to close');
+
+    // Every way it closes reports why; picking an item reports before onSelect runs.
+    const ctl2 = new AbortController();
+    openMenu(trigger, [{ label: 'Edit', onSelect: () => order.push('select') }], { signal: ctl2.signal, onClose: (r) => { reasons.push(r); order.push(`close:${r}`); } });
+    click(byClass(doc.querySelector('[data-overlay]'), 'menu-item'));
+    assert.deepEqual(order.slice(-2), ['close:select', 'select']);
+    ctl2.abort();
+    assert.deepEqual(reasons, ['api', 'select'], 'a closed menu ignores its signal');
+
+    const m = openMenu(trigger, [{ label: 'Edit' }], { onClose: (r) => reasons.push(r) });
+    pressEscape(doc);
+    openMenu(trigger, [{ label: 'Edit' }], { onClose: (r) => reasons.push(r) });
+    openMenu(other, [{ label: 'Edit' }], { onClose: (r) => reasons.push(r) }); // another menu: the first goes
+    m.close(); // already closed: nothing
+    closeTopOverlay();
+    assert.deepEqual(reasons, ['api', 'select', 'escape', 'toggle', 'escape']);
+    assert.equal(doc.querySelector('[data-overlay]'), null);
+
+    // The two-argument form is unchanged.
+    openMenu(trigger, [{ label: 'Edit' }]);
+    pressEscape(doc);
+    assert.equal(doc.activeElement, trigger);
+  });
+});
+
 test('copyText: the Clipboard API, else a hidden textarea + execCommand', async () => {
   const { doc, win, other } = fakeDom();
   const written = [];

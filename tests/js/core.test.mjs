@@ -6,7 +6,7 @@ import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { h, debounce, esc as domEsc } from '../../ui/js/core/dom.js';
 import { esc } from '../../ui/js/core/format.js';
-import { api, SESSION_EXPIRED, initToken, token, openStream } from '../../ui/js/core/api.js';
+import { api, SESSION_EXPIRED, SESSION_REOPEN, errorText, isStaleSession, initToken, token, openStream } from '../../ui/js/core/api.js';
 import { store } from '../../ui/js/core/store.js';
 import { bindKeys, comboOf } from '../../ui/js/core/keys.js';
 import { getThemePref, setThemePref, applyTheme } from '../../ui/js/core/theme.js';
@@ -223,6 +223,39 @@ test('api helpers pass keepalive through for saves sent as the page goes away', 
   });
 });
 
+test('errorText points a stale session back to the terminal, else shows the message', async () => {
+  assert.equal(SESSION_REOPEN, 'Reopen coldtrail from your terminal.');
+  const withStatus = (message, status) => Object.assign(new Error(message), { status });
+
+  // A stale session, however it shows up: the 401 api.js throws, or just its message.
+  assert.equal(isStaleSession(withStatus(SESSION_EXPIRED, 401)), true);
+  assert.equal(isStaleSession(withStatus('unauthorized', 401)), true);
+  assert.equal(isStaleSession(new Error(SESSION_EXPIRED)), true);
+  assert.equal(isStaleSession({ message: SESSION_EXPIRED }), true);
+  assert.equal(errorText(withStatus(SESSION_EXPIRED, 401)), SESSION_REOPEN, 'the banner already says the full sentence');
+  assert.equal(errorText(new Error(SESSION_EXPIRED)), SESSION_REOPEN);
+
+  // Anything else: its message, else the value as text.
+  for (const err of [withStatus('database is locked', 500), withStatus('Not Found', 404), new Error('boom')]) {
+    assert.equal(isStaleSession(err), false);
+    assert.equal(errorText(err), err.message);
+  }
+  assert.equal(errorText('plain text'), 'plain text');
+  assert.equal(errorText(withStatus('', 500)), 'Error', 'no message: String(err)');
+  assert.equal(errorText(null), '');
+  assert.equal(errorText(undefined), '');
+  assert.equal(isStaleSession(null), false);
+  assert.equal(isStaleSession(undefined), false);
+
+  // And what api.js really throws on a 401.
+  const fetch = fakeFetch(() => new Response('unauthorized', { status: 401 }));
+  await withGlobals({ fetch, window: new EventTarget() }, async () => {
+    const err = await api.get('/api/summary').catch((e) => e);
+    assert.equal(isStaleSession(err), true);
+    assert.equal(errorText(err), SESSION_REOPEN);
+  });
+});
+
 test('openStream calls onOpen once the stream is connected', async () => {
   const sources = [];
   class FakeEventSource {
@@ -395,6 +428,88 @@ test('store.start polls every 30s while visible and refreshes on return', async 
   } finally {
     mock.timers.reset();
   }
+});
+
+test('store.fetchedAt says when the summary and status on hand arrived; a failure keeps it', async () => {
+  // A fresh copy of the module, so "nothing fetched yet" is really so.
+  const { store: fresh } = await import('../../ui/js/core/store.js?fetched-at');
+  let failSummary = false;
+  const fetch = fakeFetch((path) => {
+    if (path === '/api/summary' && failSummary) return new Response('nope', { status: 500 });
+    return Response.json(path === '/api/summary' ? { counts: {} } : { onboarded: true });
+  });
+  mock.timers.enable({ apis: ['Date'], now: 1_000_000 });
+  try {
+    await withGlobals({ fetch, window: new EventTarget() }, async () => {
+      assert.equal(fresh.fetchedAt(), 0, 'nothing fetched yet');
+      assert.equal(fresh.fetchedAt('status'), 0);
+      await fresh.refresh();
+      assert.equal(fresh.fetchedAt(), 1_000_000);
+      assert.equal(fresh.fetchedAt('summary'), 1_000_000);
+      assert.equal(fresh.fetchedAt('status'), 1_000_000);
+
+      mock.timers.tick(5_000);
+      failSummary = true;
+      await fresh.refresh();
+      assert.equal(fresh.fetchedAt(), 1_000_000, 'the summary on hand is still the old one');
+      assert.equal(fresh.fetchedAt('status'), 1_005_000);
+      assert.deepEqual(fresh.get().summary, { counts: {} });
+    });
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test('store.ready settles after the first load, whether or not it worked', async () => {
+  const { store: fresh } = await import('../../ui/js/core/store.js?ready');
+  const gates = [];
+  const fetch = fakeFetch((path) => new Promise((resolve) => {
+    gates.push(() => resolve(path === '/api/summary' ? new Response('down', { status: 500 }) : Response.json({ onboarded: true })));
+  }));
+  const open = async () => { while (gates.length) gates.shift()(); await flush(); };
+  await withGlobals({ fetch, window: new EventTarget() }, async () => {
+    const first = fresh.refresh();
+    let settled = null;
+    const ready = fresh.ready().then((snap) => { settled = snap; });
+    await flush();
+    assert.equal(settled, null, 'waits for the load in flight');
+    assert.equal(fetch.calls.length, 2, 'and does not start another');
+    await open();
+    await ready;
+    await first;
+    assert.deepEqual(settled, { summary: null, status: { onboarded: true } }, 'a failed summary still settles it');
+    assert.equal(fresh.fetchedAt(), 0);
+
+    // Settled from then on, without fetching.
+    const again = await fresh.ready();
+    assert.deepEqual(again, { summary: null, status: { onboarded: true } });
+    assert.equal(fetch.calls.length, 2);
+  });
+
+  // Nothing started yet: ready() starts the first load itself.
+  const { store: idle } = await import('../../ui/js/core/store.js?ready-idle');
+  const fetch2 = fakeFetch((path) => Response.json(path === '/api/summary' ? { counts: { companies: 3 } } : {}));
+  await withGlobals({ fetch: fetch2, window: new EventTarget() }, async () => {
+    const snap = await idle.ready();
+    assert.equal(fetch2.calls.length, 2);
+    assert.deepEqual(snap.summary, { counts: { companies: 3 } });
+  });
+});
+
+test('store.subscriberCount counts subscribers and stays out of the listed API', () => {
+  const s = store;
+  const before = s.subscriberCount();
+  const off1 = s.subscribe(() => {});
+  const off2 = s.subscribe(() => {});
+  assert.equal(s.subscriberCount(), before + 2);
+  off1();
+  assert.equal(s.subscriberCount(), before + 1);
+  off1();
+  assert.equal(s.subscriberCount(), before + 1, 'unsubscribing twice is harmless');
+  off2();
+  assert.equal(s.subscriberCount(), before);
+  assert.ok(!Object.keys(s).includes('subscriberCount'), 'non-enumerable');
+  assert.deepEqual(Object.keys(s).sort(), ['fetchedAt', 'get', 'ready', 'refresh', 'start', 'stop', 'subscribe']);
 });
 
 // ---- keys ----

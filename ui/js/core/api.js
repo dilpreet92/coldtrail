@@ -5,6 +5,24 @@
 // run. Give an actionable message instead of the raw "unauthorized".
 export const SESSION_EXPIRED = "This tab's session is stale — reopen coldtrail from the URL your terminal printed.";
 
+/** The short pointer a screen shows where a request failed on a stale session. The shell's
+ *  banner already says SESSION_EXPIRED in full, once, so screens don't repeat the sentence. */
+export const SESSION_REOPEN = 'Reopen coldtrail from your terminal.';
+
+/** True when `err` came from a stale session: a 401 from api.get/post/patch/del, or any error
+ *  carrying the SESSION_EXPIRED message. */
+export const isStaleSession = (err) => !!err && (err.status === 401 || err.message === SESSION_EXPIRED);
+
+/**
+ * The text to show for a failed request: SESSION_REOPEN ('Reopen coldtrail from your terminal.')
+ * for a stale session (see isStaleSession), else err.message, else String(err) ('' for null or
+ * undefined).
+ */
+export function errorText(err) {
+  if (isStaleSession(err)) return SESSION_REOPEN;
+  return (err && err.message) || (err == null ? '' : String(err));
+}
+
 let bootToken = '';
 let expiredAnnounced = false;
 

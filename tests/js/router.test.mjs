@@ -66,6 +66,7 @@ class FakeEl {
     return null;
   }
   get textContent() { return this.children.map((c) => (typeof c === 'object' ? c.textContent : String(c))).join(''); }
+  contains(n) { return n === this || this.children.some((c) => typeof c === 'object' && c.contains(n)); }
   focus() { this.env.focused = this; }
 }
 
@@ -473,6 +474,93 @@ test('a view with autofocus: false keeps the heading from taking focus', async (
     await navigate('#/home');
     assert.equal(env.focused?.tag, 'h1');
   } finally {
+    router?.stop();
+    env.restore();
+  }
+});
+
+test('a screen that mounts late leaves focus the user moved meanwhile, and otherwise takes it', async () => {
+  const env = fakeBrowser('#/home');
+  // document.activeElement: what has focus, else <body>.
+  const body = new FakeEl('body', env);
+  env.document.body = body;
+  Object.defineProperty(env.document, 'activeElement', { get: () => env.focused || body, configurable: true });
+  const searchBox = new FakeEl('input', env); // the top bar's search: outside the view root
+  const navLink = new FakeEl('a', env);
+  const gates = [];
+  const slow = (mod) => () => new Promise((resolve) => { gates.push(() => resolve(mod)); });
+  const broken = { default: { title: 'Agent', mount() { throw new Error('kaboom'); } } };
+  const errors = [];
+  const origError = console.error;
+  console.error = (...a) => errors.push(a);
+  let router;
+  const release = async () => { while (gates.length) gates.shift()(); await router.idle(); };
+  try {
+    router = startRouter({
+      routes: {
+        home: async () => view('home', []),
+        drafts: slow(view('drafts', [])),
+        pipeline: slow(view('pipeline', [])),
+        company: slow(view('company', [])),
+        agent: slow(broken),
+      },
+      root: env.root,
+      store: {},
+    });
+    await router.ready;
+
+    // ⌘K while Drafts loads: the search keeps focus once Drafts has mounted.
+    env.focused = null; // choosing a search result blurred the box
+    navigate('#/drafts');
+    await flush();
+    searchBox.focus();
+    const before = env.scrolls;
+    await release();
+    assert.equal(env.root.textContent, 'drafts', 'Drafts mounted');
+    assert.equal(env.focused, searchBox, 'the heading did not take focus from the search');
+    assert.equal(env.scrolls, before + 1, 'the new screen still starts at the top');
+
+    // Focus still where the change began (the nav link that was clicked) goes to the heading.
+    navLink.focus();
+    navigate('#/pipeline');
+    await flush();
+    await release();
+    assert.equal(env.focused?.tag, 'h1');
+    assert.equal(env.focused.textContent, 'pipeline');
+
+    // So does focus left on <body> …
+    env.focused = null;
+    navigate('#/drafts');
+    await flush();
+    await release();
+    assert.equal(env.focused?.textContent, 'drafts');
+
+    // … or on an element the change took away (the old screen's).
+    const oldButton = new FakeEl('button', env);
+    oldButton.isConnected = false;
+    navigate('#/company');
+    await flush();
+    oldButton.focus();
+    await release();
+    assert.equal(env.focused?.textContent, 'company');
+
+    // A screen that fails to mount doesn't take focus from the search either.
+    navLink.focus();
+    navigate('#/agent');
+    await flush();
+    searchBox.focus();
+    await release();
+    assert.equal(env.root.textContent, "This screen didn't loadkaboom");
+    assert.equal(env.focused, searchBox);
+    // Retried from the nav link, untouched meanwhile: its error heading takes focus.
+    navLink.focus();
+    navigate('#/agent');
+    await flush();
+    await release();
+    assert.equal(env.focused?.tag, 'h1');
+    assert.equal(errors.length, 2);
+  } finally {
+    console.error = origError;
     router?.stop();
     env.restore();
   }

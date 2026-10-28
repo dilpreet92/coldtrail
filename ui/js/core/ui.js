@@ -3,8 +3,9 @@
 // make the app behind a modal inert, and give focus back to whatever opened them: the `opener`
 // option when given (a menu's anchor), else the element focused at open, else #view. Pass
 // `opener` when the triggering control is known: WebKit does not focus a clicked button, so a
-// mouse-opened overlay sees <body> focused. Dialogs, confirms and drawers take an AbortSignal
-// (`signal`) that closes them, so a view can tie them to its own lifetime. Every open overlay
+// mouse-opened overlay sees <body> focused. Dialogs, confirms, drawers and menus take an
+// AbortSignal (`signal`) that closes them, so a view can tie them to its own lifetime. Dialogs and
+// drawers take beforeClose(reason) to keep themselves open (unsaved typing). Every open overlay
 // carries [data-overlay], which keys.js checks so page shortcuts stay off while one is open (⌘K
 // closes the top one with closeTopOverlay() instead).
 //
@@ -195,17 +196,55 @@ function listen(on) {
   window[fn]('scroll', onViewportChange, true);
 }
 
+// Ask beforeClose(reason) → whether to go on closing: true, false, or a Promise of either
+// (`undefined` and anything but false count as yes). A throw or rejection is only a warning and
+// lets the close go on, so a broken guard never traps the user in an overlay.
+function askBeforeClose(beforeClose, reason) {
+  let answer;
+  try {
+    answer = beforeClose(reason);
+  } catch (err) {
+    console.warn(err);
+    return true;
+  }
+  if (answer && typeof answer.then === 'function') {
+    return Promise.resolve(answer).then(
+      (ok) => ok !== false,
+      (err) => {
+        console.warn(err);
+        return true;
+      },
+    );
+  }
+  return answer !== false;
+}
+
 /**
  * Put an overlay on the stack. el: the root appended to #overlays; panel: the element that
  * holds focus; opener: where focus goes back on close (default: the element focused now).
- * Returns the entry with close(reason, { restore = true }).
+ * beforeClose(reason): asked first by every close but a forced one (see askBeforeClose); while
+ * its Promise is pending further closes are ignored. Returns the entry with
+ * close(reason, { restore = true, force = false }).
  */
-function pushOverlay({ el, panel, modal, kind, anchor = null, opener = null, onKey = null, onClose = null, initialFocus }) {
+function pushOverlay({ el, panel, modal, kind, anchor = null, opener = null, onKey = null, onClose = null, beforeClose = null, initialFocus }) {
   const active = document.activeElement;
-  const entry = { el, panel, modal, kind, anchor, onKey, closed: false };
+  const entry = { el, panel, modal, kind, anchor, onKey, closed: false, asking: false };
   entry.opener = opener || (active && active !== document.body ? active : null);
-  entry.close = (reason = 'api', { restore = true } = {}) => {
+  entry.close = (reason = 'api', { restore = true, force = false } = {}) => {
     if (entry.closed) return;
+    if (beforeClose && !force) {
+      if (entry.asking) return;
+      const go = askBeforeClose(beforeClose, reason);
+      if (go === false) return;
+      if (go !== true) {
+        entry.asking = true;
+        go.then((ok) => {
+          entry.asking = false;
+          if (ok) entry.close(reason, { restore, force: true });
+        });
+        return;
+      }
+    }
     entry.closed = true;
     const i = stack.indexOf(entry);
     const wasTop = i === stack.length - 1;
@@ -237,14 +276,15 @@ function pushOverlay({ el, panel, modal, kind, anchor = null, opener = null, onK
   return entry;
 }
 
-// Close an overlay when `signal` aborts, as a code close ('api'). Returns the listener's remover.
+// Close an overlay when `signal` aborts, as a code close ('api') that beforeClose can't stop (the
+// owner is going away). Returns the listener's remover.
 function closeOnAbort(signal, close) {
   if (!signal) return () => {};
   if (signal.aborted) {
-    close('api');
+    close('api', { force: true });
     return () => {};
   }
-  const onAbort = () => close('api');
+  const onAbort = () => close('api', { force: true });
   signal.addEventListener('abort', onAbort, { once: true });
   return () => signal.removeEventListener('abort', onAbort);
 }
@@ -319,18 +359,27 @@ export function toast(text, kind = 'info') {
 
 /**
  * openDialog({ title, content, actions: [{ label, kind = 'secondary', onClick?, autofocus? }],
- * onClose?(reason), opener?, signal? }) → { close, el }. An action without onClick just closes.
- * Otherwise the dialog closes after onClick unless it returns (or resolves to) false; while a
- * returned Promise is pending the buttons are disabled, and if it rejects the dialog stays open
- * and its message is shown as an error toast. Initial focus: [data-autofocus] / [autofocus],
- * else the first field in the body, else the first action. Aborting `signal` closes it ('api').
+ * onClose?(reason), beforeClose?(reason), opener?, signal? }) → { close, el }. An action without
+ * onClick just closes. Otherwise the dialog closes after onClick unless it returns (or resolves
+ * to) false; while a returned Promise is pending the buttons are disabled, and if it rejects the
+ * dialog stays open and its message is shown as an error toast. Initial focus: [data-autofocus] /
+ * [autofocus], else the first field in the body, else the first action. Aborting `signal` closes
+ * it ('api').
+ *
+ * beforeClose(reason) runs before any other close: reason is 'escape' (Esc, or ⌘K through
+ * closeTopOverlay), 'backdrop' (a click beside the panel), 'button' (the × close button) or 'api'
+ * (handle.close() from code). Returning false, or a Promise that resolves to false, keeps the
+ * dialog open; while that Promise is pending other close attempts are ignored. A throw or a
+ * rejection is logged as a warning and the dialog closes. Not asked when an action closes it (its
+ * onClick decides), when `signal` aborts, or for handle.close(reason, { force: true }).
+ * handle.close(reason = 'api', { force = false }).
  */
-export function openDialog({ title, content, actions = [], onClose, role = 'dialog', opener = null, signal = null }) {
+export function openDialog({ title, content, actions = [], onClose, beforeClose = null, role = 'dialog', opener = null, signal = null }) {
   const titleId = nextId('dialog-title');
   const bodyId = nextId('dialog-body');
   let entry;
   let unlisten = () => {};
-  const handle = { close: (reason = 'api') => entry.close(reason) };
+  const handle = { close: (reason = 'api', { force = false } = {}) => entry.close(reason, { force }) };
 
   const buttons = actions.map((a) =>
     h('button', { type: 'button', class: `btn btn-${a.kind || 'secondary'}`, 'data-autofocus': a.autofocus ? '' : null }, a.label),
@@ -344,7 +393,7 @@ export function openDialog({ title, content, actions = [], onClose, role = 'dial
   actions.forEach((a, i) => {
     buttons[i].addEventListener('click', async () => {
       if (!a.onClick) {
-        entry.close('action');
+        entry.close('action', { force: true });
         return;
       }
       let result;
@@ -362,7 +411,7 @@ export function openDialog({ title, content, actions = [], onClose, role = 'dial
       }
       if (entry.closed) return;
       setActionsBusy(false);
-      if (result !== false) entry.close('action');
+      if (result !== false) entry.close('action', { force: true });
     });
   });
 
@@ -388,6 +437,7 @@ export function openDialog({ title, content, actions = [], onClose, role = 'dial
     modal: true,
     kind: 'dialog',
     opener,
+    beforeClose,
     onClose: (reason) => {
       unlisten();
       if (onClose) onClose(reason);
@@ -429,12 +479,14 @@ export function confirmDialog({ title, body, confirmText = 'Confirm', cancelText
 }
 
 /**
- * openDrawer({ title, content, onClose?(reason), opener?, signal? }) → { close, el, body,
- * setTitle }. A right-side modal panel; reason is 'escape' | 'backdrop' | 'button' | 'api'
- * (close() from code, or `signal` aborting), so a route-driven drawer can update the URL only
- * for user closes.
+ * openDrawer({ title, content, onClose?(reason), beforeClose?(reason), opener?, signal? }) →
+ * { close, el, body, setTitle }. A right-side modal panel; reason is 'escape' | 'backdrop' |
+ * 'button' | 'api' (close() from code, or `signal` aborting), so a route-driven drawer can update
+ * the URL only for user closes. beforeClose works as for openDialog: false (or a Promise of false)
+ * keeps the drawer open; a `signal` abort and close(reason, { force: true }) skip it.
+ * close(reason = 'api', { force = false }).
  */
-export function openDrawer({ title, content, onClose, opener = null, signal = null }) {
+export function openDrawer({ title, content, onClose, beforeClose = null, opener = null, signal = null }) {
   const titleId = nextId('drawer-title');
   let entry;
   let unlisten = () => {};
@@ -453,6 +505,7 @@ export function openDrawer({ title, content, onClose, opener = null, signal = nu
     modal: true,
     kind: 'drawer',
     opener,
+    beforeClose,
     onClose: (reason) => {
       unlisten();
       if (onClose) onClose(reason);
@@ -462,7 +515,7 @@ export function openDrawer({ title, content, onClose, opener = null, signal = nu
   closeOnBackdrop(backdrop, entry.close);
   unlisten = closeOnAbort(signal, entry.close);
   return {
-    close: (reason = 'api') => entry.close(reason),
+    close: (reason = 'api', { force = false } = {}) => entry.close(reason, { force }),
     el: panel,
     body,
     setTitle: (t) => heading.replaceChildren(String(t ?? '')),
@@ -487,19 +540,26 @@ function placeMenu(menu, anchor) {
 }
 
 /**
- * openMenu(anchor, [{ label, onSelect, danger?, disabled? }]) → { close }. Opens below the
- * anchor (flips up near the bottom). Arrow keys / Home / End / Tab move between items, Enter or
- * Space picks one, Esc closes and refocuses the anchor, a press outside closes. Calling it again
- * for the anchor of the open menu closes that menu (toggle).
+ * openMenu(anchor, [{ label, onSelect, danger?, disabled? }], { signal?, onClose? } = {}) →
+ * { close }. Opens below the anchor (flips up near the bottom). Arrow keys / Home / End / Tab move
+ * between items, Enter or Space picks one, Esc closes and refocuses the anchor, a press outside
+ * closes. Calling it again for the anchor of the open menu closes that menu (toggle).
+ * signal: aborting it closes the menu ('api'; focus goes back to the anchor if it is still in the
+ * page); an already aborted one never opens it. onClose(reason) runs once the menu has closed,
+ * however it closed: 'select' (before the item's onSelect runs) | 'escape' | 'outside' (a press
+ * elsewhere, or the anchor scrolled away) | 'toggle' (its anchor pressed again, or another menu
+ * opened) | 'api' (close() or the signal).
  */
-export function openMenu(anchor, items) {
+export function openMenu(anchor, items, { signal = null, onClose = null } = {}) {
   const open = stack.find((o) => o.kind === 'menu');
   if (open) {
     const same = open.anchor === anchor;
     open.close('toggle', { restore: same });
     if (same) return { close() {} };
   }
+  if (signal && signal.aborted) return { close() {} };
   let entry;
+  let unlisten = () => {};
   const buttons = items.map((it) =>
     h(
       'button',
@@ -547,12 +607,17 @@ export function openMenu(anchor, items) {
     anchor,
     opener: anchor,
     onKey,
-    onClose: () => anchor.setAttribute('aria-expanded', 'false'),
+    onClose: (reason) => {
+      unlisten();
+      anchor.setAttribute('aria-expanded', 'false');
+      if (onClose) onClose(reason);
+    },
     initialFocus: () => {
       placeMenu(menu, anchor);
       return enabled()[0] || null;
     },
   });
+  unlisten = closeOnAbort(signal, entry.close);
   return { close: () => entry.close('api') };
 }
 

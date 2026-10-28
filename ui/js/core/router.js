@@ -8,7 +8,8 @@
 // unmounted (it must stop its pollers/streams) and the new one mounted. A view with css: true
 // mounts only once css/views/<name>.css has loaded or failed (or 1.5s passed), so a screen never
 // paints unstyled; the old screen stays meanwhile. After mount the view's h1 takes focus, unless
-// the view sets autofocus: false to put focus somewhere else itself.
+// the view sets autofocus: false to put focus somewhere else itself, or the user has put focus
+// somewhere else (⌘K and typing in the search) while the screen was loading.
 
 import { h } from './dom.js';
 import { store as sharedStore } from './store.js';
@@ -205,6 +206,21 @@ function leave(cur, to) {
   return within(res, WAIT_MS, (err) => console.warn(err));
 }
 
+/**
+ * Whether the screen just mounted may take focus: only if the user hasn't moved it since the
+ * route change began (`from` is what was focused then). Focus still on `from`, on nothing
+ * (<body>), on an element the change removed (the old screen's), or inside the new screen
+ * counts as not moved; focus anywhere else (the search box, another sidebar link) was put there
+ * while the screen loaded, and stays.
+ */
+function focusUnmoved(from, root) {
+  if (typeof document === 'undefined') return true;
+  const now = document.activeElement;
+  if (!now || now === from || now === document.body || now === document.documentElement) return true;
+  if (now.isConnected === false) return true;
+  return !!root && typeof root.contains === 'function' && root.contains(now);
+}
+
 // Move focus to the new screen's heading so keyboard and screen-reader users land on it.
 function focusHeading(root) {
   const h1 = root.querySelector('h1');
@@ -217,7 +233,8 @@ function focusHeading(root) {
   window.scrollTo(0, 0);
 }
 
-async function handle(r, redirects = 0) {
+// `from`: what had focus when this route change began (kept across redirects).
+async function handle(r, redirects = 0, from = typeof document === 'undefined' ? null : document.activeElement) {
   r.hash = location.hash;
   r.failed = false;
   const seq = ++r.seq;
@@ -250,7 +267,7 @@ async function handle(r, redirects = 0) {
       const hash = toHash(to);
       if (hash !== location.hash) {
         history.replaceState(null, '', hash);
-        return handle(r, redirects + 1);
+        return handle(r, redirects + 1, from);
       }
     }
   }
@@ -318,8 +335,10 @@ async function handle(r, redirects = 0) {
     console.error(err);
     showError(r, err);
   }
-  // A view that places focus itself still gets its error heading focused if it failed.
-  if (view.autofocus === false && !r.failed) window.scrollTo(0, 0);
+  // A view that places focus itself still gets its error heading focused if it failed. Focus the
+  // user moved while the screen loaded stays where they put it; the new screen still starts at
+  // the top.
+  if ((view.autofocus === false && !r.failed) || !focusUnmoved(from, r.root)) window.scrollTo(0, 0);
   else focusHeading(r.root);
 }
 

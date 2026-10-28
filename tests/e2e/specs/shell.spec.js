@@ -450,6 +450,84 @@ test('a screen that failed to load is tried again from its nav link', async ({ a
   await expect(page).toHaveURL(hashIs('#/followups'));
 });
 
+/** Hold a view module's download until the returned release() is called, so its screen mounts
+ *  late (as on a loaded machine). */
+async function holdView(page, name) {
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  await page.route(`**/assets/js/views/${name}.js`, async (route) => {
+    await held;
+    await route.continue();
+  });
+  return release;
+}
+
+test('a screen that mounts late leaves focus where the user moved it meanwhile', async ({ app, page }) => {
+  const release = await holdView(page, 'followups');
+  await app.goto('#/home');
+  await shellReady(page);
+  const search = page.getByRole('combobox', { name: 'Search' });
+  const companies = page.getByRole('group', { name: 'Companies' });
+  const draft = SEED.emailDrafts.find((d) => d.domain !== SEED.xss.domain);
+
+  // Off to Follow-ups, whose module is held: Home stays on screen meanwhile.
+  await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: /^Follow-ups\b/ }).click();
+  await expect(page).toHaveURL(hashIs('#/followups'));
+  await expect(page.locator('#view h1')).toHaveText('Home');
+
+  // ⌘K and a search while it loads.
+  await page.keyboard.press('ControlOrMeta+k');
+  await expect(search).toBeFocused();
+  await search.fill(draft.domain);
+  await expect(companies.getByRole('option').first()).toContainText(draft.domain);
+
+  release();
+  // The router decides about focus in the same task that mounts the screen, so once its heading
+  // shows, any theft has already happened.
+  await expect(page.locator('#view h1')).toHaveText('Follow-ups');
+  await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => r())));
+  await expect(search).toBeFocused();
+  await expect(search).toHaveValue(draft.domain);
+  await expect(search).toHaveAttribute('aria-expanded', 'true');
+  await expect(companies.getByRole('option').first()).toBeVisible();
+
+  // The results still work: Enter opens the company.
+  await page.keyboard.press('Enter');
+  await expect(page).toHaveURL(hashIs(`#/pipeline/${draft.domain}`));
+});
+
+test('a new screen focuses its heading when the user left focus alone', async ({ app, page }) => {
+  await app.goto('#/home');
+  await shellReady(page);
+  const nav = page.getByRole('navigation', { name: 'Main' });
+
+  // A plain navigation.
+  await nav.getByRole('link', { name: /^Schedules\b/ }).click();
+  await expect(page.locator('#view h1')).toHaveText('Schedules');
+  await expect(page.locator('#view h1')).toBeFocused();
+
+  // A slow one, with focus left on the link that was clicked.
+  const release = await holdView(page, 'company');
+  const link = nav.getByRole('link', { name: 'Company profile' });
+  await link.click();
+  await expect(page).toHaveURL(hashIs('#/company'));
+  await expect(link).toBeFocused();
+  release();
+  await expect(page.locator('#view h1')).toHaveText('Company profile');
+  await expect(page.locator('#view h1')).toBeFocused();
+
+  // A search result: choosing it leaves nothing focused, so the heading takes focus.
+  const search = page.getByRole('combobox', { name: 'Search' });
+  const draft = SEED.emailDrafts.find((d) => d.domain !== SEED.xss.domain);
+  await page.keyboard.press('ControlOrMeta+k');
+  await search.fill(draft.domain);
+  const drafts = page.getByRole('group', { name: 'Drafts' });
+  await drafts.getByRole('option').first().click();
+  await expect(page).toHaveURL(hashIs(`#/drafts/${draft.domain}`));
+  await expect(page.locator('#view h1')).toHaveText('Drafts');
+  await expect(page.locator('#view h1')).toBeFocused();
+});
+
 test('the shell exports its wordmark for full-page screens', async ({ app, page }) => {
   await app.goto('#/home');
   await shellReady(page);
@@ -916,6 +994,75 @@ test.describe('components', () => {
     await page.evaluate(() => window.__ss.setDisabled(false));
     await expect(model).toBeEnabled();
     await expect(page.locator('#ss-top').getByRole('button', { name: 'Clear Model' })).toBeVisible();
+  });
+
+  test('search select: a pinned row heads the blank list and is never matched by typing', async ({ app, page }) => {
+    await app.goto('#/home');
+    await sandbox(page, async (box) => {
+      const { searchSelect } = await import('/assets/js/components/searchSelect.js');
+      const ss = searchSelect({
+        label: 'Sourced by',
+        placeholder: 'All sources',
+        value: '',
+        options: [
+          { value: 'all-hands', label: 'All-hands tooling', count: 7 },
+          { value: '', label: 'All sources', pinned: true },
+          { value: 'berlin', label: 'fintech founders in Berlin', count: 400 },
+        ],
+        onChange: (v) => window.__calls.push(v),
+      });
+      window.__ss = ss;
+      box.append(ss);
+    });
+    const box = page.getByRole('combobox', { name: 'Sourced by' });
+    const listbox = page.getByRole('listbox', { name: 'Sourced by' });
+    const options = listbox.getByRole('option');
+    const clear = page.locator('#sandbox').getByRole('button', { name: 'Clear Sourced by' });
+
+    // Chosen and blank: the field shows the placeholder, with nothing to clear.
+    await expect(box).toHaveValue('');
+    await expect(box).toHaveAttribute('placeholder', 'All sources');
+    await expect(clear).toBeHidden();
+
+    // Blank: the pinned row comes first, marked as the choice.
+    await box.click();
+    await expect(options).toHaveText(['All sources', 'All-hands tooling7', 'fintech founders in Berlin400']);
+    await expect(options.first()).toHaveClass(/is-chosen/);
+
+    // Typed text never matches it, so Enter takes the first real match.
+    await box.fill('all');
+    await expect(options).toHaveText(['All-hands tooling7']);
+    await box.fill('All sources');
+    await expect(options).toHaveCount(0);
+    await box.fill('ALL');
+    await page.keyboard.press('Enter');
+    await expect(box).toHaveValue('All-hands tooling');
+    await expect(clear).toBeVisible();
+
+    // Picking it from another value fires onChange('') and shows the placeholder again.
+    await box.click();
+    await expect(options.first()).toHaveText('All sources');
+    await options.first().click();
+    await expect(box).toHaveValue('');
+    await expect(clear).toBeHidden();
+
+    // Picking it again when it is already the choice fires nothing: by mouse or by keyboard.
+    await box.click();
+    await options.first().click();
+    await box.press('ArrowDown');
+    await expect(options.first()).toHaveAttribute('aria-selected', 'true');
+    await page.keyboard.press('Enter');
+    await expect(box).toHaveValue('');
+    expect(await calls(page)).toEqual(['all-hands', '']);
+
+    // setValue('') and setOptions keep the placeholder showing.
+    await page.evaluate(() => {
+      window.__ss.setValue('berlin');
+      window.__ss.setValue('');
+      window.__ss.setOptions([{ value: '', label: 'All sources', pinned: true }, { value: 'x', label: 'x' }]);
+    });
+    await expect(box).toHaveValue('');
+    expect(await calls(page)).toEqual(['all-hands', '']);
   });
 
   test('busy buttons ignore presses but stay legible, with a spinner', async ({ app, page }) => {

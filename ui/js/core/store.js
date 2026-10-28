@@ -7,18 +7,29 @@ const INTERVAL_MS = 30_000;
 
 const state = { summary: null, status: null };
 const subscribers = new Set();
+// Date.now() when the summary / status on hand arrived (0: never).
+const landedAt = { summary: 0, status: 0 };
 let inflight = null;
 let queued = null;
 let timer = null;
 let started = false;
+let loadedOnce = false; // a load has finished (well or not)
 
 const snapshot = () => ({ summary: state.summary, status: state.status });
 
 async function load() {
   const [summary, status] = await Promise.allSettled([api.get('/api/summary'), api.get('/api/status')]);
   // A failed fetch keeps the last good value; a stale session is reported by api.js.
-  if (summary.status === 'fulfilled') state.summary = summary.value;
-  if (status.status === 'fulfilled') state.status = status.value;
+  const now = Date.now();
+  if (summary.status === 'fulfilled') {
+    state.summary = summary.value;
+    landedAt.summary = now;
+  }
+  if (status.status === 'fulfilled') {
+    state.status = status.value;
+    landedAt.status = now;
+  }
+  loadedOnce = true;
   const snap = snapshot();
   if (summary.status === 'fulfilled' || status.status === 'fulfilled') {
     for (const fn of [...subscribers]) {
@@ -80,6 +91,23 @@ export const store = {
     return () => subscribers.delete(fn);
   },
   refresh,
+  /**
+   * When the summary on hand arrived, as a Date.now() timestamp; 0 until one has. `which` =
+   * 'status' asks the same of the status. A failed refresh keeps the old value and its time, so
+   * `Date.now() - store.fetchedAt()` is the age of what store.get() returns.
+   */
+  fetchedAt(which = 'summary') {
+    return which === 'status' ? landedAt.status : landedAt.summary;
+  },
+  /**
+   * → Promise<snapshot> that settles once the first load has finished, whether or not it worked
+   * (check snapshot.summary). Already settled after that; starts a fetch when none has run yet.
+   * Never rejects.
+   */
+  ready() {
+    if (loadedOnce) return Promise.resolve(snapshot());
+    return inflight || refresh();
+  },
   /** Fetch now, then every 30s; paused while the tab is hidden, refreshed when it returns. */
   start() {
     if (started) return;
@@ -94,3 +122,9 @@ export const store = {
     document.removeEventListener('visibilitychange', onVisibility);
   },
 };
+
+/**
+ * store.subscriberCount() → how many subscribers are attached now. For tests that check a screen
+ * unsubscribes when it unmounts; non-enumerable, so it stays out of the store's listed API.
+ */
+Object.defineProperty(store, 'subscriberCount', { value: () => subscribers.size });

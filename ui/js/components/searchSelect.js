@@ -4,7 +4,8 @@
 // else the only/first match, else (with `freeText`) what was typed; Esc closes and puts back the
 // chosen label. Options are text, never HTML. The list opens under the input (above it when
 // there is more room there) and stays inside the viewport: the room it has is set on the
-// component as --ss-room-x / --ss-room-y, and .ss-up marks it opening upwards.
+// component as --ss-room-x / --ss-room-y, and .ss-up marks it opening upwards. A `pinned`
+// option ("All sources") heads the list while nothing is typed and is never matched by typing.
 
 import { fmtNum, h } from '../core/dom.js';
 
@@ -23,19 +24,33 @@ function svg(d, size = 16) {
 
 const labelText = (o) => String(o.label ?? o.value ?? '');
 
-/** The options whose label or value contains `text` (trimmed, any case); all for blank text. */
+/**
+ * The options whose label or value contains `text` (trimmed, any case); all for blank text.
+ * Options with `pinned: true` come first (in their own order) for blank text and are left out
+ * for any other text.
+ */
 export function filterOptions(options, text) {
   const q = String(text ?? '').trim().toLowerCase();
-  if (!q) return options.slice();
-  return options.filter((o) => labelText(o).toLowerCase().includes(q) || String(o.value ?? '').toLowerCase().includes(q));
+  if (!q) return [...options.filter((o) => o.pinned), ...options.filter((o) => !o.pinned)];
+  return options.filter(
+    (o) => !o.pinned && (labelText(o).toLowerCase().includes(q) || String(o.value ?? '').toLowerCase().includes(q)),
+  );
 }
 
 /**
- * searchSelect({ options: [{ value, label?, count? }], value, placeholder?, label, onChange(value),
- * freeText = false, hideLabel = false, clearable = true, disabled = false }) → el.
+ * searchSelect({ options: [{ value, label?, count?, pinned? }], value, placeholder?, label,
+ * onChange(value), freeText = false, hideLabel = false, clearable = true, disabled = false }) → el.
  * onChange runs when the chosen value changes ('' when cleared). With freeText, leaving the field
  * also keeps what was typed. Methods: el.setOptions(options), el.setValue(value) (no onChange),
  * el.setDisabled(bool); el.input is the combobox.
+ *
+ * `pinned: true` marks a row that stands for "no choice", like Pipeline's
+ * `{ value: '', label: 'All sources', pinned: true }`: it heads the list while the field is blank,
+ * typed text never matches it (so Enter after typing picks the first real match, and typing its
+ * label doesn't pick it), and while it is the chosen value the field shows the placeholder rather
+ * than its label, with no clear button. Give it the value that means "nothing chosen" (''):
+ * picking it then fires onChange('') only when something else was chosen, never again when it
+ * already is.
  */
 export function searchSelect({
   options = [],
@@ -85,13 +100,18 @@ export function searchSelect({
   const optionFor = (v) => opts.find((o) => String(o.value) === v);
   const displayOf = (v) => {
     const o = optionFor(v);
-    if (o) return labelText(o);
+    if (o) return o.pinned ? '' : labelText(o);
     return freeText ? v : '';
+  };
+  // Nothing to clear: no value, or the pinned "no choice" row.
+  const blank = () => current === '' || !!(optionFor(current) || {}).pinned;
+  const syncClear = () => {
+    clearBtn.hidden = !clearable || blank() || disabled;
   };
 
   function showValue() {
     input.value = displayOf(current);
-    clearBtn.hidden = !clearable || current === '' || disabled;
+    syncClear();
   }
 
   // Open downwards unless the room below is short and there is more above; tell the CSS how much
@@ -193,7 +213,7 @@ export function searchSelect({
   function commitTyped() {
     const typed = input.value.trim();
     if (!typed) return false;
-    const exact = opts.find((o) => labelText(o).toLowerCase() === typed.toLowerCase() || String(o.value) === typed);
+    const exact = opts.find((o) => !o.pinned && (labelText(o).toLowerCase() === typed.toLowerCase() || String(o.value) === typed));
     if (exact) pick(String(exact.value));
     else if (freeText) pick(typed);
     else if (shown.length) pick(String(shown[0].value));
@@ -245,7 +265,7 @@ export function searchSelect({
     // Options that arrive while the user is typing must not replace what they typed.
     const typing = document.activeElement === input && input.value !== displayOf(current);
     opts = (list || []).slice();
-    if (typing) clearBtn.hidden = !clearable || current === '' || disabled;
+    if (typing) syncClear();
     else showValue();
     if (open) openWith(typing ? input.value : '');
   };
