@@ -230,7 +230,7 @@
 }
 .st-notice > svg { flex: none; margin-top: 2px; color: var(--warn); }
 .st-notice > span { text-wrap: pretty; } /* no one-word last line */
-.st-notice .mono { font-size: 12.5px; overflow-wrap: anywhere; }
+.st-notice .mono { font-size: 12px; overflow-wrap: anywhere; }
 /* A notice in two parts: what's wrong and the fix, then what it costs (the model warning). */
 .st-notice-text { display: flex; flex-direction: column; min-width: 0; }
 .st-notice-lead { font-weight: 500; }

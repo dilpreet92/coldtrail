@@ -1,11 +1,13 @@
 // Settings (spec §5.9) at #/settings?tab=agent|connections|sending|enrichment|appearance: the tabs
-// and their addresses; Agent (Setup's agentPanel: cards, the opencode model, Test connection, and
-// the warning when opencode no longer offers the saved model); Connections (Canonical, Gmail with
-// the app password first and more options folded, LinkedIn connect / reconnect / disconnect and
-// its sign-in poll; connect requests outlive the screen); Sending (email and LinkedIn auto-send
+// and their addresses; Agent (Setup's agentPanel: cards, the opencode model, Test connection, a
+// save confirmed without waiting for the store, and the warning when opencode no longer offers
+// the saved model, read from the picker's own list); Connections (Canonical, Gmail with the app
+// password first and more options folded, LinkedIn connect / reconnect / disconnect and its
+// sign-in poll; connect requests outlive the screen); Sending (email and LinkedIn auto-send
 // switches that confirm before turning on, caps that save on commit, refuse bad values, ask
 // before going up while auto-send is on and never turn it back on, today's usage, a consequence
-// line for each, and caps saved on the way out); Enrichment (the OSINT installers, intercepted);
+// line for each, caps saved on the way out but a raise not, with a toast saying so, and a leave
+// that Back overtakes still asking); Enrichment (the OSINT installers, intercepted);
 // Appearance (System / Light / Dark, kept in this browser). Also: loading, error and stale-session
 // states, keyboard use, hostile text, the poll stopping on unmount and on a stale session, and
 // every tab accessible in light and dark and at phone width.
@@ -36,6 +38,7 @@ const region = (page, name) => panel(page).getByRole('region', { name, exact: tr
 const emailSwitch = (page) => panel(page).getByRole('switch', { name: 'Auto-send emails' });
 const linkedinSwitch = (page) => panel(page).getByRole('switch', { name: 'Auto-send LinkedIn invites' });
 const confirmBox = (page) => page.getByRole('alertdialog');
+const toasts = (page) => page.locator('#toasts .toast-text');
 const goHome = (page) => page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Home' }).click();
 const EMAIL_ON = (cap) =>
   `Send now on the Drafts screen emails people right away, and the agent can send email itself in chats and scheduled runs — up to ${cap} emails a day in total.`;
@@ -271,6 +274,35 @@ test('opencode model change persists', async ({ app, page, request, server }) =>
   await postJSON(request, server, '/api/onboarding/provider', { provider: 'opencode', opencode_model: 'fake/model-a' });
 });
 
+test("a model save is confirmed without waiting for the store's refresh", async ({ app, page, request, server }) => {
+  await app.goto('#/settings?tab=agent');
+  await agentReady(page);
+  const model = panel(page).getByRole('combobox', { name: 'Model' });
+  await expect(model).toHaveValue('fake/model-a');
+  // The store's refresh (summary + status for the sidebar and the next screen) is slow.
+  let release = () => {};
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  let summaries = 0;
+  await page.route('**/api/summary', async (route) => {
+    summaries++;
+    await held;
+    await route.fallback();
+  });
+  try {
+    await model.click();
+    await panel(page).getByRole('option', { name: 'fake/model-b' }).click();
+    // Saved and re-read: the panel says so while the store is still refreshing.
+    await expect(panel(page).locator('.ap-model [role="status"]')).toHaveText('Model saved');
+    await expect.poll(() => summaries).toBeGreaterThan(0);
+    expect((await getJSON(request, server, '/api/status')).opencode_model).toBe('fake/model-b');
+  } finally {
+    release();
+    await postJSON(request, server, '/api/onboarding/provider', { provider: 'opencode', opencode_model: 'fake/model-a' });
+  }
+});
+
 test('a saved model opencode no longer offers is called out by the picker', async ({ app, page, request, server }) => {
   // opencode retired the saved model (fake/model-a): its list doesn't have it any more.
   let served = 0;
@@ -288,6 +320,10 @@ test('a saved model opencode no longer offers is called out by the picker', asyn
     await expect(warn).toHaveText(
       "fake/model-a isn't offered by opencode anymore — pick another model. Chats and scheduled runs fail until you do.",
     );
+    // The warning reads the list the picker loaded: one request (each can start an
+    // `opencode models` run on the server).
+    await expect(panel(page).locator('.ap-model .field-hint')).toContainText('2 models from opencode');
+    expect(served).toBe(1);
     // Read with the field, too.
     await expect(model).toHaveAccessibleDescription(/fake\/model-a isn't offered by opencode anymore/);
     for (const scheme of ['light', 'dark']) {
@@ -318,8 +354,8 @@ test('a saved model opencode no longer offers is called out by the picker', asyn
     });
     await page.reload();
     await agentReady(page);
-    // Both the picker and the warning have asked (and been refused).
-    await expect.poll(() => served).toBeGreaterThanOrEqual(2);
+    await expect(panel(page).locator('.ap-model .field-hint')).toContainText("Couldn't load the model list");
+    expect(served).toBe(1);
     await expect(model).toHaveValue('fake/model-a');
     await expect(warn).toBeHidden();
   } finally {
@@ -443,6 +479,37 @@ test('email daily cap saves and refuses bad values', async ({ app, page, request
   await page.reload();
   await expect(cap).toHaveValue('12');
   await resetSending(request, server);
+});
+
+test('a cap typed and left keeps its value through a status refresh until it saves', async ({ app, page, request, server }) => {
+  await resetSending(request, server);
+  // The clock holds the save's debounce, so a refresh lands while the save still waits.
+  await page.clock.install();
+  try {
+    const posts = countRequests(page, '/api/destination/auto-send');
+    await app.goto('#/settings?tab=sending');
+    const email = region(page, 'Email');
+    const cap = email.getByLabel('Daily cap');
+    await expect(cap).toHaveValue('20');
+    await cap.fill('35');
+    await email.getByRole('heading', { name: 'Email' }).click();
+    await expect(cap).not.toBeFocused();
+    // The store's refresh (as every 30s) brings the saved 20 back to the screen.
+    await page.evaluate(async () => (await import('/assets/js/core/store.js')).store.refresh());
+    await expect(cap).toHaveValue('35');
+    expect(posts).toEqual([]);
+
+    await page.clock.runFor(1_000);
+    await expect(email.locator('.st-msg')).toHaveText('Saved. Up to 35 emails a day.');
+    expect(posts).toEqual([{ enabled: false, daily_cap: 35 }]);
+    expect((await getJSON(request, server, '/api/status')).daily_send_cap).toBe(35);
+    // Saved, so later refreshes show what's saved again: a change made elsewhere comes through.
+    await postJSON(request, server, '/api/destination/auto-send', { enabled: false, daily_cap: 28 });
+    await page.evaluate(async () => (await import('/assets/js/core/store.js')).store.refresh());
+    await expect(cap).toHaveValue('28');
+  } finally {
+    await resetSending(request, server);
+  }
 });
 
 test('LinkedIn caps save', async ({ app, page, request, server }) => {
@@ -619,18 +686,78 @@ test('leaving the screen saves a cap that was typed and left', async ({ app, pag
     // The router waited for it.
     expect(posts).toEqual([{ enabled: false, daily_cap: 33 }]);
     expect((await getJSON(request, server, '/api/status')).daily_send_cap).toBe(33);
+    await expect(toasts(page)).toHaveCount(0);
 
-    // With auto-send on, a raise left that way isn't saved, and nothing asks on the way out.
+    // With auto-send on, a raise left that way isn't saved, and nothing asks on the way out; a
+    // toast (it outlives the screen) says the cap stayed where it was, and where to raise it.
     await postJSON(request, server, '/api/destination/auto-send', { enabled: true, daily_cap: 33 });
+    await postJSON(request, server, '/api/destination/linkedin/auto-send', { enabled: true, weekly_cap: 80, daily_cap: 15 });
+    const liPosts = countRequests(page, '/api/destination/linkedin/auto-send');
     await app.goto('#/settings?tab=sending');
     await expect(cap).toHaveValue('33');
     await cap.fill('90');
+    await region(page, 'LinkedIn').getByLabel('Weekly cap').fill('120');
     await goHome(page);
     await expect(view(page).locator('.settings')).toHaveCount(0);
     await expect(confirmBox(page)).toHaveCount(0);
+    await expect(toasts(page).filter({ hasText: 'Email' })).toHaveText(
+      'Email cap not raised: it stays at 33 a day. With auto-send on, a higher cap needs your confirmation under Settings → Sending.',
+    );
+    await expect(toasts(page).filter({ hasText: 'LinkedIn' })).toHaveText(
+      'LinkedIn caps not raised: they stay at 15 a day and 80 a week. With auto-send on, higher caps need your confirmation under Settings → Sending.',
+    );
     expect(posts).toEqual([{ enabled: false, daily_cap: 33 }]);
-    expect((await getJSON(request, server, '/api/status')).daily_send_cap).toBe(33);
+    expect(liPosts).toEqual([]);
+    const status = await getJSON(request, server, '/api/status');
+    expect([status.daily_send_cap, status.linkedin_weekly_cap]).toEqual([33, 80]);
   } finally {
+    await resetSending(request, server);
+  }
+});
+
+test('a leave that Back overtakes keeps the screen asking before a raise', async ({ app, page, request, server }) => {
+  await resetSending(request, server);
+  await postJSON(request, server, '/api/destination/auto-send', { enabled: true, daily_cap: 20 });
+  let release = () => {};
+  try {
+    await app.goto('#/settings?tab=sending');
+    const email = region(page, 'Email');
+    const cap = email.getByLabel('Daily cap');
+    await expect(cap).toHaveValue('20');
+    await view(page)
+      .locator('.settings')
+      .evaluate((el) => {
+        el.dataset.mark = 'kept';
+      });
+
+    // Home's screen is slow to load: Settings has been asked to leave and is still on show when
+    // Back brings the address back to it, so the router keeps it (update) instead of leaving.
+    const held = new Promise((resolve) => {
+      release = resolve;
+    });
+    let homeAsked = false;
+    await page.route('**/assets/js/views/home.js', async (route) => {
+      homeAsked = true;
+      await held;
+      await route.fallback();
+    });
+    await goHome(page);
+    await expect.poll(() => homeAsked).toBe(true);
+    await page.goBack();
+    await expect(page).toHaveURL(hashIs('#/settings?tab=sending'));
+    release();
+    await expect(view(page).locator('.settings[data-mark="kept"]')).toHaveCount(1);
+
+    // Still this screen, so a raise asks first (not "Not changed" without a word).
+    await cap.fill('40');
+    await cap.press('Enter');
+    await expect(confirmBox(page).getByRole('heading')).toHaveText('Raise the email cap to 40 a day?');
+    await confirmBox(page).getByRole('button', { name: 'Cancel' }).click();
+    await expect(email.locator('.st-msg')).toHaveText('Not changed. Up to 20 emails a day.');
+    await expect(toasts(page)).toHaveCount(0);
+    expect((await getJSON(request, server, '/api/status')).daily_send_cap).toBe(20);
+  } finally {
+    release();
     await resetSending(request, server);
   }
 });

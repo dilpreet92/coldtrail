@@ -8,8 +8,9 @@
 //                disconnect, and the poll that follows a sign-in in Chrome)
 //   sending      email and LinkedIn auto-send: switches that ask before turning ON (never before
 //                OFF), caps that save on Enter or when the field is left (asking first when a cap
-//                goes up while auto-send is on), today's usage, and a line saying what actually
-//                happens with the current setting
+//                goes up while auto-send is on; a raise nobody could confirm because the screen
+//                was going isn't saved, and a toast says so), today's usage, and a line saying
+//                what actually happens with the current setting
 //   enrichment   the OSINT installers (theHarvester, SpiderFoot) with what each still needs
 //   appearance   System / Light / Dark through core/theme.js (kept in this browser)
 //
@@ -21,11 +22,11 @@
 // (router beforeLeave) for switch, cap and model saves, so the next screen sees them.
 // Everything dynamic reaches the DOM through h() (text nodes); nothing here parses HTML.
 
-import { api } from '../core/api.js';
+import { api, errorText, isStaleSession } from '../core/api.js';
 import { debounce, fmtNum, h } from '../core/dom.js';
 import { ensureViewCss, href } from '../core/router.js';
 import { getThemePref, setThemePref } from '../core/theme.js';
-import { confirmDialog, isBusy, setBusy } from '../core/ui.js';
+import { confirmDialog, isBusy, setBusy, toast } from '../core/ui.js';
 import { badge } from '../components/badge.js';
 import { switchEl } from '../components/switch.js';
 import { tabs } from '../components/tabs.js';
@@ -107,10 +108,6 @@ function say(el, text, tone = '') {
 }
 
 const aborted = (err) => !!err && err.name === 'AbortError';
-const errText = (err) => (err && err.message) || String(err);
-/** A 401: the app's session banner already says so in full, so the screen only points at the fix. */
-const staleSession = (err) => !!err && err.status === 401;
-const REOPEN = 'Reopen coldtrail from your terminal.';
 
 function extLink(url, text) {
   return h('a', { href: url, target: '_blank', rel: 'noopener noreferrer' }, text);
@@ -120,7 +117,7 @@ let uid = 0;
 
 // ---- The screen ----
 
-let active = null; // the mounted screen: { setTab(tab) }
+let active = null; // the mounted screen: { stay(query), beforeLeave() }
 
 function mountSettings(root, ctx) {
   const id = `st-${++uid}`;
@@ -135,7 +132,9 @@ function mountSettings(root, ctx) {
   let saving = 0; // saves in flight: the store's periodic copy may predate them, so it waits
   let tab = tabOf(ctx.query);
   let gone = false;
-  let leaving = false; // the router asked to leave: nothing new may ask a question now
+  // The router asked to leave: nothing new may ask a question now. Cleared when the route change
+  // was overtaken and the screen stays (update(), e.g. Back while the leave was still waiting).
+  let leaving = false;
   // Connections a response confirmed this session, in case status lags behind (or, for an
   // intercepted or failed re-read, never catches up). null = trust status.
   const local = { canonical: null, gmail: null, linkedin: null };
@@ -228,14 +227,22 @@ function mountSettings(root, ctx) {
   }
 
   /**
-   * Re-read status after a change, then the store's copy (the sidebar's dots and counts, and the
-   * next screen, follow). Never throws: a failed re-read keeps what is shown.
+   * Refresh the store's copy (the sidebar's dots and counts, and the next screen) without waiting
+   * for it: nothing on this screen does, but leaving does (track). Its status is no newer than
+   * the one just applied, so the screen ignores the store meanwhile (saving).
    */
+  function refreshStore() {
+    if (!store) return;
+    saving++;
+    track(Promise.resolve(store.refresh()).finally(() => saving--));
+  }
+
+  /** Re-read status after a change, then refresh the store. Never throws: a failed re-read keeps what is shown. */
   async function sync({ except = null } = {}) {
     try {
       const fresh = await api.get('/api/status', { signal });
       apply(fresh, { except });
-      if (store) await store.refresh();
+      refreshStore();
       return fresh;
     } catch (err) {
       if (!aborted(err) && !gone) console.warn('settings: status re-read failed', err);
@@ -302,12 +309,12 @@ function mountSettings(root, ctx) {
   function errorState(err) {
     // A stale session: the app's banner says what happened (once, as the alert), and retrying
     // can't work until the tab is reopened, so this only points at the fix.
-    const stale = staleSession(err);
+    const stale = isStaleSession(err);
     return h(
       'div',
       { class: ['st-load-error', stale && 'is-stale'], role: stale ? null : 'alert' },
       icon('alert', 18),
-      h('div', { class: 'st-load-error-text' }, h('p', { class: 'st-load-error-title' }, "Couldn't load your settings"), h('p', {}, stale ? REOPEN : errText(err))),
+      h('div', { class: 'st-load-error-text' }, h('p', { class: 'st-load-error-title' }, "Couldn't load your settings"), h('p', {}, errorText(err))),
       stale ? null : h('button', { type: 'button', class: 'btn btn-secondary btn-sm', onClick: load }, 'Try again'),
     );
   }
@@ -347,9 +354,10 @@ function mountSettings(root, ctx) {
     const box = h('div', { class: 'st-agent' }, loadingState());
     el.append(box);
     let panelApi = null;
-    // What `opencode models` offers: null (not asked yet), 'loading', or the list ([] when it
+    // What `opencode models` offers: null (not known yet), 'loading', or the list ([] when it
     // couldn't be read: then nothing is known, and nothing is said).
     let offered = null;
+    let watching = false; // the list comes from the panel's picker (watchList), not a request here
     const warnId = `${id}-model-warn`;
     const warn = h('p', { class: 'st-notice st-model-warn', id: warnId, hidden: true });
 
@@ -371,20 +379,22 @@ function mountSettings(root, ctx) {
       panelApi = agentPanel(box, {
         status,
         signal,
-        // A save inside the panel re-reads status; everything else on the screen follows.
+        // A save inside the panel re-reads status; everything else on the screen follows. The
+        // panel confirms the save once this returns, so the store refresh isn't waited for.
         refresh: async () => {
           saving++;
           try {
             const fresh = await api.get('/api/status', { signal });
             apply(fresh, { except: built });
             checkModel();
-            if (store) await store.refresh();
+            refreshStore();
             return fresh;
           } finally {
             saving--;
           }
         },
       });
+      watching = watchList();
       placeWarning();
       checkModel();
     });
@@ -404,6 +414,22 @@ function mountSettings(root, ctx) {
       }
     }
 
+    // The panel loads the list for its picker (GET /api/provider/opencode/models) whenever the
+    // saved provider is opencode. The check reads it from there, through the picker's own
+    // setOptions, so it never asks a second time (each ask can start an `opencode models` run on
+    // the server). Without that picker it asks itself (loadOffered).
+    function watchList() {
+      const picker = box.querySelector('.ap-model .search-select');
+      if (!picker || typeof picker.setOptions !== 'function') return false;
+      const setOptions = picker.setOptions;
+      picker.setOptions = (list) => {
+        setOptions(list);
+        offered = (list || []).map((o) => String(o && typeof o === 'object' ? o.value : o)).filter(Boolean);
+        if (!gone) checkModel();
+      };
+      return true;
+    }
+
     async function loadOffered() {
       offered = 'loading';
       let list = [];
@@ -420,8 +446,9 @@ function mountSettings(root, ctx) {
     // A saved model that opencode no longer lists (it retired it, or it was mistyped) makes every
     // opencode run fail, chats and schedules alike, so it is called out by the picker.
     function checkModel() {
+      if (!panelApi) return; // the panel (and its list) isn't up yet
       const model = status && status.provider === 'opencode' ? String(status.opencode_model || '').trim() : '';
-      if (model && offered == null) loadOffered();
+      if (model && offered == null && !watching) loadOffered();
       const retired = !!model && Array.isArray(offered) && offered.length > 0 && !offered.includes(model);
       warn.hidden = !retired;
       if (!retired) {
@@ -497,7 +524,7 @@ function mountSettings(root, ctx) {
         } catch (err) {
           if (gone) return;
           setBusy(btn, false);
-          say(c.msg, errText(err), 'err');
+          say(c.msg, errorText(err), 'err');
         }
       });
       if (gone) return;
@@ -629,7 +656,7 @@ function mountSettings(root, ctx) {
         } catch (err) {
           if (gone) return;
           setBusy(apBtn, false);
-          say(c.msg, errText(err), 'err');
+          say(c.msg, errorText(err), 'err');
         }
       });
       if (!ok || gone) return;
@@ -652,7 +679,7 @@ function mountSettings(root, ctx) {
         } catch (err) {
           if (gone) return;
           setBusy(btn, false);
-          say(c.msg, errText(err), 'err');
+          say(c.msg, errorText(err), 'err');
         }
       });
       if (ok && !gone) await connected('Gmail is connected.');
@@ -679,7 +706,7 @@ function mountSettings(root, ctx) {
       } catch (err) {
         if (gone) return;
         setBusy(byoBtn, false);
-        say(c.msg, errText(err), 'err');
+        say(c.msg, errorText(err), 'err');
         return;
       }
       if (gone) return;
@@ -744,10 +771,10 @@ function mountSettings(root, ctx) {
         s = await api.get('/api/destination/linkedin/status', { signal });
       } catch (err) {
         if (aborted(err) || seq !== pollSeq || gone) return;
-        if (staleSession(err)) {
+        if (isStaleSession(err)) {
           // Every later poll would get the same 401: stop, and point at the fix.
           finish();
-          say(c.msg, REOPEN, 'err');
+          say(c.msg, errorText(err), 'err');
           render();
           return;
         }
@@ -799,7 +826,7 @@ function mountSettings(root, ctx) {
       } catch (err) {
         if (gone) return;
         finish();
-        say(c.msg, errText(err), 'err');
+        say(c.msg, errorText(err), 'err');
         render();
       }
     }
@@ -822,7 +849,7 @@ function mountSettings(root, ctx) {
       } catch (err) {
         if (gone) return;
         setBusy(disconnectBtn, false);
-        say(c.msg, errText(err), 'err');
+        say(c.msg, errorText(err), 'err');
         return;
       }
       if (gone) return;
@@ -877,9 +904,10 @@ function mountSettings(root, ctx) {
    * One channel's auto-send card. cfg: key, title, icon, switchLabel, path, enabled(status) and
    * caps(status), fields [{ key, label, unit }], hint, check(caps) → { text, fields } | null,
    * describe(on, caps), confirm(caps) and raise(caps) → dialog text (turning on; a cap going up
-   * while on), body(on, caps) → the request body, limit(caps) → "Up to …", usage(caps) → today's
-   * sends as [part, …] ([] = none known), connected() and notConnected() → { text, link }: the
-   * notice shown while the channel can't send.
+   * while on), unraised(saved) → the toast when a raise is dropped on the way out (nobody was
+   * there to confirm it), body(on, caps) → the request body, limit(caps) → "Up to …",
+   * usage(caps) → today's sends as [part, …] ([] = none known), connected() and notConnected()
+   * → { text, link }: the notice shown while the channel can't send.
    */
   function sendingCard(cfg) {
     const c = card({ key: cfg.key, iconName: cfg.icon, title: cfg.title });
@@ -889,6 +917,13 @@ function mountSettings(root, ctx) {
     let toggling = false; // the switch is mid-change (its confirm open, or its save in flight)
     let chain = Promise.resolve();
     let lastSent = null; // the caps last sent, as JSON (so a re-commit of the same values is a no-op)
+    // Per field, the value this screen last put there or saved from it. A field showing anything
+    // else holds an edit that isn't saved yet (say, typed and left while its save waits out the
+    // debounce), which a status refresh landing meanwhile must not overwrite.
+    const synced = {};
+    const markSynced = (caps) => {
+      for (const f of fields) synced[f.key] = String(caps[f.key]);
+    };
 
     const sw = switchEl({
       checked: on,
@@ -964,9 +999,11 @@ function mountSettings(root, ctx) {
       }
       const saved = cfg.caps(status);
       for (const f of fields) {
-        // Never overwrite what someone is typing, or a value they still have to fix.
-        if (document.activeElement === f.input || f.input.getAttribute('aria-invalid') === 'true') continue;
-        f.input.value = String(saved[f.key]);
+        // Never overwrite what someone is typing, an edit still waiting to save, or a value they
+        // still have to fix.
+        const edited = f.key in synced && f.input.value !== synced[f.key];
+        if (document.activeElement === f.input || edited || f.input.getAttribute('aria-invalid') === 'true') continue;
+        f.input.value = synced[f.key] = String(saved[f.key]);
       }
       lastSent = JSON.stringify(saved);
       renderText();
@@ -993,12 +1030,13 @@ function mountSettings(root, ctx) {
         try {
           await track(send(() => cfg.body(next, caps)));
         } catch (err) {
-          if (!gone) say(c.msg, `Couldn't turn auto-send ${next ? 'on' : 'off'}: ${errText(err)}`, 'err');
+          if (!gone) say(c.msg, `Couldn't turn auto-send ${next ? 'on' : 'off'}: ${errorText(err)}`, 'err');
           return false; // the switch goes back
         }
         if (gone) return true;
         on = next;
         lastSent = JSON.stringify(caps);
+        markSynced(caps);
         say(c.msg, `${cfg.title} auto-send is ${next ? 'on' : 'off'}.`, 'ok');
         renderText();
         track(sync());
@@ -1024,10 +1062,14 @@ function mountSettings(root, ctx) {
       setError('');
       renderText();
       const key = JSON.stringify(typed);
-      if (key === lastSent) return;
+      if (key === lastSent) {
+        markSynced(typed);
+        return;
+      }
       lastSent = key;
       say(c.msg, 'Saving…', 'busy');
       let kept = null; // the saved caps, when a raise wasn't confirmed
+      let unasked = false; // ... because the screen was going, so nobody could answer
       try {
         await send(async () => {
           // Auto-send as it is now, not as this screen last saw it: it may have been turned off
@@ -1039,11 +1081,13 @@ function mountSettings(root, ctx) {
           const raised = fields.filter((f) => typed[f.key] > saved[f.key]);
           if (enabled && raised.length) {
             // More sends without asking: confirm first. Never while leaving the screen; then
-            // the raise isn't saved.
+            // the raise isn't saved, and a toast (it outlives the screen) says so.
             if (!gone) say(c.msg, '');
-            const yes = !leaving && !gone && (await confirmDialog({ ...cfg.raise(typed), opener: raised[0].input, signal }));
+            const ask = !leaving && !gone;
+            const yes = ask && (await confirmDialog({ ...cfg.raise(typed), opener: raised[0].input, signal }));
             if (!yes || gone) {
               kept = saved;
+              unasked = !ask || gone; // a dialog the screen's going closed was no answer either
               return null;
             }
             say(c.msg, 'Saving…', 'busy');
@@ -1052,17 +1096,20 @@ function mountSettings(root, ctx) {
         });
       } catch (err) {
         lastSent = null;
-        if (!gone) say(c.msg, `Couldn't save the caps: ${errText(err)}`, 'err');
+        if (!gone) say(c.msg, `Couldn't save the caps: ${errorText(err)}`, 'err');
         return;
       }
+      if (unasked) toast(cfg.unraised(kept));
       if (gone) return;
       if (kept) {
         for (const f of fields) f.input.value = String(kept[f.key]);
+        markSynced(kept);
         lastSent = JSON.stringify(kept);
         say(c.msg, `Not changed. ${cfg.limit(kept)}`);
         renderText();
         return;
       }
+      markSynced(typed);
       say(c.msg, `Saved. ${cfg.limit(typed)}`, 'ok');
       await sync();
     }
@@ -1119,6 +1166,8 @@ function mountSettings(root, ctx) {
         body: `Auto-send is on, so Send now and the agent can email up to ${fmtNum(caps.daily)} people a day without asking. A sent email can't be taken back.`,
         confirmText: 'Raise cap',
       }),
+      unraised: (caps) =>
+        `Email cap not raised: it stays at ${fmtNum(caps.daily)} a day. With auto-send on, a higher cap needs your confirmation under Settings → Sending.`,
       body: (on, caps) => ({ enabled: on, daily_cap: caps.daily }),
       limit: (caps) => `Up to ${fmtNum(caps.daily)} ${caps.daily === 1 ? 'email' : 'emails'} a day.`,
       usage: (caps) => (typeof status.email_sent_today === 'number' ? [`${fmtNum(status.email_sent_today)} of ${fmtNum(caps.daily)} sent today`] : []),
@@ -1155,6 +1204,8 @@ function mountSettings(root, ctx) {
         body: `Auto-send is on, so coldtrail can send up to ${fmtNum(caps.daily)} invites a day and ${fmtNum(caps.weekly)} a week without asking. LinkedIn can restrict accounts that send too many invites.`,
         confirmText: 'Raise caps',
       }),
+      unraised: (caps) =>
+        `LinkedIn caps not raised: they stay at ${fmtNum(caps.daily)} a day and ${fmtNum(caps.weekly)} a week. With auto-send on, higher caps need your confirmation under Settings → Sending.`,
       body: (on, caps) => ({ enabled: on, weekly_cap: caps.weekly, daily_cap: caps.daily }),
       limit: (caps) => `Up to ${fmtNum(caps.daily)} ${caps.daily === 1 ? 'invite' : 'invites'} a day and ${fmtNum(caps.weekly)} a week.`,
       usage: (caps) => [
@@ -1218,7 +1269,7 @@ function mountSettings(root, ctx) {
       try {
         apply(await api.get('/api/status', { signal }));
       } catch (err) {
-        if (!aborted(err) && !gone) say(recheckMsg, `Couldn't check again: ${errText(err)}`, 'err');
+        if (!aborted(err) && !gone) say(recheckMsg, `Couldn't check again: ${errorText(err)}`, 'err');
       } finally {
         if (!gone) setBusy(recheckBtn, false);
       }
@@ -1259,7 +1310,7 @@ function mountSettings(root, ctx) {
           say(c.msg, (r && r.message) || (ok ? `${tool.title} is installed.` : `${tool.title} didn't install.`), ok ? 'ok' : 'err');
         } catch (err) {
           if (gone) return;
-          say(c.msg, errText(err), 'err');
+          say(c.msg, errorText(err), 'err');
         } finally {
           if (!gone) setBusy(btn, false);
         }
@@ -1381,15 +1432,19 @@ function mountSettings(root, ctx) {
     leaving = true;
     for (const p of panes.values()) if (p.built && p.built.flush) p.built.flush();
     const agent = panes.get('agent').built;
-    const waits = [agent && agent.settled ? agent.settled() : null];
-    // A save that lands can start its status re-read: wait for that too.
-    const drain = async () => {
-      while (pending.size) await Promise.all([...pending]);
-    };
-    await Promise.allSettled([drain(), ...waits]);
+    // The panel's saves first: each ends by starting a store refresh, which joins `pending`.
+    if (agent && agent.settled) await Promise.allSettled([agent.settled()]);
+    // A save that lands can start its status re-read and store refresh: wait for those too.
+    while (pending.size) await Promise.all([...pending]);
   }
 
-  const me = { setTab, beforeLeave };
+  /** The router keeps this screen (another tab, or a leave that was overtaken). */
+  function stay(query) {
+    leaving = false;
+    setTab(tabOf(query));
+  }
+
+  const me = { stay, beforeLeave };
   active = me;
   return () => {
     gone = true;
@@ -1414,7 +1469,7 @@ export default {
   mount: mountSettings,
   update(ctx) {
     if (!active || ctx.path[0] !== 'settings') return false;
-    active.setTab(tabOf(ctx.query));
+    active.stay(ctx.query);
     return true;
   },
   beforeLeave() {
