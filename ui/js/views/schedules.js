@@ -6,14 +6,14 @@
 // Data: GET /api/schedules, /api/runs and /api/status, each loaded (and failing) on its own.
 // No polling of its own: the shared store's 30s summary tells it when a run finished (last_run
 // changes) or is running, and a 30s ticker keeps the relative times fresh. Unmount aborts
-// requests (and, through the same signal, any dialog or confirm this screen opened), closes its
-// row menu, stops the ticker and unsubscribes.
+// requests and, through the same signal, closes any dialog, confirm or row menu this screen
+// opened; it also stops the ticker and unsubscribes.
 // The server writes a schedule's row before it installs or removes the OS timer, so a 500 from
 // a save or a toggle may come after the change was stored: the screen then reloads the list and
 // says what was saved and what wasn't.
 // Every dynamic string goes through h() (text nodes); nothing here builds HTML.
 
-import { api } from '../core/api.js';
+import { api, errorText, isStaleSession } from '../core/api.js';
 import { fmtDate, fmtNum, fmtRelative, h, pluralize, runStatus, toDate } from '../core/dom.js';
 import { href } from '../core/router.js';
 import { confirmDialog, openDialog, openMenu, setBusy, toast } from '../core/ui.js';
@@ -133,7 +133,6 @@ const listOf = (v, key) => (Array.isArray(v) ? v : (v && Array.isArray(v[key]) &
 const nameOf = (s) => (s.name && s.name.trim() ? s.name : 'Untitled schedule');
 const quoted = (s) => `“${nameOf(s)}”`;
 const enc = encodeURIComponent;
-const errText = (err) => (err && err.message) || String(err);
 /** Replace an element's children with `content` (nested arrays; null/false skipped, as h() does). */
 const fill = (el, content) => el.replaceChildren(...[content].flat(Infinity).filter((c) => c != null && c !== false));
 
@@ -198,11 +197,12 @@ function mountSchedules(root, ctx) {
   let errSchedules = null;
   let errRuns = null;
   const ctls = { schedules: null, runs: null, status: null };
-  // Aborted on unmount: closes this screen's dialogs and confirms (and resolves a confirm false).
+  // Aborted on unmount: closes this screen's dialogs, confirms (which then answer false) and
+  // row menu.
   const life = new AbortController();
-  let menu = null; // the row menu last opened here (only one menu is ever open)
+  let menu = null; // the row menu open now, or null
   const rowRefs = new Map(); // id → { s, nextCell, lastCell, row, menuBtn }
-  const busyRows = new Set();
+  const busyRows = new Set(); // ids whose Run now / Dry run is starting
   let lastRunKey = runKey(store.get().summary);
   let running = runningOf(store.get().summary);
 
@@ -277,7 +277,7 @@ function mountSchedules(root, ctx) {
       (err) => {
         errSchedules = err;
         // A reload that fails keeps what's on screen; say why unless the banner already does.
-        if (schedules && announce && err.status !== 401) toast(err.message, 'err');
+        if (schedules && announce && !isStaleSession(err)) toast(`Couldn't reload the schedules: ${errorText(err)}`, 'err');
         if (!schedules) keepFocus(renderList);
       },
     );
@@ -368,6 +368,8 @@ function mountSchedules(root, ctx) {
   }
 
   function errorBlock(what, err, retry) {
+    // A stale session reads "Reopen coldtrail from your terminal." (the banner has the rest).
+    const why = errorText(err);
     return h(
       'div',
       { class: 'sch-error', role: 'alert' },
@@ -376,8 +378,7 @@ function mountSchedules(root, ctx) {
         'p',
         { class: 'sch-error-text' },
         `${what} didn't load.`,
-        // The session banner already explains a 401; don't repeat it here.
-        err && err.status !== 401 && err.message ? h('span', { class: 'sch-error-why' }, ` ${err.message}`) : null,
+        why ? h('span', { class: 'sch-error-why' }, ` ${why}`) : null,
       ),
       h('button', { type: 'button', class: 'btn btn-secondary btn-sm', onClick: retry }, 'Try again'),
     );
@@ -546,6 +547,8 @@ function mountSchedules(root, ctx) {
       },
       dotsIcon(),
     );
+    // A run of it is still starting (the list was rebuilt meanwhile): stay busy, as before.
+    if (busyRows.has(s.id)) setBusy(menuBtn, true);
     const nextCell = h('div', { class: 'sch-cell sch-next' }, h('span', { class: 'sch-cell-label' }, 'Next run'), h('div', { class: 'sch-cell-body' }, nextContent(s)));
     const lastCell = h('div', { class: 'sch-cell sch-last' }, h('span', { class: 'sch-cell-label' }, 'Last run'), h('div', { class: 'sch-cell-body' }, lastContent(s)));
     const row = h(
@@ -611,24 +614,26 @@ function mountSchedules(root, ctx) {
     try {
       await api.patch(`/api/schedules/${enc(s.id)}`, { enabled: on });
     } catch (err) {
-      if (!alive || (err && err.status === 401)) throw err;
       // The row may already say `on` (the timer step failed after it was written): show what
-      // is stored rather than leave the switch saying the opposite.
-      const fresh = await fetchList();
-      adopt(fresh);
-      const stored = fresh && fresh.find((x) => x.id === s.id);
-      if (alive && stored && !!stored.enabled === on) {
-        store.refresh();
-        toast(
-          on
-            ? `${quoted(s)} is on, but its timer couldn't be installed, so it won't run yet: ${errText(err)}`
-            : `${quoted(s)} is paused, but its timer couldn't be removed, so it may still run: ${errText(err)}`,
-          'err',
-        );
-        return true;
+      // is stored rather than leave the switch saying the opposite. (A stale session stored
+      // nothing, and can't read the list either.)
+      if (alive && !isStaleSession(err)) {
+        const fresh = await fetchList();
+        adopt(fresh);
+        const stored = fresh && fresh.find((x) => x.id === s.id);
+        if (alive && stored && !!stored.enabled === on) {
+          store.refresh();
+          toast(
+            on
+              ? `${quoted(s)} is on, but its timer couldn't be installed, so it won't run yet: ${errorText(err)}`
+              : `${quoted(s)} is paused, but its timer couldn't be removed, so it may still run: ${errorText(err)}`,
+            'err',
+          );
+          return true;
+        }
       }
       // Nothing changed: the switch goes back and shows this.
-      throw new Error(`Couldn't ${on ? 'turn on' : 'pause'} ${quoted(s)}: ${errText(err)}`);
+      throw new Error(`Couldn't ${on ? 'turn on' : 'pause'} ${quoted(s)}: ${errorText(err)}`);
     }
     if (!alive) return true;
     // The response's last_run is always null: keep the one on screen.
@@ -645,12 +650,24 @@ function mountSchedules(root, ctx) {
     const cur = () => (schedules || []).find((x) => x.id === s.id) || s;
     // A run of this schedule is going on: a second one at once would race it.
     const live = isRunning(s);
-    menu = openMenu(btn, [
-      { label: 'Run now', disabled: live, onSelect: () => start(cur(), btn, { dry: false }) },
-      { label: 'Dry run', disabled: live, onSelect: () => start(cur(), btn, { dry: true }) },
-      { label: 'Edit', onSelect: () => openEditor(cur(), btn) },
-      { label: 'Delete', danger: true, onSelect: () => remove(cur(), btn) },
-    ]);
+    const handle = openMenu(
+      btn,
+      [
+        { label: 'Run now', disabled: live, onSelect: () => start(cur(), btn, { dry: false }) },
+        { label: 'Dry run', disabled: live, onSelect: () => start(cur(), btn, { dry: true }) },
+        { label: 'Edit', onSelect: () => openEditor(cur(), btn) },
+        { label: 'Delete', danger: true, onSelect: () => remove(cur(), btn) },
+      ],
+      {
+        // Leaving the screen closes it; `menu` is only ever the menu that is open now.
+        signal: life.signal,
+        onClose: () => {
+          if (menu === handle) menu = null;
+        },
+      },
+    );
+    // A press on the open menu's own button closes it and opens nothing (a no-op handle).
+    menu = btn.getAttribute('aria-expanded') === 'true' ? handle : null;
   }
 
   /** A confirm tied to this screen: leaving it closes the confirm, which then answers false. */
@@ -699,10 +716,15 @@ function mountSchedules(root, ctx) {
       toast(dry ? `Dry run of ${quoted(s)} started. It only writes drafts.` : `${quoted(s)} is running.`, 'info');
       nav.navigate(href(['agent', res.chat_id]));
     } catch (err) {
-      if (alive && !(err && err.name === 'AbortError')) toast(errText(err), 'err');
+      if (alive && !(err && err.name === 'AbortError')) {
+        toast(`Couldn't start ${dry ? 'a dry run of ' : ''}${quoted(s)}: ${errorText(err)}`, 'err');
+      }
     } finally {
       busyRows.delete(s.id);
       setBusy(btn, false);
+      // The list may have been rebuilt meanwhile: the row's ⋯ button now is another one.
+      const ref = rowRefs.get(s.id);
+      if (ref) setBusy(ref.menuBtn, false);
     }
   }
 
@@ -718,7 +740,7 @@ function mountSchedules(root, ctx) {
     try {
       await api.del(`/api/schedules/${enc(s.id)}`);
     } catch (err) {
-      if (alive) toast(errText(err), 'err');
+      if (alive) toast(`Couldn't delete ${quoted(s)}: ${errorText(err)}`, 'err');
       return;
     }
     if (!alive) return;
@@ -737,6 +759,9 @@ function mountSchedules(root, ctx) {
     const n = ++uid;
     const id = (k) => `sch-${k}-${n}`;
     let saved = null; // { schedule, created } once a save succeeded
+    // False once the dialog has closed. Esc and Close still work while a save is on its way (a
+    // timer install can be slow); its outcome is then told by a toast instead.
+    let open = true;
     // What is stored for editId as far as this dialog knows (the row it opened, or the one a
     // failed create left): a failed edit that sent just this can't show it was written.
     let base = s;
@@ -931,7 +956,12 @@ function mountSchedules(root, ctx) {
         task_mode: mode,
         prompt: mode === 'custom' ? prompt : null,
       };
-      const shown = (msg) => Object.assign(new Error(msg), { shown: true });
+      // Stored, but the timer step failed: said in the dialog, or by a toast once it has closed.
+      const timerFailed = (what, err) =>
+        Object.assign(new Error(`Saved, but its timer wasn't ${what}: ${errorText(err)}`), {
+          shown: true,
+          closed: `${quoted(body)} was saved, but its timer wasn't ${what}: ${errorText(err)}`,
+        });
       try {
         if (editId) {
           try {
@@ -948,9 +978,7 @@ function mountSchedules(root, ctx) {
               const stored = fresh && fresh.find((x) => x.id === editId);
               const changed = !matchesSave(base, body);
               if (stored) base = stored;
-              if (changed && matchesSave(stored, body)) {
-                throw shown(`Saved, but its timer wasn't updated: ${errText(err)}`);
-              }
+              if (changed && matchesSave(stored, body)) throw timerFailed('updated', err);
             }
             throw err;
           }
@@ -976,7 +1004,7 @@ function mountSchedules(root, ctx) {
                 store.refresh();
                 dlg.el.querySelector('.dialog-title').textContent = 'Edit schedule';
                 saveBtn.textContent = 'Save changes';
-                throw shown(`Saved, but its timer wasn't installed: ${errText(err)}`);
+                throw timerFailed('installed', err);
               }
             }
             throw err;
@@ -984,10 +1012,16 @@ function mountSchedules(root, ctx) {
         }
       } catch (err) {
         if (!alive) return false;
-        formError.textContent = err && err.shown ? err.message : `Couldn't save: ${errText(err)}`;
+        if (!open) {
+          toast(err && err.shown ? err.closed : `Couldn't save ${quoted(body)}: ${errorText(err)}`, 'err');
+          return false;
+        }
+        formError.textContent = err && err.shown ? err.message : `Couldn't save: ${errorText(err)}`;
         formError.hidden = false;
         return false;
       }
+      // Closed while it saved: onClose has been and gone, so show the result now.
+      if (!open && alive) afterSave(saved);
       return true;
     }
 
@@ -1015,26 +1049,17 @@ function mountSchedules(root, ctx) {
         { label: 'Cancel', kind: 'secondary' },
         { label: s ? 'Save changes' : 'Create schedule', kind: 'primary', onClick: save },
       ],
+      // A stray click beside the dialog doesn't throw away what was typed (a long instruction):
+      // once the form has changed, only Cancel, Close or Esc close it.
+      beforeClose: (reason) => reason !== 'backdrop' || snapshot() === pristine,
       onClose: () => {
+        open = false;
         refocus(opener);
         if (saved && alive) afterSave(saved);
       },
     });
     dlg.el.classList.add('sch-dialog');
     const saveBtn = dlg.el.querySelector('.dialog-actions .btn-primary');
-    // A stray click beside the dialog doesn't throw away what was typed (a long instruction):
-    // once the form has changed, only Cancel, Close or Esc close it. This listener runs before
-    // the backdrop's own (a capture listener on the target fires first).
-    const backdrop = dlg.el.parentElement;
-    if (backdrop) {
-      backdrop.addEventListener(
-        'click',
-        (e) => {
-          if (e.target === backdrop && snapshot() !== pristine) e.stopImmediatePropagation();
-        },
-        true,
-      );
-    }
   }
 
   // Runs once the dialog has closed and focus is back on its opener, so re-rendering the list
@@ -1183,9 +1208,7 @@ function mountSchedules(root, ctx) {
       clearInterval(ticker);
       unsubscribe();
       for (const ctl of Object.values(ctls)) if (ctl) ctl.abort();
-      life.abort(); // closes this screen's dialogs and confirms
-      if (menu) menu.close(); // a no-op once it has closed
-      menu = null;
+      life.abort(); // closes this screen's dialogs, confirms and row menu
     },
   };
   // ?new=1 (e.g. from Home or the setup finish screen) opens the dialog once the screen is up.

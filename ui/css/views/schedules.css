@@ -135,6 +135,17 @@
 /* Busy (a run is starting): the spinner stands in for the dots. */
 .sch-menu-btn[aria-busy='true'] > svg { display: none; }
 
+/* Mid widths (a laptop at 1024–1200px): tighter gaps and more of the room for the last run, so
+   its "N sourced · N enriched · N drafted · N sent" line keeps to one line. */
+@container sch-list (min-width: 720px) and (max-width: 939px) {
+  .sch-list-head,
+  .sch-row,
+  .sch-skel-row {
+    grid-template-columns: 40px minmax(180px, 1.3fr) minmax(132px, 0.7fr) minmax(244px, 1.4fr) 32px;
+    column-gap: var(--space-3);
+  }
+}
+
 @container sch-list (max-width: 719px) {
   .sch-list-head { display: none; }
 
@@ -162,11 +173,9 @@
     overflow: visible;
     clip: auto;
     color: var(--text-3);
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.06em;
+    font-size: 12.5px;
+    font-weight: 500;
     line-height: 1.4;
-    text-transform: uppercase;
   }
 
   .sch-actions { margin-top: -8px; }
@@ -488,4 +497,10 @@
 @media (max-width: 599px) {
   .sch-choices { grid-template-columns: minmax(0, 1fr); }
   .sch-field-time { flex: 1 1 128px; }
+  /* "Try again" goes under the message, lined up with its text rather than the icon. */
+  .sch-error { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: start; }
+  .sch-error > svg { margin-top: 2px; }
+  .sch-error > .btn { grid-column: 2; justify-self: start; }
+  /* The sentence wraps here: the clock sits above it rather than off to one side. */
+  .sch-history-empty { flex-direction: column; }
 }
