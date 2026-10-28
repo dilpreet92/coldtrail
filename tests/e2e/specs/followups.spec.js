@@ -5,10 +5,11 @@
 // (/api/followups and /api/drafts), hostile text, long lists, the keyboard, leaving mid-turn,
 // accessibility in light and dark, and phone width.
 //
-// Tests in this file share one server and run in order. Three change data: "mark replied …" (a
-// Due row → Replied), "keyboard …" (an Awaiting row → Bounced) and "a reply check reports …" (an
-// Awaiting row each → Replied and → Bounced). Every test before them sees the seed as built, and
-// every test after them derives what it expects from the server.
+// Tests in this file share one server and run in order. Five change data: "mark replied …" (a
+// Due row → Replied), "keyboard …" (an Awaiting row → Bounced), "a reply check reports …" (an
+// Awaiting row each → Replied and → Bounced), "a mark made by hand during a check …" (a Due row →
+// Replied) and "changes made elsewhere …" (an Awaiting row → Bounced). Every test before them sees
+// the seed as built, and every test after them derives what it expects from the server.
 import { expectAccessible } from '../harness/a11y.mjs';
 import { test, expect } from '../harness/fixtures.mjs';
 import { COMPANIES, SEED } from '../harness/seed.mjs';
@@ -135,6 +136,11 @@ test('rows show the contact, touches and time since the last send', async ({ app
   await expect(li).toContainText('No email on file');
   await expect(li.getByRole('button', { name: /^Draft follow-up/ })).toHaveCount(0);
   await expect(li.getByRole('button', { name: `Mark replied, ${linkedin.domain}` })).toBeVisible();
+  // …so it doesn't promise a next touch either ("Due in 3 days" would never come to anything).
+  await expect(li.locator('.fu-state')).toHaveText('Awaiting reply');
+  // An awaiting row with an email says when its follow-up comes due.
+  const soon = seeded('awaiting').find((c) => emailOf(c) && c.outreach.length === 1);
+  await expect(row(page, soon.domain).locator('.fu-hint')).toHaveText(/^Due in \d+ days?$/);
 
   // Three touches with no reply: the sequence is over, and the row says so.
   const done = seeded('awaiting').find((c) => c.outreach.length === 3);
@@ -175,18 +181,47 @@ test('draft follow-up shows progress then a result', async ({ app, page }) => {
   await busy.click({ force: true });
   expect(gate.seen).toHaveLength(1);
 
-  // The real request goes to the fake agent, and the result comes back as a toast.
+  // The real request goes to the fake agent. Its turn ends well (ok:true) but it never runs
+  // `coldtrail followup`, so no draft exists: the toast says what actually happened.
   const response = page.waitForResponse((res) => res.url().endsWith(`/api/followups/${target.domain}/draft`));
   gate.release();
   expect(await (await response).json()).toMatchObject({ ok: true });
-  await expect(toastWith(page, `Follow-up drafted for ${target.domain}. Review it in Drafts.`)).toBeVisible({ timeout: AGENT_MS });
+  const none = toastWith(page, `The agent finished, but no follow-up draft was saved for ${target.domain}.`);
+  await expect(none).toBeVisible({ timeout: AGENT_MS });
+  await expect(none).toHaveAttribute('role', 'alert');
+  await expect(toastWith(page, 'Follow-up drafted for')).toHaveCount(0);
   await expect(r.locator('[data-action="draft"]')).toHaveText('Draft follow-up');
   await expect(r.locator('[data-action="draft"]')).not.toHaveAttribute('aria-disabled', 'true');
   await expect(r.locator('[data-action="replied"]')).not.toHaveAttribute('aria-disabled', 'true');
+  await expect(r.getByRole('link', { name: /^Review draft/ })).toHaveCount(0);
+});
+
+test('a saved follow-up draft is confirmed and replaces the button', async ({ app, page }) => {
+  const target = seeded('due').filter((c) => emailOf(c))[1];
+  // Stand in for an agent that does save a draft: once the turn ends, Drafts has it.
+  let saved = false;
+  await page.route(`**/api/followups/${target.domain}/draft`, (route) => {
+    saved = true;
+    return route.fulfill({ json: { ok: true, message: 'Follow-up drafted — review it in Drafts.' } });
+  });
+  await page.route('**/api/drafts', async (route) => {
+    const res = await route.fetch();
+    const drafts = await res.json();
+    if (saved) drafts.unshift({ domain: target.domain, to: emailOf(target), subject: 'Re: hi', body: 'Following up', status: 'draft_pending', gmail_draft_id: null, channel: 'email', auto_skip: null, contact_name: null, company_name: null });
+    await route.fulfill({ response: res, json: drafts });
+  });
+  await app.goto('#/followups');
+  await ready(page);
+  const r = row(page, target.domain);
+  await r.getByRole('button', { name: `Draft follow-up, ${target.domain}` }).click();
+  await expect(toastWith(page, `Follow-up drafted for ${target.domain}. Review it in Drafts.`)).toBeVisible();
+  const review = r.getByRole('link', { name: `Review draft, ${target.domain}` });
+  await expect(review).toHaveAttribute('href', `#/drafts/${target.domain}`);
+  await expect(r.getByRole('button', { name: /^Draft follow-up/ })).toHaveCount(0);
 });
 
 test('a failed draft says so, and a waiting draft replaces the button', async ({ app, page }) => {
-  const [first, second] = seeded('due').filter((c) => emailOf(c));
+  const [first, second, third] = seeded('due').filter((c) => emailOf(c));
   await page.route(`**/api/followups/${first.domain}/draft`, (route) =>
     route.fulfill({ json: { ok: false, message: 'Could not reach **Gmail** — try `opencode auth login`.' } }),
   );
@@ -195,6 +230,8 @@ test('a failed draft says so, and a waiting draft replaces the button', async ({
     const res = await route.fetch();
     const drafts = await res.json();
     drafts.unshift({ domain: second.domain, to: emailOf(second), subject: 'Re: hi', body: 'Following up', status: 'draft_pending', gmail_draft_id: null, channel: 'email', auto_skip: null });
+    // A LinkedIn draft for the third is not an email follow-up: that row can still get one.
+    drafts.unshift({ domain: third.domain, to: 'https://www.linkedin.com/in/someone', subject: null, body: 'Hi again', status: 'draft_pending', gmail_draft_id: null, channel: 'linkedin', auto_skip: null });
     await route.fulfill({ response: res, json: drafts });
   });
   await app.goto('#/followups');
@@ -211,6 +248,8 @@ test('a failed draft says so, and a waiting draft replaces the button', async ({
   const review = row(page, second.domain).getByRole('link', { name: `Review draft, ${second.domain}` });
   await expect(review).toHaveAttribute('href', `#/drafts/${second.domain}`);
   await expect(row(page, second.domain).getByRole('button', { name: /^Draft follow-up/ })).toHaveCount(0);
+  await expect(row(page, third.domain).getByRole('button', { name: `Draft follow-up, ${third.domain}` })).toBeVisible();
+  await expect(row(page, third.domain).getByRole('link', { name: /^Review draft/ })).toHaveCount(0);
 });
 
 test('check for replies shows progress and completes', async ({ app, page }) => {
@@ -220,7 +259,7 @@ test('check for replies shows progress and completes', async ({ app, page }) => 
   const gate = await hold(page, '**/api/followups/check');
 
   await checkBtn(page).click();
-  await expect(checkBtn(page)).toHaveText('Checking…');
+  await expect(checkBtn(page)).toHaveText('Checking for replies…');
   await expect(checkBtn(page)).toHaveAttribute('aria-busy', 'true');
   await expect(checkBtn(page)).toHaveAttribute('aria-disabled', 'true');
   await expect(checkBtn(page)).toBeFocused(); // a busy button keeps focus
@@ -234,11 +273,11 @@ test('check for replies shows progress and completes', async ({ app, page }) => 
   const body = await (await response).json();
   expect(body.ok).toBe(true);
   await expect(notice(page)).toContainText('Reply check finished', { timeout: AGENT_MS });
-  // The fake agent marks nothing: the result says so from the list itself, whatever text the
-  // provider returned (opencode turns return none; any that is returned renders as agent text).
+  // The fake agent marks nothing: the result says so from the list itself, and then shows the
+  // agent's own final text (opencode turns return it), rendered as agent text.
   await expect(notice(page).locator('.fu-changes')).toHaveText('No new replies or bounces.');
-  if (body.message) await expect(notice(page).locator('.fu-md')).toContainText(body.message.split('\n')[0]);
-  else await expect(notice(page).locator('.fu-md')).toHaveCount(0);
+  expect(body.message).toMatch(/^Fake agent reply: Check Gmail/);
+  await expect(notice(page).locator('.fu-md')).toContainText('Fake agent reply: Check Gmail');
   await expect(checkBtn(page)).toHaveText('Check for replies');
   await expect(checkBtn(page)).not.toHaveAttribute('aria-disabled', 'true');
   // The fake agent marks nothing, so the counts hold.
@@ -360,6 +399,84 @@ test('a reply check reports who replied or bounced', async ({ app, page }) => {
   await expect(tab(page, 'Bounced').locator('.tab-count')).toHaveText(count('bounced'));
 });
 
+test('a mark made by hand during a check is not credited to it', async ({ app, page }) => {
+  await app.goto('#/followups');
+  await ready(page);
+  const list = async () => (await (await page.request.get(app.server.apiUrl('/api/followups'))).json());
+  const target = (await list()).find((f) => f.state === 'due' && f.to);
+  const gate = await hold(page, '**/api/followups/check');
+  await checkBtn(page).click();
+  await expect(checkBtn(page)).toHaveText('Checking for replies…');
+
+  // While the agent reads Gmail, the user marks a reply they already know about.
+  await row(page, target.domain).getByRole('button', { name: `Mark replied, ${target.domain}` }).click();
+  await expect(toastWith(page, `Marked ${target.domain} as replied.`)).toBeVisible();
+  await expect(row(page, target.domain)).toHaveCount(0);
+
+  // The fake agent marks nothing, so the check found nothing: the hand mark isn't its finding.
+  gate.release();
+  await expect(notice(page).locator('.fu-changes')).toHaveText('No new replies or bounces.', { timeout: AGENT_MS });
+  expect((await list()).find((f) => f.domain === target.domain).state).toBe('replied');
+});
+
+test('a failed mark is reported even after leaving the screen', async ({ app, page }) => {
+  app.allowConsole(/Failed to load resource/);
+  await app.goto('#/followups');
+  await ready(page);
+  const domain = await rows(page).first().getAttribute('data-key');
+  let release;
+  const gate = new Promise((r) => (release = r));
+  await page.route(`**/api/followups/${domain}/mark`, async (route) => {
+    await gate;
+    await route.fulfill({ status: 500, body: 'database is locked' });
+  });
+  await row(page, domain).getByRole('button', { name: `Mark bounced, ${domain}` }).click();
+  await expect(row(page, domain).locator('[data-action="bounced"]')).toHaveAttribute('aria-busy', 'true');
+  await expect(row(page, domain).locator('[data-action="replied"]')).toHaveAttribute('aria-disabled', 'true');
+
+  await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: /^Home\b/ }).click();
+  await expect(page.locator('#view h1')).toHaveText('Home');
+  release();
+  const err = toastWith(page, `Couldn't mark ${domain} as bounced.`);
+  await expect(err).toBeVisible();
+  await expect(err).toContainText('database is locked');
+  await expect(err).toHaveAttribute('role', 'alert');
+});
+
+test('changes made elsewhere reach the open list', async ({ app, page }) => {
+  const list = async () => (await (await page.request.get(app.server.apiUrl('/api/followups'))).json());
+  const before = await list();
+  const count = (state, d = 0) => fmtNum(before.filter((f) => f.state === state).length + d);
+  const target = before.find((f) => f.state === 'awaiting');
+  const due = before.find((f) => f.state === 'due' && f.to);
+  // Drafts gains a follow-up for the due company once `drafted` is set (written on another screen).
+  let drafted = false;
+  await page.route('**/api/drafts', async (route) => {
+    const res = await route.fetch();
+    const drafts = await res.json();
+    if (drafted) drafts.unshift({ domain: due.domain, to: due.to, subject: 'Re: hi', body: 'Following up', status: 'draft_pending', gmail_draft_id: null, channel: 'email', auto_skip: null, contact_name: null, company_name: null });
+    await route.fulfill({ response: res, json: drafts });
+  });
+  await app.goto('#/followups');
+  await ready(page);
+  await expect(row(page, due.domain).getByRole('button', { name: `Draft follow-up, ${due.domain}` })).toBeVisible();
+  const summary = async () => (await (await page.request.get(app.server.apiUrl('/api/summary'))).json()).counts;
+  const countsBefore = await summary();
+
+  // A chat turn bounces an awaiting contact (none of the summary's counts move), and a draft is
+  // written elsewhere.
+  await page.request.post(app.server.apiUrl(`/api/followups/${target.domain}/mark`), { data: { value: 'bounced' } });
+  const countsAfter = await summary();
+  expect([countsAfter.followups_due, countsAfter.replied, countsAfter.sent]).toEqual([countsBefore.followups_due, countsBefore.replied, countsBefore.sent]);
+  drafted = true;
+
+  // The store's next refresh (every 30s, or on coming back to the tab) brings both in.
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await expect(row(page, due.domain).getByRole('link', { name: `Review draft, ${due.domain}` })).toBeVisible();
+  await expect(tab(page, 'Awaiting').locator('.tab-count')).toHaveText(count('awaiting', -1));
+  await expect(tab(page, 'Bounced').locator('.tab-count')).toHaveText(count('bounced', 1));
+});
+
 test('filter narrows the list and long lists show 100 rows at a time', async ({ app, page }) => {
   const many = Array.from({ length: 250 }, (_, i) => ({
     domain: `company-${String(i + 1).padStart(3, '0')}.example`,
@@ -413,16 +530,22 @@ test('loading, error and retry', async ({ app, page }) => {
   await expect(page.locator('.fu-content')).toHaveAttribute('aria-busy', 'true');
   await expect(page.locator('.fu-content .skeleton').first()).toBeVisible();
   await expect(tab(page, 'Due').locator('.tab-count')).toBeHidden();
+  // The filter can be typed into meanwhile.
+  const filter = page.getByRole('searchbox', { name: 'Filter follow-ups' });
+  await expect(filter).toBeVisible();
 
   gate.release();
   await expect(page.locator('.fu-content')).toHaveAttribute('aria-busy', 'false');
   await expect(page.locator('.fu-content')).toContainText("Couldn't load follow-ups");
   await expect(page.locator('.fu-content')).toContainText('database is locked');
+  // Nothing loaded, so there is nothing to filter.
+  await expect(filter).toBeHidden();
 
   fail = false;
   await page.getByRole('button', { name: 'Try again' }).click();
   await ready(page);
   await expect(rows(page).first()).toBeVisible();
+  await expect(filter).toBeVisible();
   await expect(page.locator('.fu-content')).not.toContainText("Couldn't load follow-ups");
 });
 
@@ -453,6 +576,13 @@ test('hostile follow-up data renders as text', async ({ app, page }) => {
   await ready(page);
   await expect(row(page, evil).getByRole('link', { name: evil })).toBeVisible();
   await expect(row(page, evil)).toContainText('"><script>window.__xss=2</script>@x.example');
+  // A state this UI doesn't know is still listed (under Awaiting), with its raw label as text.
+  await expect(tab(page, 'Awaiting').locator('.tab-count')).toHaveText('1');
+  await tab(page, 'Awaiting').click();
+  const odd = row(page, 'weird.example');
+  await expect(odd.locator('.badge')).toHaveText('<b onmouseover=window.__xss=3>odd</b>');
+  await expect(odd.locator('b')).toHaveCount(0);
+  await tab(page, 'Due').click();
   await checkBtn(page).click();
   const md = notice(page).locator('.fu-md');
   await expect(md).toContainText('<img src=x onerror=window.__xss=4>');
@@ -489,7 +619,7 @@ test('leaving mid-check stops the screen timers and the result waits', async ({ 
   expect(await ours()).toBe(0);
   const gate = await hold(page, '**/api/followups/check');
   await checkBtn(page).click();
-  await expect(checkBtn(page)).toHaveText('Checking…');
+  await expect(checkBtn(page)).toHaveText('Checking for replies…');
   await expect.poll(ours).toBe(1);
 
   await nav.getByRole('link', { name: /^Home\b/ }).click();
@@ -499,20 +629,24 @@ test('leaving mid-check stops the screen timers and the result waits', async ({ 
   // Coming back mid-check shows it still running.
   await page.goBack();
   await ready(page);
-  await expect(checkBtn(page)).toHaveText('Checking…');
+  await expect(checkBtn(page)).toHaveText('Checking for replies…');
   await expect(notice(page)).toContainText('Checking Gmail for replies');
   await expect.poll(ours).toBe(1);
   await page.goForward();
   await expect(page.locator('#view h1')).toHaveText('Home');
   await expect.poll(ours).toBe(0);
 
-  // It finishes while elsewhere: a toast says so, and the result is waiting on Follow-ups.
+  // It finishes while elsewhere: a toast says what it found, and the result is waiting on
+  // Follow-ups.
   gate.release();
-  await expect(toastWith(page, 'Reply check finished. The summary is on Follow-ups.')).toBeVisible({ timeout: AGENT_MS });
+  await expect(
+    toastWith(page, 'Reply check finished: no new replies or bounces. The details are on Follow-ups.'),
+  ).toBeVisible({ timeout: AGENT_MS });
   expect(await ours()).toBe(0);
   await page.goBack();
   await ready(page);
   await expect(notice(page)).toContainText('Reply check finished');
+  await expect(notice(page).locator('.fu-changes')).toHaveText('No new replies or bounces.');
   await expect(checkBtn(page)).toHaveText('Check for replies');
   expect(await ours()).toBe(0);
 });
@@ -553,6 +687,19 @@ test('phone width: no horizontal scroll and the actions stay reachable', async (
   await action.scrollIntoViewIfNeeded();
   await expect(action).toBeInViewport();
   await expect(checkBtn(page)).toBeInViewport();
+  // The cards keep the next step ("Follow-up 1 of 2"), under the badge.
+  await expect(first.locator('.fu-hint')).toBeVisible();
+  await expect(first.locator('.fu-hint')).toHaveText(/^Follow-up \d of 2$/);
+
+  // The filter goes under the tabs, and the rule stays under the tabs (the selected tab's
+  // underline sits on it), not under the filter.
+  const box = async (loc) => loc.boundingBox();
+  const [list, filter] = [await box(tablist(page)), await box(page.locator('.fu-filter'))];
+  expect(filter.y).toBeGreaterThanOrEqual(list.y + list.height);
+  expect(await tablist(page).evaluate((el) => getComputedStyle(el).borderBottomWidth)).toBe('1px');
+  expect(await page.locator('.fu-tools').evaluate((el) => getComputedStyle(el).borderBottomWidth)).toBe('0px');
+  const selected = await box(tab(page, 'Due'));
+  expect(Math.abs(selected.y + selected.height - (list.y + list.height))).toBeLessThanOrEqual(1.5);
 
   await page.emulateMedia({ colorScheme: 'dark' });
   await expectAccessible(page);
@@ -572,8 +719,12 @@ test.describe('new workspace', () => {
     await expect(empty.getByRole('link', { name: 'Review drafts' })).toHaveAttribute('href', '#/drafts');
     for (const [, label] of STATES) await expect(tab(page, label).locator('.tab-count')).toHaveText('0');
 
-    // The real check has nothing to do and says so.
+    // The real check has nothing to do and says so. With no one to count, the progress line
+    // doesn't say "from 0 contacts".
+    const gate = await hold(page, '**/api/followups/check');
     await checkBtn(page).click();
+    await expect(notice(page).locator('.fu-notice-title')).toHaveText('Checking Gmail for replies…');
+    gate.release();
     await expect(notice(page)).toContainText('Nothing is awaiting a reply.', { timeout: AGENT_MS });
 
     await expectAccessible(page);

@@ -3,7 +3,7 @@
 // follow-up (POST /api/followups/:domain/draft, one agent turn), Mark replied / Mark bounced
 // (POST /api/followups/:domain/mark). Header action: Check for replies (POST
 // /api/followups/check, one agent turn that reads Gmail). GET /api/drafts tells which due rows
-// already have a draft waiting, so a second follow-up isn't drafted by accident.
+// already have an email draft waiting, so a second follow-up isn't drafted by accident.
 //
 // Agent turns take minutes and the server keeps running them whatever the page does, so they
 // belong to the page, not the screen: leaving Follow-ups never cancels one, coming back shows its
@@ -15,7 +15,7 @@ import { debounce, fmtNum, h, pluralize, truncate } from '../core/dom.js';
 import { renderMarkdown } from '../core/markdown.js';
 import { href } from '../core/router.js';
 import { store } from '../core/store.js';
-import { toast } from '../core/ui.js';
+import { setBusy, toast } from '../core/ui.js';
 import { badge } from '../components/badge.js';
 import { emptyState } from '../components/emptyState.js';
 import { table } from '../components/table.js';
@@ -57,58 +57,71 @@ const STATES = [
 ];
 const STATE = Object.fromEntries(STATES.map((st) => [st.id, st]));
 const tabFrom = (query) => (query && STATE[query.tab] ? query.tab : 'due');
+/** The tab a row is listed under. A state this UI doesn't know (the server only sends the four
+ *  above today) still shows, under Awaiting, with its raw label. */
+const tabOf = (r) => (STATE[r.state] ? r.state : 'awaiting');
+const isOpen = (r) => r.state === 'due' || r.state === 'awaiting';
+const lower = (s) => String(s ?? '').toLowerCase();
+/** Follow-ups are always email: a LinkedIn draft for the same company is not one. */
+const isEmailDraft = (d) => !!d && (d.channel || 'email') === 'email';
 
 // ---- Agent turns: page-lifetime state ----
 
 const jobs = {
-  check: null, // { startedAt, contacts } while a reply check runs
-  result: null, // { tone, title, message, markdown, at } of the last check, until dismissed
+  // While a reply check runs: { startedAt, contacts, before: Map(domain → state) | null,
+  // manual: Set(domain) marked by hand meanwhile, so the result doesn't credit the check }.
+  check: null,
+  result: null, // { tone, title, message, markdown, changes?, at } of the last check, until dismissed
   drafting: new Set(), // domains whose follow-up the agent is writing
 };
 let screen = null; // hooks of the mounted screen, or null
 
-function runCheck(contacts, before) {
-  jobs.check = { startedAt: Date.now(), contacts, before };
+function runCheck(contacts, before, manual) {
+  const job = { startedAt: Date.now(), contacts, before, manual };
+  jobs.check = job;
   jobs.result = null;
   api
     .post('/api/followups/check', {})
     .then(
-      (r) => {
-        jobs.result =
-          r && r.ok
-            ? { tone: 'ok', title: 'Reply check finished', message: r.message || null, markdown: true }
-            : { tone: 'warn', title: "Couldn't check for replies", message: (r && r.message) || 'The agent could not check Gmail.', markdown: true };
-      },
-      (err) => {
-        jobs.result = { tone: 'err', title: 'Reply check failed', message: (err && err.message) || String(err), markdown: false };
-      },
+      (r) =>
+        r && r.ok
+          ? { tone: 'ok', title: 'Reply check finished', message: r.message || null, markdown: true }
+          : { tone: 'warn', title: "Couldn't check for replies", message: (r && r.message) || 'The agent could not check Gmail.', markdown: true },
+      (err) => ({ tone: 'err', title: 'Reply check failed', message: (err && err.message) || String(err), markdown: false }),
     )
-    .finally(() => {
-      // What the check changed is known once the list reloads (see diffCheck).
-      if (jobs.result.tone === 'ok') jobs.result.before = jobs.check.before;
-      jobs.result.at = new Date();
+    .then(async (result) => {
+      // Who it moved to replied / bounced, read from the list right away (not when Follow-ups
+      // next loads, which would also count changes made elsewhere meanwhile).
+      if (result.tone === 'ok' && job.before) result.changes = await changesSince(job);
+      result.at = new Date();
+      jobs.result = result;
       jobs.check = null;
       if (screen) {
         screen.afterCheck();
       } else {
-        const r = jobs.result;
-        toast(r.tone === 'ok' ? 'Reply check finished. The summary is on Follow-ups.' : `${r.title}. The details are on Follow-ups.`, r.tone === 'ok' ? 'ok' : 'err');
+        const ok = result.tone === 'ok';
+        const what = ok ? (result.changes ? `Reply check finished: ${changesShort(result.changes)}.` : 'Reply check finished.') : `${result.title}.`;
+        toast(`${what} The details are on Follow-ups.`, ok ? 'ok' : 'err');
         store.refresh();
       }
     });
 }
 
-/** Once the list has reloaded after a check: who it moved to replied / bounced. */
-function diffCheck(rows) {
-  const r = jobs.result;
-  if (!r || !r.before || jobs.check) return;
+/** { replied: [domain], bounced: [domain] } the check changed, or null if the list didn't load. */
+async function changesSince(job) {
+  let rows;
+  try {
+    rows = await api.get('/api/followups');
+  } catch (_) {
+    return null;
+  }
+  if (!Array.isArray(rows)) return null;
   const changes = { replied: [], bounced: [] };
   for (const row of rows) {
-    const was = r.before.get(row.domain);
-    if (was && was !== row.state && changes[row.state]) changes[row.state].push(row.domain);
+    const was = job.before.get(row.domain);
+    if (was && was !== row.state && changes[row.state] && !job.manual.has(row.domain)) changes[row.state].push(row.domain);
   }
-  r.changes = changes;
-  r.before = null;
+  return changes;
 }
 
 /** "No new replies or bounces." / "1 new reply (a.example) and 2 bounces (b.example, c.example)." */
@@ -120,14 +133,40 @@ function changesText({ replied, bounced }) {
   return parts.length ? `${parts.join(' and ')}.` : 'No new replies or bounces.';
 }
 
+/** "no new replies or bounces" / "1 new reply and 2 bounces" (a toast's short form). */
+function changesShort({ replied, bounced }) {
+  const parts = [];
+  if (replied.length) parts.push(pluralize(replied.length, 'new reply', 'new replies'));
+  if (bounced.length) parts.push(pluralize(bounced.length, 'bounce'));
+  return parts.length ? parts.join(' and ') : 'no new replies or bounces';
+}
+
+/** Whether an email draft for `domain` is waiting in Drafts; null when that can't be told. */
+async function hasEmailDraft(domain) {
+  try {
+    const list = await api.get('/api/drafts');
+    return Array.isArray(list) ? list.some((d) => isEmailDraft(d) && lower(d.domain) === lower(domain)) : null;
+  } catch (_) {
+    return null;
+  }
+}
+
 function runDraft(domain) {
   jobs.drafting.add(domain);
   api
     .post(`/api/followups/${encodeURIComponent(domain)}/draft`, {})
     .then(
-      (r) => {
-        if (r && r.ok) toast(`Follow-up drafted for ${domain}. Review it in Drafts.`, 'ok');
-        else toast(`Couldn't draft a follow-up for ${domain}.\n${r && r.message ? mdPlain(r.message) : 'The agent finished without writing one.'}`, 'err');
+      async (r) => {
+        if (!(r && r.ok)) {
+          toast(`Couldn't draft a follow-up for ${domain}.\n${r && r.message ? mdPlain(r.message) : 'The agent finished without writing one.'}`, 'err');
+          return;
+        }
+        // ok says how the agent's turn ended, not that it saved anything: look in Drafts.
+        if ((await hasEmailDraft(domain)) === false) {
+          toast(`The agent finished, but no follow-up draft was saved for ${domain}.`, 'err');
+        } else {
+          toast(`Follow-up drafted for ${domain}. Review it in Drafts.`, 'ok');
+        }
       },
       (err) => toast(`Couldn't draft a follow-up for ${domain}.\n${(err && err.message) || err}`, 'err'),
     )
@@ -157,21 +196,21 @@ const ICONS = {
   close: 'M6 6l12 12M18 6L6 18',
 };
 
-const spinner = () => h('span', { class: 'fu-spin', 'aria-hidden': 'true' });
-
 /** "Less than a day" / "1 day" / "9 days" since the last send (whole days, as the API counts). */
 function sinceLabel(days) {
   const d = Math.max(0, Math.floor(Number(days) || 0));
   return d < 1 ? 'Less than a day' : pluralize(d, 'day');
 }
 
-/** What comes next for a row still open: which follow-up is due, or when the next one is. */
+/** What comes next for a row still open: which follow-up is due, or when the next one is. A
+ *  row without an email can't get a drafted follow-up, so it promises none. */
 function nextStep(r) {
   const touches = Number(r.touches) || 0;
+  if (r.state === 'awaiting' && touches >= MAX_TOUCHES) return 'No more follow-ups';
+  if (!r.to) return null;
   if (r.state === 'due') return `Follow-up ${fmtNum(touches)} of ${fmtNum(MAX_TOUCHES - 1)}`;
-  if (r.state !== 'awaiting') return null;
-  if (touches >= MAX_TOUCHES) return 'No more follow-ups';
-  return `Due in ${pluralize(Math.max(1, DUE_AFTER_DAYS - (Number(r.days) || 0)), 'day')}`;
+  if (r.state === 'awaiting') return `Due in ${pluralize(Math.max(1, DUE_AFTER_DAYS - (Number(r.days) || 0)), 'day')}`;
+  return null;
 }
 
 /** "0:07", "12:30". */
@@ -205,11 +244,6 @@ function mdPlain(text) {
   return truncate(lines.join('\n'), 400);
 }
 
-const sigOf = (summary) => {
-  const c = summary && summary.counts;
-  return c ? `${c.followups_due}|${c.replied}|${c.sent}` : null;
-};
-
 // ---- The screen ----
 
 function mount(root, ctx) {
@@ -219,7 +253,7 @@ function mount(root, ctx) {
     q: (ctx.query && ctx.query.q) || '',
     limit: PAGE,
     rows: null, // FollowupDto[] once loaded
-    pending: new Set(), // lowercased domains with a draft waiting in Drafts
+    pending: new Set(), // lowercased domains with an email draft waiting in Drafts
     error: null,
     loading: false,
     marking: new Map(), // domain → the value being marked
@@ -227,15 +261,20 @@ function mount(root, ctx) {
   };
   const ac = new AbortController();
   let loadSeq = 0;
+  let loaded = null; // what the last render showed (rows + pending), to skip identical reloads
   let ticker = null;
   let elapsedEl = null;
   let selfRefresh = false;
-  let sig = sigOf(store.get().summary);
   let revealFrom = null; // first row index shown by the last "Show more"
 
   // ---- Header ----
 
-  const checkBtn = h('button', { type: 'button', class: 'btn btn-secondary fu-check', 'data-action': 'check', onClick: startCheck });
+  const checkBtn = h(
+    'button',
+    { type: 'button', class: 'btn btn-secondary fu-check', 'data-action': 'check', onClick: startCheck },
+    icon(ICONS.mail),
+    h('span', {}, 'Check for replies'),
+  );
   const head = h(
     'div',
     { class: 'page-head' },
@@ -274,14 +313,15 @@ function mount(root, ctx) {
     s.q = filterInput.value;
     s.limit = PAGE;
     renderContent();
-    nav.setQuery({ q: s.q || null });
+    nav.setQuery({ q: s.q || null }, { silent: true });
   }, FILTER_MS);
   filterInput.addEventListener('input', onFilter);
   filterInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') onFilter.flush();
   });
   const filterBox = h('div', { class: 'fu-filter' }, icon(ICONS.search), filterInput);
-  const tools = h('div', { class: 'fu-tools' }, tabsEl, filterBox);
+  // The wrapper is the size container the narrow layout (tabs over the filter) is chosen by.
+  const tools = h('div', { class: 'fu-toolbar' }, h('div', { class: 'fu-tools' }, tabsEl, filterBox));
   const content = h('section', { class: 'fu-content', id: contentId, role: 'tabpanel', 'aria-busy': 'true' });
 
   root.append(head, noticeSlot, tools, content, live);
@@ -301,22 +341,19 @@ function mount(root, ctx) {
   function filtered() {
     const needle = s.q.trim().toLowerCase();
     if (!needle) return s.rows;
-    return s.rows.filter((r) => String(r.domain).toLowerCase().includes(needle) || String(r.to ?? '').toLowerCase().includes(needle));
+    return s.rows.filter((r) => lower(r.domain).includes(needle) || lower(r.to).includes(needle));
   }
 
   // Tab counts follow the filter, so a match under another tab shows where it is.
   function updateCounts() {
     const counts = Object.fromEntries(STATES.map((st) => [st.id, s.rows ? 0 : null]));
-    if (s.rows) for (const r of filtered()) if (r.state in counts) counts[r.state] += 1;
+    if (s.rows) for (const r of filtered()) counts[tabOf(r)] += 1;
     tabsEl.setCounts(counts);
   }
 
   function renderCheck() {
     const running = !!jobs.check;
-    checkBtn.setAttribute('aria-busy', running ? 'true' : 'false');
-    if (running) checkBtn.setAttribute('aria-disabled', 'true');
-    else checkBtn.removeAttribute('aria-disabled');
-    checkBtn.replaceChildren(running ? spinner() : icon(ICONS.mail), h('span', {}, running ? 'Checking…' : 'Check for replies'));
+    setBusy(checkBtn, running, { label: 'Checking for replies…' });
     renderNotice();
     if (running && !ticker) ticker = setInterval(tick, 1000);
     if (!running && ticker) {
@@ -330,7 +367,7 @@ function mount(root, ctx) {
   }
 
   function noticeBox(tone, heading, body, meta, dismissible) {
-    const mark = tone === 'progress' ? spinner() : icon(ICONS[tone] || ICONS.ok, 18);
+    const mark = tone === 'progress' ? h('span', { class: 'spinner', 'aria-hidden': 'true' }) : icon(ICONS[tone] || ICONS.ok, 18);
     return h(
       'div',
       { class: `fu-notice fu-notice-${tone}` },
@@ -351,7 +388,7 @@ function mount(root, ctx) {
       noticeSlot.replaceChildren(
         noticeBox(
           'progress',
-          n == null ? 'Checking Gmail for replies…' : `Checking Gmail for replies from ${pluralize(n, 'contact')}…`,
+          n ? `Checking Gmail for replies from ${pluralize(n, 'contact')}…` : 'Checking Gmail for replies…',
           h('p', { class: 'fu-notice-text' }, 'The agent reads your inbox and marks who replied or bounced. This can take a few minutes, and you can leave this screen meanwhile.'),
           [elapsedEl, ' elapsed'],
           false,
@@ -363,11 +400,11 @@ function mount(root, ctx) {
       if (r.tone !== 'ok') {
         body = r.markdown ? mdBlock(r.message) : h('p', { class: 'fu-notice-text' }, r.message);
       } else {
+        // coldtrail's own summary (from the list), then whatever the agent reported.
         body = [
           r.changes ? h('p', { class: 'fu-notice-text fu-changes' }, changesText(r.changes)) : null,
-          r.before ? h('p', { class: 'fu-notice-text' }, 'Updating the list…') : null,
           r.message ? mdBlock(r.message) : null,
-          !r.changes && !r.before && !r.message ? h('p', { class: 'fu-notice-text' }, 'The agent did not report anything.') : null,
+          !r.changes && !r.message ? h('p', { class: 'fu-notice-text' }, 'The agent did not report anything.') : null,
         ];
       }
       noticeSlot.replaceChildren(noticeBox(r.tone, r.title, body, r.at ? `Finished at ${clock(r.at)}` : null, true));
@@ -406,8 +443,9 @@ function mount(root, ctx) {
     return h('div', { class: 'fu-panel', ...attrs }, node);
   }
 
+  /** A row action. `busy` (a label, or true to keep the text) shows the shared busy state. */
   function actButton({ action, domain, text, aria, kind = 'ghost', busy = false, disabled = false, onClick }) {
-    return h(
+    const b = h(
       'button',
       {
         type: 'button',
@@ -415,12 +453,13 @@ function mount(root, ctx) {
         'data-action': action,
         'data-domain': domain,
         'aria-label': aria,
-        'aria-busy': busy ? 'true' : null,
-        'aria-disabled': busy || disabled ? 'true' : null,
+        'aria-disabled': disabled ? 'true' : null,
         onClick,
       },
       text,
     );
+    if (busy) setBusy(b, true, typeof busy === 'string' ? { label: busy } : {});
+    return b;
   }
 
   function actionsCell(r) {
@@ -429,7 +468,7 @@ function mount(root, ctx) {
     const marking = s.marking.has(domain);
     const box = h('div', { class: 'fu-actions' });
     if (r.state === 'due' && r.to) {
-      if (!drafting && s.pending.has(String(domain).toLowerCase())) {
+      if (!drafting && s.pending.has(lower(domain))) {
         box.append(
           h('a', { class: 'btn btn-secondary btn-sm', href: href(['drafts', domain]), 'data-action': 'review', 'data-domain': domain, 'aria-label': `Review draft, ${domain}` }, 'Review draft'),
         );
@@ -439,27 +478,29 @@ function mount(root, ctx) {
             action: 'draft',
             domain,
             kind: 'secondary',
-            text: drafting ? [spinner(), 'Drafting…'] : 'Draft follow-up',
+            text: 'Draft follow-up',
             aria: `${drafting ? 'Drafting follow-up' : 'Draft follow-up'}, ${domain}`,
-            busy: drafting,
+            busy: drafting ? 'Drafting…' : false,
             disabled: marking,
             onClick: () => draftFollowup(domain),
           }),
         );
       }
     }
-    for (const value of ['replied', 'bounced']) {
-      box.append(
-        actButton({
-          action: value,
-          domain,
-          text: `Mark ${value}`,
-          aria: `Mark ${value}, ${domain}`,
-          busy: marking && s.marking.get(domain) === value,
-          disabled: drafting || marking,
-          onClick: () => mark(domain, value),
-        }),
-      );
+    if (isOpen(r)) {
+      for (const value of ['replied', 'bounced']) {
+        box.append(
+          actButton({
+            action: value,
+            domain,
+            text: `Mark ${value}`,
+            aria: `Mark ${value}, ${domain}`,
+            busy: marking && s.marking.get(domain) === value,
+            disabled: drafting || marking,
+            onClick: () => mark(domain, value),
+          }),
+        );
+      }
     }
     return box;
   }
@@ -488,7 +529,7 @@ function mount(root, ctx) {
         key: 'touches',
         label: 'Touches',
         align: 'right',
-        // data-unit: the word the phone layout adds after the number (CSS generated content).
+        // data-unit: the word the card layout adds after the number (CSS generated content).
         render: (r) => h('span', { class: 'mono num', 'data-unit': Number(r.touches) === 1 ? 'touch' : 'touches' }, fmtNum(r.touches)),
       },
       {
@@ -503,22 +544,6 @@ function mount(root, ctx) {
       cols.push({ key: 'actions', label: h('span', { class: 'sr-only' }, 'Actions'), align: 'right', nowrap: true, render: actionsCell });
     }
     return cols;
-  }
-
-  /** Explicit table roles (phones restyle the rows as cards, which would drop the implicit
-   *  ones) and a class per column for that layout. */
-  function withRoles(wrap, cols) {
-    const tbl = wrap.querySelector('table');
-    tbl.setAttribute('role', 'table');
-    for (const g of tbl.querySelectorAll('thead, tbody')) g.setAttribute('role', 'rowgroup');
-    for (const tr of tbl.querySelectorAll('tr')) {
-      tr.setAttribute('role', 'row');
-      [...tr.children].forEach((cell, i) => {
-        cell.setAttribute('role', cell.tagName === 'TH' ? 'columnheader' : 'cell');
-        if (cols[i]) cell.classList.add(`fu-c-${cols[i].key}`);
-      });
-    }
-    return wrap;
   }
 
   const rowEls = () => [...content.querySelectorAll('tbody tr[data-key]')];
@@ -538,7 +563,7 @@ function mount(root, ctx) {
     if (f.action === 'more') {
       target = content.querySelector('[data-action="more"]') || (revealFrom != null ? inRow(trs[revealFrom]) : null);
     } else if (f.action === 'clear' || f.action === 'retry') {
-      target = filterInput;
+      target = filterBox.hidden ? null : filterInput;
     } else {
       const same = f.domain != null ? trs.find((tr) => tr.dataset.key === f.domain) : null;
       if (same) target = inRow(same);
@@ -552,6 +577,9 @@ function mount(root, ctx) {
     const focus = captureFocus();
     syncPanelLabel();
     if (!s.rows) {
+      // While loading the filter can be typed into (it applies once the rows land); after a
+      // failed load there is nothing for it to filter.
+      filterBox.hidden = !!s.error;
       if (s.error) {
         content.setAttribute('aria-busy', 'false');
         content.replaceChildren(
@@ -574,8 +602,8 @@ function mount(root, ctx) {
     content.setAttribute('aria-busy', s.loading ? 'true' : 'false');
 
     const st = STATE[s.tab];
-    const inTab = s.rows.filter((r) => r.state === s.tab);
-    const matched = filtered().filter((r) => r.state === s.tab);
+    const inTab = s.rows.filter((r) => tabOf(r) === s.tab);
+    const matched = filtered().filter((r) => tabOf(r) === s.tab);
     filterBox.hidden = !s.rows.length && !s.q;
     updateCounts();
 
@@ -603,17 +631,17 @@ function mount(root, ctx) {
       );
     } else {
       const shown = matched.slice(0, s.limit);
-      const cols = columns(s.tab);
+      // Explicit roles: the card layout restyles the rows, which would drop the implicit ones.
+      // A class per column places each cell in that layout.
       const parts = [
-        withRoles(
-          table({
-            columns: cols,
-            rows: shown,
-            rowKey: 'domain',
-            label: `${st.label} follow-ups`,
-          }),
-          cols,
-        ),
+        table({
+          columns: columns(s.tab),
+          rows: shown,
+          rowKey: 'domain',
+          label: `${st.label} follow-ups`,
+          roles: true,
+          cellClass: (col) => `fu-c-${col.key}`,
+        }),
       ];
       if (matched.length > shown.length) {
         parts.push(
@@ -633,7 +661,7 @@ function mount(root, ctx) {
   /** Where the filter does match, when it isn't the open tab. */
   function elsewhere() {
     const hits = STATES.filter((x) => x.id !== s.tab)
-      .map((x) => [x, filtered().filter((r) => r.state === x.id).length])
+      .map((x) => [x, filtered().filter((r) => tabOf(r) === x.id).length])
       .filter(([, n]) => n > 0);
     if (!hits.length) return 'No domain or email under any tab contains that text.';
     return `Nothing under ${STATE[s.tab].label}, but ${hits.map(([x, n]) => `${fmtNum(n)} under ${x.label}`).join(' and ')}.`;
@@ -656,7 +684,10 @@ function mount(root, ctx) {
 
   // ---- Data ----
 
-  async function load() {
+  /** Fetch the list and the drafts. `quiet` (a background check for changes made elsewhere):
+   *  skipped while another load runs, no error toast, and no re-render when nothing changed. */
+  async function load({ quiet = false } = {}) {
+    if (quiet && s.loading) return;
     const seq = ++loadSeq;
     s.loading = true;
     if (!s.rows) renderContent();
@@ -669,44 +700,39 @@ function mount(root, ctx) {
     if (fu.status === 'fulfilled') {
       s.rows = Array.isArray(fu.value) ? fu.value : [];
       s.error = null;
-      if (jobs.result && jobs.result.before) {
-        diffCheck(s.rows);
-        renderNotice();
-      }
-    } else {
+    } else if (!quiet) {
       if (s.rows) toast(`Couldn't refresh follow-ups: ${fu.reason && fu.reason.message}`, 'err');
       else s.error = fu.reason || new Error('Unknown error');
-      // Without a fresh list there is nothing to compare a finished check against.
-      if (jobs.result && jobs.result.before && !jobs.check) {
-        jobs.result.before = null;
-        renderNotice();
-      }
     }
     // The drafts list only adds the "Review draft" hint; without it the rows still work.
     if (dr.status === 'fulfilled' && Array.isArray(dr.value)) {
-      s.pending = new Set(dr.value.map((d) => String(d.domain).toLowerCase()));
+      s.pending = new Set(dr.value.filter(isEmailDraft).map((d) => lower(d.domain)));
     }
-    updateCounts();
+    const now = s.rows ? JSON.stringify([s.rows, [...s.pending].sort()]) : null;
+    if (quiet && now === loaded) {
+      content.setAttribute('aria-busy', 'false');
+      return;
+    }
+    loaded = now;
     renderContent();
   }
 
   async function refreshStore() {
     selfRefresh = true;
     try {
-      const snap = await store.refresh();
-      sig = sigOf(snap && snap.summary);
+      await store.refresh();
     } finally {
       selfRefresh = false;
     }
   }
 
-  // Work done elsewhere (a chat turn, a scheduled run) changes the summary's counts: reload then.
-  const unsubscribe = store.subscribe(({ summary }) => {
-    const next = sigOf(summary);
-    if (next === sig) return;
-    const changed = sig !== null;
-    sig = next;
-    if (changed && !selfRefresh && s.rows && !s.gone) load();
+  // Work done elsewhere (a chat turn or scheduled run marking a reply or bounce, a draft made or
+  // discarded on another screen) shows up on the store's next refresh. Not every such change
+  // moves the summary's counts (a bounce on an Awaiting row doesn't), so look at the list itself
+  // each time: one cheap GET, and nothing is redrawn unless it changed.
+  const unsubscribe = store.subscribe(() => {
+    if (selfRefresh || s.gone || !s.rows) return;
+    load({ quiet: true });
   });
 
   // ---- Actions ----
@@ -716,7 +742,7 @@ function mount(root, ctx) {
     s.limit = PAGE;
     revealFrom = null;
     renderContent();
-    nav.setQuery({ tab: id === 'due' ? null : id });
+    nav.setQuery({ tab: id === 'due' ? null : id }, { silent: true });
   }
 
   function showMore() {
@@ -732,7 +758,7 @@ function mount(root, ctx) {
     s.limit = PAGE;
     renderContent();
     filterInput.focus();
-    nav.setQuery({ q: null });
+    nav.setQuery({ q: null }, { silent: true });
   }
 
   function retry() {
@@ -742,11 +768,11 @@ function mount(root, ctx) {
 
   function startCheck() {
     if (jobs.check) return;
-    const contacts = s.rows ? s.rows.filter((r) => (r.state === 'due' || r.state === 'awaiting') && r.to).length : null;
+    const open = s.rows ? s.rows.filter((r) => isOpen(r) && r.to) : null;
     // Snapshot the states, so the result can say who replied or bounced whatever the agent
-    // reports (some providers return no summary text at all).
-    const before = contacts ? new Map(s.rows.map((r) => [r.domain, r.state])) : null;
-    runCheck(contacts, before);
+    // reports. A mark already on its way is the user's, not the check's.
+    const before = open && open.length ? new Map(s.rows.map((r) => [r.domain, r.state])) : null;
+    runCheck(open ? open.length : null, before, new Set(s.marking.keys()));
     renderCheck();
     announce('Checking Gmail for replies.');
   }
@@ -760,6 +786,9 @@ function mount(root, ctx) {
 
   async function mark(domain, value) {
     if (s.marking.has(domain) || jobs.drafting.has(domain)) return;
+    // A reply check running now must not report this mark as something it found.
+    const job = jobs.check;
+    if (job) job.manual.add(domain);
     s.marking.set(domain, value);
     refreshRow(domain);
     let ok = false;
@@ -768,7 +797,9 @@ function mount(root, ctx) {
       ok = true;
       toast(`Marked ${domain} as ${value}.`, 'ok');
     } catch (err) {
-      if (!s.gone) toast((err && err.message) || String(err), 'err');
+      if (job) job.manual.delete(domain);
+      // Toasts are page-level: say so even if the user has moved on.
+      toast(`Couldn't mark ${domain} as ${value}.\n${(err && err.message) || err}`, 'err');
     } finally {
       s.marking.delete(domain);
     }
@@ -807,7 +838,8 @@ function mount(root, ctx) {
     applyQuery,
     afterCheck() {
       renderCheck();
-      if (jobs.result) announce(jobs.result.title);
+      const r = jobs.result;
+      if (r) announce(r.changes ? `${r.title}. ${changesText(r.changes)}` : r.title);
       load();
       refreshStore();
     },
