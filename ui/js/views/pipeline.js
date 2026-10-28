@@ -7,12 +7,15 @@
 // The URL is the single source of truth: controls only call nav.setQuery / nav.navigate, and
 // update(ctx) applies whatever the address now says (typing, tabs, pager, back/forward, deep
 // links). Every dynamic string reaches the page through h() / textContent.
+//
+// ⌘K over the drawer is the shell's (keys.js closes the drawer as Esc would, then search takes
+// focus); the drawer's onClose puts the list back in the URL like any other user close.
 
 import { api } from '../core/api.js';
 import { debounce, fmtDate, fmtNum, fmtRelative, h, pluralize, safeUrl, toDate } from '../core/dom.js';
 import { bindKeys } from '../core/keys.js';
 import { href } from '../core/router.js';
-import { openDrawer, toast } from '../core/ui.js';
+import { isBusy, openDrawer, setBusy, toast } from '../core/ui.js';
 import { badge } from '../components/badge.js';
 import { emptyState } from '../components/emptyState.js';
 import { pager } from '../components/pager.js';
@@ -25,6 +28,9 @@ const PER = 50;
 const SEARCH_MS = 250;
 const LOOKUP_PER = 200;
 const DAY_MS = 86_400_000;
+// The value of the Sourced by picker's "All sources" row (picking it clears the filter): starts
+// with a NUL, which no real source query does.
+const ALL_SOURCES = '\u0000all';
 
 /** Company statuses in pipeline order: label (inventory "Friendly stage labels") and tone. */
 export const STAGES = [
@@ -165,6 +171,7 @@ function createView(root, ctx) {
 
   let listCtl = null;
   let listSeq = 0;
+  let listLoading = null; // the list load in flight (loadList)
   const rowsByDomain = new Map(); // the rows on screen, by lowercased domain
 
   // ---- Header ----
@@ -256,15 +263,22 @@ function createView(root, ctx) {
     }
   });
 
-  // The picker's own label stays for screen readers; the visible one sits beside the field
-  // (so the listbox lines up under the input, not the label).
+  // The picker's own label stays for screen readers; the visible one sits beside the field. The
+  // list opens under the input and the component keeps it inside the window (--ss-room-x).
   const source = searchSelect({
     label: 'Sourced by',
     hideLabel: true,
     placeholder: 'All sources',
     options: [],
     value: state.query,
-    onChange: (v) => nav.setQuery({ query: v || null, page: null }),
+    onChange: (v) => {
+      if (v === ALL_SOURCES) {
+        // Show the placeholder again even when no filter was set (no route change to do it).
+        source.setValue('');
+        v = '';
+      }
+      nav.setQuery({ query: v || null, page: null });
+    },
   });
   const sourceLabel = h(
     'span',
@@ -278,17 +292,6 @@ function createView(root, ctx) {
     },
     'Sourced by',
   );
-
-  // Long source queries widen the list, but never past the window's right edge.
-  const fitSourceList = () => {
-    const r = source.getBoundingClientRect();
-    if (!r.width) return;
-    const room = document.documentElement.clientWidth - r.left - 16;
-    source.style.setProperty('--pl-list-max', `${Math.round(Math.max(r.width, Math.min(440, room)))}px`);
-  };
-  source.input.addEventListener('focus', fitSourceList);
-  source.input.addEventListener('pointerdown', fitSourceList);
-  window.addEventListener('resize', fitSourceList);
 
   const clearBtn = h('button', { type: 'button', class: 'btn btn-ghost btn-sm pl-clear', onClick: clearFilters }, 'Clear filters');
 
@@ -311,7 +314,7 @@ function createView(root, ctx) {
     const opts = (queries || []).map(([q, n]) => ({ value: q, label: q, count: n }));
     // A source in the URL that no company has (any more) still shows what's filtered.
     if (state.query && !opts.some((o) => o.value === state.query)) opts.unshift({ value: state.query, label: state.query, count: 0 });
-    source.setOptions(opts);
+    source.setOptions([{ value: ALL_SOURCES, label: 'All sources' }, ...opts]);
     source.setValue(state.query);
   }
 
@@ -339,16 +342,21 @@ function createView(root, ctx) {
 
   // ---- The table ----
 
+  // The row's contact is the best one with an email (server side), so a "Name only" company
+  // whose founder has no email or LinkedIn has none to show: say what is known instead.
   function contactCell(r) {
     const lines = [];
     if (r.founder || r.email) {
-      lines.push(h('span', { class: 'pl-contact-name' }, r.founder || r.email));
+      const name = r.founder || r.email;
+      lines.push(h('span', { class: 'pl-contact-name', title: name }, name));
       const meta = [];
-      if (r.email && r.founder) meta.push(h('span', { class: 'pl-contact-email mono' }, r.email));
+      if (r.email && r.founder) meta.push(h('span', { class: 'pl-contact-email mono', title: r.email }, r.email));
       if (r.linkedin) meta.push(h('span', { class: 'pl-li' }, icon('person', 12), 'LinkedIn'));
       if (meta.length) lines.push(h('span', { class: 'pl-sub' }, meta));
     } else if (r.linkedin) {
       lines.push(h('span', { class: 'pl-contact-name pl-li' }, icon('person', 13), 'LinkedIn only'));
+    } else if (r.status === 'named') {
+      lines.push(h('span', { class: 'pl-none' }, 'Name found, no email yet'));
     } else {
       lines.push(h('span', { class: 'pl-none' }, 'No contact yet'));
     }
@@ -363,8 +371,8 @@ function createView(root, ctx) {
         h(
           'div',
           { class: 'pl-cell-stack' },
-          h('span', { class: ['pl-company-name', !r.name && 'pl-none'] }, r.name || 'Unnamed'),
-          h('span', { class: 'pl-sub pl-domain mono' }, r.domain),
+          h('span', { class: ['pl-company-name', !r.name && 'pl-none'], title: r.name || null }, r.name || 'Unnamed'),
+          h('span', { class: 'pl-sub pl-domain mono', title: r.domain }, r.domain),
         ),
     },
     { key: 'contact', label: 'Contact', render: contactCell },
@@ -396,14 +404,23 @@ function createView(root, ctx) {
       ),
   }));
 
-  function setBusy(on) {
+  // Every cell carries its column (pl-col-<key>): the column widths in pipeline.css hang off it.
+  const colClass = (col) => `pl-col-${col.key}`;
+
+  function setListBusy(on) {
     const t = results.querySelector('table');
     if (t) t.setAttribute('aria-busy', on ? 'true' : 'false');
     results.classList.toggle('is-loading', on);
   }
 
   function showSkeleton() {
-    const wrap = table({ label: 'Companies', columns: SKELETON_COLUMNS, rows: Array.from({ length: 8 }, (_, i) => ({ i })), rowKey: 'i' });
+    const wrap = table({
+      label: 'Companies',
+      columns: SKELETON_COLUMNS,
+      rows: Array.from({ length: 8 }, (_, i) => ({ i })),
+      rowKey: 'i',
+      cellClass: colClass,
+    });
     wrap.querySelector('table').setAttribute('aria-busy', 'true');
     results.replaceChildren(wrap);
     results.classList.add('is-loading');
@@ -452,9 +469,9 @@ function createView(root, ctx) {
     pg.update({ page: page.page, per: page.per, total: page.total });
 
     // Re-render the same rows in place of the old table, keeping a focused row focused.
-    const focusedKey = document.activeElement && document.activeElement.closest && results.contains(document.activeElement)
-      ? (document.activeElement.closest('tr') || {}).dataset?.key
-      : null;
+    const focusedTr = results.contains(document.activeElement) ? document.activeElement.closest('tr') : null;
+    const focusedKey = focusedTr ? focusedTr.dataset.key : null;
+    const focusedAt = focusedTr ? rowEls().indexOf(focusedTr) : -1;
 
     if (workspaceEmpty) {
       results.replaceChildren(
@@ -479,21 +496,35 @@ function createView(root, ctx) {
         columns: COLUMNS,
         rows: page.rows,
         rowKey: 'domain',
+        cellClass: colClass,
         onRowClick: (row, e) => openCompany(row.domain, e.currentTarget),
       });
       results.replaceChildren(wrap);
-      if (drawer) markRow(drawer.domain);
-      // A focused row that left the list hands focus to the first row, not to <body>.
-      if (focusedKey && !focusRow(focusedKey)) {
-        const first = rowEls()[0];
-        if (first) first.focus();
+      if (drawer) {
+        markRow(drawer.domain);
+        const at = rowEls().indexOf(rowFor(drawer.domain));
+        if (at >= 0) drawer.rowIndex = at;
       }
     }
+    // A focused row that left the list (skipped, filtered out) hands focus to the row now in its
+    // place, not to <body>.
+    if (focusedKey && !focusRow(focusedKey)) focusListAt(focusedAt);
     results.classList.remove('is-loading');
-    setBusy(false);
+    setListBusy(false);
   }
 
-  async function loadList() {
+  /** Load the list for the current route → a Promise that settles (never rejects) once it is
+   *  shown, failed or superseded. `listLoading` holds it meanwhile, for the drawer. */
+  function loadList() {
+    const p = fetchList();
+    listLoading = p;
+    p.then(() => {
+      if (listLoading === p) listLoading = null;
+    });
+    return p;
+  }
+
+  async function fetchList() {
     if (listCtl) listCtl.abort();
     const ctl = new AbortController();
     listCtl = ctl;
@@ -502,7 +533,7 @@ function createView(root, ctx) {
     // Rows on screen stay (marked busy) while the next page loads; anything else becomes a
     // skeleton (first load, or after an empty / error state).
     const shown = results.querySelector('table');
-    if (shown && shown.getAttribute('aria-busy') !== 'true') setBusy(true);
+    if (shown && shown.getAttribute('aria-busy') !== 'true') setListBusy(true);
     else if (!shown) showSkeleton();
 
     const qs = new URLSearchParams({ per: String(PER) });
@@ -539,6 +570,19 @@ function createView(root, ctx) {
     return !!tr;
   }
 
+  /** Focus the row at `index` (the last one if the list got shorter), else the empty state's
+   *  action. → whether anything took focus. */
+  function focusListAt(index) {
+    const list = rowEls();
+    if (list.length) {
+      list[Math.max(0, Math.min(index, list.length - 1))].focus();
+      return true;
+    }
+    const action = results.querySelector('.empty-state .btn');
+    if (action) action.focus();
+    return !!action;
+  }
+
   function markRow(domain) {
     for (const tr of rowEls()) {
       const on = domain && String(tr.dataset.key).toLowerCase() === String(domain).toLowerCase();
@@ -570,19 +614,23 @@ function createView(root, ctx) {
 
   // ---- The drawer ----
 
-  // The open drawer: { domain, hash, pushedFrom, handle, ctl, company, detail }.
+  // The open drawer: { domain, hash, pushedFrom, rowIndex, handle, ctl, company, detail }.
   let drawer = null;
   let detailSeq = 0;
+  // Handed from a row press (openCompany) to the drawer the route change opens (syncDrawer).
+  let pendingOpener = null;
+  let pushedFrom = null;
 
   /** A row press: push the drawer route (Back closes it again). */
   function openCompany(domain, opener) {
+    // Typing just before the press: apply it now, so the drawer route carries it and the
+    // debounced search doesn't fire later behind the drawer.
+    pushSearch.flush();
     const target = href(['pipeline', domain], listQuery(state));
     pendingOpener = opener || null;
     pushedFrom = location.hash;
     nav.navigate(target);
   }
-  let pendingOpener = null;
-  let pushedFrom = null;
 
   function closeDrawer() {
     if (!drawer) return;
@@ -603,9 +651,13 @@ function createView(root, ctx) {
     } else if (parseDomain() === d.domain) {
       nav.navigate(listHash, { replace: true });
     }
-    // Focus the row it came from (the table may have been re-rendered meanwhile).
+    // Focus the row it came from (the table may have been re-rendered meanwhile); if that row
+    // has left the list (skipped under a stage filter), the row now in its place. A deep link
+    // to a company that was never on screen leaves focus on the page.
     const active = document.activeElement;
-    if (!active || active === document.body || active.id === 'view' || !active.isConnected) focusRow(d.domain);
+    if (!active || active === document.body || active.id === 'view' || !active.isConnected) {
+      if (!focusRow(d.domain) && d.rowIndex != null) focusListAt(d.rowIndex);
+    }
   }
 
   function parseDomain() {
@@ -616,6 +668,11 @@ function createView(root, ctx) {
     } catch (_) {
       return m[1].toLowerCase();
     }
+  }
+
+  function rowIndexOf(domain) {
+    const at = rowEls().indexOf(rowFor(domain));
+    return at >= 0 ? at : null;
   }
 
   function syncDrawer(domain) {
@@ -631,10 +688,11 @@ function createView(root, ctx) {
     pushedFrom = null;
     if (drawer) {
       // Another company while one is open (e.g. back/forward between two): reuse the panel.
-      if (drawer.ctl) drawer.ctl.abort();
+      // loadDetail aborts whatever the panel was still loading for the previous one.
       drawer.domain = want;
       drawer.hash = location.hash;
       drawer.pushedFrom = from;
+      drawer.rowIndex = rowIndexOf(want);
       drawer.company = rowsByDomain.get(want) || null;
       drawer.detail = null;
       drawer.handle.setTitle(displayName(drawer.company, want));
@@ -642,7 +700,15 @@ function createView(root, ctx) {
       loadDetail();
       return;
     }
-    const d = { domain: want, hash: location.hash, pushedFrom: from, company: rowsByDomain.get(want) || null, detail: null, ctl: null };
+    const d = {
+      domain: want,
+      hash: location.hash,
+      pushedFrom: from,
+      rowIndex: rowIndexOf(want),
+      company: rowsByDomain.get(want) || null,
+      detail: null,
+      ctl: null,
+    };
     d.handle = openDrawer({
       title: displayName(d.company, want),
       content: null,
@@ -654,20 +720,15 @@ function createView(root, ctx) {
       },
     });
     d.handle.el.classList.add('company-drawer');
-    // ⌘K is global search: it closes the drawer so the (modal-inert) top bar can take focus.
-    d.handle.el.addEventListener('keydown', (e) => {
-      if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && String(e.key).toLowerCase() === 'k') d.handle.close('shortcut');
-    });
     drawer = d;
     markRow(want);
     loadDetail();
   }
 
-  /** Is `domain` a company? Answered from the rows on screen, else a search for it, so an
-   *  unknown link shows "not found" without a failed (404) request. null = can't tell. */
+  /** Is `domain` a company? Answered from a search for it, so an unknown link shows "not found"
+   *  without a failed (404) request: the browser logs every 404 as a console error, and the e2e
+   *  suite fails on those. null = can't tell. */
   async function lookup(domain, signal) {
-    const known = rowsByDomain.get(domain);
-    if (known) return known;
     const qs = new URLSearchParams({ q: domain, per: String(LOOKUP_PER) });
     const page = await api.get(`/api/companies?${qs}`, { signal });
     const row = (page.rows || []).find((r) => String(r.domain).toLowerCase() === domain);
@@ -675,7 +736,13 @@ function createView(root, ctx) {
     return page.total <= (page.rows || []).length ? false : null;
   }
 
-  async function loadDetail() {
+  /**
+   * Load the drawer's company. `refresh` re-reads it after a change (Skip / Restore) with the
+   * current content left up, and `focusAction` then puts focus back on the action slot. Every
+   * load runs under the drawer's AbortController, so moving the drawer to another company (or
+   * closing it) drops whatever was still on its way for this one.
+   */
+  async function loadDetail({ refresh = false, focusAction = false } = {}) {
     const d = drawer;
     if (!d) return;
     if (d.ctl) d.ctl.abort();
@@ -684,18 +751,22 @@ function createView(root, ctx) {
     const seq = ++detailSeq;
     const domain = d.domain;
     const fresh = () => !dead && drawer === d && d.domain === domain && seq === detailSeq;
-    renderDrawerLoading(d);
+    if (!refresh) renderDrawerLoading(d);
     try {
-      let company = d.company;
-      if (!company) {
-        const found = await lookup(domain, ctl.signal);
+      if (!refresh && !d.company) {
+        // A deep link while the list is still loading: that page may well have the company.
+        if (listLoading) {
+          await listLoading;
+          if (!fresh()) return;
+        }
+        const found = rowsByDomain.get(domain) || (await lookup(domain, ctl.signal));
         if (!fresh()) return;
         if (found === false) {
+          d.ctl = null;
           renderNotFound(d);
           return;
         }
         if (found) {
-          company = found;
           d.company = found;
           d.handle.setTitle(displayName(found, domain));
           renderDrawerLoading(d);
@@ -708,6 +779,10 @@ function createView(root, ctx) {
       d.company = detail.company;
       d.handle.setTitle(displayName(detail.company, domain));
       renderDetail(d);
+      if (focusAction) {
+        const next = d.handle.el.querySelector('.cd-actions .btn:last-child') || d.handle.el;
+        next.focus({ preventScroll: true });
+      }
     } catch (err) {
       if (!fresh() || isAbort(err)) return;
       d.ctl = null;
@@ -747,15 +822,14 @@ function createView(root, ctx) {
   function renderNotFound(d) {
     d.handle.body.removeAttribute('aria-busy');
     d.handle.setTitle(d.domain);
-    // The empty-state look, with an h3 under the drawer's h2 title.
+    // An h3 under the drawer's own h2 title.
     d.handle.body.replaceChildren(
-      h(
-        'div',
-        { class: 'empty-state' },
-        h('h3', { class: 'empty-title' }, `No company at ${d.domain}`),
-        h('p', { class: 'empty-body' }, 'It isn’t in this workspace. The link may have a typo, or the company was never sourced here.'),
-        h('div', { class: 'empty-action' }, h('button', { type: 'button', class: 'btn btn-secondary', onClick: () => d.handle.close('button') }, 'Back to pipeline')),
-      ),
+      emptyState({
+        level: 3,
+        title: `No company at ${d.domain}`,
+        body: 'It isn’t in this workspace. The link may have a typo, or the company was never sourced here.',
+        action: h('button', { type: 'button', class: 'btn btn-secondary', onClick: () => d.handle.close('button') }, 'Back to pipeline'),
+      }),
     );
   }
 
@@ -789,9 +863,11 @@ function createView(root, ctx) {
     if (st === 'sourced' || st === 'named') out.push(ask('enrich', true));
     else if (st === 'emailed') out.push(ask('draft', true));
     else if (st === 'drafted') out.push(h('a', { class: 'btn btn-primary', href: href(['drafts', company.domain]) }, 'Open in Drafts'));
-    else if (st === 'sent' || st === 'replied' || st === 'bounced') {
+    else if (st !== 'skip') {
+      // Sent, replied, bounced or a status this screen doesn't know: its next step is in
+      // Follow-ups. A sent company may be Due or Awaiting there; the filter finds it in either.
       const tab = st === 'replied' || st === 'bounced' ? st : null;
-      out.push(h('a', { class: 'btn btn-primary', href: href(['followups'], { tab }) }, 'Open in Follow-ups'));
+      out.push(h('a', { class: 'btn btn-primary', href: href(['followups'], { tab, q: company.domain }) }, 'Open in Follow-ups'));
     }
     if (st === 'skip') out.push(statusButton(d, company, 'restore'));
     else if (st === 'sourced' || st === 'named' || st === 'emailed') out.push(statusButton(d, company, 'skip'));
@@ -805,24 +881,24 @@ function createView(root, ctx) {
         type: 'button',
         class: 'btn btn-secondary',
         onClick: async () => {
-          if (btn.disabled) return;
-          btn.disabled = true;
-          btn.setAttribute('aria-busy', 'true');
-          const name = displayName(company, d.domain);
+          if (isBusy(btn)) return;
+          // Busy, not disabled: the button keeps focus while the change is saved.
+          setBusy(btn, true);
+          const domain = d.domain;
+          const name = displayName(company, domain);
           try {
             await api.post(`/api/companies/${encodeURIComponent(company.domain)}/status`, { value });
             if (dead) return;
             toast(value === 'skip' ? `Skipped ${name}. It won’t be contacted.` : `Restored ${name} to the pipeline.`, 'ok');
             ctx.store.refresh();
             loadList();
-            if (drawer === d) {
-              d.company = null;
-              await refreshDetail(d);
+            // Re-read it unless the drawer has moved on to another company meanwhile.
+            if (drawer === d && d.domain === domain) {
+              loadDetail({ refresh: true, focusAction: d.handle.el.contains(document.activeElement) });
             }
           } catch (err) {
             if (dead) return;
-            btn.disabled = false;
-            btn.removeAttribute('aria-busy');
+            setBusy(btn, false);
             toast(errText(err), 'err');
           }
         },
@@ -832,25 +908,6 @@ function createView(root, ctx) {
     return btn;
   }
 
-  /** Re-read the drawer's company after a change, keeping focus on the same action slot. */
-  async function refreshDetail(d) {
-    const hadFocus = d.handle.el.contains(document.activeElement);
-    try {
-      const detail = await api.get(`/api/companies/${encodeURIComponent(d.domain)}`);
-      if (dead || drawer !== d) return;
-      d.detail = detail;
-      d.company = detail.company;
-      renderDetail(d);
-      if (hadFocus) {
-        const next = d.handle.el.querySelector('.cd-actions .btn:last-child') || d.handle.el;
-        next.focus({ preventScroll: true });
-      }
-    } catch (err) {
-      if (dead || drawer !== d || isAbort(err)) return;
-      renderDrawerError(d, err);
-    }
-  }
-
   function contactItem(k) {
     const name = k.founder_name || 'Name not on file';
     const email = k.email
@@ -858,11 +915,20 @@ function createView(root, ctx) {
           'div',
           { class: 'cd-email' },
           icon('mail', 13),
-          h('span', { class: 'mono cd-email-addr' }, k.email),
-          k.email_confidence
-            ? h('span', { class: 'cd-conf', title: CONFIDENCE_HINT[k.email_confidence] || null }, badge(CONFIDENCE[k.email_confidence] || k.email_confidence, 'neutral'))
-            : null,
-          k.mx_ok ? badge('MX ok', 'ok') : badge('No MX', 'warn'),
+          // On a narrow drawer the badges wrap together, under the address.
+          h(
+            'div',
+            { class: 'cd-email-main' },
+            h('span', { class: 'mono cd-email-addr' }, k.email),
+            h(
+              'span',
+              { class: 'cd-badges' },
+              k.email_confidence
+                ? h('span', { class: 'cd-conf', title: CONFIDENCE_HINT[k.email_confidence] || null }, badge(CONFIDENCE[k.email_confidence] || k.email_confidence, 'neutral'))
+                : null,
+              k.mx_ok ? badge('MX ok', 'ok') : badge('No MX', 'warn'),
+            ),
+          ),
         )
       : h('div', { class: 'cd-email cd-muted' }, icon('mail', 13), h('span', {}, 'No email'));
     const li = safeUrl(k.linkedin_url);
@@ -909,11 +975,14 @@ function createView(root, ctx) {
   function renderDetail(d) {
     const { company, contacts = [], outreach = [] } = d.detail;
     d.handle.body.removeAttribute('aria-busy');
+    // "2h ago" within 48h (the exact time on hover), else the date and time.
+    const seen = fmtRelative(company.first_seen);
+    const seenAt = longWhen(company.first_seen);
     const details = h(
       'dl',
       { class: 'cd-details' },
       h('div', {}, h('dt', {}, 'Sourced by'), h('dd', {}, company.source_query || '—')),
-      h('div', {}, h('dt', {}, 'First seen'), h('dd', { class: 'mono' }, longWhen(company.first_seen) || '—')),
+      h('div', {}, h('dt', {}, 'First seen'), h('dd', { class: 'mono', title: seenAt && seenAt !== seen ? seenAt : null }, seen)),
     );
     d.handle.body.replaceChildren(
       h('div', { class: 'cd-head' }, drawerTop(d, company), actionsFor(d, company)),
@@ -955,7 +1024,6 @@ function createView(root, ctx) {
       dead = true;
       pushSearch.cancel();
       unbindKeys();
-      window.removeEventListener('resize', fitSourceList);
       if (listCtl) listCtl.abort();
       closeDrawer();
     },

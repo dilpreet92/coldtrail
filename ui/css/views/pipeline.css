@@ -58,7 +58,8 @@
 .pl-filter-input { padding-left: 34px; }
 .pl-filter-input::-webkit-search-cancel-button { cursor: pointer; }
 
-/* "Sourced by" sits beside its picker; the list opens under the input, wider for long queries. */
+/* "Sourced by" sits beside its picker. The list opens under the input (searchSelect keeps it in
+   the window and sets the room it has as --ss-room-x), wider than the field for long queries. */
 .pl-source {
   display: flex;
   flex: 0 1 340px;
@@ -73,7 +74,7 @@
   right: auto;
   min-width: 100%;
   width: max-content;
-  max-width: var(--pl-list-max, 100%); /* set by the view from the room to the right */
+  max-width: min(440px, var(--ss-room-x, 440px));
 }
 
 /* ---- Results: table, empty, error, loading ---- */
@@ -86,11 +87,14 @@
   min-width: 0;
 }
 
-.pl-results .table { table-layout: fixed; min-width: 760px; }
-.pl-results .table th:nth-child(1) { width: 28%; }
-.pl-results .table th:nth-child(2) { width: 31%; }
-.pl-results .table th:nth-child(3) { width: 136px; }
-.pl-results .table th:nth-child(5) { width: 104px; }
+/* Column widths (every cell has pl-col-<key>): Company and Sourced by take a share of the width,
+   Stage and First seen what their longest value needs, Contact the rest. A 1024px window keeps
+   every header whole and no sideways scroll; below 1000px see "Narrow windows". */
+.pl-results .table { table-layout: fixed; min-width: 680px; }
+.pl-results .pl-col-company { width: 24%; }
+.pl-results .pl-col-stage { width: 128px; }
+.pl-results .pl-col-source { width: 18%; }
+.pl-results .pl-col-first_seen { width: 104px; }
 .pl-results .table td { padding-top: var(--space-2); padding-bottom: var(--space-2); height: 56px; }
 
 .pl-cell-stack { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
@@ -129,31 +133,32 @@
 .pl-source-text { color: var(--text-2); }
 .pl-when { font-size: 12.5px; color: var(--text-2); }
 
-.table tr.is-clickable[aria-current="true"] td { background: var(--accent-soft); }
-
 /* Skeleton rows while the first page loads. */
 .pl-results .skeleton { height: 12px; }
 .pl-results .skeleton.pl-sk-sub { height: 10px; margin-top: 4px; }
 
-/* A later load keeps the rows and shows a thin bar across the top of the table. */
+/* A later load keeps the rows and runs a solid accent segment along the top of the table (clear
+   of its rounded corners). With reduced motion it is a still bar. */
 .pl-results.is-loading { cursor: progress; }
 .pl-results.is-loading::after {
   content: '';
   position: absolute;
   top: 1px;
-  left: 1px;
-  right: 1px;
+  left: var(--space-2);
+  width: 0;
   height: 2px;
-  z-index: 2;
-  border-radius: var(--radius-input) var(--radius-input) 0 0;
-  background: linear-gradient(90deg, transparent, var(--accent), transparent);
-  background-size: 40% 100%;
-  background-repeat: no-repeat;
+  z-index: 3;
+  border-radius: 1px;
+  background: var(--accent);
   animation: pl-loading 1.1s ease-in-out infinite;
 }
 @keyframes pl-loading {
-  from { background-position: -40% 0; }
-  to { background-position: 140% 0; }
+  0% { left: var(--space-2); width: 0; }
+  50% { left: 30%; width: 40%; }
+  100% { left: calc(100% - var(--space-2)); width: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .pl-results.is-loading::after { right: var(--space-2); width: auto; animation: none; opacity: 0.6; }
 }
 
 /* Empty and error states sit in the same surface box as the table. */
@@ -278,17 +283,31 @@
 .cd-email,
 .cd-li {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
-  gap: var(--space-1) var(--space-2);
+  gap: var(--space-2);
   font-size: 13px;
   color: var(--text-2);
 }
+/* The icon keeps to the first line (its box is a badge row tall; the glyph centres in it), and
+   what wraps lines up under the address, not under the icon. */
+.cd-email { align-items: flex-start; }
+.cd-email > svg { height: 22px; } /* a badge's height */
+.cd-email.cd-muted { align-items: center; }
+.cd-email.cd-muted > svg { height: 13px; }
+.cd-email-main {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-2);
+  min-width: 0;
+  min-height: 22px;
+}
 .cd-email > svg,
 .cd-li > svg,
-.cd-channel > svg { color: var(--text-3); }
+.cd-channel > svg { flex: none; color: var(--text-3); }
 .cd-email-addr { font-size: 12.5px; overflow-wrap: anywhere; }
 .cd-conf { display: inline-flex; }
+.cd-badges { display: inline-flex; align-items: center; gap: var(--space-2); }
 .cd-muted { color: var(--text-3); }
 
 .cd-channel { display: inline-flex; align-items: center; gap: 6px; font-weight: 500; }
@@ -321,24 +340,27 @@
 .cd-loading .skeleton { height: 12px; }
 .cd-loading .skeleton.cd-sk-head { width: 30%; height: 14px; }
 
-/* ---- Narrow screens ---- */
+/* ---- Narrow windows ---- */
 
-@media (max-width: 899px) {
-  .pl-hint { display: none; }
-  .pl-filter { flex-basis: 100%; max-width: none; }
-  .pl-source { flex: 1 1 auto; }
-
-  /* The table scrolls sideways; the company stays put so every row keeps its name. */
+/* Below 1000px (phones, tablets, a desktop window with the sidebar under ~1000px) the five
+   columns don't fit: the table scrolls sideways and the company stays put, so every row keeps
+   its name. Hover and selection still colour the pinned cell (these rules are weaker). */
+@media (max-width: 999px) {
   .pl-results .table { min-width: 800px; }
-  .pl-results .table th:nth-child(1) { width: 176px; }
-  .pl-results .table th:nth-child(2) { width: 220px; }
-  .pl-results .table th:first-child,
-  .pl-results .table td:first-child {
+  .pl-results .pl-col-source { width: 160px; }
+  .pl-results .pl-col-company {
+    width: 176px;
     position: sticky;
     left: 0;
     z-index: 1;
     background: var(--surface);
     box-shadow: inset -1px 0 0 var(--border);
   }
-  .pl-results .table th:first-child { z-index: 2; }
+  .pl-results th.pl-col-company { z-index: 2; }
+}
+
+@media (max-width: 899px) {
+  .pl-hint { display: none; }
+  .pl-filter { flex-basis: 100%; max-width: none; }
+  .pl-source { flex: 1 1 auto; }
 }

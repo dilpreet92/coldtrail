@@ -23,6 +23,11 @@ const STAGE = {
 const STAGE_ORDER = Object.keys(STAGE);
 
 const reEscape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+// Spec §5.10 dates: relative within 48h ("2h ago"), else "Oct 9" in the table (the year only
+// outside this one); the exact time goes in the title, and the drawer shows "Oct 9, 13:00".
+const SHORT_WHEN = /^(just now|\d+[mh] ago|[A-Z][a-z]{2} \d{1,2}(, \d{4})?)$/;
+const DATED = /^[A-Z][a-z]{2} \d{1,2}(, \d{4})?$/;
+const DATED_TIME = /^[A-Z][a-z]{2} \d{1,2}(, \d{4})?, \d{2}:\d{2}$/;
 const hashIs = (hash) => new RegExp(`${reEscape(hash)}$`);
 const stageCount = (status) => (SEED.stages.find(([s]) => s === status) || [null, 0])[1];
 const label = (c) => (c.name ? `${c.name} (${c.domain})` : c.domain);
@@ -115,7 +120,8 @@ test.describe('empty workspace', () => {
     const { drawer } = ui(page);
     await expect(drawer).toBeVisible();
     await expect(drawer.getByRole('heading', { level: 2 })).toHaveText('nope.example');
-    await expect(drawer).toContainText('No company at nope.example');
+    // The empty state's heading sits under the drawer's own h2.
+    await expect(drawer.getByRole('heading', { level: 3 })).toHaveText('No company at nope.example');
     await drawer.getByRole('button', { name: 'Back to pipeline' }).click();
     await expect(drawer).toHaveCount(0);
     await expect(page).toHaveURL(hashIs('#/pipeline'));
@@ -157,7 +163,10 @@ test('first page renders 50 rows and total', async ({ app, page, server, request
     expect(cells[0]).toBe(`${c.name} ${c.domain}`);
     expect(cells[2]).toBe(STAGE[c.status]);
     expect(cells[3]).toBe(c.source_query);
-    expect(cells[4]).toMatch(/\S/);
+    // The newest companies are hours old: "1h ago", with the exact time on hover.
+    expect(cells[4]).toMatch(SHORT_WHEN);
+    expect(cells[4]).toMatch(/^\d+h ago$/);
+    await expect(rows.nth(i).locator('td').nth(4).locator('[title]')).toHaveAttribute('title', DATED_TIME);
   }
   // Contact: the server's best emailed contact with its address, and a LinkedIn flag.
   const apiRows = (await (await request.get(server.apiUrl(`/api/companies?per=${PER}`))).json()).rows;
@@ -180,13 +189,14 @@ test('first page renders 50 rows and total', async ({ app, page, server, request
     await expect(tab(STAGE[s]).locator('.tab-count')).toHaveText(fmtNum(stageCount(s)));
   }
 
-  // "Sourced by" lists every source query with its count, most first.
+  // "Sourced by" lists "All sources", then every source query with its count, most first.
   await source.click();
   const options = page.getByRole('listbox', { name: 'Sourced by' }).getByRole('option');
-  await expect(options).toHaveCount(SEED.queries.length);
+  await expect(options).toHaveCount(SEED.queries.length + 1);
+  await expect(options.first()).toHaveText('All sources');
   for (let i = 0; i < SEED.queries.length; i++) {
     const [q, n] = SEED.queries[i];
-    await expect(options.nth(i)).toHaveText(`${q}${fmtNum(n)}`);
+    await expect(options.nth(i + 1)).toHaveText(`${q}${fmtNum(n)}`);
   }
   await page.keyboard.press('Escape');
 });
@@ -265,7 +275,19 @@ test('stage and source filters combine', async ({ app, page }) => {
   await expect(tab(STAGE.named)).toBeFocused();
   await expect(rows.first()).toContainText(STAGE.named);
 
-  // Clearing the source keeps the stage.
+  // "All sources" drops the source and keeps the stage; the picker shows its placeholder again.
+  await source.click();
+  await page.getByRole('listbox', { name: 'Sourced by' }).getByRole('option', { name: 'All sources' }).click();
+  await expect(page).toHaveURL(hashIs('#/pipeline?stage=named'));
+  await expect(source).toHaveValue('');
+  await expect(page.getByRole('button', { name: 'Clear Sourced by' })).toBeHidden();
+  await expect(range).toHaveText(`1–${PER} of ${fmtNum(stageCount('named'))}`);
+
+  // So does the clear button.
+  await source.click();
+  await source.fill('Q3');
+  await page.keyboard.press('Enter');
+  await expect(page).toHaveURL(hashIs('#/pipeline?stage=named&query=Q3'));
   await page.getByRole('button', { name: 'Clear Sourced by' }).click();
   await expect(page).toHaveURL(hashIs('#/pipeline?stage=named'));
   await expect(range).toHaveText(`1–${PER} of ${fmtNum(stageCount('named'))}`);
@@ -294,6 +316,8 @@ test('pager moves pages', async ({ app, page }) => {
   await expect(range).toHaveText(`${fmtNum((last - 1) * PER + 1)}–${fmtNum(SEED.companies)} of ${fmtNum(SEED.companies)}`);
   await expect(next).toBeDisabled();
   await expect(rows.last()).toContainText(COMPANIES[SEED.companies - 1].domain);
+  // The oldest companies were sourced weeks ago: a date, not "Nh ago".
+  expect((await rowCells(rows.last()))[4]).toMatch(DATED);
   await page.evaluate(() => { location.hash = '#/pipeline?page=999'; });
   await expect(page).toHaveURL(hashIs(`#/pipeline?page=${last}`));
   await expect(range).toHaveText(`${fmtNum((last - 1) * PER + 1)}–${fmtNum(SEED.companies)} of ${fmtNum(SEED.companies)}`);
@@ -337,6 +361,10 @@ test('drawer shows contacts and outreach, Esc closes, URL updates', async ({ app
   await expect(contacts.nth(1).getByRole('link', { name: /LinkedIn/ })).toHaveAttribute('target', '_blank');
   await expect(drawer).toContainText('Nothing drafted or sent yet');
   await expect(drawer.locator('.cd-details')).toContainText(quarry.source_query);
+  // First seen reads like the table ("2h ago"), with the exact time on hover.
+  const seen = drawer.locator('.cd-details dd').nth(1);
+  await expect(seen).toHaveText(/^\d+h ago$/);
+  await expect(seen).toHaveAttribute('title', DATED_TIME);
 
   // Focus is in the drawer; Esc closes it, the URL drops the domain and focus returns to the row.
   expect(await drawer.evaluate((d) => d.contains(document.activeElement))).toBe(true);
@@ -358,12 +386,28 @@ test('drawer shows contacts and outreach, Esc closes, URL updates', async ({ app
     await expect(outreach.nth(i)).toContainText(STAGE[newestFirst[i].status]);
     await expect(outreach.nth(i)).toContainText(/Sent /);
   }
-  // Its next step is in Follow-ups, not another draft.
-  await expect(drawer.getByRole('link', { name: 'Open in Follow-ups' })).toHaveAttribute('href', '#/followups');
+  // Its next step is in Follow-ups, not another draft: filtered to it, since a sent company can
+  // be under Due or Awaiting there.
+  await expect(drawer.getByRole('link', { name: 'Open in Follow-ups' })).toHaveAttribute('href', `#/followups?q=${wren.domain}`);
+  // Sourced weeks ago: the date and time.
+  await expect(drawer.locator('.cd-details dd').nth(1)).toHaveText(DATED_TIME);
 
-  // Reload keeps the drawer; the close button and browser Back both close it.
+  // A replied company opens on Follow-ups' Replied tab.
+  const replied = COMPANIES.find((c) => c.status === 'replied');
+  await page.evaluate((d) => { location.hash = `#/pipeline/${d}`; }, replied.domain);
+  await expect(drawer.getByRole('heading', { level: 2 })).toHaveText(replied.name);
+  await expect(drawer.getByRole('link', { name: 'Open in Follow-ups' })).toHaveAttribute(
+    'href',
+    `#/followups?tab=replied&q=${replied.domain}`,
+  );
+  await page.goBack();
+  await expect(drawer.getByRole('heading', { level: 2 })).toHaveText(wren.name);
+
+  // Reload keeps the drawer, with focus in it; the close button and browser Back both close it.
   await page.reload();
   await expect(ui(page).drawer.getByRole('heading', { level: 2 })).toHaveText(wren.name);
+  await expect(ui(page).drawer.getByRole('list', { name: 'Outreach' })).toBeVisible();
+  expect(await ui(page).drawer.evaluate((d) => d.contains(document.activeElement))).toBe(true);
   await ui(page).drawer.getByRole('button', { name: 'Close' }).click();
   await expect(ui(page).drawer).toHaveCount(0);
   await expect(page).toHaveURL(hashIs('#/pipeline'));
@@ -415,11 +459,19 @@ test('skip then restore updates the badge', async ({ app, page, server }) => {
 
 test('ask agent opens Agent with a prefilled prompt', async ({ app, page }) => {
   await stubView(page, 'agent', 'Agent');
+  const lists = [];
+  page.on('request', (r) => {
+    if (/\/api\/companies\?/.test(r.url())) lists.push(new URL(r.url()).searchParams.get('q'));
+  });
   // emailed → draft; sourced → enrich (inventory "Row actions by status").
   const emailed = COMPANIES.find((c) => c.domain === 'quarry-security.example');
   await app.goto(`#/pipeline/${emailed.domain}`);
   const { drawer } = ui(page);
   await expect(drawer.getByRole('heading', { level: 2 })).toHaveText(emailed.name);
+  // A deep link to a company on the first page needs only the list and its detail: no search
+  // for the domain.
+  await expect(drawer.getByRole('list', { name: 'Contacts' })).toBeVisible();
+  expect(lists).toEqual([null]);
   await expect(drawer.getByRole('button', { name: 'Ask agent to enrich' })).toHaveCount(0);
   await drawer.getByRole('button', { name: 'Ask agent to draft' }).click();
   await expect(drawer).toHaveCount(0);
@@ -500,6 +552,34 @@ test('loading, error and retry states for the list and the drawer', async ({ app
   await page.unroute(/\/api\/companies\?/);
   await err.getByRole('button', { name: 'Try again' }).click();
   await listReady(page);
+
+  // A later load keeps the rows under a moving bar: one solid accent segment (spec §2: no
+  // gradients).
+  let releaseTab;
+  const tabGate = new Promise((r) => { releaseTab = r; });
+  await page.route(/\/api\/companies\?/, async (rt) => {
+    await tabGate;
+    await rt.continue();
+  });
+  await ui(page).tab(STAGE.emailed).click();
+  const results = page.locator('.pipeline .pl-results');
+  await expect(results).toHaveClass(/is-loading/);
+  await expect(table).toHaveAttribute('aria-busy', 'true');
+  const bar = await results.evaluate((el) => {
+    const cs = getComputedStyle(el, '::after');
+    const probe = document.createElement('i');
+    probe.style.color = 'var(--accent)';
+    document.body.append(probe);
+    const accent = getComputedStyle(probe).color;
+    probe.remove();
+    return { image: cs.backgroundImage, color: cs.backgroundColor, accent };
+  });
+  expect(bar.image).toBe('none');
+  expect(bar.color).toBe(bar.accent);
+  releaseTab();
+  await expect(table).toHaveAttribute('aria-busy', 'false');
+  await expect(results).not.toHaveClass(/is-loading/);
+  await page.unroute(/\/api\/companies\?/);
 
   // A filter change while the list is loading: only the latest answer is shown.
   await ui(page).tab(STAGE.replied).click();
@@ -664,4 +744,156 @@ test('pipeline is accessible in light and dark, and fits 390px', async ({ app, p
   await expectAccessible(page);
   await page.emulateMedia({ colorScheme: 'light' });
   await expectAccessible(page);
+});
+
+// ---- Edge cases (these last: they change companies and put them back) ----
+
+test('a status the screen does not know points to Follow-ups', async ({ app, page }) => {
+  const c = COMPANIES[1];
+  await page.route(`**/api/companies/${c.domain}`, async (rt) => {
+    const res = await rt.fetch();
+    const body = await res.json();
+    body.company.status = 'paused_by_hand';
+    await rt.fulfill({ response: res, json: body });
+  });
+  await app.goto(`#/pipeline/${c.domain}`);
+  const { drawer } = ui(page);
+  await expect(drawer.locator('.cd-stage')).toHaveText('paused_by_hand');
+  // Inventory "Row actions by status": anything not handled goes to Follow-ups, filtered to it.
+  await expect(drawer.getByRole('link', { name: 'Open in Follow-ups' })).toHaveAttribute('href', `#/followups?q=${c.domain}`);
+  await expect(drawer.locator('.cd-actions .btn')).toHaveCount(1);
+});
+
+test('a Name only company without an email says the name is known', async ({ app, page }) => {
+  // The row's contact is the best one with an email; the seed has no named company without
+  // one, so make the first row such a company.
+  await page.route(/\/api\/companies\?/, async (rt) => {
+    const res = await rt.fetch();
+    const body = await res.json();
+    Object.assign(body.rows[0], { status: 'named', founder: null, email: null, linkedin: false });
+    await rt.fulfill({ response: res, json: body });
+  });
+  await app.goto('#/pipeline');
+  const { rows } = ui(page);
+  await listReady(page);
+  const cells = await rowCells(rows.first());
+  expect(cells[1]).toBe('Name found, no email yet');
+  expect(cells[2]).toBe(STAGE.named);
+  // A sourced company with no contact at all still says so.
+  expect(COMPANIES[4].contacts).toHaveLength(0);
+  expect((await rowCells(rows.nth(4)))[1]).toBe('No contact yet');
+});
+
+test('a row pressed right after typing opens with the search applied', async ({ app, page }) => {
+  await app.goto('#/pipeline');
+  const { rows, filter, drawer } = ui(page);
+  await listReady(page);
+  // Hold the page's clock, so the 250ms search debounce can't fire on its own.
+  await page.clock.install();
+  await page.clock.pauseAt(new Date(Date.now() + 1000));
+  const c = COMPANIES[0];
+  const q = c.name.split(' ')[0].toLowerCase();
+  expect(matching(q)[0].domain).toBe(c.domain);
+  await filter.fill(q);
+  await rows.first().click();
+  // The press applied the search first, so the drawer route carries it.
+  await expect(page).toHaveURL(hashIs(`#/pipeline/${c.domain}?q=${q}`));
+  await expect(drawer.getByRole('heading', { level: 2 })).toHaveText(c.name);
+  await expect(rows).toHaveCount(Math.min(PER, matching(q).length));
+  // Closing goes back to that list entry rather than adding one: Forward opens it again.
+  await page.keyboard.press('Escape');
+  await expect(drawer).toHaveCount(0);
+  await expect(page).toHaveURL(hashIs(`#/pipeline?q=${q}`));
+  await expect(filter).toHaveValue(q);
+  await page.goForward();
+  await expect(drawer.getByRole('heading', { level: 2 })).toHaveText(c.name);
+});
+
+test('skipping under a stage filter keeps focus in the list', async ({ app, page, server }) => {
+  const sourced = COMPANIES.filter((c) => c.status === 'sourced');
+  const [, target, next] = sourced;
+  expect(target.contacts).toHaveLength(0); // so Restore makes it Sourced again
+  await app.goto('#/pipeline?stage=sourced');
+  const { rows, drawer } = ui(page);
+  await listReady(page);
+  await rows.nth(1).click();
+  await expect(drawer.getByRole('heading', { level: 2 })).toHaveText(target.name);
+
+  await drawer.getByRole('button', { name: 'Skip' }).click();
+  await expect(page.locator('#toasts')).toContainText(`Skipped ${target.name}`);
+  await expect(drawer.locator('.cd-stage')).toHaveText(STAGE.skip);
+  // Focus stays on the action slot through the save (busy, not disabled) and the refresh.
+  await expect(drawer.getByRole('button', { name: 'Restore' })).toBeFocused();
+
+  // The row left the filtered list; Esc lands on the row now in its place, not on the page.
+  await expect(rows.filter({ hasText: target.domain })).toHaveCount(0);
+  await page.keyboard.press('Escape');
+  await expect(drawer).toHaveCount(0);
+  await expect(page).toHaveURL(hashIs('#/pipeline?stage=sourced'));
+  await expect(rows.nth(1)).toBeFocused();
+  await expect(rows.nth(1)).toContainText(next.domain);
+
+  // Put it back.
+  await page.evaluate((d) => { location.hash = `#/pipeline/${d}`; }, target.domain);
+  await drawer.getByRole('button', { name: 'Restore' }).click();
+  await expect(drawer.locator('.cd-stage')).toHaveText(STAGE.sourced);
+  expect(server.query('SELECT status FROM companies WHERE domain = ?', target.domain)).toEqual([{ status: 'sourced' }]);
+});
+
+test('a Skip refresh that lands after the drawer moved on is dropped', async ({ app, page, server }) => {
+  // Record the drawer's detail reads and whether each was aborted.
+  await page.addInitScript(() => {
+    const real = window.fetch;
+    window.__details = [];
+    window.fetch = (input, init = {}) => {
+      if (!init.method && /\/api\/companies\/[^/?]+$/.test(String(input))) {
+        window.__details.push({ url: String(input), signal: init.signal || null });
+      }
+      return real(input, init);
+    };
+  });
+  const reads = (domain) =>
+    page.evaluate(
+      (d) => window.__details.filter((f) => f.url.endsWith(`/${d}`)).map((f) => !!(f.signal && f.signal.aborted)),
+      domain,
+    );
+  const a = COMPANIES.filter((c) => c.status === 'sourced' && !c.contacts.length)[2];
+  const b = COMPANIES.find((c) => c.domain === 'quarry-security.example');
+  await app.goto(`#/pipeline/${a.domain}`);
+  const { drawer } = ui(page);
+  await expect(drawer.getByRole('button', { name: 'Skip' })).toBeVisible();
+
+  // Hold the re-read that follows the Skip.
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  let held = 0;
+  let done = false;
+  await page.route(`**/api/companies/${a.domain}`, async (rt) => {
+    held++;
+    await gate;
+    await rt.continue().catch(() => {});
+    done = true;
+  });
+  await drawer.getByRole('button', { name: 'Skip' }).click();
+  await expect(page.locator('#toasts')).toContainText(`Skipped ${a.name}`);
+  await expect.poll(() => held).toBe(1);
+
+  // Back/forward-style move to another company while it is held: that read is aborted.
+  await page.evaluate((d) => { location.hash = `#/pipeline/${d}`; }, b.domain);
+  await expect(drawer.getByRole('heading', { level: 2 })).toHaveText(b.name);
+  await expect(drawer.getByRole('list', { name: 'Contacts' }).getByRole('listitem')).toHaveCount(b.contacts.length);
+  await expect.poll(() => reads(a.domain)).toEqual([false, true]);
+  release();
+  await expect.poll(() => done).toBe(true);
+  await expect(drawer.getByRole('heading', { level: 2 })).toHaveText(b.name);
+  await expect(drawer.locator('.cd-stage')).toHaveText(STAGE[b.status]);
+  await expect(drawer.getByRole('link', { name: b.domain })).toBeVisible();
+  await page.unroute(`**/api/companies/${a.domain}`);
+
+  // Put it back.
+  await page.evaluate((d) => { location.hash = `#/pipeline/${d}`; }, a.domain);
+  await expect(drawer.locator('.cd-stage')).toHaveText(STAGE.skip);
+  await drawer.getByRole('button', { name: 'Restore' }).click();
+  await expect(drawer.locator('.cd-stage')).toHaveText(STAGE.sourced);
+  expect(server.query('SELECT status FROM companies WHERE domain = ?', a.domain)).toEqual([{ status: 'sourced' }]);
 });
