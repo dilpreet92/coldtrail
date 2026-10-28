@@ -10,7 +10,7 @@
 // progress or result, and one that ends elsewhere says so in a toast. Everything the screen
 // itself starts (fetches, the elapsed-time ticker, its store subscription) stops on unmount.
 
-import { api } from '../core/api.js';
+import { api, errorText } from '../core/api.js';
 import { debounce, fmtNum, h, pluralize, truncate } from '../core/dom.js';
 import { renderMarkdown } from '../core/markdown.js';
 import { href } from '../core/router.js';
@@ -76,35 +76,60 @@ const jobs = {
 };
 let screen = null; // hooks of the mounted screen, or null
 
-function runCheck(contacts, before, manual) {
-  const job = { startedAt: Date.now(), contacts, before, manual };
+/** Contacts a reply check covers: due or awaiting, with an email (the server's own rule). */
+const checkable = (rows) => rows.filter((r) => isOpen(r) && r.to).length;
+
+/** Start a reply check. `rows` (the list on screen, or null) gives the progress line its count
+ *  at once; `manual` holds the domains being marked by hand right now. */
+function runCheck(rows, manual) {
+  const job = { startedAt: Date.now(), contacts: rows ? checkable(rows) : null, before: null, manual };
   jobs.check = job;
   jobs.result = null;
-  api
-    .post('/api/followups/check', {})
-    .then(
-      (r) =>
+  (async () => {
+    // Snapshot every state before the agent starts, so the result can say who replied or
+    // bounced whatever the agent reports. Read it from the server, not the screen: the list on
+    // screen can be a store refresh old, or not yet reloaded after a mark that just finished,
+    // and either would credit the check with a change it didn't make.
+    let list = null;
+    try {
+      list = await api.get('/api/followups');
+    } catch (_) {
+      // The check itself may still work: fall back to the rows on screen.
+    }
+    if (!Array.isArray(list)) list = rows;
+    if (list) {
+      const n = checkable(list);
+      job.before = n ? new Map(list.map((r) => [r.domain, r.state])) : null;
+      if (n !== job.contacts) {
+        job.contacts = n;
+        if (screen) screen.checkProgress();
+      }
+    }
+    let result;
+    try {
+      const r = await api.post('/api/followups/check', {});
+      result =
         r && r.ok
           ? { tone: 'ok', title: 'Reply check finished', message: r.message || null, markdown: true }
-          : { tone: 'warn', title: "Couldn't check for replies", message: (r && r.message) || 'The agent could not check Gmail.', markdown: true },
-      (err) => ({ tone: 'err', title: 'Reply check failed', message: (err && err.message) || String(err), markdown: false }),
-    )
-    .then(async (result) => {
-      // Who it moved to replied / bounced, read from the list right away (not when Follow-ups
-      // next loads, which would also count changes made elsewhere meanwhile).
-      if (result.tone === 'ok' && job.before) result.changes = await changesSince(job);
-      result.at = new Date();
-      jobs.result = result;
-      jobs.check = null;
-      if (screen) {
-        screen.afterCheck();
-      } else {
-        const ok = result.tone === 'ok';
-        const what = ok ? (result.changes ? `Reply check finished: ${changesShort(result.changes)}.` : 'Reply check finished.') : `${result.title}.`;
-        toast(`${what} The details are on Follow-ups.`, ok ? 'ok' : 'err');
-        store.refresh();
-      }
-    });
+          : { tone: 'warn', title: "Couldn't check for replies", message: (r && r.message) || 'The agent could not check Gmail.', markdown: true };
+    } catch (err) {
+      result = { tone: 'err', title: 'Reply check failed', message: errorText(err), markdown: false };
+    }
+    // Who it moved to replied / bounced, read from the list right away (not when Follow-ups
+    // next loads, which would also count changes made elsewhere meanwhile).
+    if (result.tone === 'ok' && job.before) result.changes = await changesSince(job);
+    result.at = new Date();
+    jobs.result = result;
+    jobs.check = null;
+    if (screen) {
+      screen.afterCheck();
+    } else {
+      const ok = result.tone === 'ok';
+      const what = ok ? (result.changes ? `Reply check finished: ${changesShort(result.changes)}.` : 'Reply check finished.') : `${result.title}.`;
+      toast(`${what} The details are on Follow-ups.`, ok ? 'ok' : 'err');
+      store.refresh();
+    }
+  })();
 }
 
 /** { replied: [domain], bounced: [domain] } the check changed, or null if the list didn't load. */
@@ -141,11 +166,11 @@ function changesShort({ replied, bounced }) {
   return parts.length ? parts.join(' and ') : 'no new replies or bounces';
 }
 
-/** Whether an email draft for `domain` is waiting in Drafts; null when that can't be told. */
-async function hasEmailDraft(domain) {
+/** How many email drafts for `domain` are waiting in Drafts; null when that can't be told. */
+async function emailDraftCount(domain) {
   try {
     const list = await api.get('/api/drafts');
-    return Array.isArray(list) ? list.some((d) => isEmailDraft(d) && lower(d.domain) === lower(domain)) : null;
+    return Array.isArray(list) ? list.filter((d) => isEmailDraft(d) && lower(d.domain) === lower(domain)).length : null;
   } catch (_) {
     return null;
   }
@@ -153,28 +178,36 @@ async function hasEmailDraft(domain) {
 
 function runDraft(domain) {
   jobs.drafting.add(domain);
-  api
-    .post(`/api/followups/${encodeURIComponent(domain)}/draft`, {})
-    .then(
-      async (r) => {
-        if (!(r && r.ok)) {
-          toast(`Couldn't draft a follow-up for ${domain}.\n${r && r.message ? mdPlain(r.message) : 'The agent finished without writing one.'}`, 'err');
-          return;
-        }
-        // ok says how the agent's turn ended, not that it saved anything: look in Drafts.
-        if ((await hasEmailDraft(domain)) === false) {
-          toast(`The agent finished, but no follow-up draft was saved for ${domain}.`, 'err');
-        } else {
-          toast(`Follow-up drafted for ${domain}. Review it in Drafts.`, 'ok');
-        }
-      },
-      (err) => toast(`Couldn't draft a follow-up for ${domain}.\n${(err && err.message) || err}`, 'err'),
-    )
-    .finally(() => {
-      jobs.drafting.delete(domain);
-      if (screen) screen.afterDraft(domain);
-      else store.refresh();
-    });
+  (async () => {
+    // Saving a follow-up always adds a draft (`coldtrail followup` inserts a row), so count the
+    // domain's drafts first: one made elsewhere that this screen hadn't picked up yet must not
+    // pass for the agent's.
+    const before = await emailDraftCount(domain);
+    let r;
+    try {
+      r = await api.post(`/api/followups/${encodeURIComponent(domain)}/draft`, {});
+    } catch (err) {
+      toast(`Couldn't draft a follow-up for ${domain}.\n${errorText(err)}`, 'err');
+      return;
+    }
+    if (!(r && r.ok)) {
+      toast(`Couldn't draft a follow-up for ${domain}.\n${r && r.message ? mdPlain(r.message) : 'The agent finished without writing one.'}`, 'err');
+      return;
+    }
+    // ok says how the agent's turn ended, not that it saved anything: look in Drafts.
+    const after = await emailDraftCount(domain);
+    if (after == null || after > (before ?? 0)) {
+      toast(`Follow-up drafted for ${domain}. Review it in Drafts.`, 'ok');
+    } else if (after > 0) {
+      toast(`The agent finished, but no new follow-up draft was saved for ${domain}. An earlier one is waiting in Drafts.`, 'err');
+    } else {
+      toast(`The agent finished, but no follow-up draft was saved for ${domain}.`, 'err');
+    }
+  })().finally(() => {
+    jobs.drafting.delete(domain);
+    if (screen) screen.afterDraft(domain);
+    else store.refresh();
+  });
 }
 
 // ---- Small helpers ----
@@ -262,6 +295,7 @@ function mount(root, ctx) {
   const ac = new AbortController();
   let loadSeq = 0;
   let loaded = null; // what the last render showed (rows + pending), to skip identical reloads
+  let draftsSeen = null; // the summary's email-draft count when the drafts on hand were asked for
   let ticker = null;
   let elapsedEl = null;
   let selfRefresh = false;
@@ -349,6 +383,9 @@ function mount(root, ctx) {
     const counts = Object.fromEntries(STATES.map((st) => [st.id, s.rows ? 0 : null]));
     if (s.rows) for (const r of filtered()) counts[tabOf(r)] += 1;
     tabsEl.setCounts(counts);
+    // Counts widen the tabs without resizing the list, so the shared component doesn't re-check
+    // its overflow fade: its scroll listener does that.
+    tabsEl.dispatchEvent(new Event('scroll'));
   }
 
   function renderCheck() {
@@ -586,7 +623,7 @@ function mount(root, ctx) {
           panel(
             emptyState({
               title: "Couldn't load follow-ups",
-              body: s.error.message || String(s.error),
+              body: errorText(s.error),
               action: h('button', { type: 'button', class: 'btn btn-secondary', 'data-action': 'retry', onClick: retry }, 'Try again'),
             }),
             { role: 'alert' },
@@ -685,15 +722,19 @@ function mount(root, ctx) {
   // ---- Data ----
 
   /** Fetch the list and the drafts. `quiet` (a background check for changes made elsewhere):
-   *  skipped while another load runs, no error toast, and no re-render when nothing changed. */
+   *  skipped while another load runs, no error toast, no re-render when nothing changed, and
+   *  the drafts list (bodies and all) only when the summary's email-draft count has moved. */
   async function load({ quiet = false } = {}) {
     if (quiet && s.loading) return;
     const seq = ++loadSeq;
     s.loading = true;
     if (!s.rows) renderContent();
+    // Read before fetching: a count that moves while the list is on its way is caught next time.
+    const drafts = emailDraftTotal();
+    const withDrafts = !quiet || drafts == null || drafts !== draftsSeen;
     const [fu, dr] = await Promise.allSettled([
       api.get('/api/followups', { signal: ac.signal }),
-      api.get('/api/drafts', { signal: ac.signal }),
+      withDrafts ? api.get('/api/drafts', { signal: ac.signal }) : null,
     ]);
     if (s.gone || seq !== loadSeq) return;
     s.loading = false;
@@ -701,12 +742,13 @@ function mount(root, ctx) {
       s.rows = Array.isArray(fu.value) ? fu.value : [];
       s.error = null;
     } else if (!quiet) {
-      if (s.rows) toast(`Couldn't refresh follow-ups: ${fu.reason && fu.reason.message}`, 'err');
+      if (s.rows) toast(`Couldn't refresh follow-ups: ${errorText(fu.reason)}`, 'err');
       else s.error = fu.reason || new Error('Unknown error');
     }
     // The drafts list only adds the "Review draft" hint; without it the rows still work.
-    if (dr.status === 'fulfilled' && Array.isArray(dr.value)) {
+    if (withDrafts && dr.status === 'fulfilled' && Array.isArray(dr.value)) {
       s.pending = new Set(dr.value.filter(isEmailDraft).map((d) => lower(d.domain)));
+      draftsSeen = drafts;
     }
     const now = s.rows ? JSON.stringify([s.rows, [...s.pending].sort()]) : null;
     if (quiet && now === loaded) {
@@ -715,6 +757,13 @@ function mount(root, ctx) {
     }
     loaded = now;
     renderContent();
+  }
+
+  /** The summary's count of email drafts waiting, or null if there is no summary yet. */
+  function emailDraftTotal() {
+    const { summary } = store.get();
+    const n = summary && summary.counts ? summary.counts.drafts_email : null;
+    return Number.isFinite(n) ? n : null;
   }
 
   async function refreshStore() {
@@ -729,7 +778,9 @@ function mount(root, ctx) {
   // Work done elsewhere (a chat turn or scheduled run marking a reply or bounce, a draft made or
   // discarded on another screen) shows up on the store's next refresh. Not every such change
   // moves the summary's counts (a bounce on an Awaiting row doesn't), so look at the list itself
-  // each time: one cheap GET, and nothing is redrawn unless it changed.
+  // each time: one cheap GET, and nothing is redrawn unless it changed. The drafts list is
+  // heavier, and a draft made or discarded does move the email-draft count, so load() asks for
+  // it only when that count has changed.
   const unsubscribe = store.subscribe(() => {
     if (selfRefresh || s.gone || !s.rows) return;
     load({ quiet: true });
@@ -768,11 +819,8 @@ function mount(root, ctx) {
 
   function startCheck() {
     if (jobs.check) return;
-    const open = s.rows ? s.rows.filter((r) => isOpen(r) && r.to) : null;
-    // Snapshot the states, so the result can say who replied or bounced whatever the agent
-    // reports. A mark already on its way is the user's, not the check's.
-    const before = open && open.length ? new Map(s.rows.map((r) => [r.domain, r.state])) : null;
-    runCheck(open ? open.length : null, before, new Set(s.marking.keys()));
+    // A mark already on its way is the user's, not the check's.
+    runCheck(s.rows, new Set(s.marking.keys()));
     renderCheck();
     announce('Checking Gmail for replies.');
   }
@@ -799,7 +847,7 @@ function mount(root, ctx) {
     } catch (err) {
       if (job) job.manual.delete(domain);
       // Toasts are page-level: say so even if the user has moved on.
-      toast(`Couldn't mark ${domain} as ${value}.\n${(err && err.message) || err}`, 'err');
+      toast(`Couldn't mark ${domain} as ${value}.\n${errorText(err)}`, 'err');
     } finally {
       s.marking.delete(domain);
     }
@@ -836,6 +884,7 @@ function mount(root, ctx) {
 
   screen = {
     applyQuery,
+    checkProgress: renderNotice,
     afterCheck() {
       renderCheck();
       const r = jobs.result;

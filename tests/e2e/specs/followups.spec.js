@@ -5,11 +5,12 @@
 // (/api/followups and /api/drafts), hostile text, long lists, the keyboard, leaving mid-turn,
 // accessibility in light and dark, and phone width.
 //
-// Tests in this file share one server and run in order. Five change data: "mark replied …" (a
+// Tests in this file share one server and run in order. Six change data: "mark replied …" (a
 // Due row → Replied), "keyboard …" (an Awaiting row → Bounced), "a reply check reports …" (an
 // Awaiting row each → Replied and → Bounced), "a mark made by hand during a check …" (a Due row →
-// Replied) and "changes made elsewhere …" (an Awaiting row → Bounced). Every test before them sees
-// the seed as built, and every test after them derives what it expects from the server.
+// Replied), "changes made elsewhere …" (an Awaiting row → Bounced) and "a reply check credits
+// only …" (an Awaiting row → Bounced, a Due row → Replied). Every test before them sees the seed
+// as built, and every test after them derives what it expects from the server.
 import { expectAccessible } from '../harness/a11y.mjs';
 import { test, expect } from '../harness/fixtures.mjs';
 import { COMPANIES, SEED } from '../harness/seed.mjs';
@@ -177,9 +178,9 @@ test('draft follow-up shows progress then a result', async ({ app, page }) => {
   await expect(busy).toHaveAttribute('aria-busy', 'true');
   await expect(busy).toHaveAttribute('aria-disabled', 'true');
   await expect(r.locator('[data-action="replied"]')).toHaveAttribute('aria-disabled', 'true');
-  // A second press while it runs does not start another turn.
+  // A second press while it runs does not start another turn (counted again once it's over).
+  await expect.poll(() => gate.seen.length).toBe(1);
   await busy.click({ force: true });
-  expect(gate.seen).toHaveLength(1);
 
   // The real request goes to the fake agent. Its turn ends well (ok:true) but it never runs
   // `coldtrail followup`, so no draft exists: the toast says what actually happened.
@@ -189,6 +190,7 @@ test('draft follow-up shows progress then a result', async ({ app, page }) => {
   const none = toastWith(page, `The agent finished, but no follow-up draft was saved for ${target.domain}.`);
   await expect(none).toBeVisible({ timeout: AGENT_MS });
   await expect(none).toHaveAttribute('role', 'alert');
+  expect(gate.seen).toHaveLength(1);
   await expect(toastWith(page, 'Follow-up drafted for')).toHaveCount(0);
   await expect(r.locator('[data-action="draft"]')).toHaveText('Draft follow-up');
   await expect(r.locator('[data-action="draft"]')).not.toHaveAttribute('aria-disabled', 'true');
@@ -218,6 +220,32 @@ test('a saved follow-up draft is confirmed and replaces the button', async ({ ap
   const review = r.getByRole('link', { name: `Review draft, ${target.domain}` });
   await expect(review).toHaveAttribute('href', `#/drafts/${target.domain}`);
   await expect(r.getByRole('button', { name: /^Draft follow-up/ })).toHaveCount(0);
+});
+
+test('a draft made elsewhere is not taken for the agent’s', async ({ app, page }) => {
+  const target = seeded('due').filter((c) => emailOf(c))[2];
+  // The screen's list predates a follow-up written elsewhere: its first /api/drafts doesn't
+  // have it, every later one does. The agent's turn then ends well without saving another.
+  let loads = 0;
+  await page.route('**/api/drafts', async (route) => {
+    const res = await route.fetch();
+    const drafts = await res.json();
+    if (loads++ > 0) drafts.unshift({ domain: target.domain, to: emailOf(target), subject: 'Re: hi', body: 'Following up', status: 'draft_pending', gmail_draft_id: null, channel: 'email', auto_skip: null, contact_name: null, company_name: null });
+    await route.fulfill({ response: res, json: drafts });
+  });
+  await page.route(`**/api/followups/${target.domain}/draft`, (route) =>
+    route.fulfill({ json: { ok: true, message: 'Follow-up drafted — review it in Drafts.' } }),
+  );
+  await app.goto('#/followups');
+  await ready(page);
+  const r = row(page, target.domain);
+  await r.getByRole('button', { name: `Draft follow-up, ${target.domain}` }).click();
+  const none = toastWith(page, `The agent finished, but no new follow-up draft was saved for ${target.domain}. An earlier one is waiting in Drafts.`);
+  await expect(none).toBeVisible();
+  await expect(none).toHaveAttribute('role', 'alert');
+  await expect(toastWith(page, 'Follow-up drafted for')).toHaveCount(0);
+  // The waiting draft is linked now.
+  await expect(r.getByRole('link', { name: `Review draft, ${target.domain}` })).toHaveAttribute('href', `#/drafts/${target.domain}`);
 });
 
 test('a failed draft says so, and a waiting draft replaces the button', async ({ app, page }) => {
@@ -265,14 +293,16 @@ test('check for replies shows progress and completes', async ({ app, page }) => 
   await expect(checkBtn(page)).toBeFocused(); // a busy button keeps focus
   await expect(notice(page)).toContainText(`Checking Gmail for replies from ${CHECKABLE} contacts…`);
   await expect(notice(page).locator('.fu-elapsed')).toHaveText(/^0:0\d$/);
+  await expect.poll(() => gate.seen.length).toBe(1);
   await checkBtn(page).click({ force: true });
-  expect(gate.seen).toHaveLength(1);
 
   const response = page.waitForResponse((res) => res.url().endsWith('/api/followups/check'));
   gate.release();
   const body = await (await response).json();
   expect(body.ok).toBe(true);
   await expect(notice(page)).toContainText('Reply check finished', { timeout: AGENT_MS });
+  // The second press started nothing: still one check.
+  expect(gate.seen).toHaveLength(1);
   // The fake agent marks nothing: the result says so from the list itself, and then shows the
   // agent's own final text (opencode turns return it), rendered as agent text.
   await expect(notice(page).locator('.fu-changes')).toHaveText('No new replies or bounces.');
@@ -449,13 +479,23 @@ test('changes made elsewhere reach the open list', async ({ app, page }) => {
   const count = (state, d = 0) => fmtNum(before.filter((f) => f.state === state).length + d);
   const target = before.find((f) => f.state === 'awaiting');
   const due = before.find((f) => f.state === 'due' && f.to);
-  // Drafts gains a follow-up for the due company once `drafted` is set (written on another screen).
+  // Drafts gains a follow-up for the due company once `drafted` is set (written on another screen),
+  // and the summary counts it.
   let drafted = false;
   await page.route('**/api/drafts', async (route) => {
     const res = await route.fetch();
     const drafts = await res.json();
     if (drafted) drafts.unshift({ domain: due.domain, to: due.to, subject: 'Re: hi', body: 'Following up', status: 'draft_pending', gmail_draft_id: null, channel: 'email', auto_skip: null, contact_name: null, company_name: null });
     await route.fulfill({ response: res, json: drafts });
+  });
+  await page.route('**/api/summary', async (route) => {
+    const res = await route.fetch();
+    const summary = await res.json();
+    if (drafted) {
+      summary.counts.drafts += 1;
+      summary.counts.drafts_email += 1;
+    }
+    await route.fulfill({ response: res, json: summary });
   });
   await app.goto('#/followups');
   await ready(page);
@@ -475,6 +515,66 @@ test('changes made elsewhere reach the open list', async ({ app, page }) => {
   await expect(row(page, due.domain).getByRole('link', { name: `Review draft, ${due.domain}` })).toBeVisible();
   await expect(tab(page, 'Awaiting').locator('.tab-count')).toHaveText(count('awaiting', -1));
   await expect(tab(page, 'Bounced').locator('.tab-count')).toHaveText(count('bounced', 1));
+});
+
+test('a background refresh reloads the drafts list only when the draft count moves', async ({ app, page }) => {
+  const drafts = [];
+  page.on('request', (req) => {
+    if (new URL(req.url()).pathname === '/api/drafts') drafts.push(req);
+  });
+  let extra = 0;
+  await page.route('**/api/summary', async (route) => {
+    const res = await route.fetch();
+    const summary = await res.json();
+    summary.counts.drafts_email += extra;
+    await route.fulfill({ response: res, json: summary });
+  });
+  await app.goto('#/followups');
+  await ready(page);
+  expect(drafts).toHaveLength(1);
+  // The store refreshes (every 30s, or on coming back to the tab): the list is asked again,
+  // but with the same number of email drafts the heavy drafts list is not.
+  const refresh = async () => {
+    const list = page.waitForResponse((res) => isList(new URL(res.url())));
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    await list;
+    // One more round trip, so a drafts request sent alongside the list has been seen.
+    await page.evaluate(() => fetch('/assets/js/core/api.js').then((res) => res.text()));
+  };
+  await refresh();
+  expect(drafts).toHaveLength(1);
+  // A draft made or discarded elsewhere moves the count: then it is.
+  extra = 1;
+  await refresh();
+  expect(drafts).toHaveLength(2);
+  await refresh();
+  expect(drafts).toHaveLength(2);
+});
+
+test('a reply check credits only what changed after it started', async ({ app, page }) => {
+  await app.goto('#/followups');
+  await ready(page);
+  const list = async () => (await (await page.request.get(app.server.apiUrl('/api/followups'))).json());
+  const now = await list();
+  const outside = now.find((f) => f.state === 'awaiting');
+  const mine = now.find((f) => f.state === 'due' && f.to);
+  // A chat turn bounces someone after this list loaded, and the screen hasn't refreshed since.
+  await page.request.post(app.server.apiUrl(`/api/followups/${outside.domain}/mark`), { data: { value: 'bounced' } });
+  // A hand mark finishes, but the list reload after it is slow: the check starts before it lands.
+  const gate = await hold(page, isList);
+  await row(page, mine.domain).getByRole('button', { name: `Mark replied, ${mine.domain}` }).click();
+  await expect(toastWith(page, `Marked ${mine.domain} as replied.`)).toBeVisible();
+  await expect.poll(() => gate.seen.length).toBe(1);
+  await expect(row(page, mine.domain)).toBeVisible();
+  await checkBtn(page).click();
+  gate.release();
+
+  // The fake agent marks nothing: neither change is the check's.
+  await expect(notice(page).locator('.fu-changes')).toHaveText('No new replies or bounces.', { timeout: AGENT_MS });
+  await expect(row(page, mine.domain)).toHaveCount(0);
+  const after = await list();
+  expect(after.find((f) => f.domain === outside.domain).state).toBe('bounced');
+  expect(after.find((f) => f.domain === mine.domain).state).toBe('replied');
 });
 
 test('filter narrows the list and long lists show 100 rows at a time', async ({ app, page }) => {
@@ -547,6 +647,24 @@ test('loading, error and retry', async ({ app, page }) => {
   await expect(rows(page).first()).toBeVisible();
   await expect(filter).toBeVisible();
   await expect(page.locator('.fu-content')).not.toContainText("Couldn't load follow-ups");
+});
+
+test('a stale session says what to do, without repeating the banner', async ({ app, page }) => {
+  app.allowConsole(/Failed to load resource/);
+  await page.route(isList, (route) => route.fulfill({ status: 401, body: 'unauthorized' }));
+  await page.route('**/api/followups/check', (route) => route.fulfill({ status: 401, body: 'unauthorized' }));
+  await app.goto('#/followups');
+  // The shell's banner gives the whole sentence once; the screen only says what to do.
+  await expect(page.locator('.session-banner')).toContainText("This tab's session is stale");
+  const content = page.locator('.fu-content');
+  await expect(content).toContainText("Couldn't load follow-ups");
+  await expect(content.locator('.empty-state')).toContainText('Reopen coldtrail from your terminal.');
+  await expect(content).not.toContainText("This tab's session is stale");
+  await checkBtn(page).click();
+  await expect(notice(page)).toHaveClass(/fu-notice-err/);
+  await expect(notice(page)).toContainText('Reply check failed');
+  await expect(notice(page)).toContainText('Reopen coldtrail from your terminal.');
+  await expect(notice(page)).not.toContainText("This tab's session is stale");
 });
 
 test('a drafts list that fails to load only hides the draft hint', async ({ app, page }) => {
@@ -706,6 +824,36 @@ test('phone width: no horizontal scroll and the actions stay reachable', async (
   await page.emulateMedia({ colorScheme: 'light' });
   await expectAccessible(page);
   await expect.poll(scrollWidth).toBeLessThanOrEqual(390);
+});
+
+test('small phone: card text wraps in place, and the tabs show there are more', async ({ app, page }) => {
+  await page.setViewportSize({ width: 320, height: 640 });
+  const fresh = 'just-now.example';
+  await page.route(isList, (route) =>
+    route.fulfill({
+      json: [
+        { domain: fresh, to: `founder@${fresh}`, days: 0, touches: 1, state: 'awaiting' },
+        { domain: 'a-company-name-far-too-long-for-a-phone.example', to: 'someone.with.a.long.name@a-company-name-far-too-long-for-a-phone.example', days: 2, touches: 1, state: 'awaiting' },
+        { domain: 'due.example', to: 'founder@due.example', days: 6, touches: 1, state: 'due' },
+      ],
+    }),
+  );
+  await app.goto('#/followups?tab=awaiting');
+  await ready(page);
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(320);
+  // "Less than a day since the last send" wraps inside its card instead of running past it.
+  const overflowing = () =>
+    page.locator('.fu-content td').evaluateAll((tds) => tds.filter((td) => td.scrollWidth > td.clientWidth + 1).map((td) => td.className));
+  await expect.poll(overflowing).toEqual([]);
+  const days = row(page, fresh).locator('.fu-c-days');
+  await expect(days).toContainText('Less than a day');
+  expect(await days.evaluate((el) => el.getBoundingClientRect().height)).toBeGreaterThan(20); // two lines
+
+  // The tabs with their counts are wider than the screen: the edge fade says there is more.
+  const list = tablist(page);
+  const [scroll, client] = await list.evaluate((el) => [el.scrollWidth, el.clientWidth]);
+  expect(scroll).toBeGreaterThan(client);
+  await expect(list).toHaveAttribute('data-more', /\bend\b/);
 });
 
 test.describe('new workspace', () => {

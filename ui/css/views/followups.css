@@ -235,6 +235,11 @@
     padding: var(--space-3);
   }
   .fu-content .table .fu-c-actions { margin-top: var(--space-2); }
+  /* "Less than a day since the last send" can be wider than a small phone's card: it wraps,
+     indented past the separator, with the touch count level with its first line. */
+  .fu-content .table .fu-c-days { display: flex; white-space: normal; }
+  .fu-content .table .fu-c-touches,
+  .fu-content .table .fu-c-days { align-self: baseline; }
   .fu-actions { justify-content: flex-start; }
   .fu-actions > .btn-ghost:last-child { margin-right: 0; }
   .fu-actions > .btn-ghost:first-child { margin-left: calc(-1 * var(--space-2)); }
