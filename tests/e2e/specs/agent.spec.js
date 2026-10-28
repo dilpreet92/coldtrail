@@ -287,6 +287,7 @@ test('a failed run says why it ended', async ({ app, page, server }) => {
     id,
   );
   dbRun(server, "UPDATE scheduled_runs SET chat_id = ? WHERE status = 'error'", id);
+  const empty = transcript(page).locator('.empty-state');
   try {
     await openAgent(app, page, `#/agent/${id}`);
     const head = page.locator('.agent-chat-head');
@@ -294,7 +295,17 @@ test('a failed run says why it ended', async ({ app, page, server }) => {
     const log = transcript(page);
     // Inside the conversation, under its h2.
     await expect(log.getByRole('heading', { level: 3, name: 'This run recorded nothing' })).toBeVisible();
-    await expect(log.locator('.agent-run-note')).toHaveText('Failed: opencode exited with status 1');
+    // The reason sits under the explanation, before the action, in place of a pointer to the
+    // run history (which would only say the same thing).
+    await expect(empty.locator('.agent-run-note')).toHaveText('Failed: opencode exited with status 1');
+    await expect(empty.locator('.empty-body')).toHaveText('It ended before the agent started.');
+    expect(await empty.evaluate((el) => [...el.children].map((c) => c.className))).toEqual([
+      'empty-title',
+      'empty-body',
+      'agent-error agent-run-note',
+      'empty-action',
+    ]);
+    await expect(empty.getByRole('link', { name: 'Open Schedules' })).toHaveAttribute('href', '#/schedules');
     await expect(log.getByRole('alert')).toHaveCount(0); // stored, not news: not announced
 
     // A sign-in failure reads, and is toned, like its badge.
@@ -303,8 +314,17 @@ test('a failed run says why it ended', async ({ app, page, server }) => {
     await expect(head.getByText('Sign-in failed', { exact: true })).toBeVisible();
     await expect(log.locator('.agent-run-note')).toHaveText('Sign-in failed: opencode exited with status 1');
     await expect(log.locator('.agent-run-note')).toHaveClass(/\bis-warn\b/);
+
+    // A run with no recorded reason points to the run history instead.
+    dbRun(server, 'UPDATE scheduled_runs SET note = NULL WHERE chat_id = ?', id);
+    await page.reload();
+    await expect(head.getByText('Sign-in failed', { exact: true })).toBeVisible();
+    await expect(empty.locator('.empty-body')).toHaveText(
+      'It ended before the agent started. The run history in Schedules shows how it finished.',
+    );
+    await expect(log.locator('.agent-run-note')).toHaveCount(0);
   } finally {
-    dbRun(server, "UPDATE scheduled_runs SET status = 'error' WHERE chat_id = ?", id);
+    dbRun(server, "UPDATE scheduled_runs SET status = 'error', note = 'opencode exited with status 1' WHERE chat_id = ?", id);
     dbRun(server, "UPDATE scheduled_runs SET chat_id = NULL WHERE chat_id = ?", id);
     dbRun(server, 'DELETE FROM chat_sessions WHERE id = ?', id);
   }
@@ -324,8 +344,9 @@ test('a running scheduled run polls until it finishes and stops polling when you
     const head = page.locator('.agent-chat-head');
     const meta = page.locator('.agent-chat-meta');
     await expect(head.getByText('Running', { exact: true })).toBeVisible();
-    // A live run has no outcome yet: no finish time or status from an earlier row.
-    await expect(meta).toHaveText('Updates as the run works');
+    // A live run has no outcome yet: no finish time or status from an earlier row. When it last
+    // wrote shows whether it is still going (this one's last step is two days old).
+    await expect(meta).toHaveText(/^Updates as the run works · last update [A-Z][a-z]{2} \d{1,2}, \d\d:\d\d$/);
     await expect(head.getByText('Succeeded', { exact: true })).toHaveCount(0);
     await expect(page.locator('.agent-readonly')).toBeVisible();
     await expect(transcript(page).locator('.agent-working')).toBeVisible();
@@ -347,6 +368,7 @@ test('a running scheduled run polls until it finishes and stops polling when you
     ).lastInsertRowid;
     const live = log.getByRole('button', { name: 'Working… · 1 step' });
     await expect(live).toBeVisible();
+    await expect(meta).toHaveText('Updates as the run works · last update just now');
     // The redraw kept what the reader opened, and their place: focus is still on the steps.
     await expect(worked).toBeFocused();
     await expect(worked).toHaveAttribute('aria-expanded', 'true');
@@ -485,7 +507,9 @@ test('Stop ends a SLOW turn and re-enables the composer', async ({ app, page }) 
   await expect(log.locator('.agent-msg-user')).toHaveText(['Please go SLOW today']);
   // The header names the conversation the message is starting, not "Saved once you send…".
   await expect(chatTitle(page)).toHaveText('Please go SLOW today');
-  await expect(page.locator('.agent-chat-meta')).toBeHidden();
+  await expect(page.locator('.agent-chat-meta')).toBeEmpty();
+  const headHeight = () => page.locator('.agent-chat-head').evaluate((el) => el.getBoundingClientRect().height);
+  const pendingHeight = await headHeight();
   // Live: the group counts steps as they land and says it is working.
   await expect(log.getByRole('button', { name: /^Working… · ([2-9]|1\d) steps$/ })).toBeVisible();
   await expect(sendBtn(page)).toHaveCount(0);
@@ -504,6 +528,8 @@ test('Stop ends a SLOW turn and re-enables the composer', async ({ app, page }) 
 
   await expect(chatTitle(page)).toHaveText('Please go SLOW today');
   await expect(page.locator('.agent-chat-meta')).toHaveText(/^Updated /);
+  // The meta line arriving doesn't move the transcript down.
+  expect(await headHeight()).toBeCloseTo(pendingHeight, 1);
 
   // The server cancelled the turn, so the next one is answered right away, in the same chat.
   await send(page, 'Next question');
@@ -618,6 +644,154 @@ test('Stop while the message is on its way: the conversation it started stays on
   } finally {
     dbRun(server, 'DELETE FROM chat_sessions WHERE id = ?', sneaky);
   }
+});
+
+test('a first turn stopped while another holds the server keeps its conversation once the server is free', async ({
+  app,
+  page,
+  server,
+  request,
+}) => {
+  test.setTimeout(60_000);
+  // Another tab's turns hold the server's one-turn lock: two SLOW ones (20 steps × 0.4s each)
+  // whose streams nobody claims. The conversation this screen starts is only saved once its
+  // turn gets the lock, long after Stop.
+  const blocker = 'Hold the lock SLOW, from another tab';
+  await request.post(server.apiUrl('/api/chats/new'));
+  for (const message of [blocker, `${blocker} again`]) {
+    expect((await request.post(server.apiUrl('/api/chat'), { data: { message } })).ok()).toBe(true);
+  }
+  const blockerChat = () => dbAll(server, 'SELECT id FROM chat_sessions WHERE title = ?', blocker);
+  try {
+    await expect.poll(() => blockerChat().length).toBe(1); // the first one has the lock
+    await openAgent(app, page);
+    const text = 'Queued behind the other tab';
+    const claimed = streamClaimed(page);
+    await send(page, text);
+    await claimed; // the server has the message; its turn waits for the lock
+    await stopBtn(page).click();
+    const log = transcript(page);
+    const note = log.locator('.agent-note');
+    await expect(note).toHaveText('Stopped');
+    // The wait outlasts the first looks: the note says what it is waiting for, and the screen
+    // still shows the conversation the message started.
+    await expect(note).toHaveText("Stopped. The agent is busy with another turn; this conversation is saved once it's free.");
+    await expect(chatTitle(page)).toHaveText(text);
+    await expect(page).toHaveURL(/#\/agent$/);
+
+    // The lock frees: the stopped turn's conversation is saved and takes the screen's address.
+    await expect(page).toHaveURL(CHAT_URL, { timeout: 30_000 });
+    const id = idFromUrl(page);
+    await expect(note).toHaveText('Stopped');
+    await expect(chatTitle(page)).toHaveText(text);
+    await expect(section(page, 'Your chats').locator('[aria-current="page"]')).toHaveAttribute('href', `#/agent/${id}`);
+
+    // The next message continues it: one transcript on screen, one conversation on the server.
+    await send(page, 'Follow-up after the wait');
+    await expect(log.locator('.agent-msg-agent').last()).toHaveText('Fake agent reply: Follow-up after the wait');
+    await expect(page).toHaveURL(new RegExp(`#/agent/${id}$`));
+    const userRows = dbAll(
+      server,
+      "SELECT session_id, content FROM chat_messages WHERE role = 'user' AND content IN (?, ?) ORDER BY id",
+      text,
+      'Follow-up after the wait',
+    );
+    expect(userRows).toEqual([
+      { session_id: id, content: text },
+      { session_id: id, content: 'Follow-up after the wait' },
+    ]);
+  } finally {
+    for (const { id } of blockerChat()) {
+      dbRun(server, 'DELETE FROM chat_messages WHERE session_id = ?', id);
+      dbRun(server, 'DELETE FROM chat_sessions WHERE id = ?', id);
+    }
+  }
+});
+
+test('a stopped first turn still not saved after two minutes leaves a new conversation on screen', async ({ app, page }) => {
+  // As if another tab's turn held the server all that time: the list never shows the stopped
+  // turn's conversation, and the clock skips the wait.
+  const text = 'Never listed, SLOW';
+  await page.clock.install();
+  await page.route('**/api/chats', async (route) => {
+    const res = await route.fetch();
+    const rows = (await res.json()).filter((/** @type {{ title: string }} */ c) => c.title !== text);
+    await route.fulfill({ response: res, json: rows });
+  });
+  await openAgent(app, page);
+  const claimed = streamClaimed(page);
+  await send(page, text);
+  await claimed;
+  await stopBtn(page).click();
+  const log = transcript(page);
+  const note = log.locator('.agent-note');
+  await expect(note).toHaveText("Stopped. The agent is busy with another turn; this conversation is saved once it's free.");
+  await page.clock.fastForward('02:10');
+  // The next message would start another conversation, so the screen doesn't show it under
+  // this one: it starts afresh and says where the stopped message goes.
+  await expect(note).toHaveText(
+    "Stopped. The agent is still busy with another turn, so your message is saved as a conversation of its own once it's free.",
+  );
+  await expect(chatTitle(page)).toHaveText('New conversation');
+  await expect(log.locator('.agent-msg-user')).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: 'What should the agent work on?' })).toBeVisible();
+  await expect(page).toHaveURL(/#\/agent$/);
+
+  await page.unroute('**/api/chats');
+  await send(page, 'A fresh start');
+  await expect(log.locator('.agent-msg-user')).toHaveText(['A fresh start']);
+  await expect(log.locator('.agent-msg-agent')).toHaveText('Fake agent reply: A fresh start');
+  await expect(page).toHaveURL(CHAT_URL);
+});
+
+test('a message stopped before it was sent comes back after you move on', async ({ app, page }) => {
+  const posts = chatPosts(page);
+  /** Hold POST /api/chats/new (the step before the message goes out) until release(). */
+  const holdNew = async () => {
+    let release = () => {};
+    const gate = new Promise((r) => (release = r));
+    let onHeld = () => {};
+    const held = new Promise((r) => (onHeld = r));
+    await page.route('**/api/chats/new', async (route) => {
+      onHeld();
+      await gate;
+      // The page may have given up on it (leaving the screen aborts it).
+      await route.fallback().catch(() => {});
+    });
+    return { held, release };
+  };
+  const mainNav = page.getByRole('navigation', { name: 'Main' });
+  await openAgent(app, page);
+
+  // Stopped, then another conversation opened before the server answered: the composer, which
+  // every conversation shares, gets the text back; that conversation's transcript isn't told.
+  let gate = await holdNew();
+  await send(page, 'Stopped, then I opened another chat');
+  await gate.held;
+  await stopBtn(page).click();
+  await section(page, 'Your chats').getByRole('link', { name: new RegExp(notes.title) }).click();
+  await expect(chatTitle(page)).toHaveText(notes.title);
+  gate.release();
+  await expect(composer(page)).toHaveValue('Stopped, then I opened another chat');
+  await expect(transcript(page).locator('.agent-note, .agent-msg-user.is-unsent')).toHaveCount(0);
+  await page.unroute('**/api/chats/new');
+
+  // Stopped, then the screen went away: the text waits in the composer for it.
+  await composer(page).fill('');
+  await page.getByRole('button', { name: 'New chat', exact: true }).click();
+  await expect(chatTitle(page)).toHaveText('New conversation');
+  gate = await holdNew();
+  await send(page, 'Stopped, then I left');
+  await gate.held;
+  await stopBtn(page).click();
+  await mainNav.getByRole('link', { name: /^Home/ }).click();
+  await expect(page.locator('#view h1')).toHaveText('Home');
+  gate.release();
+  await mainNav.getByRole('link', { name: 'Agent', exact: true }).click();
+  await expect(page.locator('#view h1')).toHaveText('Agent');
+  await expect(composer(page)).toHaveValue('Stopped, then I left');
+  await page.unroute('**/api/chats/new');
+  expect(posts).toEqual([]);
 });
 
 test('FAIL turn shows the error', async ({ app, page, server }) => {
@@ -842,6 +1016,37 @@ test('starter prompts and Shift+Enter fill the composer; only Enter sends', asyn
   await expect(transcript(page).locator('.agent-msg-agent')).toHaveCount(1);
 });
 
+test('a starter cut short beside the list shows its whole text on hover', async ({ app, page }) => {
+  const starters = page.getByRole('list', { name: 'Starter prompts' }).getByRole('button');
+  const first = starters.first().locator('.agent-starter-text');
+  const cut = () => first.evaluate((el) => el.scrollHeight > el.clientHeight + 1);
+  const full = 'Find 20 seed-stage B2B SaaS companies that fit my company profile and add them to the pipeline.';
+  const hover = async () => {
+    await page.mouse.move(0, 0);
+    await first.hover();
+  };
+
+  // A laptop: two columns beside the list, each description cut to two lines.
+  await page.setViewportSize({ width: 1024, height: 768 });
+  await openAgent(app, page);
+  await expect(first).toHaveText(full);
+  expect(await cut()).toBe(true);
+  await hover();
+  await expect(first).toHaveAttribute('title', full);
+  // On the text, not the button: a screen reader hears it once, in the button's name.
+  await expect(starters.first()).toHaveAccessibleDescription('');
+
+  // Wide enough to show it whole: no tooltip repeating it.
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await expect.poll(cut).toBe(false);
+  await hover();
+  await expect(first).not.toHaveAttribute('title', /.*/);
+
+  // A phone: one column, and the transcript scrolls, so nothing is cut.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect.poll(cut).toBe(false);
+});
+
 test('hostile text in a message renders as text everywhere', async ({ app, page }) => {
   await openAgent(app, page);
   const hostile = '<img src=x onerror=window.__xss=9>';
@@ -921,6 +1126,33 @@ test('loading, error and retry states', async ({ app, page }) => {
   await expect(log.locator('.agent-msg-user')).toHaveCount(0);
   await expect(sendBtn(page)).toBeEnabled();
   await page.unroute('**/api/chat');
+});
+
+test('a stale session says what to do, without repeating the banner', async ({ app, page }) => {
+  app.allowConsole(/Failed to load resource/);
+  const stale = (route) => route.fulfill({ status: 401, body: 'unauthorized' });
+  await page.route('**/api/chats', stale);
+  await page.route(`**/api/chats/${notes.id}`, stale);
+  await openAgent(app, page);
+  // The shell's banner gives the whole sentence once; the screen only says what to do.
+  await expect(page.locator('.session-banner')).toContainText("This tab's session is stale");
+  const listPane = page.locator('.agent-list');
+  await expect(listPane.getByText("Couldn't load conversations")).toBeVisible();
+  await expect(listPane.locator('.agent-list-msg-body')).toHaveText('Reopen coldtrail from your terminal.');
+
+  await page.evaluate((id) => {
+    location.hash = `#/agent/${id}`;
+  }, notes.id);
+  const log = transcript(page);
+  await expect(log.getByText("Couldn't open this conversation")).toBeVisible();
+  await expect(log.locator('.empty-body')).toHaveText('Reopen coldtrail from your terminal.');
+
+  await page.route('**/api/chat', (route) => (route.request().method() === 'POST' ? stale(route) : route.fallback()));
+  await page.getByRole('button', { name: 'New chat', exact: true }).click();
+  await send(page, 'Sent from a stale tab');
+  await expect(log.getByRole('alert')).toHaveText("Couldn't start the turn: Reopen coldtrail from your terminal.");
+  await expect(composer(page)).toHaveValue('Sent from a stale tab');
+  await expect(page.locator('#view')).not.toContainText("This tab's session is stale");
 });
 
 test('a message sent while the conversation is still being opened waits for it', async ({ app, page }) => {
@@ -1114,6 +1346,13 @@ test('phone width: conversations toggle, no horizontal scroll', async ({ app, pa
   await expect(convNav(page)).toBeHidden();
   await expect(toggle).toHaveAttribute('aria-expanded', 'false');
   await expect(transcript(page).locator('.agent-msg-agent')).toBeVisible();
+  // The wrapped header has no empty badge row under a chat's title and time.
+  const headGap = await page.evaluate(() => {
+    const head = /** @type {HTMLElement} */ (document.querySelector('.agent-chat-head'));
+    const titles = /** @type {HTMLElement} */ (document.querySelector('.agent-chat-titles'));
+    return head.getBoundingClientRect().bottom - titles.getBoundingClientRect().bottom;
+  });
+  expect(headGap).toBeLessThan(14); // its 12px padding and 1px border
   // The composer stays on screen.
   const box = await composer(page).boundingBox();
   expect(box && box.y + box.height).toBeLessThanOrEqual(844);

@@ -132,9 +132,13 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.agent-chat-meta:empty { display: none; }
+/* An empty meta line keeps its height, so the header doesn't jump as a conversation goes from
+   loading or "on its way" to saved. */
+.agent-chat-meta:empty::before { content: '\00a0'; }
 .agent-meta-part { white-space: nowrap; }
 .agent-chat-badges { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-2); }
+/* No badges (a regular chat): no empty row under the title when a narrow header wraps. */
+.agent-chat-badges:empty { display: none; }
 .agent-skel-title { width: 220px; max-width: 60%; height: 1.1em; }
 
 .agent-live-dot {
@@ -329,6 +333,8 @@
 .agent-error.is-warn { border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); }
 .agent-error.is-warn svg { color: var(--warn); }
 .agent-error-text { min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+/* A run that recorded nothing: its reason sits under the explanation, before the action. */
+.empty-state .agent-run-note { max-width: min(100%, 60ch); margin-top: var(--space-1); text-align: left; }
 
 .agent-note { align-self: flex-start; font-size: 12px; color: var(--text-3); }
 
@@ -403,8 +409,8 @@
 }
 .agent-starter:hover { background: var(--surface-2); border-color: var(--border-strong); }
 .agent-starter-title { font-weight: 500; }
-/* Two lines at most, so the four fit beside the list at laptop sizes; a starter puts its whole
-   text in the composer. */
+/* Two lines at most, so the four fit beside the list at laptop sizes. Hovering a cut one shows
+   it whole (agent.js), and a starter puts its whole text in the composer. */
 .agent-starter-text {
   display: -webkit-box;
   overflow: hidden;
@@ -549,6 +555,8 @@
 
 @container agent-chat (max-width: 479px) {
   .agent-starters { grid-template-columns: minmax(0, 1fr); }
+  /* One column (a phone): the transcript scrolls anyway, so each starter shows all its text. */
+  .agent-starter-text { display: block; -webkit-line-clamp: none; line-clamp: none; }
 }
 
 /* ---- Motion ---- */

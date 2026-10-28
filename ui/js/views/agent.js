@@ -19,7 +19,7 @@
 // (holding the server's one-turn lock) until a 45s reaper, so a turn this view gives up on is
 // still claimed once and closed as soon as it connects, which cancels it.
 
-import { api, openStream } from '../core/api.js';
+import { api, errorText, openStream } from '../core/api.js';
 import { fmtNum, fmtRelative, h, runStatus } from '../core/dom.js';
 import { renderMarkdown } from '../core/markdown.js';
 import { href } from '../core/router.js';
@@ -34,10 +34,19 @@ const POLL_MS = 2000;
 // After `done` the server still saves the reply (or deletes a failed first turn) before it
 // closes the stream; wait for that close, but never longer than this.
 const SETTLE_MS = 2000;
-// A first turn stopped or cut off early may still be queued behind the server's one-turn lock,
-// so its conversation isn't saved yet: look for it this many more times, this far apart.
-const ADOPT_RETRIES = 3;
-const ADOPT_RETRY_MS = 700;
+// A first turn stopped or cut off early may still be queued behind the server's one-turn lock
+// (another tab's turn, or a stopped one finishing a long step), so its conversation isn't saved
+// until that lock frees. Look for it again, less and less often: for ADOPT_PATIENCE_MS, and for a
+// stopped turn up to ADOPT_WAIT_MS, its "Stopped" note saying what it waits for meanwhile.
+const ADOPT_FIRST_GAP_MS = 700;
+const ADOPT_MAX_GAP_MS = 5000;
+const ADOPT_PATIENCE_MS = 2000;
+const ADOPT_WAIT_MS = 120000;
+const STOPPED_WAITING = "Stopped. The agent is busy with another turn; this conversation is saved once it's free.";
+const STOPPED_DETACHED =
+  "Stopped. The agent is still busy with another turn, so your message is saved as a conversation of its own once it's free.";
+// A scheduled run whose log is empty.
+const EMPTY_RUN = 'It ended before the agent started.';
 const LIST_PAGE = 50;
 const MAX_INPUT_PX = 200;
 const TITLE_CHARS = 60;
@@ -99,7 +108,6 @@ function icon(name, size = 16) {
 
 const isRun = (t) => RUN_TITLE.test(t || '');
 const isAbort = (err) => !!err && err.name === 'AbortError';
-const errText = (err) => (err && err.message) || String(err);
 const enc = encodeURIComponent;
 
 /** The list label: runs drop the "Scheduled run —" prefix their section already says. */
@@ -114,6 +122,12 @@ function titleFrom(text) {
   const one = String(text).trim().replace(/\n/g, ' ');
   const chars = [...one];
   return chars.length > TITLE_CHARS ? `${chars.slice(0, TITLE_CHARS).join('')}…` : one;
+}
+
+/** When a stored conversation last got a message (the newest one's created_at), or null. */
+function lastAt(d) {
+  const msgs = d && Array.isArray(d.messages) ? d.messages : [];
+  return (msgs.length && msgs[msgs.length - 1].created_at) || null;
 }
 
 /** A ?prompt= hand-off (Pipeline, Home), or ''. */
@@ -395,9 +409,24 @@ export default {
       timers.delete(id);
     }
 
-    /** Resolves after `ms`; never, if the screen goes away first. */
-    function pause(ms) {
-      return new Promise((resolve) => later(resolve, ms));
+    /**
+     * Resolves after `ms`, or as soon as another conversation is put on screen (wakeNaps());
+     * never, if the screen goes away first.
+     */
+    const wakers = new Set();
+    function nap(ms) {
+      return new Promise((resolve) => {
+        const done = () => {
+          wakers.delete(done);
+          cancel(id);
+          resolve();
+        };
+        const id = later(done, ms);
+        wakers.add(done);
+      });
+    }
+    function wakeNaps() {
+      for (const done of [...wakers]) done();
     }
 
     /** Where the router would put focus: the screen's heading. */
@@ -602,8 +631,9 @@ export default {
       const listed = chats.find((c) => c.id === currentId);
       if (current.run) {
         if (current.running) {
-          // The run history only gets this run's row when it ends.
-          headMeta.textContent = 'Updates as the run works';
+          // The run history only gets this run's row when it ends. When the run last wrote
+          // shows whether it is still going (a run that died can leave `running` set).
+          headMeta.textContent = runningMeta();
           const live = badge('Running', 'accent');
           live.prepend(h('span', { class: 'agent-live-dot', 'aria-hidden': 'true' }));
           headBadges.append(live);
@@ -630,6 +660,13 @@ export default {
       } else if (listed && listed.updated_at) {
         headMeta.textContent = `Updated ${fmtRelative(listed.updated_at)}`;
       }
+    }
+
+    /** A running run's meta line: live, and when it last wrote to its log. */
+    function runningMeta() {
+      const listed = chats.find((c) => c.id === currentId);
+      const at = (current && current.lastAt) || (listed && listed.updated_at) || null;
+      return at ? `Updates as the run works · last update ${fmtRelative(at)}` : 'Updates as the run works';
     }
 
     // ---- Composer modes and status ----
@@ -863,7 +900,7 @@ export default {
         if (gone || isAbort(err) || seq !== listSeq) return chats;
         if (listState !== 'ready') {
           listState = 'error';
-          listError = errText(err);
+          listError = errorText(err);
           renderList();
         }
       }
@@ -903,7 +940,21 @@ export default {
                 'button',
                 { type: 'button', class: 'agent-starter', onClick: () => fill(s.text) },
                 h('span', { class: 'agent-starter-title' }, s.title),
-                h('span', { class: 'agent-starter-text' }, s.text),
+                h(
+                  'span',
+                  {
+                    class: 'agent-starter-text',
+                    // Cut to two lines beside the list (agent.css): hovering a cut one shows it
+                    // whole. The title sits on the text, not the button, so a screen reader
+                    // (which reads the whole text already) doesn't hear it twice.
+                    onPointerenter: (e) => {
+                      const el = e.currentTarget;
+                      if (el.scrollHeight > el.clientHeight + 1) el.title = s.text;
+                      else el.removeAttribute('title');
+                    },
+                  },
+                  s.text,
+                ),
               ),
             ),
           ),
@@ -966,8 +1017,9 @@ export default {
         logState(
           emptyState({
             title: run ? 'This run recorded nothing' : 'No messages yet',
+            // showRunNote() drops the second sentence once it has the run's own reason.
             body: run
-              ? 'It ended before the agent started. The run history in Schedules shows how it finished.'
+              ? `${EMPTY_RUN} The run history in Schedules shows how it finished.`
               : 'Send a message to start this conversation.',
             action: run ? { label: 'Open Schedules', href: '#/schedules' } : null,
             level: 3,
@@ -1068,8 +1120,9 @@ export default {
       });
     }
 
-    function newConversation() {
+    function newConversation({ keepList = false } = {}) {
       openSeq++;
+      wakeNaps();
       dropTurn();
       stopPoll();
       currentId = null;
@@ -1080,11 +1133,12 @@ export default {
       renderHead();
       showWelcome();
       markCurrent();
-      setListOpen(false);
+      if (!keepList) setListOpen(false);
     }
 
     async function openChat(id) {
       const seq = ++openSeq;
+      wakeNaps();
       dropTurn();
       stopPoll();
       currentId = id;
@@ -1112,7 +1166,7 @@ export default {
             { class: 'agent-load-error' },
             emptyState({
               title: "Couldn't open this conversation",
-              body: errText(err),
+              body: errorText(err),
               action: { label: 'Try again', onClick: () => openChat(id) },
               level: 3,
             }),
@@ -1136,7 +1190,7 @@ export default {
         return;
       }
       const run = isRun(d.title);
-      current = { id, title: d.title, run, running: !!d.running, missing: false };
+      current = { id, title: d.title, run, running: !!d.running, missing: false, lastAt: lastAt(d) };
       renderHead();
       renderStored(d);
       toBottom();
@@ -1158,7 +1212,7 @@ export default {
       const err = await p;
       if (activating === p) activating = null;
       if (!err || gone || isAbort(err) || seq !== openSeq) return;
-      setMode('blocked', errText(err));
+      setMode('blocked', errorText(err));
     }
 
     async function loadRunInfo(id, seq) {
@@ -1173,15 +1227,26 @@ export default {
       }
     }
 
-    /** Why a finished run didn't succeed (the run history's note), at the end of its log. */
+    /**
+     * Why a finished run didn't succeed (the run history's note), at the end of its log. In a
+     * run that recorded nothing it goes under the explanation, in place of the pointer to the
+     * run history, which would only say the same thing.
+     */
     function showRunNote() {
-      const old = logInner.querySelector('.agent-run-note');
-      if (old) old.remove();
+      for (const old of logInner.querySelectorAll('.agent-run-note')) old.remove();
       if (!current || !current.run || current.running || !runInfo || !runInfo.note) return;
       if (runInfo.status === 'ok') return;
       const [label, tone] = runStatus(runInfo.status);
       const cls = ['agent-run-note', tone === 'warn' && 'is-warn'];
-      follow(() => logInner.append(errorRow(`${label}: ${runInfo.note}`, { live: false, cls })));
+      const row = errorRow(`${label}: ${runInfo.note}`, { live: false, cls });
+      const empty = logInner.querySelector('.empty-state');
+      if (empty) {
+        const body = empty.querySelector('.empty-body');
+        if (body) body.textContent = EMPTY_RUN;
+        empty.insertBefore(row, empty.querySelector('.empty-action'));
+        return;
+      }
+      follow(() => logInner.append(row));
     }
 
     const signature = (d) => JSON.stringify([d.running, d.messages]);
@@ -1201,11 +1266,14 @@ export default {
           const d = await api.get(`/api/chats/${enc(id)}`, { signal });
           if (gone || seq !== openSeq) return;
           const sig = signature(d);
+          current.lastAt = lastAt(d);
           if (sig !== last) {
             last = sig;
             current.running = !!d.running;
             follow(() => renderStored(d, { keep: true }));
             renderHead();
+          } else if (current.running) {
+            headMeta.textContent = runningMeta(); // "last update 1m ago" moves on with the clock
           }
           if (!d.running) {
             stopPoll();
@@ -1314,7 +1382,7 @@ export default {
         if (gone || t.abandoned || t.stopped) {
           // Left, or stopped, before anything started: send nothing.
           t.resolveSent(false);
-          if (!gone && !t.abandoned) takeBack(t, null);
+          if (t.stopped) takeBack(t, null);
           return;
         }
         // Not on the screen's signal: once the server has the message the turn runs, so this
@@ -1322,8 +1390,9 @@ export default {
         ({ run } = await api.post('/api/chat', { message: text }));
       } catch (err) {
         t.resolveSent(false);
-        if (gone || isAbort(err) || t.abandoned) return;
-        takeBack(t, t.stopped ? null : `Couldn't start the turn: ${errText(err)}`);
+        // Stopped first: whatever happened since (even leaving the screen), the text comes back.
+        if (t.stopped) takeBack(t, null);
+        else if (!gone && !isAbort(err) && !t.abandoned) takeBack(t, `Couldn't start the turn: ${errorText(err)}`);
         return;
       }
       t.resolveSent(true);
@@ -1344,12 +1413,24 @@ export default {
      * bubble stays, marked as not sent. `error` says why; without one, it was stopped.
      */
     function takeBack(t, error) {
+      if (gone) {
+        // Stopped, then the screen went away: the text waits for it with what was being typed,
+        // unless something else was.
+        if (!unsent.trim()) unsent = t.text;
+        return;
+      }
       if (turn === t) {
         turn = null;
         setLive(false);
       }
       if (t.seq !== openSeq) {
-        // Stopped, then another conversation opened: that one isn't told about it.
+        // Stopped, then another conversation opened: that one's transcript isn't told about it,
+        // but the composer (which every conversation shares) gets the text back if it is empty.
+        if (!input.value.trim()) {
+          input.value = t.text;
+          grow();
+          announce('Stopped before it was sent. Your message is back in the composer.');
+        }
         settle(t);
         return;
       }
@@ -1503,8 +1584,12 @@ export default {
       if (saved && onScreen(t)) hit = await findChat(t);
       else await loadList();
       if (onScreen(t)) {
-        if (hit) adopt(hit);
-        else if (pendingTitle !== null) {
+        if (hit) {
+          adopt(hit);
+          if (t.note && t.note.textContent === STOPPED_WAITING) t.note.textContent = 'Stopped';
+        } else if (saved && t.stopped) {
+          detach();
+        } else if (pendingTitle !== null) {
           pendingTitle = null;
           renderHead();
         }
@@ -1515,20 +1600,44 @@ export default {
     /**
      * The conversation a new turn's message went to: the server's active one, with the title it
      * gives the first message. If another tab has made something else active since, one with
-     * that title that wasn't listed before the turn (never a run's log). A turn stopped early
-     * may not be saved yet: look again a few times.
+     * that title that wasn't listed before the turn (never a run's log). A turn cut off early
+     * may not be saved until the server's one-turn lock frees: look again a few times, and for a
+     * stopped one keep looking, less often as time goes on, while it is on screen (a message sent
+     * meanwhile waits for it, so it lands there too). After a while the "Stopped" note says what
+     * this waits for.
      */
     async function findChat(t) {
-      for (let tries = 0; ; tries++) {
+      const start = Date.now();
+      const limit = t.stopped ? ADOPT_WAIT_MS : ADOPT_PATIENCE_MS;
+      let gap = ADOPT_FIRST_GAP_MS;
+      for (;;) {
         const rows = await loadList();
         if (!onScreen(t)) return null;
         const hit =
           rows.find((c) => c.active && c.title === t.title) ||
           (t.known && rows.find((c) => c.title === t.title && !isRun(c.title) && !t.known.has(c.id)));
         // A finished turn's conversation is there already, if it is anywhere.
-        if (hit || t.ok || tries >= ADOPT_RETRIES) return hit || null;
-        await pause(ADOPT_RETRY_MS);
+        if (hit || t.ok) return hit || null;
+        const waited = Date.now() - start;
+        if (waited >= limit) return null;
+        if (waited >= ADOPT_PATIENCE_MS && t.note && t.note.textContent !== STOPPED_WAITING) {
+          t.note.textContent = STOPPED_WAITING;
+          announce(STOPPED_WAITING);
+        }
+        await nap(gap);
+        gap = Math.min(Math.round(gap * 1.5), ADOPT_MAX_GAP_MS);
       }
+    }
+
+    /**
+     * A stopped first turn's conversation still isn't saved after all that: showing the next
+     * message under it would be wrong (it would start another conversation), so the screen
+     * starts a new one and says where the stopped message goes.
+     */
+    function detach() {
+      newConversation({ keepList: true });
+      logInner.prepend(noteRow(STOPPED_DETACHED));
+      announce(STOPPED_DETACHED);
     }
 
     /** The new conversation on screen is now `c`: its title, its place in the list, its address. */
