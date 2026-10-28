@@ -55,14 +55,14 @@
   color: var(--text-3);
   pointer-events: none;
 }
-.pl-filter-input { padding-left: 34px; }
+.pl-filter-input { padding-left: 34px; text-overflow: ellipsis; } /* the placeholder too */
 .pl-filter-input::-webkit-search-cancel-button { cursor: pointer; }
 
 /* "Sourced by" sits beside its picker. The list opens under the input (searchSelect keeps it in
    the window and sets the room it has as --ss-room-x), wider than the field for long queries. */
 .pl-source {
   display: flex;
-  flex: 0 1 340px;
+  flex: 0 1 320px;
   align-items: center;
   gap: var(--space-2);
   min-width: 0;
@@ -88,12 +88,14 @@
 }
 
 /* Column widths (every cell has pl-col-<key>): Company and Sourced by take a share of the width,
-   Stage and First seen what their longest value needs, Contact the rest. A 1024px window keeps
-   every header whole and no sideways scroll; below 1000px see "Narrow windows". */
+   Stage and First seen what their longest value needs, Contact the rest. Company gets the larger
+   share (a 1024px window shows a 22-character domain whole); a long source query truncates with
+   its tooltip. A 1024px window keeps every header whole and no sideways scroll; below 1000px see
+   "Narrow windows". */
 .pl-results .table { table-layout: fixed; min-width: 680px; }
-.pl-results .pl-col-company { width: 24%; }
+.pl-results .pl-col-company { width: 26%; }
 .pl-results .pl-col-stage { width: 128px; }
-.pl-results .pl-col-source { width: 18%; }
+.pl-results .pl-col-source { width: 15%; }
 .pl-results .pl-col-first_seen { width: 104px; }
 .pl-results .table td { padding-top: var(--space-2); padding-bottom: var(--space-2); height: 56px; }
 
@@ -359,8 +361,10 @@
   .pl-results th.pl-col-company { z-index: 2; }
 }
 
+/* The filter takes a row of its own; Sourced by fills the next, with Clear filters beside it
+   while the picker keeps 220px (a phone), else on a row below. */
 @media (max-width: 899px) {
   .pl-hint { display: none; }
   .pl-filter { flex-basis: 100%; max-width: none; }
-  .pl-source { flex: 1 1 auto; }
+  .pl-source { flex: 1 1 0; min-width: min(220px, 100%); }
 }

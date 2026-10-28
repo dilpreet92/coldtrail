@@ -4,6 +4,7 @@
 import { expectAccessible } from '../harness/a11y.mjs';
 import { test, expect } from '../harness/fixtures.mjs';
 import { COMPANIES, SEED } from '../harness/seed.mjs';
+import { SESSION_EXPIRED, SESSION_REOPEN } from '../../../ui/js/core/api.js';
 import { fmtNum } from '../../../ui/js/core/format.js';
 import { parseHash } from '../../../ui/js/core/router.js';
 
@@ -189,11 +190,12 @@ test('first page renders 50 rows and total', async ({ app, page, server, request
     await expect(tab(STAGE[s]).locator('.tab-count')).toHaveText(fmtNum(stageCount(s)));
   }
 
-  // "Sourced by" lists "All sources", then every source query with its count, most first.
+  // "Sourced by" lists "All sources" (every company), then every source query with its count,
+  // most first.
   await source.click();
   const options = page.getByRole('listbox', { name: 'Sourced by' }).getByRole('option');
   await expect(options).toHaveCount(SEED.queries.length + 1);
-  await expect(options.first()).toHaveText('All sources');
+  await expect(options.first()).toHaveText(`All sources${fmtNum(SEED.companies)}`);
   for (let i = 0; i < SEED.queries.length; i++) {
     const [q, n] = SEED.queries[i];
     await expect(options.nth(i + 1)).toHaveText(`${q}${fmtNum(n)}`);
@@ -293,6 +295,98 @@ test('stage and source filters combine', async ({ app, page }) => {
   await expect(range).toHaveText(`1–${PER} of ${fmtNum(stageCount('named'))}`);
   await tab('All').click();
   await expect(page).toHaveURL(hashIs('#/pipeline'));
+});
+
+test('typing in Sourced by picks a real source, never "All sources"', async ({ app, page }) => {
+  // The seed's sources (Q1–Q8) share no letters with "All sources": offer one that does.
+  const extra = 'Seed-stage SaaS';
+  await page.route(/\/api\/companies\?/, async (rt) => {
+    const res = await rt.fetch();
+    const body = await res.json();
+    body.queries = [...body.queries, [extra, 4]];
+    await rt.fulfill({ response: res, json: body });
+  });
+  await app.goto('#/pipeline?query=Q3');
+  const { source } = ui(page);
+  await listReady(page);
+  await expect(source).toHaveValue('Q3');
+  const options = page.getByRole('listbox', { name: 'Sourced by' }).getByRole('option');
+
+  // Its own words match nothing, so Enter picks nothing and the source stays.
+  await source.click();
+  await source.fill('all');
+  await expect(page.locator('.pl-source .ss-empty')).toHaveText('No matches');
+  await page.keyboard.press('Enter');
+  await page.keyboard.press('Escape');
+  await expect(source).toHaveValue('Q3');
+  expect(route(page).query.query).toBe('Q3');
+
+  // Text that it and a source both contain: only the source is offered, and Enter picks it.
+  await source.fill('s');
+  await expect(options).toHaveText([`${extra}4`]);
+  await page.keyboard.press('Enter');
+  await expect(source).toHaveValue(extra);
+  await expect.poll(() => route(page).query.query).toBe(extra);
+});
+
+test('picking "All sources" when no source is set keeps the page', async ({ app, page }) => {
+  await app.goto('#/pipeline?page=2');
+  const { source, range, next } = ui(page);
+  await listReady(page);
+  await expect(range).toHaveText(`${PER + 1}–${2 * PER} of ${fmtNum(SEED.companies)}`);
+  const listbox = page.getByRole('listbox', { name: 'Sourced by' });
+
+  // By mouse, then by keyboard (the list opens on the chosen row).
+  await source.click();
+  await listbox.getByRole('option', { name: /^All sources/ }).click();
+  await expect(listbox).toBeHidden();
+  await source.press('ArrowDown');
+  await expect(listbox.getByRole('option').first()).toHaveAttribute('aria-selected', 'true');
+  await page.keyboard.press('Enter');
+  await expect(listbox).toBeHidden();
+  await expect(source).toHaveValue('');
+
+  // Still on page 2: Next goes to page 3.
+  await next.click();
+  await expect(page).toHaveURL(hashIs('#/pipeline?page=3'));
+  await expect(range).toHaveText(`${2 * PER + 1}–${3 * PER} of ${fmtNum(SEED.companies)}`);
+});
+
+test('"All sources" counts every company the search matches', async ({ app, page }) => {
+  const { source, filter, tab } = ui(page);
+  const listbox = page.getByRole('listbox', { name: 'Sourced by' });
+  const allRow = listbox.getByRole('option').first();
+  const pick = async (name) => {
+    await source.click();
+    await listbox.getByRole('option', { name }).click();
+    await expect(listbox).toBeHidden();
+  };
+
+  // A link with a source set has only that source's counts: no figure rather than a wrong one.
+  await app.goto('#/pipeline?query=Q3');
+  await listReady(page);
+  await source.click();
+  await expect(allRow).toHaveText('All sources');
+  await page.keyboard.press('Escape');
+
+  // Without a source it is every company, like each source's own count whatever the stage, and
+  // it stays while a source is picked under the same search.
+  await pick(/^All sources/);
+  await expect(page).toHaveURL(hashIs('#/pipeline'));
+  await tab(STAGE.emailed).click();
+  await pick(/^Q3/);
+  await expect(page).toHaveURL(hashIs('#/pipeline?stage=emailed&query=Q3'));
+  await source.click();
+  await expect(allRow).toHaveText(`All sources${fmtNum(SEED.companies)}`);
+  await page.keyboard.press('Escape');
+
+  // A search narrows it.
+  const q = 'acme';
+  await pick(/^All sources/);
+  await filter.fill(q);
+  await expect.poll(() => route(page).query).toEqual({ stage: 'emailed', q });
+  await source.click();
+  await expect(allRow).toHaveText(`All sources${fmtNum(matching(q).length)}`);
 });
 
 test('pager moves pages', async ({ app, page }) => {
@@ -603,6 +697,37 @@ test('loading, error and retry states for the list and the drawer', async ({ app
   await expect(drawer.getByRole('list', { name: 'Contacts' }).getByRole('listitem')).toHaveCount(granite.contacts.length);
 });
 
+test('a stale session is explained once, by the banner', async ({ app, page, context }) => {
+  app.allowConsole(/status of 401/);
+  const c = COMPANIES[1];
+  const { drawer, rows } = ui(page);
+  /** How often the banner's sentence is in the page, hidden text included. */
+  const timesSaid = () => page.evaluate((s) => document.body.textContent.split(s).length - 1, SESSION_EXPIRED);
+
+  // After a restart the old cookie no longer works (here it's gone): the list and the drawer say
+  // what didn't load and point at the fix, in short. No Try again that can't work until the tab
+  // is reopened, and the banner is the only alert.
+  await app.goto(`#/pipeline/${c.domain}`);
+  await expect(drawer.getByRole('list', { name: 'Contacts' })).toBeVisible();
+  await context.clearCookies();
+  await page.reload();
+  await expect(page.locator('.session-banner')).toHaveText(SESSION_EXPIRED);
+  const drawerError = drawer.locator('.pl-error');
+  await expect(drawerError).toContainText('Couldn’t load this company');
+  await expect(drawerError).toContainText(SESSION_REOPEN);
+  await expect(drawer.getByRole('button', { name: 'Try again' })).toHaveCount(0);
+  await page.keyboard.press('Escape');
+  await expect(drawer).toHaveCount(0);
+  const listError = page.locator('.pipeline .pl-error');
+  await expect(listError).toContainText('Couldn’t load companies');
+  await expect(listError).toContainText(SESSION_REOPEN);
+  await expect(rows).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Try again' })).toHaveCount(0);
+  await expect(page.getByRole('alert')).toHaveCount(1);
+  expect(await timesSaid()).toBe(1);
+  await expectAccessible(page);
+});
+
 test('keyboard: J/K move rows, Enter opens, Esc returns, / filters', async ({ app, page }) => {
   await app.goto('#/pipeline');
   const { rows, drawer, filter } = ui(page);
@@ -762,6 +887,24 @@ test('a status the screen does not know points to Follow-ups', async ({ app, pag
   // Inventory "Row actions by status": anything not handled goes to Follow-ups, filtered to it.
   await expect(drawer.getByRole('link', { name: 'Open in Follow-ups' })).toHaveAttribute('href', `#/followups?q=${c.domain}`);
   await expect(drawer.locator('.cd-actions .btn')).toHaveCount(1);
+});
+
+test('a Skip that fails says why and leaves the company as it was', async ({ app, page, server }) => {
+  app.allowConsole(/status of 500/);
+  const c = COMPANIES[0];
+  expect(c.status).toBe('sourced');
+  await page.route(`**/api/companies/${c.domain}/status`, (rt) =>
+    rt.fulfill({ status: 500, contentType: 'text/plain', body: 'database is locked' }),
+  );
+  await app.goto(`#/pipeline/${c.domain}`);
+  const { drawer } = ui(page);
+  const skip = drawer.getByRole('button', { name: 'Skip' });
+  await skip.click();
+  await expect(page.locator('#toasts')).toContainText(`Couldn’t skip ${c.name}: database is locked`);
+  await expect(skip).not.toHaveAttribute('aria-busy', 'true');
+  await expect(skip).toBeFocused();
+  await expect(drawer.locator('.cd-stage')).toHaveText(STAGE.sourced);
+  expect(server.query('SELECT status FROM companies WHERE domain = ?', c.domain)).toEqual([{ status: 'sourced' }]);
 });
 
 test('a Name only company without an email says the name is known', async ({ app, page }) => {

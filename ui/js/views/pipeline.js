@@ -11,7 +11,7 @@
 // ⌘K over the drawer is the shell's (keys.js closes the drawer as Esc would, then search takes
 // focus); the drawer's onClose puts the list back in the URL like any other user close.
 
-import { api } from '../core/api.js';
+import { api, errorText, isStaleSession } from '../core/api.js';
 import { debounce, fmtDate, fmtNum, fmtRelative, h, pluralize, safeUrl, toDate } from '../core/dom.js';
 import { bindKeys } from '../core/keys.js';
 import { href } from '../core/router.js';
@@ -28,9 +28,6 @@ const PER = 50;
 const SEARCH_MS = 250;
 const LOOKUP_PER = 200;
 const DAY_MS = 86_400_000;
-// The value of the Sourced by picker's "All sources" row (picking it clears the filter): starts
-// with a NUL, which no real source query does.
-const ALL_SOURCES = '\u0000all';
 
 /** Company statuses in pipeline order: label (inventory "Friendly stage labels") and tone. */
 export const STAGES = [
@@ -136,6 +133,21 @@ function externalLink(url, label, cls) {
   );
 }
 
+/** A failed load (the list, or the drawer's company): what didn't load, why, and Try again. On a
+ *  stale session the shell's banner (an alert) already says what happened, once: this gives the
+ *  short pointer at the fix (errorText), isn't an alert itself, and offers no Try again (nothing
+ *  loads until the tab is reopened). */
+function errorBox(title, err, retry) {
+  const stale = isStaleSession(err);
+  return h(
+    'div',
+    { class: 'pl-error', role: stale ? null : 'alert' },
+    icon('alert', 18),
+    h('div', { class: 'pl-error-text' }, h('p', { class: 'pl-error-title' }, title), h('p', { class: 'pl-error-msg' }, errorText(err))),
+    stale ? null : h('button', { type: 'button', class: 'btn btn-secondary btn-sm', onClick: retry }, 'Try again'),
+  );
+}
+
 const SITE_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i;
 const siteUrl = (domain) => (SITE_RE.test(String(domain || '')) ? `https://${domain}` : '');
 
@@ -157,7 +169,6 @@ const sameList = (a, b) => a.q.trim() === b.q.trim() && a.stage === b.stage && a
 const listQuery = (s) => ({ q: s.q.trim() || null, stage: s.stage || null, query: s.query || null, page: s.page > 1 ? s.page : null });
 
 const isAbort = (err) => err && err.name === 'AbortError';
-const errText = (err) => (err && err.message) || String(err);
 
 // ---- The view ----
 
@@ -264,21 +275,16 @@ function createView(root, ctx) {
   });
 
   // The picker's own label stays for screen readers; the visible one sits beside the field. The
-  // list opens under the input and the component keeps it inside the window (--ss-room-x).
+  // list opens under the input and the component keeps it inside the window (--ss-room-x). Its
+  // "All sources" row is pinned (renderSources): the field shows the placeholder while it is the
+  // choice, typing never matches it, and picking it again changes nothing.
   const source = searchSelect({
     label: 'Sourced by',
     hideLabel: true,
     placeholder: 'All sources',
     options: [],
     value: state.query,
-    onChange: (v) => {
-      if (v === ALL_SOURCES) {
-        // Show the placeholder again even when no filter was set (no route change to do it).
-        source.setValue('');
-        v = '';
-      }
-      nav.setQuery({ query: v || null, page: null });
-    },
+    onChange: (v) => nav.setQuery({ query: v || null, page: null }),
   });
   const sourceLabel = h(
     'span',
@@ -310,11 +316,19 @@ function createView(root, ctx) {
     filter.focus();
   }
 
+  // How many companies "All sources" stands for, like each source's own count: every company the
+  // search matches, whatever its stage or source. A page loaded without a source filter tells
+  // (its stage counts add up to it); one with a source filter can't, so the last figure for the
+  // same search is used, else the row shows none.
+  let allSources = null; // { q, n }
+
   function renderSources(queries) {
     const opts = (queries || []).map(([q, n]) => ({ value: q, label: q, count: n }));
     // A source in the URL that no company has (any more) still shows what's filtered.
     if (state.query && !opts.some((o) => o.value === state.query)) opts.unshift({ value: state.query, label: state.query, count: 0 });
-    source.setOptions([{ value: ALL_SOURCES, label: 'All sources' }, ...opts]);
+    const all = { value: '', label: 'All sources', pinned: true };
+    if (allSources && allSources.q === state.q.trim()) all.count = allSources.n;
+    source.setOptions([all, ...opts]);
     source.setValue(state.query);
   }
 
@@ -428,20 +442,7 @@ function createView(root, ctx) {
 
   function showError(err) {
     results.classList.remove('is-loading');
-    results.replaceChildren(
-      h(
-        'div',
-        { class: 'pl-error', role: 'alert' },
-        icon('alert', 18),
-        h(
-          'div',
-          { class: 'pl-error-text' },
-          h('p', { class: 'pl-error-title' }, 'Couldn’t load companies'),
-          h('p', { class: 'pl-error-msg' }, errText(err)),
-        ),
-        h('button', { type: 'button', class: 'btn btn-secondary btn-sm', onClick: () => loadList() }, 'Try again'),
-      ),
-    );
+    results.replaceChildren(errorBox('Couldn’t load companies', err, () => loadList()));
     footer.hidden = true;
   }
 
@@ -465,6 +466,7 @@ function createView(root, ctx) {
     else desc.textContent = `${pluralize(page.total, 'company', 'companies')}, newest first. Open one to see its contacts and outreach.`;
 
     renderStageCounts(page.stages, stagesTotal);
+    if (!state.query) allSources = { q: state.q.trim(), n: stagesTotal };
     renderSources(page.queries);
     pg.update({ page: page.page, per: page.per, total: page.total });
 
@@ -835,16 +837,7 @@ function createView(root, ctx) {
 
   function renderDrawerError(d, err) {
     d.handle.body.removeAttribute('aria-busy');
-    d.handle.body.replaceChildren(
-      drawerTop(d, d.company),
-      h(
-        'div',
-        { class: 'pl-error', role: 'alert' },
-        icon('alert', 18),
-        h('div', { class: 'pl-error-text' }, h('p', { class: 'pl-error-title' }, 'Couldn’t load this company'), h('p', { class: 'pl-error-msg' }, errText(err))),
-        h('button', { type: 'button', class: 'btn btn-secondary btn-sm', onClick: () => loadDetail() }, 'Try again'),
-      ),
-    );
+    d.handle.body.replaceChildren(drawerTop(d, d.company), errorBox('Couldn’t load this company', err, () => loadDetail()));
   }
 
   function actionsFor(d, company) {
@@ -899,7 +892,7 @@ function createView(root, ctx) {
           } catch (err) {
             if (dead) return;
             setBusy(btn, false);
-            toast(errText(err), 'err');
+            toast(`Couldn’t ${value === 'skip' ? 'skip' : 'restore'} ${name}: ${errorText(err)}`, 'err');
           }
         },
       },
