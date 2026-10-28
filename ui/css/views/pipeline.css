@@ -1,0 +1,344 @@
+/* Pipeline (spec §5.3): the companies table with its filters and pager, and the company drawer.
+   Tokens only (tokens.css); spacing on the 4px scale. */
+
+/* ---- Layout: header, controls, results, footer ---- */
+
+.pipeline {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.pl-controls {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  margin-top: var(--space-4);
+}
+
+/* On a desktop-sized window the page fits the viewport: the table scrolls under its sticky
+   header and the pager stays in view. Smaller screens let the page scroll instead. */
+@media (min-width: 900px) and (min-height: 600px) {
+  .pipeline { height: calc(100vh - var(--topbar-h) - var(--space-6) - var(--space-8)); }
+  @supports (height: 100dvh) {
+    .pipeline { height: calc(100dvh - var(--topbar-h) - var(--space-6) - var(--space-8)); }
+  }
+  .pl-results { flex: 1 1 auto; min-height: 0; }
+  .pl-results > .table-wrap { flex: 1 1 auto; min-height: 0; }
+}
+
+/* ---- Stage tabs ---- */
+
+.pl-tabs .tab.is-zero { color: var(--text-3); }
+.pl-tabs .tab[aria-selected="true"].is-zero { color: var(--text); }
+
+/* ---- Toolbar: filter, Sourced by, Clear filters ---- */
+
+.pl-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+}
+
+.pl-filter {
+  position: relative;
+  flex: 1 1 260px;
+  max-width: 400px;
+  min-width: 0;
+}
+.pl-filter .pl-icon {
+  position: absolute;
+  top: 50%;
+  left: 11px;
+  transform: translateY(-50%);
+  color: var(--text-3);
+  pointer-events: none;
+}
+.pl-filter-input { padding-left: 34px; }
+.pl-filter-input::-webkit-search-cancel-button { cursor: pointer; }
+
+/* "Sourced by" sits beside its picker; the list opens under the input, wider for long queries. */
+.pl-source {
+  display: flex;
+  flex: 0 1 340px;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.pl-source-label { flex: none; font-size: 13px; font-weight: 500; color: var(--text-2); white-space: nowrap; cursor: default; }
+.pl-source .search-select { flex: 1 1 auto; }
+.pl-source .ss-list,
+.pl-source .ss-empty {
+  right: auto;
+  min-width: 100%;
+  width: max-content;
+  max-width: var(--pl-list-max, 100%); /* set by the view from the room to the right */
+}
+
+/* ---- Results: table, empty, error, loading ---- */
+
+.pl-results {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  margin-top: var(--space-3);
+  min-width: 0;
+}
+
+.pl-results .table { table-layout: fixed; min-width: 760px; }
+.pl-results .table th:nth-child(1) { width: 28%; }
+.pl-results .table th:nth-child(2) { width: 31%; }
+.pl-results .table th:nth-child(3) { width: 136px; }
+.pl-results .table th:nth-child(5) { width: 104px; }
+.pl-results .table td { padding-top: var(--space-2); padding-bottom: var(--space-2); height: 56px; }
+
+.pl-cell-stack { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.pl-cell-stack > * { min-width: 0; }
+
+.pl-company-name,
+.pl-contact-name,
+.pl-domain,
+.pl-contact-email,
+.pl-source-text {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pl-company-name { font-weight: 500; color: var(--text); }
+.pl-contact-name { color: var(--text); }
+
+.pl-sub {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: 12.5px;
+  line-height: 18px;
+  color: var(--text-3);
+}
+.pl-sub .mono { font-size: 12px; }
+.pl-sub.pl-domain { display: block; font-size: 12px; }
+.pl-contact-email { flex: 0 1 auto; }
+
+.pl-li { display: inline-flex; flex: none; align-items: center; gap: var(--space-1); }
+.pl-contact-name.pl-li { color: var(--text-2); }
+.pl-icon { flex: none; }
+
+.pl-none { color: var(--text-3); }
+.pl-source-text { color: var(--text-2); }
+.pl-when { font-size: 12.5px; color: var(--text-2); }
+
+.table tr.is-clickable[aria-current="true"] td { background: var(--accent-soft); }
+
+/* Skeleton rows while the first page loads. */
+.pl-results .skeleton { height: 12px; }
+.pl-results .skeleton.pl-sk-sub { height: 10px; margin-top: 4px; }
+
+/* A later load keeps the rows and shows a thin bar across the top of the table. */
+.pl-results.is-loading { cursor: progress; }
+.pl-results.is-loading::after {
+  content: '';
+  position: absolute;
+  top: 1px;
+  left: 1px;
+  right: 1px;
+  height: 2px;
+  z-index: 2;
+  border-radius: var(--radius-input) var(--radius-input) 0 0;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  background-size: 40% 100%;
+  background-repeat: no-repeat;
+  animation: pl-loading 1.1s ease-in-out infinite;
+}
+@keyframes pl-loading {
+  from { background-position: -40% 0; }
+  to { background-position: 140% 0; }
+}
+
+/* Empty and error states sit in the same surface box as the table. */
+.pl-controls[hidden] + .pl-results { margin-top: var(--space-6); }
+.pl-results > .empty-state {
+  flex: none;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-input);
+  padding: var(--space-8) var(--space-6);
+}
+
+.pl-error {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  background: var(--surface);
+  border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--border));
+  border-radius: var(--radius-input);
+}
+.pl-error > svg { margin-top: 1px; color: var(--danger); }
+.pl-error-text { flex: 1 1 240px; min-width: 0; }
+.pl-error-title { font-weight: 500; color: var(--text); }
+.pl-error-msg { margin-top: 2px; font-size: 13px; color: var(--text-2); overflow-wrap: anywhere; }
+
+/* ---- Footer: keyboard hint + pager ---- */
+
+.pl-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-top: var(--space-2);
+}
+.pl-hint {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: 12.5px;
+  color: var(--text-3);
+}
+.pl-hint .kbd { min-width: 20px; text-align: center; }
+.pl-footer .pager { margin-left: auto; }
+
+/* ---- Company drawer ---- */
+
+.company-drawer .drawer-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+}
+.company-drawer .drawer-body > .empty-state { padding-top: var(--space-8); }
+
+.cd-head { display: flex; flex-direction: column; gap: var(--space-4); }
+
+.cd-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+}
+
+.pl-ext {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.pl-ext { text-decoration: none; }
+.pl-ext:hover > span:first-child { text-decoration: underline; }
+.pl-ext svg { color: var(--text-3); }
+.cd-site { font-size: 13px; }
+
+.cd-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+
+.cd-section { display: flex; flex-direction: column; gap: var(--space-2); }
+.cd-section-title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+.cd-count {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--text-3);
+}
+
+.cd-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-input);
+}
+.cd-item {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-3);
+  min-width: 0;
+}
+.cd-item + .cd-item { border-top: 1px solid var(--border); }
+
+.cd-item-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-1) var(--space-2);
+}
+.cd-name { font-weight: 500; overflow-wrap: anywhere; }
+.cd-role { font-size: 12.5px; color: var(--text-3); }
+
+.cd-email,
+.cd-li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-2);
+  font-size: 13px;
+  color: var(--text-2);
+}
+.cd-email > svg,
+.cd-li > svg,
+.cd-channel > svg { color: var(--text-3); }
+.cd-email-addr { font-size: 12.5px; overflow-wrap: anywhere; }
+.cd-conf { display: inline-flex; }
+.cd-muted { color: var(--text-3); }
+
+.cd-channel { display: inline-flex; align-items: center; gap: 6px; font-weight: 500; }
+.cd-subject { color: var(--text-2); overflow-wrap: anywhere; }
+.cd-subject.cd-muted { color: var(--text-3); }
+.cd-dates {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) 6px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+.cd-empty {
+  padding: var(--space-3);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-input);
+  font-size: 13px;
+  color: var(--text-2);
+}
+
+.cd-details { display: flex; flex-direction: column; gap: var(--space-2); margin: 0; }
+.cd-details > div { display: grid; grid-template-columns: 96px minmax(0, 1fr); align-items: baseline; gap: var(--space-3); }
+.cd-details dt { font-size: 13px; color: var(--text-3); }
+.cd-details dd { margin: 0; overflow-wrap: anywhere; }
+.cd-details dd.mono { font-size: 12.5px; }
+
+.cd-loading { display: flex; flex-direction: column; gap: var(--space-6); }
+.cd-loading .cd-section { gap: 10px; }
+.cd-loading .skeleton { height: 12px; }
+.cd-loading .skeleton.cd-sk-head { width: 30%; height: 14px; }
+
+/* ---- Narrow screens ---- */
+
+@media (max-width: 899px) {
+  .pl-hint { display: none; }
+  .pl-filter { flex-basis: 100%; max-width: none; }
+  .pl-source { flex: 1 1 auto; }
+
+  /* The table scrolls sideways; the company stays put so every row keeps its name. */
+  .pl-results .table { min-width: 800px; }
+  .pl-results .table th:nth-child(1) { width: 176px; }
+  .pl-results .table th:nth-child(2) { width: 220px; }
+  .pl-results .table th:first-child,
+  .pl-results .table td:first-child {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    background: var(--surface);
+    box-shadow: inset -1px 0 0 var(--border);
+  }
+  .pl-results .table th:first-child { z-index: 2; }
+}
