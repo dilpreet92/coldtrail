@@ -1,0 +1,232 @@
+/* Follow-ups (spec §5.5). The shared pieces (page head, tabs, table, badge, buttons, empty state,
+   skeleton) come from components.css; this file only arranges them for this screen. Tokens only. */
+
+/* ---- Reply-check notice (progress, result) ---- */
+
+.fu-notice-slot { margin-top: var(--space-4); }
+.fu-notice-slot:empty { display: none; }
+
+.fu-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-3) var(--space-3) var(--space-4);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-input);
+}
+.fu-notice-ok { border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); }
+.fu-notice-warn { border-color: color-mix(in srgb, var(--warn) 55%, var(--border)); }
+.fu-notice-err { border-color: var(--danger); }
+
+.fu-notice-icon { display: inline-flex; flex: none; margin-top: 1px; color: var(--accent); }
+.fu-notice-ok .fu-notice-icon { color: var(--ok); }
+.fu-notice-warn .fu-notice-icon { color: var(--warn); }
+.fu-notice-err .fu-notice-icon { color: var(--danger); }
+
+.fu-notice-main { display: flex; flex: 1; flex-direction: column; gap: var(--space-1); min-width: 0; }
+.fu-notice-title { font-weight: 600; overflow-wrap: anywhere; }
+.fu-notice-text { color: var(--text-2); overflow-wrap: anywhere; }
+.fu-notice-meta { font-size: 12.5px; color: var(--text-3); }
+.fu-elapsed { font-size: 12px; font-variant-numeric: tabular-nums; color: var(--text-2); }
+.fu-notice-close { flex: none; margin: -6px -4px -6px 0; }
+
+/* Agent text (renderMarkdown output), set off from coldtrail's own summary above it. */
+.fu-md { color: var(--text-2); overflow-wrap: anywhere; }
+.fu-notice .fu-md { margin-top: var(--space-1); padding-left: var(--space-3); border-left: 2px solid var(--border); }
+.fu-md > * + * { margin-top: var(--space-2); }
+.fu-md ul,
+.fu-md ol { margin: 0; padding-left: 20px; }
+.fu-md li + li { margin-top: 2px; }
+.fu-md strong { color: var(--text); font-weight: 600; }
+.fu-md code { padding: 1px 4px; border-radius: 4px; background: var(--surface-2); color: var(--text); }
+.fu-md pre {
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-control);
+  background: var(--surface-2);
+  overflow-x: auto;
+}
+.fu-md pre code { padding: 0; background: none; }
+
+/* Progress spinner: a ring with a gap (motion is cut by base.css under reduced motion; the
+   text beside it always says what is happening). */
+.fu-spin {
+  display: inline-block;
+  flex: none;
+  width: 14px;
+  height: 14px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: fu-spin 0.8s linear infinite;
+}
+.fu-notice-icon .fu-spin { width: 16px; height: 16px; margin: 1px; }
+
+@keyframes fu-spin { to { transform: rotate(360deg); } }
+
+/* Busy is not disabled: the button stays legible and says what is happening. */
+.fu-check[aria-busy="true"] { opacity: 1; cursor: progress; }
+
+/* ---- Tabs and filter on one rule ---- */
+
+.fu-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2) var(--space-4);
+  margin-top: var(--space-6);
+  border-bottom: 1px solid var(--border);
+}
+.fu-tools .tabs { flex: 0 1 auto; min-width: 0; border-bottom: 0; }
+
+.fu-filter {
+  position: relative;
+  display: flex;
+  align-items: center;
+  width: 260px;
+  max-width: 100%;
+  margin-bottom: var(--space-1);
+}
+.fu-filter svg { position: absolute; left: 10px; color: var(--text-3); pointer-events: none; }
+.fu-filter-input { min-height: 32px; padding: 5px 10px 5px 32px; }
+
+/* ---- List ---- */
+
+/* Wide enough: a table. Narrower (phones, and laptops with the sidebar beside a small window):
+   cards, see the container query at the end. */
+.fu-content { margin-top: var(--space-4); container-type: inline-size; }
+
+.fu-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-input);
+}
+
+.fu-content .table td { height: 57px; padding-top: var(--space-2); padding-bottom: var(--space-2); }
+
+.fu-who { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+
+.fu-domain,
+.fu-email {
+  max-width: 40ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fu-domain {
+  align-self: flex-start;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  text-decoration: none;
+}
+.fu-domain:hover { color: var(--accent); text-decoration: underline; }
+.fu-email { font-size: 12.5px; color: var(--text-2); }
+.fu-none { color: var(--text-3); }
+.fu-since { color: var(--text-2); }
+
+.fu-state { display: flex; align-items: center; gap: var(--space-2); }
+.fu-hint { font-size: 12.5px; color: var(--text-3); }
+
+.fu-actions { display: inline-flex; justify-content: flex-end; gap: var(--space-1); }
+/* A busy button stays readable (it is saying what is happening), and keeps its width so the
+   row doesn't shift while the agent writes. */
+.fu-actions .btn[aria-busy="true"] { opacity: 1; cursor: progress; }
+.fu-actions [data-action="draft"] { min-width: 120px; }
+
+.fu-more {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding-top: var(--space-3);
+}
+.fu-more-count {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2);
+}
+
+/* ---- Loading placeholder: the table's shape ---- */
+
+.fu-skeleton {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-input);
+}
+.fu-skeleton-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-6);
+  height: 57px;
+  padding: 0 var(--space-3);
+  overflow: hidden;
+  border-bottom: 1px solid var(--border);
+}
+.fu-skeleton-row:last-child { border-bottom: 0; }
+.fu-skeleton-row .skeleton { flex: 0 1 auto; min-width: 0; height: 10px; }
+.fu-skeleton-who { display: flex; flex: 0 1 260px; flex-direction: column; gap: var(--space-2); min-width: 0; }
+.fu-skeleton-who .skeleton { height: 9px; }
+
+@media (pointer: coarse) {
+  .fu-actions .btn { min-height: 40px; }
+}
+
+@media (max-width: 599px) {
+  .fu-filter { width: 100%; margin-bottom: var(--space-2); }
+}
+
+/* Rows become cards when the table would not fit, so every action is in view without sideways
+   scrolling:
+     domain ............ [state]
+     contact
+     1 touch · 5 days since the last send
+     [Draft follow-up] [Mark replied] [Mark bounced]
+   The table keeps explicit ARIA roles (set by the view), so it still reads as a table. */
+@container (max-width: 959px) {
+  .fu-content .table-wrap { overflow: visible; background: none; border: 0; border-radius: 0; }
+  .fu-content .table,
+  .fu-content .table tbody { display: block; }
+  .fu-content .table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+  .fu-content .table tbody tr {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-areas:
+      "who who state"
+      "touches days days";
+    gap: var(--space-1) var(--space-2);
+    margin-bottom: var(--space-2);
+    padding: var(--space-3);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-input);
+  }
+  .fu-content .table tbody tr:last-child { margin-bottom: 0; }
+  .fu-content .table td { display: block; height: auto; min-width: 0; padding: 0; border: 0; text-align: left; }
+  .fu-content .table .fu-c-domain { grid-area: who; }
+  .fu-content .table .fu-c-state { grid-area: state; }
+  .fu-content .table .fu-c-touches { grid-area: touches; }
+  .fu-content .table .fu-c-days { grid-area: days; }
+  .fu-content .table .fu-c-actions { grid-column: 1 / -1; margin-top: var(--space-2); }
+  .fu-content .table .fu-c-touches,
+  .fu-content .table .fu-c-days { color: var(--text-2); font-size: 13px; }
+  .fu-c-touches .num::after { content: ' ' attr(data-unit); font-family: var(--font-sans); }
+  .fu-c-days::before { content: '·'; margin-right: var(--space-2); color: var(--text-3); }
+  .fu-c-days .fu-since::after { content: ' since the last send'; }
+  .fu-domain,
+  .fu-email { max-width: 100%; }
+  .fu-hint { display: none; }
+  .fu-actions { display: flex; flex-wrap: wrap; justify-content: flex-start; }
+  .fu-actions .btn-ghost { padding-left: var(--space-2); padding-right: var(--space-2); }
+  /* A row that starts with a borderless button lines its text up with the card's text. */
+  .fu-actions > .btn-ghost:first-child { margin-left: calc(-1 * var(--space-2)); }
+}
