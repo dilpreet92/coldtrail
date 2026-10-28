@@ -171,6 +171,13 @@
   white-space: nowrap;
 }
 .chan-tag-linkedin { background: var(--accent-soft); color: var(--accent-ink); }
+/* A row's badges (Parked, In Gmail, Opened…) are the channel tag's height, so a row with two of
+   them stacked is no taller than one with a single tag. */
+.draft-row-tags .badge {
+  padding: 0 6px;
+  font-size: 11.5px;
+  line-height: 16px;
+}
 .draft-row[aria-selected="true"] .chan-tag { background: var(--surface); }
 /* An accent badge (Opened, Sending) is accent-soft like the selected row: keep it a pill. */
 .draft-row[aria-selected="true"] .badge-accent {
@@ -319,11 +326,20 @@
   line-height: 1.55;
 }
 
+/* Under the note: the link it carries, and its length against LinkedIn's limit at the end. */
+.draft-note-meta {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+}
 .draft-link {
+  flex: 1;
+  min-width: 0;
   font-size: 12.5px;
   color: var(--text-3);
   overflow-wrap: anywhere;
 }
+.draft-note-meta .draft-count { flex: none; margin-left: auto; color: var(--text-3); }
 
 .draft-info { color: var(--text-2); }
 
@@ -367,8 +383,9 @@
   font-family: var(--font-mono);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
-.draft-count.is-over { color: var(--danger); font-weight: 600; }
+.draft-note-meta .draft-count.is-over { color: var(--danger); font-weight: 600; }
 .draft-save.is-error { color: var(--danger); }
 
 .draft-actions {
@@ -434,6 +451,16 @@
   .drafts-keys { display: none; }
   .draft { padding: var(--space-4); gap: var(--space-3); }
   .draft-back { display: inline-flex; }
-  .draft-actions { justify-content: flex-start; }
   .draft-text { min-height: 200px; }
+}
+
+/* Narrow: the actions take the full width and their buttons share each row, so one that wraps
+   (usually the primary, last) is a full-width button rather than a stray one at the edge. */
+@media (max-width: 599px) {
+  .draft-actions { flex: 1 1 100%; }
+  .draft-actions > .btn { flex: 1 1 auto; }
+  .draft-actions > .draft-hint { flex-basis: 100%; }
+  .draft-ask { flex: 1 1 100%; }
+  .draft-ask > .btn { flex: 1 1 auto; }
+  .draft-ask-q { flex-basis: 100%; }
 }
