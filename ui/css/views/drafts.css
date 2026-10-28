@@ -262,17 +262,36 @@
   overflow-wrap: anywhere;
 }
 .draft-name:focus { outline: none; }
+/* "Role · Company · domain · profile": items wrap between them, never inside one. Each item
+   draws its "·" in front, and the row is pulled left by that much, so the "·" of an item that
+   starts a line falls outside the clip: no line starts or ends on a separator. The 4px of
+   padding (taken back by the negative margins) keeps a focused link's ring inside both clips. */
 .draft-meta {
-  margin-top: 2px;
+  margin: 2px -4px 0;
+  padding: 0 4px;
+  overflow-x: clip;
   color: var(--text-2);
 }
+.draft-meta-items {
+  display: flex;
+  flex-wrap: wrap;
+  margin-left: -1em;
+}
 .draft-meta-item {
-  display: inline-block;
+  min-width: 0;
   max-width: 100%;
+  margin: -4px;
+  padding: 4px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  vertical-align: bottom;
+}
+.draft-meta-item::before {
+  content: '·';
+  content: '·' / '';
+  display: inline-block;
+  width: 1em;
+  text-align: center;
 }
 .draft-badges {
   display: flex;
@@ -325,6 +344,8 @@
   padding: var(--space-3);
   line-height: 1.55;
 }
+/* A LinkedIn note is short (300 characters): it grows to show all of it, where the browser can. */
+.draft-note { field-sizing: content; }
 
 /* Under the note: the link it carries, and its length against LinkedIn's limit at the end. */
 .draft-note-meta {
@@ -418,6 +439,16 @@
   gap: var(--space-2);
 }
 .draft-ask-q { margin-right: var(--space-1); font-weight: 500; }
+
+/* Toasts sit bottom right, where the action bar can be (pinned under a long draft, mid-pane under
+   a short one). When the stack in its usual place would cover the bar, drafts.js measures where
+   the bar is and sets --drafts-toast-lift (on <html>) to stack the toasts just above it, so an
+   error that stays until dismissed never covers Send or Discard. Unset, they stay where they are. */
+@media (min-width: 900px) {
+  #app[data-route="drafts"] ~ #toasts {
+    bottom: max(var(--space-4), var(--drafts-toast-lift, 0px));
+  }
+}
 
 /* ---- Send all dialog (rendered in #overlays) ---- */
 

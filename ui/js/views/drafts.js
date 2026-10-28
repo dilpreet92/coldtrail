@@ -17,7 +17,7 @@
 // store (status for auto-send and caps, summary for the empty state). A draft with no names falls
 // back to its domain and recipient.
 
-import { api } from '../core/api.js';
+import { api, errorText, isStaleSession } from '../core/api.js';
 import { debounce, fmtNum, h, pluralize, safeUrl } from '../core/dom.js';
 import { bindKeys } from '../core/keys.js';
 import { confirmDialog, isBusy, openDialog, setBusy, toast } from '../core/ui.js';
@@ -330,9 +330,9 @@ function createView(root, ctx) {
   );
   const tabBar = tabs({
     items: [
-      { id: 'all', label: 'All', count: 0 },
-      { id: 'email', label: 'Email', count: 0 },
-      { id: 'linkedin', label: 'LinkedIn', count: 0 },
+      { id: 'all', label: 'All' },
+      { id: 'email', label: 'Email' },
+      { id: 'linkedin', label: 'LinkedIn' },
     ],
     active: s.tab,
     label: 'Channel',
@@ -409,6 +409,20 @@ function createView(root, ctx) {
       email: n(all.filter((it) => it.channel === 'email')),
       linkedin: n(all.filter((it) => it.channel === 'linkedin')),
     };
+  }
+
+  // The server's draft counts: [all, email, linkedin], or null.
+  const queueCounts = (sm) => {
+    const n = sm && sm.counts;
+    return n && Number.isFinite(n.drafts) ? [n.drafts, n.drafts_email, n.drafts_linkedin] : null;
+  };
+
+  // The tabs' counts: the queue's once it has loaded; until then (or when it couldn't load) the
+  // summary's, as the sidebar shows them, else none rather than a 0 that isn't known.
+  function tabCounts() {
+    if (s.items) return counts();
+    const n = queueCounts(s.summary) || [];
+    return { all: n[0], email: n[1], linkedin: n[2] };
   }
 
   function caps() {
@@ -489,8 +503,10 @@ function createView(root, ctx) {
   }
 
   function renderHeader() {
-    tabBar.setCounts(counts());
-    desc.textContent = s.items ? describe() : 'Loading the review queue…';
+    tabBar.setCounts(tabCounts());
+    // (A failed first load says so in the body.)
+    desc.textContent = s.items ? describe() : s.error ? '' : 'Loading the review queue…';
+    desc.hidden = !desc.textContent;
     stats.replaceChildren(...statsLine());
     renderSendAll();
   }
@@ -498,13 +514,15 @@ function createView(root, ctx) {
   // ---- Body: loading / error / empty / list + detail ----
 
   function errorPanel() {
-    const expired = s.error && s.error.status === 401;
+    // A stale session: the shell's banner says what happened, this says what to do, and Try
+    // again isn't offered (it can't work until coldtrail is reopened).
+    const expired = isStaleSession(s.error);
     return h(
       'div',
       { class: 'drafts-panel' },
       emptyState({
         title: 'Couldn’t load drafts',
-        body: expired ? 'This tab’s session ended; see the message above.' : (s.error && s.error.message) || 'Something went wrong.',
+        body: errorText(s.error) || 'Something went wrong.',
         action: expired
           ? null
           : h('button', { type: 'button', class: 'btn btn-secondary', onClick: retry }, 'Try again'),
@@ -991,7 +1009,7 @@ function createView(root, ctx) {
         showSave(key, isDirty(find(key)) ? 'pending' : 'saved');
         return null;
       } catch (err) {
-        const msg = (err && err.message) || String(err);
+        const msg = errorText(err);
         showSave(key, 'error', msg);
         if (last) {
           // The screen was left: the edit goes with it, so say which one.
@@ -1105,6 +1123,7 @@ function createView(root, ctx) {
       // With nothing in the list (empty tab, no filter matches) the list pane already says why.
       const quiet = !s.missing && !visibleItems().length;
       detailPane.replaceChildren(...(quiet ? [] : [h('div', { class: 'drafts-detail-empty' }, placeholder())]));
+      watchToasts();
       return;
     }
     const el = h('article', { class: 'draft', 'aria-labelledby': 'draft-title' });
@@ -1152,7 +1171,8 @@ function createView(root, ctx) {
     el.append(editor(it));
     d.save = editable(it) ? h('span', { class: 'draft-save', role: 'status' }) : null;
     d.actions = h('div', { class: 'draft-actions' });
-    el.append(h('div', { class: 'draft-foot' }, h('div', { class: 'draft-state' }, d.save), d.actions));
+    d.foot = h('div', { class: 'draft-foot' }, h('div', { class: 'draft-state' }, d.save), d.actions);
+    el.append(d.foot);
     detailPane.replaceChildren(el);
     detailPane.scrollTop = 0;
     if (failedSaves.has(it.key)) showSave(it.key, 'error', failedSaves.get(it.key));
@@ -1160,13 +1180,14 @@ function createView(root, ctx) {
     fillHead(it);
     if (it.channel === 'linkedin') updateNote(it);
     refreshActions(true);
+    watchToasts();
   }
 
   function editor(it) {
     if (it.channel === 'linkedin') {
       const note = h('textarea', {
         id: 'draft-note',
-        class: 'input draft-text',
+        class: 'input draft-text draft-note',
         rows: '8',
         spellcheck: 'true',
         'data-editor': '',
@@ -1278,13 +1299,10 @@ function createView(root, ctx) {
       const url = safeUrl(it.to);
       parts.push(url ? h('a', { href: url, target: '_blank', rel: 'noopener noreferrer' }, linkedinHandle(url)) : h('span', { class: 'draft-to-missing' }, recipientText(it)));
     }
-    // Each item stays whole (a domain never breaks at its hyphen); the line wraps between them.
-    d.meta.replaceChildren(
-      ...parts.flatMap((p, i) => {
-        const item = h('span', { class: 'draft-meta-item' }, p);
-        return i ? [h('span', { class: 'draft-meta-sep', 'aria-hidden': 'true' }, ' · '), item] : [item];
-      }),
-    );
+    // Each item stays whole (a domain never breaks at its hyphen) and the line wraps between
+    // them. The "·" between items is drawn by the CSS in front of each one, so a wrapped line
+    // never ends on one (drafts.css, .draft-meta).
+    d.meta.replaceChildren(h('span', { class: 'draft-meta-items' }, parts.map((p) => h('span', { class: 'draft-meta-item' }, p))));
     const status =
       it.channel === 'email' && it.status === 'drafted' ? badge('In Gmail', 'accent') : badge('Draft', 'neutral');
     d.badges.replaceChildren(...(it.parked ? [badge('Parked', 'warn')] : []), status);
@@ -1550,7 +1568,7 @@ function createView(root, ctx) {
         toast(`${what} — ${(r && r.message) || 'it could not be completed'}`, 'err');
       }
     } catch (err) {
-      toast(`${what} — ${err.message}`, 'err');
+      toast(`${what} — ${errorText(err)}`, 'err');
     } finally {
       pushing.delete(key);
       restore();
@@ -1570,7 +1588,7 @@ function createView(root, ctx) {
       restore();
     } catch (err) {
       restore();
-      toast(`Not marked sent — ${err.message}`, 'err');
+      toast(`Not marked sent — ${errorText(err)}`, 'err');
     }
   }
 
@@ -1618,7 +1636,7 @@ function createView(root, ctx) {
       await load({ focusOnVanish: true });
     } catch (err) {
       restore();
-      toast(`Draft not discarded — ${err.message}`, 'err');
+      toast(`Draft not discarded — ${errorText(err)}`, 'err');
       // Still there, so an edit that was waiting to save still needs to.
       if (isDirty(find(key))) saveSoon(key);
     }
@@ -1655,7 +1673,7 @@ function createView(root, ctx) {
       }
     } catch (err) {
       restore();
-      toast(`LinkedIn not opened — ${err.message}`, 'err');
+      toast(`LinkedIn not opened — ${errorText(err)}`, 'err');
     }
   }
 
@@ -1684,7 +1702,7 @@ function createView(root, ctx) {
     } catch (err) {
       restore();
       for (const b of others) if (b.isConnected) b.disabled = false;
-      toast(err.message, 'err');
+      toast(`${sent ? 'Not marked sent' : 'Your answer wasn’t recorded'} — ${errorText(err)}`, 'err');
     }
   }
 
@@ -1722,7 +1740,7 @@ function createView(root, ctx) {
       scheduleRowPoll();
     } catch (err) {
       restore();
-      toast(`Invite not sent — ${err.message}`, 'err');
+      toast(`Invite not sent — ${errorText(err)}`, 'err');
     }
   }
 
@@ -1858,6 +1876,8 @@ function createView(root, ctx) {
     openDialog({
       title,
       opener: sendAllBtn,
+      // Leaving the screen (the browser's Back) closes it; a run already going carries on.
+      signal: ctl.signal,
       content: [
         h('p', {}, label ? 'This is exactly what happens when you confirm:' : 'Nothing goes out from here right now:'),
         h('ul', { class: 'sendall-list' }, p.emailSide ? emailLine(p) : null, p.liSide ? linkedinLine(p) : null),
@@ -1889,6 +1909,7 @@ function createView(root, ctx) {
     };
     let ok = 0;
     let stopped = null;
+    let staleStop = false; // a stale session stopped the emails: the LinkedIn part would meet it too
     const failed = [];
     runChanged();
     try {
@@ -1920,8 +1941,13 @@ function createView(root, ctx) {
             failed.push(`${name}: ${msg}`);
           }
         } catch (err) {
-          failed.push(`${name}: ${err.message}`);
-          if (err.status === 401) break;
+          failed.push(`${name}: ${errorText(err)}`);
+          // Every send after it would fail the same way (and so would the LinkedIn sender's
+          // start: it isn't tried, so the summary toast is the only one).
+          if (isStaleSession(err)) {
+            staleStop = true;
+            break;
+          }
         }
       }
       run.i = run.n;
@@ -1932,7 +1958,7 @@ function createView(root, ctx) {
         else toast(done, 'ok');
       }
       if (gate) toast(`No LinkedIn invites went out. ${gatePlain(gate)}`);
-      if (liGo) await startLinkedinSender(p, step);
+      if (liGo && !staleStop) await startLinkedinSender(p, step);
       // Send now stays off until the queue shows what went out, so nothing goes twice.
       store.refresh();
       if (active) await active.reload();
@@ -1945,9 +1971,18 @@ function createView(root, ctx) {
   // Send all's LinkedIn part: one bulk sender for the queue. Every note it will send is saved
   // first; if one can't be, nothing starts (the sender would send the older text).
   async function startLinkedinSender(p, step) {
-    // A Send invite started while the dialog was open is that send's.
+    // A Send invite started while the dialog was open is that send's. When that leaves nothing,
+    // say so: the confirm promised invites, and they are going out, just not from here.
     const queue = p.queued.filter((it) => !rowSending(it));
-    if (!queue.length) return;
+    if (!queue.length) {
+      const n = p.queued.length;
+      toast(
+        n === 1
+          ? 'No LinkedIn bulk send started: the invite is already being sent from its draft.'
+          : `No LinkedIn bulk send started: all ${fmtNum(n)} invites are already being sent from their drafts.`,
+      );
+      return;
+    }
     step('Starting the LinkedIn sender…');
     const unsavedNotes = [];
     for (const it of queue) {
@@ -1971,7 +2006,7 @@ function createView(root, ctx) {
         toast('Couldn’t start the LinkedIn bulk send.', 'err');
       }
     } catch (err) {
-      toast(`The LinkedIn bulk send didn’t start: ${err.message}`, 'err');
+      toast(`The LinkedIn bulk send didn’t start: ${errorText(err)}`, 'err');
     }
   }
 
@@ -2217,13 +2252,86 @@ function createView(root, ctx) {
     if (it) fillHead(it);
   }
 
-  // ---- Store, URL updates, unmount ----
+  // ---- Toasts clear of the actions (desktop) ----
+  //
+  // Toasts stack up from the bottom right, which is where a draft's action bar can be: pinned to
+  // the pane's bottom edge under a long draft, or anywhere mid-pane under a short one (a LinkedIn
+  // note), in one row or two. When the stack in its usual place would cover the bar, it moves to
+  // just above the bar instead (an error toast stays until dismissed: it would block Send and
+  // Discard). drafts.css reads the lift; it's set on <html> because #toasts is #app's sibling.
+  const LIFT_VAR = '--drafts-toast-lift';
+  const rootStyle = document.documentElement.style;
+  const tokenPx = (name, fallback) => parseFloat(getComputedStyle(document.documentElement).getPropertyValue(name)) || fallback;
+  const TOAST_EDGE = tokenPx('--space-4', 16); // components.css: #toasts' usual distance from the bottom
+  const TOAST_GAP = tokenPx('--space-2', 8); // between the bar and the lifted stack
+  const ldDetail = ld.querySelector('.ld-detail');
+  const liftRO = typeof ResizeObserver === 'function' ? new ResizeObserver(() => placeToasts()) : null;
+  let lift = '';
+  let liftFrame = 0;
 
-  // The server's draft counts: [all, email, linkedin], or null.
-  const queueCounts = (sm) => {
-    const n = sm && sm.counts;
-    return n && Number.isFinite(n.drafts) ? [n.drafts, n.drafts_email, n.drafts_linkedin] : null;
-  };
+  function setLift(px) {
+    const v = px > 0 ? `${Math.ceil(px)}px` : '';
+    if (v === lift) return;
+    lift = v;
+    if (v) rootStyle.setProperty(LIFT_VAR, v);
+    else rootStyle.removeProperty(LIFT_VAR);
+  }
+
+  function placeToasts() {
+    const host = document.getElementById('toasts');
+    const foot = alive && wide.matches && d && d.foot && d.foot.isConnected ? d.foot : null;
+    if (!host || !foot || !host.firstElementChild) {
+      // (No toast showing: nothing to move. The next one resizes the stack, which calls back here
+      // before it's painted.)
+      setLift(0);
+      return;
+    }
+    const vh = document.documentElement.clientHeight;
+    const bar = foot.getBoundingClientRect();
+    const col = host.getBoundingClientRect();
+    const onScreen = bar.bottom > 0 && bar.top < vh;
+    const underColumn = bar.right > col.left && bar.left < col.right;
+    // The stack's top edge in its usual place, bottom right.
+    const usualTop = vh - TOAST_EDGE - host.offsetHeight;
+    const covers = onScreen && underColumn && bar.bottom + TOAST_GAP > usualTop;
+    setLift(covers ? vh - bar.top + TOAST_GAP : 0);
+  }
+
+  // Scrolling the page (a short window) or resizing it moves the bar: once a frame is enough.
+  function placeToastsSoon() {
+    if (liftFrame) return;
+    liftFrame = requestAnimationFrame(() => {
+      liftFrame = 0;
+      placeToasts();
+    });
+  }
+
+  // What moves the bar or the stack: the stack growing or shrinking, the pane changing size (the
+  // window, the header above it wrapping), the draft above the bar (banners, a resized editor),
+  // and the bar itself (its actions wrapping onto a second row). Called whenever the detail is
+  // rendered, to follow the new draft's elements.
+  function watchToasts() {
+    if (liftRO) {
+      liftRO.disconnect();
+      const host = document.getElementById('toasts');
+      for (const el of [host, ldDetail, d && d.el, d && d.foot]) if (el) liftRO.observe(el);
+    }
+    placeToasts();
+  }
+
+  window.addEventListener('resize', placeToastsSoon);
+  window.addEventListener('scroll', placeToastsSoon, { capture: true, passive: true });
+
+  function unwatchToasts() {
+    if (liftRO) liftRO.disconnect();
+    cancelAnimationFrame(liftFrame);
+    liftFrame = 0;
+    window.removeEventListener('resize', placeToastsSoon);
+    window.removeEventListener('scroll', placeToastsSoon, { capture: true });
+    setLift(0);
+  }
+
+  // ---- Store, URL updates, unmount ----
 
   const unsubscribe = store.subscribe(({ status, summary }) => {
     if (!alive) return;
@@ -2248,6 +2356,7 @@ function createView(root, ctx) {
   const onWide = () => {
     if (!alive) return;
     if (wide.matches) autoSelect();
+    placeToasts();
   };
   wide.addEventListener('change', onWide);
 
@@ -2334,6 +2443,7 @@ function createView(root, ctx) {
     unsubscribe();
     wide.removeEventListener('change', onWide);
     window.removeEventListener('pagehide', onPageHide);
+    unwatchToasts();
   }
 
   // ---- Start ----

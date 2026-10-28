@@ -5,7 +5,7 @@
 // dialog with exact counts and its one-run-at-a-time guard, the first-send confirm, no send over
 // an edit that couldn't be saved, Open in LinkedIn + "Did it send?", the LinkedIn pollers
 // (finished at the cap, timed out even when the queue can't be read, stopped on leaving), drafts
-// arriving while the screen is open, and the phone list keeping its place.
+// arriving while the screen is open, a stale session, and the phone list keeping its place.
 //
 // Tests share one server in order, so the read-only and count-sensitive tests come first and
 // each mutating test uses its own draft (or puts back the rows it added). Every LinkedIn route
@@ -21,6 +21,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { expectAccessible } from '../harness/a11y.mjs';
 import { test, expect } from '../harness/fixtures.mjs';
 import { COMPANIES, SEED } from '../harness/seed.mjs';
+import { SESSION_EXPIRED, SESSION_REOPEN } from '../../../ui/js/core/api.js';
 import { fmtNum } from '../../../ui/js/core/format.js';
 
 const reEscape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -39,6 +40,9 @@ const emailBody = (page) => detail(page).getByRole('textbox', { name: 'Body' });
 
 const person = (domain) => COMPANIES.find((c) => c.domain === domain).contacts[0].founder_name;
 const firstName = (domain) => person(domain).split(' ')[0];
+/** A domain's pending draft on `channel` as the seed wrote it: { subject, body, … }. */
+const seeded = (domain, channel) =>
+  COMPANIES.find((c) => c.domain === domain).outreach.find((o) => o.channel === channel && o.status === 'draft_pending');
 
 // Drafts the tests act on, each used by one mutating test only.
 const pendingEmail = SEED.emailDrafts.filter((d) => d.status === 'draft_pending');
@@ -69,6 +73,8 @@ const LI = {
   evening: sendableLinkedin[9],
   discardOpening: sendableLinkedin[10],
   offline: sendableLinkedin[11],
+  ownRow: sendableLinkedin[12],
+  stale: sendableLinkedin[13],
 };
 const ROW_TIMEOUT_MS = 240_000; // drafts.js: how long a per-row LinkedIn send is watched
 const FILTER_URL_MS = 250; // drafts.js: the filter reaches the URL this long after the last key
@@ -343,6 +349,15 @@ test('send all dialog states exact counts', async ({ app, page, server, request 
   await expect(dialog.getByRole('button', { name: `Send ${upTo} invites`, exact: true })).toBeVisible();
   await dialog.getByRole('button', { name: 'Cancel' }).click();
 
+  // Leaving the screen with the dialog open (as the browser's Back does) closes it.
+  await sendAll.click();
+  await expect(dialog).toBeVisible();
+  await page.evaluate(() => {
+    location.hash = '#/home';
+  });
+  await expect(page.locator('#view h1')).toHaveText('Home');
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+
   // Nothing was sent or started.
   expect(app.calls).toEqual([]);
   await dbRows(server, "SELECT count(*) AS n FROM outreach WHERE status IN ('draft_pending','drafted')").toEqual([
@@ -599,7 +614,9 @@ test('a company with an email and a LinkedIn draft saves each one on its own', a
   // The seed has no company with drafts on both channels, and no API writes a second draft for a
   // company (the agent does, through the CLI), so the test adds the LinkedIn note to the database
   // as the agent would. Saves then go to the real server, which keeps each channel's text apart.
+  // The email is EMAIL.autosave's, which a later test opens too: its text is put back at the end.
   const e = EMAIL.autosave;
+  const original = seeded(e.domain, 'email');
   const k = COMPANIES.find((c) => c.domain === e.domain).contacts[0];
   expect(k.linkedin_url).toBeTruthy();
   const noteText = `Hi ${k.founder_name.split(' ')[0]}, glad to connect.`;
@@ -642,6 +659,13 @@ test('a company with an email and a LinkedIn draft saves each one on its own', a
     await expect(emailBody(page)).toHaveValue(emailText);
   } finally {
     deleteDraft(server, id);
+    writeDb(
+      server,
+      "UPDATE outreach SET subject = ?, body = ? WHERE domain = ? AND channel = 'email' AND status = 'draft_pending'",
+      original.subject,
+      original.body,
+      e.domain,
+    );
   }
 });
 
@@ -711,11 +735,13 @@ test('edit autosaves and survives reload', async ({ app, page, server }) => {
   await page.reload();
   await expect(note(page)).toHaveValue(text);
 
-  // Email drafts autosave subject and body together.
+  // Email drafts autosave subject and body together. (This one is as seeded: no earlier test
+  // left its edit behind.)
   const e = EMAIL.autosave;
   await optionFor(page, e.domain).click();
   const subject = detail(page).getByRole('textbox', { name: 'Subject' });
   await expect(subject).toHaveValue(e.subject);
+  await expect(emailBody(page)).toHaveValue(seeded(e.domain, 'email').body);
   await subject.fill(`${e.subject} (v2)`);
   await expect(saveState(page)).toHaveText('Saved');
   await page.reload();
@@ -1233,7 +1259,7 @@ test('a send never goes out over an edit that couldn’t be saved, and says so',
   await emailBody(page).fill('An edit the server never gets.');
   await expect(saveState(page)).toHaveText('Couldn’t save: database is locked');
   const errors = page.locator('#toasts .toast-err');
-  // (Error toasts stay until dismissed, over the draft's actions.)
+  // (Error toasts stay until dismissed: each check clears them, so it counts only its own press's.)
   const dismissErrors = async () => {
     for (let n = await errors.count(); n > 0; n--) await errors.first().getByRole('button', { name: 'Dismiss' }).click();
     await expect(errors).toHaveCount(0);
@@ -1518,6 +1544,55 @@ test('a row send stops waiting on time even while the queue can’t be read', as
   expect(polls.length).toBe(seen);
 });
 
+test('Send all says so when every invite it would start is already going out from its draft', async ({ app, page }) => {
+  // One LinkedIn note waits. Its own Send invite is still on its way when Send all opens (so the
+  // dialog counts it), and has started by the time Send all is confirmed: that send owns it, so
+  // the bulk sender has nothing to start, and the screen says so rather than nothing at all.
+  const d = LI.ownRow;
+  await daytime(page);
+  await patchStatus(page, LI_AUTO);
+  await page.route(
+    (url) => url.pathname === '/api/drafts',
+    async (route) => {
+      const res = await route.fetch();
+      const rows = (await res.json()).filter((r) => r.channel !== 'linkedin' || r.domain === d.domain);
+      await route.fulfill({ response: res, json: rows });
+    },
+  );
+  let start;
+  const started = new Promise((resolve) => {
+    start = resolve;
+  });
+  await page.route(
+    (url) => url.pathname === `/api/drafts/${d.domain}/linkedin/send`,
+    async (route) => {
+      await started;
+      await route.fulfill({ json: { sending: true } });
+    },
+  );
+  await app.goto(`#/drafts/${d.domain}?tab=linkedin`);
+  await listReady(page);
+  await expect(options(page)).toHaveCount(1);
+  await detail(page).getByRole('button', { name: `Send invite to ${firstName(d.domain)}` }).click();
+  await page.getByRole('alertdialog', { name: 'Send this LinkedIn invite?' }).getByRole('button', { name: 'Send invite' }).click();
+  await expect(detail(page).locator('[data-action="invite"]')).toHaveAttribute('aria-busy', 'true');
+
+  await page.getByRole('button', { name: 'Send all…' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Send all LinkedIn invites' });
+  const confirm = dialog.getByRole('button', { name: 'Send 1 invite', exact: true });
+  await expect(confirm).toBeVisible();
+  start();
+  await expect(optionFor(page, d.domain).locator('.draft-row-tags')).toContainText('Sending');
+  await confirm.click();
+  await expect(dialog).toBeHidden();
+  await expect(
+    toast(page).filter({ hasText: 'No LinkedIn bulk send started: the invite is already being sent from its draft.' }),
+  ).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Send all…' })).toBeEnabled();
+  expect(app.calls.filter((c) => c.path === '/api/drafts/linkedin/send-all')).toEqual([]);
+  expect(await page.evaluate(() => sessionStorage.getItem('ct-li-bulk'))).toBeNull();
+});
+
 test('loading, error and retry', async ({ app, page }) => {
   app.allowConsole(/Failed to load resource/);
   let release;
@@ -1534,8 +1609,18 @@ test('loading, error and retry', async ({ app, page }) => {
   await app.goto('#/drafts');
   await expect(page.locator('.drafts-body')).toHaveAttribute('aria-busy', 'true');
   await expect(page.locator('.drafts-body .skeleton').first()).toBeVisible();
+  // Until the queue arrives the tabs count what the sidebar does (the summary's), never a 0, and
+  // the counts don't jump when it lands.
+  await expect(page.locator('.page-desc')).toHaveText('Loading the review queue…');
+  const nav = page.locator('#nav a[data-route="drafts"] .nav-count');
+  await expect(nav).toHaveText(/^[1-9]/);
+  await expect(tab(page, 'All').locator('.tab-count')).toHaveText((await nav.textContent()).trim());
+  const linkedin = tab(page, 'LinkedIn').locator('.tab-count');
+  await expect(linkedin).toHaveText(/^[1-9]/);
+  const linkedinCount = (await linkedin.textContent()).trim();
   release();
   await listReady(page);
+  await expect(linkedin).toHaveText(linkedinCount);
   await expect(page.locator('.drafts-body')).not.toHaveAttribute('aria-busy', 'true');
 
   await page.unrouteAll({ behavior: 'wait' });
@@ -1547,9 +1632,81 @@ test('loading, error and retry', async ({ app, page }) => {
   await app.goto('#/drafts');
   await expect(page.getByRole('heading', { name: 'Couldn’t load drafts' })).toBeVisible();
   await expect(page.getByText('database is locked')).toBeVisible();
+  // The header no longer says it's loading.
+  await expect(page.locator('.page-desc')).toBeHidden();
+  await expect(page.getByText('Loading the review queue…')).toHaveCount(0);
   fail = false;
   await page.getByRole('button', { name: 'Try again' }).click();
   await listReady(page);
+});
+
+test('a stale session says to reopen coldtrail, and offers no Try again', async ({ app, page }) => {
+  app.allowConsole(/Failed to load resource/);
+  // The queue can't load: the shell's banner has the full sentence (once); the screen says what
+  // to do, and has no Try again (it can't work until coldtrail is reopened).
+  let stale = true;
+  await page.route(
+    (url) => url.pathname === '/api/drafts',
+    (route) => (stale ? route.fulfill({ status: 401, body: 'Unauthorized' }) : route.fallback()),
+  );
+  await app.goto('#/drafts');
+  const panel = page.locator('.drafts-panel');
+  await expect(panel.getByRole('heading', { name: 'Couldn’t load drafts' })).toBeVisible();
+  await expect(panel).toContainText(SESSION_REOPEN);
+  await expect(panel.getByRole('button')).toHaveCount(0);
+  await expect(page.getByText(SESSION_EXPIRED)).toHaveCount(1);
+  await expect(page.locator('.page-desc')).toBeHidden();
+
+  // An edit whose save meets a stale session: the same pointer beside the editor and in the toast.
+  stale = false;
+  const d = LI.stale;
+  await page.route(
+    (url) => url.pathname === `/api/drafts/${d.domain}`,
+    (route) => (route.request().method() === 'POST' ? route.fulfill({ status: 401, body: 'Unauthorized' }) : route.fallback()),
+  );
+  await app.goto(`#/drafts/${d.domain}`);
+  await expect(note(page)).toBeEditable();
+  await note(page).fill(`${d.body} (stale)`);
+  await expect(saveState(page)).toHaveText(`Couldn’t save: ${SESSION_REOPEN}`);
+  await expect(page.locator('#toasts .toast-err')).toHaveText([`Couldn’t save your edit: ${SESSION_REOPEN}`]);
+  await expect(page.getByText(SESSION_EXPIRED)).toHaveCount(1);
+});
+
+test('Send all stops at a stale session, and doesn’t try the LinkedIn sender after it', async ({ app, page }) => {
+  app.allowConsole(/Failed to load resource/);
+  await daytime(page);
+  await patchStatus(page, LI_AUTO);
+  // The first email meets a stale session; so would the LinkedIn sender's start.
+  const sends = [];
+  let bulkStarts = 0;
+  await page.route(
+    (url) => /^\/api\/drafts\/[^/]+\/send$/.test(url.pathname),
+    (route) => {
+      sends.push(new URL(route.request().url()).pathname);
+      return route.fulfill({ status: 401, body: 'Unauthorized' });
+    },
+  );
+  await page.route(
+    (url) => url.pathname === '/api/drafts/linkedin/send-all',
+    (route) => {
+      bulkStarts++;
+      return route.fulfill({ status: 401, body: 'Unauthorized' });
+    },
+  );
+  await app.goto('#/drafts');
+  await listReady(page);
+  await page.getByRole('button', { name: 'Send all…' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Send all drafts' });
+  const go = dialog.getByRole('button', { name: /^Create \d+ Gmail drafts and send \d+ invites$/ });
+  await go.click();
+  await expect(dialog).toBeHidden(); // the run is over
+  // One toast says what happened, and what to do.
+  await expect(toast(page)).toHaveText([
+    new RegExp(`^Created 0 Gmail drafts\\. 1 failed:\\s+.+: ${reEscape(SESSION_REOPEN)}$`),
+  ]);
+  expect(sends).toHaveLength(1);
+  expect(bulkStarts).toBe(0);
+  await expect(page.getByText(SESSION_EXPIRED)).toHaveCount(1);
 });
 
 test('secondary lookups failing still leave a usable screen', async ({ app, page }) => {
@@ -1603,22 +1760,117 @@ test('drafts is accessible in light and dark', async ({ app, page }) => {
   }
 });
 
-test('a draft’s actions stay in view on laptop screens, and the filter hint fits', async ({ app, page }) => {
+test('on laptop screens a draft’s actions stay in view and clear of toasts, and its details, note and the filter hint fit', async ({
+  app,
+  page,
+}) => {
+  await daytime(page);
+  await patchStatus(page, LI_AUTO); // LinkedIn drafts show their full bar, Send invite included
+  const errorToast = (text) => page.evaluate((t) => import('/assets/js/core/ui.js').then((m) => m.toast(t, 'err')), text);
+  const clearToasts = async () => {
+    while (await toast(page).count()) await toast(page).first().getByRole('button', { name: 'Dismiss' }).click();
+  };
+  // Where the toasts are against the draft's action bar: all on screen, none over any part of the
+  // bar, and in their usual place (bottom right) whenever the stack fits there below the bar.
+  // (They're placed when the stack resizes, before it's painted: polled, not read once.)
+  const placement = () =>
+    page.evaluate(() => {
+      const vh = document.documentElement.clientHeight;
+      const host = document.getElementById('toasts');
+      const stack = host.getBoundingClientRect();
+      const bar = document.querySelector('.draft-foot').getBoundingClientRect();
+      const toasts = [...host.querySelectorAll('.toast')].map((t) => t.getBoundingClientRect());
+      const hit = (a, b) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+      const edge = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--space-4'));
+      const lifted = stack.bottom < vh - edge - 0.5;
+      const fitsBelow = bar.bottom + 8 <= vh - edge - stack.height;
+      return {
+        toasts: toasts.length,
+        onScreen: toasts.every((t) => t.top >= 0 && t.bottom <= vh),
+        overBar: toasts.some((t) => hit(t, bar)),
+        usualWhenItFits: !fitsBelow || !lifted,
+        lifted,
+      };
+    });
+  const clear = (n) => ({ toasts: n, onScreen: true, overBar: false, usualWhenItFits: true, lifted: expect.any(Boolean) });
+
   // The email editor is taller than the detail pane on common laptop screens: the pane scrolls,
-  // and the actions stay pinned to its bottom edge.
+  // and the actions stay pinned to its bottom edge. Toasts (an error stays until dismissed) stack
+  // above them rather than over Send and Discard.
   const d = EMAIL.autosave;
   for (const [width, height, hash] of [
     [1366, 768, `#/drafts/${d.domain}?tab=email`],
     [1280, 800, `#/drafts/${d.domain}`],
     [1440, 900, `#/drafts/${d.domain}?tab=email`],
   ]) {
+    const at = `${width}×${height}`;
     await page.setViewportSize({ width, height });
     await app.goto(hash);
     await listReady(page);
     await expect(emailBody(page)).toBeVisible();
-    await expect(detail(page).locator('[data-action="push"]'), `${width}×${height}`).toBeInViewport({ ratio: 1 });
-    await expect(detail(page).getByRole('button', { name: 'Discard' }), `${width}×${height}`).toBeInViewport({ ratio: 1 });
+    await expect(detail(page).locator('[data-action="push"]'), at).toBeInViewport({ ratio: 1 });
+    await expect(detail(page).getByRole('button', { name: 'Discard' }), at).toBeInViewport({ ratio: 1 });
+    await errorToast('Couldn’t save your edit: disk full');
+    await expect.poll(placement, at).toEqual({ ...clear(1), lifted: true });
+    const shown = await page.locator('#toasts .toast-err').boundingBox();
+    const foot = await detail(page).locator('.draft-foot').boundingBox();
+    expect(shown.y + shown.height, at).toBeLessThanOrEqual(foot.y);
+    await clearToasts();
   }
+
+  // A LinkedIn note is short (300 characters at most): its bar sits mid-pane, in one row or, from
+  // 900 to ~1000px wide, two. The toasts stay below it where there's room, and move above it where
+  // there isn't, never over Discard, Open in LinkedIn or Send invite.
+  const li = LI.autosave;
+  for (const [width, height] of [
+    [1366, 768],
+    [1440, 790],
+    [1280, 800],
+    [1100, 800],
+    [1280, 720],
+    [960, 720],
+    [1440, 900],
+  ]) {
+    const at = `LinkedIn ${width}×${height}`;
+    await page.setViewportSize({ width, height });
+    await app.goto(`#/drafts/${li.domain}`);
+    await expect(note(page)).toBeVisible();
+    await expect(detail(page).getByRole('button', { name: `Send invite to ${firstName(li.domain)}` })).toBeVisible();
+    await errorToast('Couldn’t save your edit: disk full');
+    await expect.poll(placement, at).toEqual(clear(1));
+    // Plenty of room below the bar: the toast stays where toasts always are.
+    if (height === 900) expect((await placement()).lifted, at).toBe(false);
+    if (width === 960) {
+      const rows = await detail(page)
+        .locator('.draft-foot button')
+        .evaluateAll((bs) => new Set(bs.map((b) => Math.round(b.getBoundingClientRect().top))).size);
+      expect(rows, `${at}: the bar wraps`).toBeGreaterThan(1);
+    }
+    if (width === 1280 && height === 720) {
+      // A taller stack moves as one.
+      await errorToast('Your edit to Acme wasn’t saved: disk full\nTry again in a moment.');
+      await expect.poll(placement, at).toEqual(clear(2));
+    }
+    await clearToasts();
+  }
+
+  // Leaving the screen puts the toasts back in their usual place.
+  await page.setViewportSize({ width: 1366, height: 768 });
+  await app.goto(`#/drafts/${d.domain}`);
+  await expect(emailBody(page)).toBeVisible();
+  await errorToast('Couldn’t save your edit: disk full');
+  await expect.poll(placement).toEqual({ ...clear(1), lifted: true });
+  await page.getByRole('link', { name: 'Home', exact: true }).click();
+  await expect(page).toHaveURL(hashIs('#/home'));
+  await expect
+    .poll(() =>
+      page.evaluate(() => ({
+        lift: document.documentElement.style.getPropertyValue('--drafts-toast-lift'),
+        gap: document.documentElement.clientHeight - document.getElementById('toasts').getBoundingClientRect().bottom,
+      })),
+    )
+    .toEqual({ lift: '', gap: 16 });
+  await clearToasts();
 
   // The filter's placeholder fits the narrowest list column (264px, from 900 to ~1100px wide).
   await page.setViewportSize({ width: 1024, height: 768 });
@@ -1632,6 +1884,53 @@ test('a draft’s actions stay in view on laptop screens, and the filter hint fi
     return { text: Math.ceil(ctx.measureText(input.placeholder).width), room };
   });
   expect(fit.text).toBeLessThanOrEqual(fit.room);
+
+  // At this width a LinkedIn draft's details wrap onto more lines: none starts or ends on a "·"
+  // (each item draws its own in front, and the one before an item that starts a line is clipped).
+  await app.goto(`#/drafts/${LI.autosave.domain}`);
+  await expect(note(page)).toBeVisible();
+  const meta = detail(page).locator('.draft-meta');
+  await expect(meta.getByRole('link')).toHaveCount(2);
+  const layout = await meta.evaluate((p) => {
+    const clip = p.getBoundingClientRect().left;
+    let top = null;
+    let lines = 0;
+    const dots = [];
+    for (const item of p.querySelectorAll('.draft-meta-item')) {
+      const box = item.getBoundingClientRect();
+      const text = document.createRange();
+      text.selectNodeContents(item);
+      const sep = parseFloat(getComputedStyle(item, '::before').width);
+      const startsLine = top === null || box.top > top + 1;
+      if (startsLine) {
+        lines++;
+        top = box.top;
+      }
+      // The "·" sits in the middle of its box, just before the text: shown only inside the clip.
+      dots.push({ startsLine, shown: text.getBoundingClientRect().left - sep / 2 > clip });
+    }
+    return { lines, dots };
+  });
+  expect(layout.lines).toBeGreaterThan(1);
+  expect(layout.dots.map((x) => x.shown)).toEqual(layout.dots.map((x) => !x.startsLine));
+  // A focused link's ring (base.css: 2px wide, 2px out) isn't cut off by either clip.
+  const RING = 4;
+  for (const link of await meta.getByRole('link').all()) {
+    const room = await link.evaluate((a, ring) => {
+      const r = a.getBoundingClientRect();
+      const item = a.closest('.draft-meta-item').getBoundingClientRect();
+      const row = a.closest('.draft-meta').getBoundingClientRect();
+      return [
+        r.left - ring >= Math.max(item.left, row.left) - 0.5,
+        r.right + ring <= Math.min(item.right, row.right) + 0.5,
+        r.top - ring >= item.top - 0.5,
+        r.bottom + ring <= item.bottom + 0.5,
+      ];
+    }, RING);
+    expect(room).toEqual([true, true, true, true]);
+  }
+  // The note shows in full, with no scrolling inside it.
+  expect(await note(page).evaluate((el) => el.scrollHeight <= el.clientHeight)).toBe(true);
 });
 
 test('phone width: list then draft, no horizontal scroll', async ({ app, page }) => {
