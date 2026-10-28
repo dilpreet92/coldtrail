@@ -6,21 +6,24 @@
 // /api/companies?per=1 (for `queries`) are fetched here, and fetched again when the summary says
 // they changed (a newer last run, a different company count). Each source has its own loading,
 // empty and error state. Every server string reaches the page as text through h(); hrefs are
-// built with href() or checked against the app's own routes. Below the phone breakpoint Recent
-// runs render as cards (a matchMedia listener swaps them). Unmount drops the store subscription
-// and that listener, and aborts any request in flight.
+// built with href() or checked against the app's own routes. Where their section is too narrow
+// for a table, Recent runs render as cards (a ResizeObserver swaps them). Unmount drops the store
+// subscription and that observer, and aborts any request in flight. Run statuses use the shared
+// wording (runStatus, core/format.js), so Home and Schedules name a run the same way.
 
 import { api } from '../core/api.js';
-import { fmtDate, fmtNum, fmtRelative, h, toDate } from '../core/dom.js';
+import { fmtDate, fmtNum, fmtRelative, h, pluralize, runStatus, toDate } from '../core/dom.js';
 import { href } from '../core/router.js';
 import { badge } from '../components/badge.js';
+import { emptyState } from '../components/emptyState.js';
 import { table } from '../components/table.js';
 
 const title = 'Home';
 
 const RUNS_SHOWN = 5;
-// Below this width (home.css's phone breakpoint) Recent runs are cards, not a table.
-const NARROW = '(max-width: 699px)';
+// Recent runs are a table when their section is at least this wide (px), else a list of cards:
+// on a phone, and in a window the sidebar leaves narrow (1024px wide leaves the section ~730px).
+const RUNS_TABLE_MIN = 820;
 const SEARCHES_SHOWN = 8;
 const STARTER_PROMPT =
   "Find 20 companies that match my company profile, then find each founder's email or LinkedIn profile.";
@@ -41,12 +44,6 @@ const STAGES = {
   drafted: 'Drafted',
   sent: 'Sent',
   replied: 'Replied',
-};
-
-const RUN_STATUS = {
-  ok: ['Finished', 'ok'],
-  error: ['Failed', 'danger'],
-  auth_failed: ["Couldn't sign in", 'danger'],
 };
 
 const TRIGGERS = { scheduled: 'Scheduled', manual: 'Manual', dry: 'Dry run' };
@@ -94,6 +91,28 @@ const isAbort = (err) => err && (err.name === 'AbortError' || err.code === 20);
 
 /** The error's message unless the session banner already says it (a 401). */
 const detailOf = (err) => (err && err.status === 401 ? '' : (err && err.message) || String(err || ''));
+
+const HOUR = 3_600_000;
+
+/**
+ * When a schedule runs next, worded to end the sentence "<name> runs next …": "in 18h" within 48h
+ * (spec §5.10, as the top bar's chip says it), else "on Oct 30, 09:00". A time that has come
+ * already (the timer is late) is "any minute now". `title` is the full date for the tooltip.
+ */
+export function nextRunWhen(iso, now = new Date()) {
+  const d = toDate(iso);
+  if (!d) return null;
+  const ms = d.getTime() - now.getTime();
+  const full = fmtDate(d, { time: true, now });
+  const text = ms < 60_000 ? 'any minute now' : ms < 48 * HOUR ? fmtRelative(d, now) : `on ${full}`;
+  return { text, datetime: d.toISOString(), title: full };
+}
+
+/** "<name> runs next in 18h." as nodes, the time in a <time> with the full date as its tooltip. */
+function nextRunSentence(next, when, tail = '') {
+  const name = next && next.name ? String(next.name) : 'A schedule';
+  return [`${name} runs next `, h('time', { datetime: when.datetime, title: when.title }, when.text), `.${tail}`];
+}
 
 /** A section: an h2 head (with an optional link on the right) over a body the view refills. */
 function section(id, heading, { link, cls, hiddenHeading = false } = {}) {
@@ -337,9 +356,44 @@ export function runName(r) {
   return { text: 'No schedule', muted: true };
 }
 
+/** Why a run failed, from its note: the first non-blank line to show and the whole note for the
+ *  tooltip. Null for a run that succeeded or is still running, or that has no note. */
+export function runNote(r) {
+  if (!r || r.note == null || r.status === 'ok' || r.status === 'running') return null;
+  const full = String(r.note).trim();
+  const line = full
+    .split('\n')
+    .map((l) => l.trim())
+    .find(Boolean);
+  return line ? { line, full } : null;
+}
+
+/** A key per run that stays the same when newer runs push it down the list (its start time and
+ *  conversation, not its index), so a focused "View run" link keeps focus through a refetch. */
+export function runKeys(rows) {
+  const seen = new Map();
+  return rows.map((r) => {
+    const base = `${(r && r.started_at) ?? ''}|${(r && r.chat_id) ?? ''}`;
+    const n = seen.get(base) || 0;
+    seen.set(base, n + 1);
+    return n ? `${base}#${n}` : base;
+  });
+}
+
 const runTrigger = (r) => TRIGGERS[r.trigger] || r.trigger || '—';
-const runStatus = (r) => RUN_STATUS[r.status] || [r.status == null ? 'Unknown' : String(r.status), 'warn'];
+const runBadge = (r) => badge(...runStatus(r.status));
 const runHref = (r) => (r.chat_id ? href(['agent', String(r.chat_id)]) : null);
+const runLinkName = (r) => `View run: ${runName(r).text}, ${fmtRelative(r.started_at)}`;
+
+/** The run's name, and under it why it failed (the note's first line; the whole note on hover). */
+function runTitle(r, noteClass) {
+  const { text, muted } = runName(r);
+  const note = runNote(r);
+  return [
+    h('span', { class: ['home-run-name', muted && 'is-muted'], title: text }, text),
+    note ? h('span', { class: noteClass, title: note.full }, h('span', { class: 'sr-only' }, 'Why it failed: '), note.line) : null,
+  ];
+}
 
 /** Recent runs as a table: one row per run, every column on screen. */
 function runsTable(rows) {
@@ -348,17 +402,9 @@ function runsTable(rows) {
     label: 'Recent runs',
     rowKey: (r) => r.key,
     columns: [
-      {
-        key: 'name',
-        label: 'Run',
-        nowrap: true,
-        render: (r) => {
-          const { text, muted } = runName(r);
-          return h('span', { class: ['home-run-name', muted && 'is-muted'], title: text }, text);
-        },
-      },
+      { key: 'name', label: 'Run', nowrap: true, render: (r) => runTitle(r, 'home-run-note') },
       { key: 'trigger', label: 'Trigger', nowrap: true, render: runTrigger },
-      { key: 'status', label: 'Status', nowrap: true, render: (r) => badge(...runStatus(r)) },
+      { key: 'status', label: 'Status', nowrap: true, render: runBadge },
       // Home is a glance: what each run added (Schedules has the full history, with enriched).
       count('sourced'),
       count('drafted'),
@@ -369,14 +415,14 @@ function runsTable(rows) {
         label: h('span', { class: 'sr-only' }, 'Conversation'),
         nowrap: true,
         align: 'right',
-        render: (r) => (r.chat_id ? h('a', { href: runHref(r), 'data-focus': `run:${r.key}` }, 'View run') : ''),
+        render: (r) => (r.chat_id ? h('a', { href: runHref(r), 'data-focus': `run:${r.key}`, 'aria-label': runLinkName(r) }, 'View run') : ''),
       },
     ],
     rows,
   });
 }
 
-/** Recent runs on a phone: the table's eight columns don't fit, so each run is a short card with
+/** Recent runs in a narrow section: the table's eight columns don't fit, so each run is a card with
  *  the same facts (name and status, trigger and time, the counts, the link to its conversation). */
 function runsCards(rows) {
   const n = (v, what) => [h('span', { class: 'home-num' }, fmtNum(v)), ` ${what}`];
@@ -384,24 +430,18 @@ function runsCards(rows) {
     'ul',
     { class: 'home-run-cards', role: 'list', 'aria-label': 'Recent runs' },
     rows.map((r) => {
-      const { text, muted } = runName(r);
+      const [name, note] = runTitle(r, 'home-run-card-note');
       return h(
         'li',
         { class: 'home-run-card', 'data-key': r.key },
-        h(
-          'div',
-          { class: 'home-run-card-head' },
-          h('span', { class: ['home-run-name', muted && 'is-muted'], title: text }, text),
-          badge(...runStatus(r)),
-        ),
+        h('div', { class: 'home-run-card-head' }, name, runBadge(r)),
+        note,
         h('p', { class: 'home-run-card-meta' }, runTrigger(r), ' · ', runWhen(r.started_at)),
         h(
           'div',
           { class: 'home-run-card-foot' },
           h('p', { class: 'home-run-card-counts' }, ...n(r.sourced, 'sourced'), ' · ', ...n(r.drafted, 'drafted'), ' · ', ...n(r.sent, 'sent')),
-          r.chat_id
-            ? h('a', { class: 'home-run-card-link', href: runHref(r), 'data-focus': `run:${r.key}`, 'aria-label': `View run: ${text}, ${fmtRelative(r.started_at)}` }, 'View run')
-            : null,
+          r.chat_id ? h('a', { class: 'home-run-card-link', href: runHref(r), 'data-focus': `run:${r.key}`, 'aria-label': runLinkName(r) }, 'View run') : null,
         ),
       );
     }),
@@ -410,17 +450,18 @@ function runsCards(rows) {
 
 function renderRuns(rows, next, narrow) {
   if (!rows.length) {
+    const when = next ? nextRunWhen(next.next_at) : null;
     return h(
       'div',
       { class: 'home-empty' },
-      h(
-        'p',
-        {},
-        next
-          ? `No runs yet. ${next.name} runs next ${fmtDate(next.next_at, { time: true })}.`
-          : 'No runs yet. A run shows up here after a schedule fires or you use Run now.',
-      ),
-      h('a', { class: 'btn btn-secondary btn-sm', href: '#/schedules' }, next ? 'Open Schedules' : 'Create a schedule'),
+      emptyState({
+        level: 3,
+        title: 'No runs yet',
+        body: when
+          ? nextRunSentence(next, when, ' What it adds shows up here.')
+          : 'A run shows up here after a schedule fires or you use Run now on Schedules.',
+        action: h('a', { class: 'btn btn-secondary', href: '#/schedules' }, when ? 'Open Schedules' : 'Create a schedule'),
+      }),
     );
   }
   return narrow ? runsCards(rows) : runsTable(rows);
@@ -428,11 +469,32 @@ function renderRuns(rows, next, narrow) {
 
 // ---- Top searches ----
 
-// /api/companies `queries` leaves out companies with no source query (a missing source can't be
-// a Pipeline filter), so the "No search recorded" row only guards against a null from the server.
-function renderSearches(queries, total, open) {
+/**
+ * The line under Top searches: how many searches the list leaves out, and how many companies no
+ * search found. /api/companies `queries` lists every search but leaves out companies with no
+ * source query (a missing source can't be a Pipeline filter), so without this the shares wouldn't
+ * add up and those companies would be missing from Home. '' when there is nothing to add.
+ */
+export function searchesCaption({ shown, searches, total, found }) {
+  const parts = [];
+  if (searches > shown) parts.push(`Showing the top ${fmtNum(shown)} of ${fmtNum(searches)} searches.`);
+  const none = Number(total) - Number(found);
+  if (none > 0) parts.push(`${pluralize(none, 'company has', 'companies have')} no search recorded.`);
+  return parts.join(' ');
+}
+
+// The "No search recorded" row only guards against a null query from the server.
+function renderSearches({ queries, total, searches, found }, open) {
   if (!queries.length) {
-    return h('div', { class: 'home-empty' }, h('p', {}, 'No searches yet. Companies are grouped here by the search that found them.'));
+    return h(
+      'div',
+      { class: 'home-empty' },
+      emptyState({
+        level: 3,
+        title: 'No searches yet',
+        body: 'Companies the agent finds are grouped here by the search that found them.',
+      }),
+    );
   }
   const wrap = table({
     label: 'Top searches',
@@ -440,6 +502,9 @@ function renderSearches(queries, total, open) {
     // A click anywhere on the row opens Pipeline filtered by its search. This is a click handler
     // (the table ignores presses on the link itself), not a link stretched over the row: WebKit
     // can't position anything against a <tr>, so a stretched link would cover the whole page.
+    // The search's link is the row's one keyboard stop (a real link, named by the search, that
+    // Cmd/Ctrl-click opens in a new tab), so the rows aren't tab stops too.
+    rowFocus: false,
     onRowClick: (r) => {
       if (r.q) open(href(['pipeline'], { query: r.q }));
     },
@@ -457,14 +522,12 @@ function renderSearches(queries, total, open) {
     ],
     rows: queries.map(([q, n], i) => ({ key: `${i}`, q: q == null ? '' : String(q), n: Number(n) || 0 })),
   });
-  // The search's link is the row's one keyboard stop: a real link, named by the search, that
-  // Cmd/Ctrl-click opens in a new tab. So the rows are not tab stops too, and a row with nothing
-  // to filter by isn't clickable at all.
-  for (const tr of wrap.querySelectorAll('tbody tr')) {
-    tr.removeAttribute('tabindex');
+  // A row with nothing to filter by doesn't look clickable (its click does nothing).
+  for (const tr of wrap.querySelectorAll('tbody tr.is-clickable')) {
     if (!tr.querySelector('a[href]')) tr.classList.remove('is-clickable');
   }
-  return wrap;
+  const caption = searchesCaption({ shown: queries.length, searches, total, found });
+  return [wrap, caption ? h('p', { class: 'home-caption' }, caption) : null];
 }
 
 // ---- Getting started ----
@@ -485,9 +548,9 @@ function startSteps(summary, status) {
   const next = summary && summary.next_schedule;
   steps.push({
     title: 'Create a schedule',
-    body: next
-      ? `${next.name} runs next ${fmtDate(next.next_at, { time: true })}.`
-      : 'Run the agent daily or weekly so new companies and drafts arrive while you are away.',
+    body: 'Run the agent daily or weekly so new companies and drafts arrive while you are away.',
+    // Plain data (the step list's signature is its JSON); renderStart words it.
+    next: next ? { name: next.name, when: nextRunWhen(next.next_at) } : null,
     done: !!next,
     action: { label: next ? 'View schedules' : 'Open Schedules', href: '#/schedules' },
   });
@@ -516,7 +579,7 @@ function renderStart(summary, status) {
           'div',
           { class: 'home-start-text' },
           h('h3', { class: 'home-start-title' }, s.title, s.done ? h('span', { class: 'home-start-done' }, ' ', badge('Done', 'ok')) : null),
-          h('p', { class: 'home-start-body' }, s.body),
+          h('p', { class: 'home-start-body' }, s.next && s.next.when ? nextRunSentence(s.next, s.next.when) : s.body),
         ),
         h(
           'a',
@@ -537,6 +600,21 @@ const DESC = {
 };
 
 let current = null;
+
+// A summary this recent is the one on screen already; mounting doesn't fetch it again.
+const FRESH_MS = 3000;
+
+/** How long ago the latest /api/summary answer arrived, from the page's resource timing (the store
+ *  doesn't say when it last fetched); Infinity when unknown, so Home then asks for fresh numbers. */
+function summaryAgeMs() {
+  try {
+    const seen = performance.getEntriesByName(new URL('/api/summary', location.href).href, 'resource');
+    const last = seen[seen.length - 1];
+    return last && last.responseEnd > 0 ? performance.now() - last.responseEnd : Infinity;
+  } catch (_) {
+    return Infinity;
+  }
+}
 
 function mountHome(root, ctx) {
   const store = ctx.store;
@@ -577,18 +655,30 @@ function mountHome(root, ctx) {
   let searchesCtl = null;
   let summaryShown = null;
 
-  // Recent runs become cards below the phone breakpoint (home.css uses the same width).
-  const narrowMq = typeof window.matchMedia === 'function' ? window.matchMedia(NARROW) : null;
-  const isNarrow = () => !!(narrowMq && narrowMq.matches);
-  const onNarrowChange = () => {
-    if (!gone) drawRuns();
+  // Recent runs become cards when their section is narrower than RUNS_TABLE_MIN. The section's
+  // width, not the window's, decides: the sidebar takes 232px from 900px up, so a 1024px window
+  // leaves less room than an 899px one. Unknown (not laid out yet) means the table.
+  const isNarrow = () => {
+    const w = dash && dash.recent ? dash.recent.el.clientWidth : 0;
+    return w > 0 && w < RUNS_TABLE_MIN;
   };
-  if (narrowMq) narrowMq.addEventListener('change', onNarrowChange);
+  let runsWidth = 0;
+  const runsRo =
+    typeof ResizeObserver === 'function'
+      ? new ResizeObserver((entries) => {
+          const w = Math.round(entries[entries.length - 1].contentRect.width);
+          if (gone || w === runsWidth) return;
+          runsWidth = w;
+          drawRuns();
+        })
+      : null;
 
   function setMode(next) {
     if (mode === next) return;
     mode = next;
     for (const k of Object.keys(sigs)) delete sigs[k];
+    if (runsRo) runsRo.disconnect();
+    runsWidth = 0;
     desc.textContent = DESC[next] || DESC.dash;
     askAgent.hidden = next !== 'dash';
     body.removeAttribute('aria-busy');
@@ -608,6 +698,7 @@ function mountHome(root, ctx) {
       const recent = section('runs', 'Recent runs', { cls: 'home-runs', link: { label: 'All runs', href: '#/schedules' } });
       dash = { needs, glance, funnel, top, recent };
       body.replaceChildren(needs.el, glance.el, h('div', { class: 'home-grid' }, funnel.el, top.el), recent.el);
+      if (runsRo) runsRo.observe(recent.el);
     } else if (next === 'start') {
       const start = section('start', 'Get started', { cls: 'home-start' });
       dash = { start };
@@ -665,10 +756,11 @@ function mountHome(root, ctx) {
     if (loading) sec.el.setAttribute('aria-busy', 'true');
     else sec.el.removeAttribute('aria-busy');
     if (runs.rows) {
-      // Relative times ("2h ago") are part of the signature, so they stay current.
+      // Relative times ("2h ago", "in 18h") are part of the signature, so they stay current.
       const next = (summaryShown && summaryShown.next_schedule) || null;
       const narrow = isNarrow();
-      const sig = JSON.stringify([narrow, runs.rows.map((r) => [r, fmtRelative(r.started_at)]), runs.rows.length ? null : next]);
+      const upcoming = runs.rows.length || !next ? null : [next, nextRunWhen(next.next_at)];
+      const sig = JSON.stringify([narrow, runs.rows.map((r) => [r, fmtRelative(r.started_at)]), upcoming]);
       part('runs', sig, sec.body, () => renderRuns(runs.rows, next, narrow));
     } else if (runs.status === 'error') {
       part('runs', `error:${detailOf(runs.error)}`, sec.body, () => errorBox("Couldn't load recent runs", runs.error, () => loadRuns({ fromRetry: true })));
@@ -684,8 +776,9 @@ function mountHome(root, ctx) {
     if (loading) sec.el.setAttribute('aria-busy', 'true');
     else sec.el.removeAttribute('aria-busy');
     if (searches.queries) {
-      part('searches', JSON.stringify([searches.queries, searches.total]), sec.body, () =>
-        renderSearches(searches.queries, searches.total, (to) => ctx.nav.navigate(to)),
+      const { queries, total, count, found } = searches;
+      part('searches', JSON.stringify([queries, total, count, found]), sec.body, () =>
+        renderSearches({ queries, total, searches: count, found }, (to) => ctx.nav.navigate(to)),
       );
     } else if (searches.status === 'error') {
       part('searches', `error:${detailOf(searches.error)}`, sec.body, () => errorBox("Couldn't load top searches", searches.error, () => loadSearches({ fromRetry: true })));
@@ -712,7 +805,8 @@ function mountHome(root, ctx) {
       const rows = await api.get('/api/runs', { signal: ctl.signal });
       if (gone || ctl.signal.aborted) return;
       const list = Array.isArray(rows) ? rows.slice(0, RUNS_SHOWN) : [];
-      runs = { status: 'ok', rows: list.map((r, i) => ({ ...r, key: `${i}:${r.started_at}` })) };
+      const keys = runKeys(list);
+      runs = { status: 'ok', rows: list.map((r, i) => ({ ...r, key: keys[i] })) };
     } catch (err) {
       if (gone || ctl.signal.aborted || isAbort(err)) return;
       // A failed background refetch keeps what is on screen.
@@ -735,8 +829,14 @@ function mountHome(root, ctx) {
     try {
       const page = await api.get('/api/companies?per=1', { signal: ctl.signal });
       if (gone || ctl.signal.aborted) return;
-      const queries = Array.isArray(page && page.queries) ? page.queries.slice(0, SEARCHES_SHOWN) : [];
-      searches = { status: 'ok', queries, total: Number(page && page.total) || 0 };
+      const all = Array.isArray(page && page.queries) ? page.queries.filter(Array.isArray) : [];
+      searches = {
+        status: 'ok',
+        queries: all.slice(0, SEARCHES_SHOWN),
+        total: Number(page && page.total) || 0,
+        count: all.length,
+        found: all.reduce((sum, [, n]) => sum + (Number(n) || 0), 0),
+      };
     } catch (err) {
       if (gone || ctl.signal.aborted || isAbort(err)) return;
       searches = searches.queries && !fromRetry ? { ...searches, status: 'ok' } : { status: 'error', error: err };
@@ -793,17 +893,23 @@ function mountHome(root, ctx) {
     renderSummary(snap.summary, snap.status);
   });
 
+  // Fresh numbers on every visit, unless the store's summary only just arrived: on a cold load the
+  // router mounts Home right after the store's first fetch, and asking again would repeat it.
   const first = store.get();
-  if (first && first.summary) renderSummary(first.summary, first.status);
-  else setMode('loading');
-  loadSummary();
+  if (first && first.summary) {
+    renderSummary(first.summary, first.status);
+    if (summaryAgeMs() > FRESH_MS) loadSummary();
+  } else {
+    setMode('loading');
+    loadSummary();
+  }
 
   const instance = {
     refresh: () => loadSummary(),
     unmount() {
       gone = true;
       unsubscribe();
-      if (narrowMq) narrowMq.removeEventListener('change', onNarrowChange);
+      if (runsRo) runsRo.disconnect();
       for (const ctl of ctls) ctl.abort();
       ctls.clear();
       if (current === instance) current = null;

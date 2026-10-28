@@ -8,15 +8,22 @@
 import { expectAccessible } from '../harness/a11y.mjs';
 import { test, expect } from '../harness/fixtures.mjs';
 import { SEED } from '../harness/seed.mjs';
-import { fmtDate, fmtNum, fmtRelative } from '../../../ui/js/core/format.js';
+import { fmtDate, fmtNum, fmtRelative, runStatus } from '../../../ui/js/core/format.js';
 
 const reEscape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const hashIs = (hash) => new RegExp(`${reEscape(hash)}$`);
 const PCT = new Intl.NumberFormat('en-US', { style: 'percent', maximumFractionDigits: 1 });
 const pct = (part, whole) => (whole ? PCT.format(part / whole) : '—');
+const HOUR = 3_600_000;
+const pad = (n) => String(n).padStart(2, '0');
+/** A Date as the summary's next_at: zone-less local time, "2026-10-28T13:30". */
+const localIso = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+/** A Date as SQLite's datetime('now') writes it (UTC, space separator), like /api/runs started_at. */
+const sqliteUtc = (d) => d.toISOString().slice(0, 19).replace('T', ' ');
 
 const STAGE_LABELS = ['Sourced', 'Contact found', 'Drafted', 'Sent', 'Replied'];
-const RUN_STATUS = { ok: 'Finished', error: 'Failed', auth_failed: "Couldn't sign in" };
+// The shared run-status wording (core/format.js), the same on Schedules.
+const statusLabel = (status) => runStatus(status)[0];
 const TRIGGERS = { scheduled: 'Scheduled', manual: 'Manual', dry: 'Dry run' };
 const OTHER_VIEWS = ['pipeline', 'drafts', 'followups', 'agent', 'schedules', 'company', 'settings'];
 
@@ -83,13 +90,16 @@ test('numbers match the seed', async ({ app, page, server, request }) => {
     pct(SEED.counts.replied, SEED.counts.sent),
   ]);
 
-  // Needs you: the failed last run first, then drafts, follow-ups due and replies.
+  // Needs you: the failed last run first (with why it failed, from its note), then drafts,
+  // follow-ups due and replies.
+  const runs = await (await request.get(server.apiUrl('/api/runs'))).json();
   const cards = needsYou(page).getByRole('link');
   await expect(cards).toHaveCount(4);
   const lastRun = SEED.runs.at(-1);
   expect(lastRun.status).toBe('error');
+  expect(runs[0].note).toBeTruthy();
   await expect(cards.nth(0)).toContainText('Last run failed');
-  await expect(cards.nth(0)).toContainText(`The last run (${lastRun.schedule_name}) ended with an error`);
+  await expect(cards.nth(0)).toContainText(`The last run (${lastRun.schedule_name}) ended with an error: ${runs[0].note}`);
   await expect(cards.nth(1).locator('.home-ny-num')).toHaveText(fmtNum(SEED.counts.drafts));
   await expect(cards.nth(1)).toContainText('drafts waiting');
   await expect(cards.nth(1)).toContainText(`${SEED.counts.drafts_email} email · ${SEED.counts.drafts_linkedin} LinkedIn`);
@@ -118,8 +128,8 @@ test('numbers match the seed', async ({ app, page, server, request }) => {
   expect(widths[0]).toBe(100);
   SEED.funnel.forEach(([, n], i) => expect(widths[i]).toBeCloseTo((n / SEED.funnel[0][1]) * 100, 1));
 
-  // Recent runs: the last five, newest first, with status, counts and a link to the run.
-  const runs = await (await request.get(server.apiUrl('/api/runs'))).json();
+  // Recent runs: the last five, newest first, with status (and why a run failed), counts and a
+  // link to the run.
   const expected = SEED.runs.slice().reverse().slice(0, 5);
   const runTable = page.getByRole('table', { name: 'Recent runs' });
   await expect(runTable.locator('th')).toHaveText(['Run', 'Trigger', 'Status', 'Sourced', 'Drafted', 'Sent', 'When', 'Conversation']);
@@ -129,9 +139,12 @@ test('numbers match the seed', async ({ app, page, server, request }) => {
     const cells = rRows.nth(i).locator('td');
     // The seed's one run with no schedule is a manual one (a deleted schedule is its own test).
     if (!r.schedule_name) expect(r.trigger).toBe('manual');
-    await expect(cells.nth(0)).toHaveText(r.schedule_name ?? 'Manual run');
+    await expect(cells.nth(0).locator('.home-run-name')).toHaveText(r.schedule_name ?? 'Manual run');
+    if (r.status === 'ok') await expect(cells.nth(0).locator('.home-run-note')).toHaveCount(0);
+    else await expect(cells.nth(0).locator('.home-run-note')).toHaveText(`Why it failed: ${runs[i].note}`);
     await expect(cells.nth(1)).toHaveText(TRIGGERS[r.trigger]);
-    await expect(cells.nth(2)).toHaveText(RUN_STATUS[r.status]);
+    await expect(cells.nth(2)).toHaveText(statusLabel(r.status));
+    await expect(cells.nth(2).locator('.badge')).toHaveClass(new RegExp(`badge-${runStatus(r.status)[1]}`));
     await expect(cells.nth(3)).toHaveText(fmtNum(r.sourced));
     await expect(cells.nth(4)).toHaveText(fmtNum(r.drafted));
     await expect(cells.nth(5)).toHaveText(fmtNum(r.sent));
@@ -154,6 +167,8 @@ test('numbers match the seed', async ({ app, page, server, request }) => {
   await expect(sRows.locator('td:nth-child(2)')).toHaveText(top.map(([, n]) => fmtNum(n)));
   await expect(sRows.locator('td:nth-child(3)')).toHaveText(top.map(([, n]) => pct(n, SEED.companies)));
   await expect(sRows.first().getByRole('link')).toHaveAttribute('href', `#/pipeline?query=${top[0][0]}`);
+  // Every seeded company came from one of these searches: nothing to add under the table.
+  await expect(page.getByRole('region', { name: 'Top searches' }).locator('.home-caption')).toHaveCount(0);
 
   // Every number on screen is data, so it is set in the mono face.
   const mono = await page.locator('.home-stats .home-stat-value').first().evaluate((el) => getComputedStyle(el).fontFamily);
@@ -409,11 +424,13 @@ test('a run with no schedule name says why', async ({ app, page }) => {
   const rows = page.getByRole('table', { name: 'Recent runs' }).locator('tbody tr');
   await expect(rows).toHaveCount(5);
   for (const [i, c] of cases.entries()) {
-    await expect(rows.nth(i).locator('td').nth(0)).toHaveText(c.name);
+    await expect(rows.nth(i).locator('.home-run-name')).toHaveText(c.name);
+    await expect(rows.nth(i).locator('.home-run-name')).toHaveClass(/is-muted/);
     await expect(rows.nth(i).locator('td').nth(1)).toHaveText(c.triggerText);
   }
   // The fifth keeps its schedule's name.
-  await expect(rows.nth(4).locator('td').nth(0)).toHaveText(SEED.runs.slice().reverse()[4].schedule_name);
+  await expect(rows.nth(4).locator('.home-run-name')).toHaveText(SEED.runs.slice().reverse()[4].schedule_name);
+  await expect(rows.nth(4).locator('.home-run-name')).not.toHaveClass(/is-muted/);
 });
 
 test('hostile text from the server renders as text', async ({ app, page }) => {
@@ -432,6 +449,7 @@ test('hostile text from the server renders as text', async ({ app, page }) => {
     const runs = await res.json();
     runs[0].schedule_name = evil;
     runs[0].status = '<b>odd</b>';
+    runs[0].note = `${evil} broke\n<script>window.__xss=4</script>`;
     runs[1].chat_id = '../../x"><img src=x onerror=window.__xss=3>';
     await route.fulfill({ response: res, json: runs });
   });
@@ -449,8 +467,12 @@ test('hostile text from the server renders as text', async ({ app, page }) => {
   // A target that isn't an app route never becomes the link.
   await expect(warn).toHaveAttribute('href', '#/settings?tab=connections');
   const runRow = page.getByRole('table', { name: 'Recent runs' }).locator('tbody tr').first();
-  await expect(runRow.locator('td').first()).toHaveText(evil);
+  await expect(runRow.locator('.home-run-name')).toHaveText(evil);
+  // A status the app doesn't know shows as it is, in a neutral badge; its note is text too.
   await expect(runRow.locator('td').nth(2)).toHaveText('<b>odd</b>');
+  await expect(runRow.locator('.badge')).toHaveClass(/badge-neutral/);
+  await expect(runRow.locator('.home-run-note')).toHaveText(`Why it failed: ${evil} broke`);
+  await expect(runRow.locator('.home-run-note')).toHaveAttribute('title', `${evil} broke\n<script>window.__xss=4</script>`);
   const viewLink = page.getByRole('table', { name: 'Recent runs' }).locator('tbody tr').nth(1).getByRole('link', { name: 'View run' });
   await expect(viewLink).toHaveAttribute('href', `#/agent/${encodeURIComponent('../../x"><img src=x onerror=window.__xss=3>')}`);
   const searches = page.getByRole('table', { name: 'Top searches' });
@@ -464,7 +486,7 @@ test('hostile text from the server renders as text', async ({ app, page }) => {
   await noSearch.locator('td').nth(1).click();
   await expect(page).toHaveURL(hashIs('#/home'));
   await expect(page.locator('#view h1')).toHaveText('Home');
-  await expect(page.locator('#view img')).toHaveCount(0);
+  await expect(page.locator('#view img, #view script, #view b')).toHaveCount(0);
   expect(await page.evaluate(() => window.__xss)).toBeUndefined();
 });
 
@@ -480,42 +502,66 @@ test('updates live from the store and stops when you leave', async ({ app, page 
     }
     await route.fulfill({ response: res, json: s });
   });
-  // Count /api/runs fetches in the page: a subscriber's fetch starts synchronously inside
-  // store.refresh(), so the count is exact once refresh() resolves.
+  // A test hook on the shared store (served as is, plus one line): how many subscribers it has,
+  // so a view that forgets to unsubscribe shows up as one too many.
+  await page.route('**/assets/js/core/store.js', async (route) => {
+    const res = await route.fetch();
+    const body = `${await res.text()}\nwindow.__storeSubscribers = () => subscribers.size;\n`;
+    await route.fulfill({ response: res, body });
+  });
+  // Count /api/runs and /api/summary fetches in the page: a subscriber's fetch starts
+  // synchronously inside store.refresh(), so the counts are exact once refresh() resolves.
   await page.addInitScript(() => {
-    window.__runsFetches = 0;
+    window.__fetches = { runs: 0, summary: 0 };
     const realFetch = window.fetch;
     window.fetch = (input, init) => {
-      if (String(input instanceof Request ? input.url : input).includes('/api/runs')) window.__runsFetches++;
+      const url = String(input instanceof Request ? input.url : input);
+      if (url.includes('/api/runs')) window.__fetches.runs++;
+      if (url.includes('/api/summary')) window.__fetches.summary++;
       return realFetch(input, init);
     };
   });
-  const runsFetches = () => page.evaluate(() => window.__runsFetches);
+  const fetches = () => page.evaluate(() => ({ ...window.__fetches }));
+  const subscribers = () => page.evaluate(() => window.__storeSubscribers());
   await app.goto('#/home');
   await homeReady(page);
   await expect(page.getByRole('table', { name: 'Recent runs' }).locator('tbody tr')).toHaveCount(5);
-  expect(await runsFetches()).toBe(1);
+  // A cold load asks for the summary once: Home shows what the store fetched just before it.
+  expect(await fetches()).toEqual({ runs: 1, summary: 1 });
 
   // A store refresh with new numbers and a newer run updates the cards and refetches the runs.
   patch = { counts: { drafts: 99, drafts_email: 59 }, started_at: '2026-10-27 09:00:00' };
   await refreshStore(page);
   await expect(card(page, /drafts waiting/).locator('.home-ny-num')).toHaveText('99');
   await expect(card(page, /drafts waiting/)).toContainText(`59 email · ${SEED.counts.drafts_linkedin} LinkedIn`);
-  expect(await runsFetches()).toBe(2);
+  expect((await fetches()).runs).toBe(2);
 
   // A refresh that changes nothing keeps the focused card focused.
   await card(page, /drafts waiting/).focus();
   await refreshStore(page);
   await expect(card(page, /drafts waiting/)).toBeFocused();
 
-  // Leave Home: later store updates no longer reach it (no refetch, no errors).
+  // Leave Home: it unsubscribes, and later store updates no longer reach it (no refetch, no
+  // errors).
+  const withHome = await subscribers();
   await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: /^Pipeline\b/ }).click();
   await expect(page.locator('#view h1')).toHaveText('Stub pipeline');
+  await expect.poll(subscribers).toBe(withHome - 1);
   patch = { counts: { drafts: 7 }, started_at: '2026-10-27 10:00:00' };
   await refreshStore(page);
   await expect(page.locator('#view h1')).toHaveText('Stub pipeline');
   await expect(page.locator('#view .home')).toHaveCount(0);
-  expect(await runsFetches()).toBe(2);
+  expect((await fetches()).runs).toBe(2);
+
+  // Come back once the store's numbers are no longer fresh (no summary fetch on record): Home
+  // shows them at once, asks for new ones, and subscribes once again.
+  const before = await fetches();
+  await page.evaluate(() => performance.clearResourceTimings());
+  await page.goBack();
+  await homeReady(page);
+  await expect(card(page, /drafts waiting/).locator('.home-ny-num')).toHaveText('7');
+  await expect.poll(async () => (await fetches()).summary).toBe(before.summary + 1);
+  expect(await subscribers()).toBe(withHome);
 });
 
 test('home is accessible in light and dark, and fits a phone', async ({ app, page }) => {
@@ -527,8 +573,21 @@ test('home is accessible in light and dark, and fits a phone', async ({ app, pag
   await page.emulateMedia({ colorScheme: 'dark' });
   await expectAccessible(page);
 
+  // The three count cards stay on one row down to the narrowest content area above the phone
+  // breakpoint (a 900px window, where the sidebar still shows; and 700px, where it doesn't).
+  const countCards = needsYou(page).locator('.home-ny-list > li');
+  await expect(countCards).toHaveCount(3);
+  for (const width of [900, 700]) {
+    await page.setViewportSize({ width, height: 900 });
+    await expect
+      .poll(() => countCards.evaluateAll((els) => new Set(els.map((el) => Math.round(el.getBoundingClientRect().top))).size), `${width}px`)
+      .toBe(1);
+  }
+
   await page.setViewportSize({ width: 390, height: 844 });
   await homeReady(page);
+  // A phone stacks them.
+  await expect.poll(() => countCards.evaluateAll((els) => new Set(els.map((el) => Math.round(el.getBoundingClientRect().left))).size)).toBe(1);
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
 
   // On a phone the eight run columns don't fit, so each run is a card with the same facts and
@@ -543,7 +602,7 @@ test('home is accessible in light and dark, and fits a phone', async ({ app, pag
   for (const [i, r] of expected.entries()) {
     const c = cards.nth(i);
     await expect(c).toContainText(r.schedule_name ?? 'Manual run');
-    await expect(c).toContainText(RUN_STATUS[r.status]);
+    await expect(c).toContainText(statusLabel(r.status));
     await expect(c).toContainText(TRIGGERS[r.trigger]);
     await expect(c).toContainText(`${fmtNum(r.sourced)} sourced · ${fmtNum(r.drafted)} drafted · ${fmtNum(r.sent)} sent`);
     const link = c.getByRole('link', { name: /^View run/ });
@@ -571,6 +630,172 @@ test('home is accessible in light and dark, and fits a phone', async ({ app, pag
   await page.setViewportSize({ width: 1440, height: 900 });
   await expect(recent.getByRole('table', { name: 'Recent runs' }).locator('tbody tr')).toHaveCount(expected.length);
   await expect(recent.getByRole('list', { name: 'Recent runs' })).toHaveCount(0);
+});
+
+test('failed runs say why, in the table and on a phone', async ({ app, page }) => {
+  const why = 'Model anthropic/claude-3-opus has been deprecated.';
+  const more = 'Pick another model in Settings.';
+  await page.route('**/api/runs*', async (route) => {
+    const res = await route.fetch();
+    const runs = await res.json();
+    runs[0].note = `\n${why}\n${more}`; // the seed's newest run failed ('error')
+    Object.assign(runs[1], { status: 'auth_failed', note: 'opencode: not signed in' });
+    Object.assign(runs[2], { status: 'ok', note: 'a note on a run that worked' });
+    await route.fulfill({ response: res, json: runs });
+  });
+  await app.goto('#/home');
+  await homeReady(page);
+  const rows = page.getByRole('table', { name: 'Recent runs' }).locator('tbody tr');
+  await expect(rows).toHaveCount(5);
+
+  // Under the run's name: the note's first line (screen readers hear what it is), the whole
+  // note on hover.
+  const note = rows.nth(0).locator('.home-run-note');
+  await expect(note).toHaveText(`Why it failed: ${why}`);
+  await expect(note).toHaveAttribute('title', `${why}\n${more}`);
+  await expect(rows.nth(0).locator('.badge')).toHaveText('Failed');
+  // A sign-in failure, in the shared wording and tone (Schedules says it the same way).
+  await expect(rows.nth(1).locator('.home-run-note')).toHaveText('Why it failed: opencode: not signed in');
+  await expect(rows.nth(1).locator('.badge')).toHaveText('Sign-in failed');
+  await expect(rows.nth(1).locator('.badge')).toHaveClass(/badge-warn/);
+  // A run that worked shows no note.
+  await expect(rows.nth(2).locator('.home-run-note')).toHaveCount(0);
+  await expect(rows.nth(2).locator('.badge')).toHaveText('Succeeded');
+
+  // On a phone each card says it too.
+  await page.setViewportSize({ width: 390, height: 844 });
+  const cards = page.getByRole('list', { name: 'Recent runs' }).getByRole('listitem');
+  await expect(cards.nth(0).locator('.home-run-card-note')).toHaveText(`Why it failed: ${why}`);
+  await expect(cards.nth(1).locator('.home-run-card-note')).toHaveText('Why it failed: opencode: not signed in');
+  await expect(cards.nth(2).locator('.home-run-card-note')).toHaveCount(0);
+});
+
+test('recent runs never scroll sideways: a table where it fits, else cards', async ({ app, page }) => {
+  const long = 'A schedule name long enough to need more room than the run column has to give it';
+  await page.route('**/api/runs*', async (route) => {
+    const res = await route.fetch();
+    const runs = await res.json();
+    runs[0].schedule_name = long;
+    runs[0].note = 'word '.repeat(80);
+    await route.fulfill({ response: res, json: runs });
+  });
+  await app.goto('#/home');
+  await homeReady(page);
+  const recent = page.getByRole('region', { name: 'Recent runs' });
+  const sideways = () =>
+    recent.evaluate((s) => [...s.querySelectorAll('.table-wrap, .home-run-cards')].filter((el) => el.scrollWidth > el.clientWidth + 1).length);
+  // The section's width decides, not the window's: from 900px up the sidebar takes 232px, so a
+  // 1024px window leaves less room than an 899px one.
+  for (const [width, shape] of [
+    [1440, 'table'],
+    [1280, 'table'],
+    [1024, 'cards'],
+    [899, 'table'],
+    [760, 'cards'],
+  ]) {
+    await page.setViewportSize({ width, height: 900 });
+    if (shape === 'table') {
+      await expect(recent.getByRole('table', { name: 'Recent runs' })).toBeVisible();
+      await expect(recent.getByRole('list', { name: 'Recent runs' })).toHaveCount(0);
+      // The long name is cut short in place, with the full name as its tooltip.
+      const name = recent.locator('tbody tr').first().locator('.home-run-name');
+      await expect(name).toHaveAttribute('title', long);
+      expect(await name.evaluate((el) => el.scrollWidth > el.clientWidth), `${width}px: name ellipsized`).toBe(true);
+    } else {
+      await expect(recent.getByRole('list', { name: 'Recent runs' })).toBeVisible();
+      await expect(recent.getByRole('table')).toHaveCount(0);
+    }
+    await expect.poll(sideways, `${width}px: nothing scrolls sideways`).toBe(0);
+    // The run's link is on screen, inside the section.
+    const link = recent.getByRole('link', { name: /^View run/ });
+    const [lb, sb] = [await link.boundingBox(), await recent.boundingBox()];
+    expect(lb.x + lb.width, `${width}px: link inside the section`).toBeLessThanOrEqual(sb.x + sb.width + 0.5);
+  }
+});
+
+test('a focused run link keeps focus when a newer run arrives', async ({ app, page }) => {
+  let newer = null;
+  await page.route('**/api/runs*', async (route) => {
+    const res = await route.fetch();
+    const runs = await res.json();
+    await route.fulfill({ response: res, json: newer ? [newer, ...runs] : runs });
+  });
+  await page.route('**/api/summary*', async (route) => {
+    const res = await route.fetch();
+    const s = await res.json();
+    if (newer) s.last_run = { ...s.last_run, started_at: newer.started_at, status: newer.status };
+    await route.fulfill({ response: res, json: s });
+  });
+  await app.goto('#/home');
+  await homeReady(page);
+  const rows = page.getByRole('table', { name: 'Recent runs' }).locator('tbody tr');
+  await expect(rows).toHaveCount(5);
+  const at = SEED.runs.slice().reverse().findIndex((r) => r.chat_id);
+  expect(at).toBeGreaterThanOrEqual(0);
+  await rows.nth(at).getByRole('link', { name: /^View run/ }).focus();
+
+  // A run newer than all of them pushes every row down one; the same run's link keeps focus.
+  newer = { started_at: sqliteUtc(new Date()), status: 'ok', sourced: 3, enriched: 1, drafted: 1, sent: 0, chat_id: null, trigger: 'manual', schedule_name: null, note: null };
+  await refreshStore(page);
+  await expect(rows.first().locator('.home-run-name')).toHaveText('Manual run');
+  await expect(rows.nth(at + 1).getByRole('link', { name: /^View run/ })).toBeFocused();
+});
+
+test('with no runs yet, says when the next schedule runs', async ({ app, page }) => {
+  // 5½ hours away: "in 5h" (relative within 48h, as the top bar's chip says it).
+  const at = localIso(new Date(Date.now() + 5.5 * HOUR));
+  await page.route('**/api/summary*', async (route) => {
+    const res = await route.fetch();
+    const s = await res.json();
+    s.next_schedule = { id: 'x', name: 'Lunch <b>Source</b>', next_at: at };
+    await route.fulfill({ response: res, json: s });
+  });
+  await page.route('**/api/runs*', (route) => route.fulfill({ json: [] }));
+  await app.goto('#/home');
+  await homeReady(page);
+  const runs = page.getByRole('region', { name: 'Recent runs' });
+  await expect(runs.getByRole('heading', { name: 'No runs yet', level: 3 })).toBeVisible();
+  await expect(runs).toContainText('Lunch <b>Source</b> runs next in 5h. What it adds shows up here.');
+  await expect(runs.locator('time')).toHaveAttribute('title', fmtDate(at, { time: true }));
+  await expect(runs.getByRole('link', { name: 'Open Schedules' })).toHaveAttribute('href', '#/schedules');
+});
+
+test('top searches say what the list leaves out, and few cards share the row', async ({ app, page }) => {
+  const unlisted = 45;
+  const extra = [
+    ['Q9', 20],
+    ['Q10', 10],
+  ];
+  await page.route('**/api/companies?*', async (route) => {
+    const res = await route.fetch();
+    const body = await res.json();
+    body.queries = [...body.queries, ...extra];
+    body.total += 30 + unlisted; // the two extra searches, and companies no search found
+    await route.fulfill({ response: res, json: body });
+  });
+  // Only drafts wait on the human: one card, as wide as the row (no empty columns beside it).
+  await page.route('**/api/summary*', async (route) => {
+    const res = await route.fetch();
+    const s = await res.json();
+    s.counts = { ...s.counts, followups_due: 0, replied: 0 };
+    s.attention = [];
+    await route.fulfill({ response: res, json: s });
+  });
+  await app.goto('#/home');
+  await homeReady(page);
+
+  const top = page.getByRole('region', { name: 'Top searches' });
+  const total = SEED.companies + 30 + unlisted;
+  await expect(top.locator('tbody tr')).toHaveCount(8);
+  await expect(top.locator('.home-caption')).toHaveText(
+    `Showing the top 8 of ${SEED.queries.length + extra.length} searches. ${unlisted} companies have no search recorded.`,
+  );
+  await expect(top.locator('tbody tr').first().locator('td').nth(2)).toHaveText(pct(SEED.queries[0][1], total));
+
+  const list = needsYou(page).getByRole('list');
+  await expect(list.getByRole('listitem')).toHaveCount(1);
+  const [cardBox, listBox] = [await card(page, /drafts waiting/).boundingBox(), await list.boundingBox()];
+  expect(Math.abs(cardBox.width - listBox.width)).toBeLessThanOrEqual(1);
 });
 
 // Last: a different seed restarts the server.
@@ -622,10 +847,11 @@ test.describe('new workspace', () => {
       const res = await route.fetch();
       await route.fulfill({ response: res, json: { ...(await res.json()), destination_connected: true } });
     });
+    let nextAt = localIso(new Date(Date.now() + 5.5 * HOUR));
     await page.route('**/api/summary*', async (route) => {
       const res = await route.fetch();
       const s = await res.json();
-      s.next_schedule = { id: 'x', name: 'Morning <b>Source</b>', next_at: '2026-10-28T09:00' };
+      s.next_schedule = { id: 'x', name: 'Morning <b>Source</b>', next_at: nextAt };
       await route.fulfill({ response: res, json: s });
     });
     await app.goto('#/home');
@@ -634,6 +860,13 @@ test.describe('new workspace', () => {
     await expect(start).not.toContainText('Connect where outreach goes');
     const schedule = start.getByRole('listitem').nth(2);
     await expect(schedule).toContainText('Done');
-    await expect(schedule).toContainText('Morning <b>Source</b> runs next');
+    // Within 48h the time is relative (spec §5.10), with the date and time as its tooltip.
+    await expect(schedule.locator('p')).toHaveText('Morning <b>Source</b> runs next in 5h.');
+    await expect(schedule.locator('time')).toHaveAttribute('title', fmtDate(nextAt, { time: true }));
+
+    // Further out it is the date and time.
+    nextAt = localIso(new Date(Date.now() + 4 * 24 * HOUR));
+    await refreshStore(page);
+    await expect(schedule.locator('p')).toHaveText(`Morning <b>Source</b> runs next on ${fmtDate(nextAt, { time: true })}.`);
   });
 });

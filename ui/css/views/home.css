@@ -53,10 +53,13 @@
 
 /* ---- Needs you ---- */
 
-/* Counts: one row of up to three equal cards (drafts, follow-ups due, replies). */
+/* Counts: one row of up to three equal cards (drafts, follow-ups due, replies). One or two cards
+   share the row between them rather than leave an empty column. 190px keeps three side by side
+   in the narrowest content area above the phone breakpoint (604px, a 900px window); phones
+   stack them. */
 .home-ny-list {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
   gap: var(--space-3);
   margin: 0;
   padding: 0;
@@ -190,12 +193,12 @@ a.home-ny-alert:hover .home-ny-cta { text-decoration: underline; }
 .home-stat {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--space-1);
   min-width: 0;
   padding: var(--space-4);
   background: var(--surface);
 }
-.home-stat-label { font-size: 12.5px; font-weight: 500; color: var(--text-2); }
+.home-stat-label { font-size: 13px; font-weight: 500; color: var(--text-2); }
 .home-stat-value {
   margin: var(--space-1) 0 0;
   font-size: 24px;
@@ -222,7 +225,7 @@ a.home-ny-alert:hover .home-ny-cta { text-decoration: underline; }
 .home-funnel-cell {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--space-2);
   min-width: 0;
 }
 .home-funnel-stage { font-weight: 500; white-space: nowrap; }
@@ -268,21 +271,43 @@ a.home-ny-alert:hover .home-ny-cta { text-decoration: underline; }
 
 /* ---- Recent runs ---- */
 
+/* The Run column takes the table's spare width and the others keep to their content, so the
+   numbers sit together on the right. A long name ellipsizes (full text in its tooltip) instead
+   of pushing the table wider than its box: max-width 0 lets the cell shrink below its text. */
+.home-runs .table th:first-child,
+.home-runs .table td:first-child { width: 100%; max-width: 0; }
 .home-run-name {
-  display: inline-block;
-  max-width: 240px;
+  display: block;
   overflow: hidden;
   text-overflow: ellipsis;
-  vertical-align: bottom;
+  white-space: nowrap;
   font-weight: 500;
 }
 /* A description, not a schedule's name: "Manual run", "Deleted schedule". */
 .home-run-name.is-muted { color: var(--text-2); font-weight: 400; }
+/* Why a failed run failed, under its name: at most two lines (the whole note is the tooltip). */
+.home-run-note,
+.home-run-card-note {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--text-2);
+  font-size: 13px;
+  line-height: 1.4;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+}
+.home-run-note { max-width: 48ch; margin-top: var(--space-1); }
+/* Rows with a note are taller: the other cells stay on the run name's line. */
+.home-runs .table td { vertical-align: top; }
+.home-runs .table td .badge { vertical-align: top; }
 .home-runs .table td a { font-weight: 500; text-decoration: none; white-space: nowrap; }
 .home-runs .table td a:hover { text-decoration: underline; }
 .home-runs time { color: var(--text-2); }
 
-/* On a phone each run is a card (the view swaps the table for this list below 700px). */
+/* Where the section is too narrow for the table (home.js RUNS_TABLE_MIN), each run is a card. */
 .home-run-cards {
   margin: 0;
   padding: 0;
@@ -294,7 +319,7 @@ a.home-ny-alert:hover .home-ny-cta { text-decoration: underline; }
 .home-run-card {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--space-1);
   padding: var(--space-3) var(--space-4);
 }
 .home-run-card + .home-run-card { border-top: 1px solid var(--border); }
@@ -305,7 +330,7 @@ a.home-ny-alert:hover .home-ny-cta { text-decoration: underline; }
   gap: var(--space-3);
   min-width: 0;
 }
-.home-run-card-head .home-run-name { max-width: none; min-width: 0; white-space: nowrap; }
+.home-run-card-head .home-run-name { min-width: 0; }
 .home-run-card-meta { color: var(--text-2); font-size: 13px; }
 .home-run-card-foot {
   display: flex;
@@ -332,17 +357,19 @@ a.home-ny-alert:hover .home-ny-cta { text-decoration: underline; }
   border-radius: var(--radius-input);
 }
 
+/* A section with nothing to list: the shared empty state, in the frame its table would have. */
 .home-empty {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-3);
-  padding: var(--space-4);
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-input);
-  color: var(--text-2);
+}
+.home-empty .empty-state { padding: var(--space-6) var(--space-4); }
+
+/* A note under a section's table. */
+.home-caption {
+  margin-top: var(--space-2);
+  color: var(--text-3);
+  font-size: 13px;
 }
 
 .home-error {
@@ -359,10 +386,10 @@ a.home-ny-alert:hover .home-ny-cta { text-decoration: underline; }
 .home-error-text { flex: 1 1 240px; min-width: 0; }
 .home-error-title { font-weight: 600; color: var(--text); }
 .home-error-detail {
-  margin-top: 2px;
+  margin-top: var(--space-1);
   color: var(--text-2);
   font-family: var(--font-mono);
-  font-size: 12.5px;
+  font-size: 12px;
   overflow-wrap: anywhere;
 }
 
@@ -406,7 +433,7 @@ a.home-ny-alert:hover .home-ny-cta { text-decoration: underline; }
 .home-start-text { min-width: 0; }
 .home-start-title { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); font-size: 15px; }
 .home-start-done { display: inline-flex; }
-.home-start-body { margin-top: 2px; color: var(--text-2); max-width: 64ch; }
+.home-start-body { margin-top: var(--space-1); color: var(--text-2); max-width: 64ch; }
 .home-start-action { justify-self: end; }
 
 /* ---- Narrower screens ---- */
@@ -415,15 +442,17 @@ a.home-ny-alert:hover .home-ny-cta { text-decoration: underline; }
   .home-grid { grid-template-columns: minmax(0, 1fr); }
 }
 
-/* The phone breakpoint; home.js's NARROW query matches it. */
+/* Phones. */
 @media (max-width: 699px) {
   .home-ny-list { grid-template-columns: minmax(0, 1fr); gap: var(--space-2); }
   .home-ny-card { padding: var(--space-3) var(--space-4); }
   .home-ny-card-skeleton { min-height: 0; }
+  /* The title, message and action stack beside the icon; the action lines up with the text
+     (the icon's 18px plus the row's gap). */
   .home-ny-alert { flex-wrap: wrap; align-items: flex-start; }
   .home-ny-alert .home-ny-icon { margin-top: 1px; }
-  .home-ny-alert-text { flex-basis: calc(100% - 30px); flex-direction: column; }
-  .home-ny-alert .home-ny-cta { margin-left: 30px; }
+  .home-ny-alert-text { flex-basis: calc(100% - 18px - var(--space-3)); flex-direction: column; }
+  .home-ny-alert .home-ny-cta { margin-left: calc(18px + var(--space-3)); }
 
   .home-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .home-stats .home-stat:last-child { grid-column: 1 / -1; }
