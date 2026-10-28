@@ -1,12 +1,14 @@
 // Settings (spec §5.9) at #/settings?tab=agent|connections|sending|enrichment|appearance: the tabs
-// and their addresses; Agent (Setup's agentPanel: cards, the opencode model, Test connection);
-// Connections (Canonical, Gmail with the app password first and more options folded, LinkedIn
-// connect / reconnect / disconnect and its sign-in poll); Sending (email and LinkedIn auto-send
-// switches that confirm before turning on, caps that save on commit and refuse bad values, a
-// consequence line for each); Enrichment (the OSINT installers, intercepted); Appearance
-// (System / Light / Dark, kept in this browser). Also: loading, error and stale-session states,
-// keyboard use, hostile text, the poll stopping on unmount, and every tab accessible in light and
-// dark and at phone width.
+// and their addresses; Agent (Setup's agentPanel: cards, the opencode model, Test connection, and
+// the warning when opencode no longer offers the saved model); Connections (Canonical, Gmail with
+// the app password first and more options folded, LinkedIn connect / reconnect / disconnect and
+// its sign-in poll; connect requests outlive the screen); Sending (email and LinkedIn auto-send
+// switches that confirm before turning on, caps that save on commit, refuse bad values, ask
+// before going up while auto-send is on and never turn it back on, today's usage, a consequence
+// line for each, and caps saved on the way out); Enrichment (the OSINT installers, intercepted);
+// Appearance (System / Light / Dark, kept in this browser). Also: loading, error and stale-session
+// states, keyboard use, hostile text, the poll stopping on unmount and on a stale session, and
+// every tab accessible in light and dark and at phone width.
 //
 // Tests share one server (the `full` seed) and run in order; each one puts back any setting it
 // changes, so none depends on another.
@@ -15,6 +17,7 @@ import { join } from 'node:path';
 
 import { expectAccessible } from '../harness/a11y.mjs';
 import { test, expect } from '../harness/fixtures.mjs';
+import { SEED } from '../harness/seed.mjs';
 import { SESSION_EXPIRED } from '../../../ui/js/core/api.js';
 import { fmtNum } from '../../../ui/js/core/format.js';
 
@@ -33,6 +36,9 @@ const region = (page, name) => panel(page).getByRole('region', { name, exact: tr
 const emailSwitch = (page) => panel(page).getByRole('switch', { name: 'Auto-send emails' });
 const linkedinSwitch = (page) => panel(page).getByRole('switch', { name: 'Auto-send LinkedIn invites' });
 const confirmBox = (page) => page.getByRole('alertdialog');
+const goHome = (page) => page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Home' }).click();
+const EMAIL_ON = (cap) =>
+  `Send now on the Drafts screen emails people right away, and the agent can send email itself in chats and scheduled runs — up to ${cap} emails a day in total.`;
 
 /** GET a token-guarded API path from the test (not the page). */
 async function getJSON(request, server, path) {
@@ -246,6 +252,8 @@ test('opencode model change persists', async ({ app, page, request, server }) =>
   const model = panel(page).getByRole('combobox', { name: 'Model' });
   await expect(model).toHaveValue('fake/model-a');
   await expect(panel(page).locator('.ap-model .field-hint')).toContainText('3 models from opencode');
+  // opencode offers the saved model: nothing to warn about.
+  await expect(panel(page).locator('.st-model-warn')).toBeHidden();
 
   await model.click();
   await expect(panel(page).getByRole('option')).toHaveText(['fake/model-a', 'fake/model-b', 'opencode/free-c']);
@@ -261,6 +269,62 @@ test('opencode model change persists', async ({ app, page, request, server }) =>
   await expect(panel(page).locator('.ap-test-result')).toHaveText('opencode is signed in and responding.', { timeout: 30_000 });
 
   await postJSON(request, server, '/api/onboarding/provider', { provider: 'opencode', opencode_model: 'fake/model-a' });
+});
+
+test('a saved model opencode no longer offers is called out by the picker', async ({ app, page, request, server }) => {
+  // opencode retired the saved model (fake/model-a): its list doesn't have it any more.
+  let served = 0;
+  await page.route('**/api/provider/opencode/models', (route) => {
+    served++;
+    return route.fulfill({ json: { models: ['fake/model-b', 'opencode/free-c'], message: null } });
+  });
+  try {
+    await app.goto('#/settings?tab=agent');
+    await agentReady(page);
+    const model = panel(page).getByRole('combobox', { name: 'Model' });
+    await expect(model).toHaveValue('fake/model-a');
+    const warn = panel(page).locator('.ap-model .st-model-warn');
+    await expect(warn).toBeVisible();
+    await expect(warn).toHaveText(
+      "fake/model-a isn't offered by opencode anymore — pick another model. Chats and scheduled runs fail until you do.",
+    );
+    // Read with the field, too.
+    await expect(model).toHaveAccessibleDescription(/fake\/model-a isn't offered by opencode anymore/);
+    for (const scheme of ['light', 'dark']) {
+      await page.emulateMedia({ colorScheme: scheme });
+      await expectAccessible(page);
+    }
+
+    // Picking one it offers saves it, and the warning goes.
+    await model.click();
+    await panel(page).getByRole('option', { name: 'fake/model-b' }).click();
+    await expect(panel(page).locator('.ap-model [role="status"]')).toHaveText('Model saved');
+    await expect(warn).toBeHidden();
+    await expect(model).not.toHaveAccessibleDescription(/isn't offered/);
+    expect((await getJSON(request, server, '/api/status')).opencode_model).toBe('fake/model-b');
+
+    // Set elsewhere to a model it doesn't offer: the warning follows status.
+    await postJSON(request, server, '/api/onboarding/provider', { provider: 'opencode', opencode_model: 'fake/model-a' });
+    await page.reload();
+    await expect(warn).toBeVisible();
+
+    // A list that can't be read says nothing either way.
+    app.allowConsole(/status of 500/);
+    await page.unroute('**/api/provider/opencode/models');
+    served = 0;
+    await page.route('**/api/provider/opencode/models', (route) => {
+      served++;
+      return route.fulfill({ status: 500, contentType: 'text/plain', body: 'opencode crashed' });
+    });
+    await page.reload();
+    await agentReady(page);
+    // Both the picker and the warning have asked (and been refused).
+    await expect.poll(() => served).toBeGreaterThanOrEqual(2);
+    await expect(model).toHaveValue('fake/model-a');
+    await expect(warn).toBeHidden();
+  } finally {
+    await postJSON(request, server, '/api/onboarding/provider', { provider: 'opencode', opencode_model: 'fake/model-a' });
+  }
 });
 
 test('enabling email auto-send asks to confirm and persists', async ({ app, page, request, server }) => {
@@ -279,15 +343,14 @@ test('enabling email auto-send asks to confirm and persists', async ({ app, page
   await expect(dialog.getByRole('heading')).toHaveText('Turn on email auto-send?');
   // While it asks, the switch still says off.
   await expect(emailSwitch(page)).toHaveAttribute('aria-checked', 'false');
+  // The cap counts every email send: Send now, and the agent's own in chats and scheduled runs.
   await expect(dialog).toContainText(
-    "Send now on the Drafts screen will email people right away, and scheduled runs can send up to 20 emails a day without asking. A sent email can't be taken back.",
+    "Send now on the Drafts screen will email people right away, and the agent can send email itself in chats and scheduled runs — up to 20 emails a day in total. A sent email can't be taken back.",
   );
   await dialog.getByRole('button', { name: 'Turn on' }).click();
   await expect(dialog).toHaveCount(0);
   await expect(emailSwitch(page)).toHaveAttribute('aria-checked', 'true');
-  await expect(email.locator('.switch-desc')).toHaveText(
-    'Send now on the Drafts screen emails people right away, and scheduled runs can send up to 20 emails a day without asking.',
-  );
+  await expect(email.locator('.switch-desc')).toHaveText(EMAIL_ON(20));
   await expect(email.locator('.st-msg')).toHaveText('Email auto-send is on.');
   await expect(emailSwitch(page)).toBeFocused();
   let status = await getJSON(request, server, '/api/status');
@@ -342,6 +405,8 @@ test('email daily cap saves and refuses bad values', async ({ app, page, request
   const email = region(page, 'Email');
   const cap = email.getByLabel('Daily cap');
   await expect(cap).toHaveValue('20');
+  // Today's email sends against the cap (the seed's, as the server counts them).
+  await expect(email.locator('.st-usage')).toHaveText(`${fmtNum(SEED.capUsage.emailToday)} of 20 sent today`);
 
   for (const bad of ['0', '501', '2.5']) {
     await cap.fill(bad);
@@ -352,6 +417,8 @@ test('email daily cap saves and refuses bad values', async ({ app, page, request
   expect(posts).toEqual([]);
 
   await cap.fill('35');
+  // The usage line follows what's typed, before it's saved.
+  await expect(email.locator('.st-usage')).toHaveText(`${fmtNum(SEED.capUsage.emailToday)} of 35 sent today`);
   await cap.press('Enter');
   await expect(email.locator('.st-msg')).toHaveText('Saved. Up to 35 emails a day.');
   await expect(cap).not.toHaveAttribute('aria-invalid', /.*/);
@@ -429,11 +496,143 @@ test('LinkedIn caps save', async ({ app, page, request, server }) => {
   await expect(daily).toHaveValue('10');
   await expect(weekly).toHaveValue('50');
   await expect(linkedinSwitch(page)).toHaveAttribute('aria-checked', 'true');
-  // Today's invites against the caps.
+  // Today's and this week's invites (the seed's) against the caps.
   await expect(li.locator('.st-usage')).toHaveText(
-    `${fmtNum(status.linkedin_sent_today)} of 10 sent today · ${fmtNum(status.linkedin_sent_7d)} of 50 in the last 7 days`,
+    `${fmtNum(SEED.capUsage.linkedinToday)} of 10 sent today · ${fmtNum(SEED.capUsage.linkedin7d)} of 50 in the last 7 days`,
   );
   await resetSending(request, server);
+});
+
+test('a cap save keeps auto-send as it is now, even when the screen is behind', async ({ app, page, request, server }) => {
+  await resetSending(request, server);
+  await postJSON(request, server, '/api/destination/auto-send', { enabled: true, daily_cap: 20 });
+  try {
+    const posts = countRequests(page, '/api/destination/auto-send');
+    // Every status this screen reads says auto-send is on, until `behind` goes false.
+    let behind = true;
+    await page.route(statusPath, async (route) => {
+      if (!behind) return route.fallback();
+      const res = await route.fetch();
+      await route.fulfill({ response: res, json: { ...(await res.json()), auto_send: true } });
+    });
+    await app.goto('#/settings?tab=sending');
+    const email = region(page, 'Email');
+    await expect(emailSwitch(page)).toHaveAttribute('aria-checked', 'true');
+
+    // Turned off elsewhere (the CLI, another tab); this screen hasn't heard.
+    await postJSON(request, server, '/api/destination/auto-send', { enabled: false });
+    await expect(email.locator('.switch-desc')).toHaveText(EMAIL_ON(20));
+    behind = false;
+
+    // Saving a cap reads auto-send afresh and must not turn it back on.
+    await email.getByLabel('Daily cap').fill('18');
+    await email.getByLabel('Daily cap').press('Enter');
+    await expect(email.locator('.st-msg')).toHaveText('Saved. Up to 18 emails a day.');
+    expect(posts).toEqual([{ enabled: false, daily_cap: 18 }]);
+    expect((await getJSON(request, server, '/api/status')).auto_send).toBe(false);
+    // … and the screen catches up.
+    await expect(emailSwitch(page)).toHaveAttribute('aria-checked', 'false');
+    await expect(email.locator('.switch-desc')).toHaveText('Drafts only: each email is saved to your Gmail drafts for you to review and send.');
+  } finally {
+    await resetSending(request, server);
+  }
+});
+
+test('raising a cap while auto-send is on asks first', async ({ app, page, request, server }) => {
+  await resetSending(request, server);
+  await postJSON(request, server, '/api/destination/auto-send', { enabled: true, daily_cap: 20 });
+  await postJSON(request, server, '/api/destination/linkedin/auto-send', { enabled: true, weekly_cap: 80, daily_cap: 15 });
+  try {
+    const emailPosts = countRequests(page, '/api/destination/auto-send');
+    const linkedinPosts = countRequests(page, '/api/destination/linkedin/auto-send');
+    await app.goto('#/settings?tab=sending');
+    const email = region(page, 'Email');
+    const cap = email.getByLabel('Daily cap');
+    await expect(cap).toHaveValue('20');
+    await expect(email.locator('.switch-desc')).toHaveText(EMAIL_ON(20));
+
+    // Up: it asks, naming the new cap. Cancel keeps the saved one.
+    await cap.fill('40');
+    await expect(email.locator('.switch-desc')).toHaveText(EMAIL_ON(40));
+    await cap.press('Enter');
+    const dialog = confirmBox(page);
+    await expect(dialog.getByRole('heading')).toHaveText('Raise the email cap to 40 a day?');
+    await expect(dialog).toContainText(
+      "Auto-send is on, so Send now and the agent can email up to 40 people a day without asking. A sent email can't be taken back.",
+    );
+    await dialog.getByRole('button', { name: 'Cancel' }).click();
+    await expect(dialog).toHaveCount(0);
+    await expect(cap).toHaveValue('20');
+    await expect(cap).toBeFocused();
+    await expect(email.locator('.st-msg')).toHaveText('Not changed. Up to 20 emails a day.');
+    await expect(email.locator('.switch-desc')).toHaveText(EMAIL_ON(20));
+    expect(emailPosts).toEqual([]);
+
+    // Confirmed: saved, and auto-send stays on.
+    await cap.fill('40');
+    await cap.press('Enter');
+    await confirmBox(page).getByRole('button', { name: 'Raise cap' }).click();
+    await expect(email.locator('.st-msg')).toHaveText('Saved. Up to 40 emails a day.');
+    expect(emailPosts).toEqual([{ enabled: true, daily_cap: 40 }]);
+
+    // Down never asks.
+    await cap.fill('25');
+    await cap.press('Enter');
+    await expect(email.locator('.st-msg')).toHaveText('Saved. Up to 25 emails a day.');
+    await expect(confirmBox(page)).toHaveCount(0);
+    expect(emailPosts).toEqual([
+      { enabled: true, daily_cap: 40 },
+      { enabled: true, daily_cap: 25 },
+    ]);
+    let status = await getJSON(request, server, '/api/status');
+    expect([status.auto_send, status.daily_send_cap]).toEqual([true, 25]);
+
+    // LinkedIn: either cap going up asks; Esc is a cancel.
+    const li = region(page, 'LinkedIn');
+    await li.getByLabel('Weekly cap').fill('100');
+    await li.getByLabel('Weekly cap').press('Enter');
+    await expect(confirmBox(page).getByRole('heading')).toHaveText('Raise the LinkedIn caps?');
+    await expect(confirmBox(page)).toContainText('coldtrail can send up to 15 invites a day and 100 a week without asking.');
+    await page.keyboard.press('Escape');
+    await expect(confirmBox(page)).toHaveCount(0);
+    await expect(li.getByLabel('Weekly cap')).toHaveValue('80');
+    await expect(li.locator('.st-msg')).toHaveText('Not changed. Up to 15 invites a day and 80 a week.');
+    expect(linkedinPosts).toEqual([]);
+    status = await getJSON(request, server, '/api/status');
+    expect([status.linkedin_auto_send, status.linkedin_daily_cap, status.linkedin_weekly_cap]).toEqual([true, 15, 80]);
+  } finally {
+    await resetSending(request, server);
+  }
+});
+
+test('leaving the screen saves a cap that was typed and left', async ({ app, page, request, server }) => {
+  await resetSending(request, server);
+  try {
+    const posts = countRequests(page, '/api/destination/auto-send');
+    await app.goto('#/settings?tab=sending');
+    const cap = region(page, 'Email').getByLabel('Daily cap');
+    await expect(cap).toHaveValue('20');
+    // Typed, then straight to another screen (the save was still waiting out its debounce).
+    await cap.fill('33');
+    await goHome(page);
+    await expect(view(page).locator('.settings')).toHaveCount(0);
+    // The router waited for it.
+    expect(posts).toEqual([{ enabled: false, daily_cap: 33 }]);
+    expect((await getJSON(request, server, '/api/status')).daily_send_cap).toBe(33);
+
+    // With auto-send on, a raise left that way isn't saved, and nothing asks on the way out.
+    await postJSON(request, server, '/api/destination/auto-send', { enabled: true, daily_cap: 33 });
+    await app.goto('#/settings?tab=sending');
+    await expect(cap).toHaveValue('33');
+    await cap.fill('90');
+    await goHome(page);
+    await expect(view(page).locator('.settings')).toHaveCount(0);
+    await expect(confirmBox(page)).toHaveCount(0);
+    expect(posts).toEqual([{ enabled: false, daily_cap: 33 }]);
+    expect((await getJSON(request, server, '/api/status')).daily_send_cap).toBe(33);
+  } finally {
+    await resetSending(request, server);
+  }
 });
 
 test('osint install calls the (intercepted) endpoint', async ({ app, page }) => {
@@ -534,6 +733,13 @@ test('connections connect through the intercepted routes', async ({ app, page, r
   await linkedin.getByRole('button', { name: 'Connect LinkedIn' }).click();
   await expect(linkedin.locator('.badge').first()).toHaveText('Waiting for sign-in');
   await expect(linkedin.locator('.st-msg')).toContainText('Sign in to LinkedIn in the Chrome window');
+  // The buttons are away while it waits, and so is their (empty) row: the message sits under
+  // the note at the usual distance.
+  await expect(linkedin.locator('.st-card-body')).toBeHidden();
+  const gap = await linkedin.evaluate(
+    (card) => card.querySelector('.st-msg').getBoundingClientRect().top - card.querySelector('.st-card-head').getBoundingClientRect().bottom,
+  );
+  expect(gap).toBeCloseTo(12, 0);
   finished = true;
   await expect(linkedin.locator('.badge').first()).toHaveText('Connected', { timeout: 15_000 });
   await expect(linkedin.locator('.st-msg')).toHaveText('LinkedIn is connected.');
@@ -623,6 +829,58 @@ test('leaving settings stops the LinkedIn poll', async ({ app, page }) => {
   const before = await polls();
   await page.clock.runFor(20_000);
   expect(await polls()).toBe(before);
+});
+
+test('a stale session stops the LinkedIn sign-in poll', async ({ app, page }) => {
+  app.allowConsole(/status of 401/);
+  await page.clock.install();
+  let polls = 0;
+  await page.route('**/api/destination/linkedin/status', (route) => {
+    polls++;
+    return route.fulfill({ status: 401, contentType: 'text/plain', body: 'unauthorized' });
+  });
+  await app.goto('#/settings?tab=connections');
+  const linkedin = region(page, 'LinkedIn');
+  await linkedin.getByRole('button', { name: 'Connect LinkedIn' }).click();
+  await expect(linkedin.locator('.badge').first()).toHaveText('Waiting for sign-in');
+  await page.clock.runFor(2_100);
+  // One refused poll is enough: it says how to fix it and offers Connect again.
+  await expect(linkedin.locator('.st-msg')).toHaveText('Reopen coldtrail from your terminal.');
+  await expect(linkedin.locator('.badge').first()).toHaveText('Not connected');
+  await expect(linkedin.getByRole('button', { name: 'Connect LinkedIn' })).toBeVisible();
+  expect(polls).toBe(1);
+  await page.clock.runFor(20_000);
+  expect(polls).toBe(1);
+});
+
+test('connect requests outlive the screen', async ({ app, page }) => {
+  // Canonical's connect is held open by the server until the browser approval comes back:
+  // moving to another screen meanwhile must not drop it (that would stop the callback listener).
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  await page.route('**/api/discovery/canonical/connect', async (route) => {
+    await held;
+    await route.fallback(); // the harness's intercept answers {ok:true}
+  });
+  const failed = [];
+  page.on('requestfailed', (req) => {
+    if (new URL(req.url()).pathname === '/api/discovery/canonical/connect') failed.push(req.failure());
+  });
+  await app.goto('#/settings?tab=connections');
+  const canonical = region(page, 'Canonical');
+  await canonical.getByRole('button', { name: 'Reconnect' }).click();
+  await expect(canonical.getByRole('button', { name: 'Waiting for approval…' })).toHaveAttribute('aria-busy', 'true');
+  await expect(canonical.locator('.st-msg')).toContainText('Approve coldtrail in the browser tab that opened.');
+
+  await goHome(page);
+  await expect(view(page).locator('.settings')).toHaveCount(0);
+  const finished = page.waitForEvent('requestfinished', (req) => new URL(req.url()).pathname === '/api/discovery/canonical/connect');
+  release();
+  await finished;
+  expect(failed).toEqual([]);
+  expect(app.calls.map((c) => c.path)).toEqual(['/api/discovery/canonical/connect']);
 });
 
 test('appearance persists across reload', async ({ app, page }) => {
@@ -769,20 +1027,33 @@ test('every tab is accessible in light and dark and fits a phone', async ({ app,
         await panel(page).locator('.ap-card[data-kind="openai"] .ap-pick').click();
       }
       if (id === 'connections') await region(page, 'Gmail').getByText('More options').click();
-      if (id === 'sending') await expect(linkedinSwitch(page)).toBeVisible();
+      if (id === 'sending') {
+        await expect(linkedinSwitch(page)).toBeVisible();
+        // The usage line wraps between its parts, never inside one.
+        const parts = region(page, 'LinkedIn').locator('.st-usage-part');
+        await expect(parts).toHaveCount(2);
+        expect(await parts.evaluateAll((els) => els.map((el) => el.getClientRects().length))).toEqual([1, 1]);
+      }
       if (id === 'enrichment') await expect(region(page, 'SpiderFoot')).toBeVisible();
       if (id === 'appearance') await expect(panel(page).getByRole('radio', { name: 'Dark' })).toBeVisible();
       await expectNoSideScroll(page, 390);
       // The tabs scroll sideways here: a deep link brings its tab into view.
       await expect.poll(() => selectedTabInView(page)).toBe(true);
+      await expectAccessible(page);
     }
-    await expectAccessible(page);
   }
-  // The edge with more tabs fades: the end of the list from Appearance, both ways from Sending.
-  await expect(view(page).locator('.st-tabs')).toHaveAttribute('data-more', 'left');
+  // The edge with more tabs fades (tabs.js marks it): the start from Appearance, the end from
+  // Agent, both when scrolled part way.
+  await expect(tabList(page)).toHaveAttribute('data-more', 'start');
   await tab(page, 'Agent').click();
   await expect.poll(() => selectedTabInView(page)).toBe(true);
-  await expect(view(page).locator('.st-tabs')).toHaveAttribute('data-more', 'right');
+  await expect(tabList(page)).toHaveAttribute('data-more', 'end');
+  await tabList(page).evaluate((list) => {
+    list.scrollLeft = (list.scrollWidth - list.clientWidth) / 2;
+  });
+  await expect(tabList(page)).toHaveAttribute('data-more', 'start end');
+  await tab(page, 'Sending').click();
+  await expect.poll(() => selectedTabInView(page)).toBe(true);
 
   // The menu still opens at phone width.
   await page.getByRole('button', { name: 'Menu' }).click();
