@@ -10,7 +10,7 @@
 // it needs only the app's tokens and base styles around it (it loads its own stylesheet), and
 // cleans up when its root leaves the document or when dispose() is called.
 
-import { api } from '../core/api.js';
+import { api, errorText, isStaleSession } from '../core/api.js';
 import { debounce, h, pluralize } from '../core/dom.js';
 import { ensureViewCss } from '../core/router.js';
 import { store as sharedStore } from '../core/store.js';
@@ -286,6 +286,29 @@ function skeletonLines(widths) {
   return h('div', { class: 'cp-skeleton', 'aria-hidden': 'true' }, widths.map((w) => h('span', { class: 'skeleton', style: `width:${w}%` })));
 }
 
+/** Fill `box` with a failed load: what didn't load, why, an optional note, and Try again. On a
+ *  stale session the shell's banner (an alert) already says what happened, once: the card gives
+ *  the short pointer at the fix, isn't an alert itself, and has no Try again (nothing loads
+ *  until the tab is reopened). */
+function showLoadError(box, { title, err, note, retry }) {
+  const stale = isStaleSession(err);
+  if (stale) box.removeAttribute('role');
+  else box.setAttribute('role', 'alert');
+  const parts = [
+    h('span', { class: 'cp-load-error-icon' }, icon('error', 18)),
+    h(
+      'div',
+      { class: 'cp-load-error-text' },
+      h('p', { class: 'cp-load-error-title' }, title),
+      h('p', { class: 'cp-load-error-detail' }, errorText(err)),
+      note ? h('p', { class: 'cp-load-error-detail' }, note) : null,
+    ),
+  ];
+  if (!stale) parts.push(h('button', { type: 'button', class: 'btn btn-secondary', onClick: retry }, 'Try again'));
+  box.replaceChildren(...parts);
+  box.hidden = false;
+}
+
 const isSave = (e) => (e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && String(e.key).toLowerCase() === 's';
 
 /** Browsers cap the bodies of in-flight keepalive requests at 64 KiB in total; leave headroom. */
@@ -361,15 +384,20 @@ const STATUS_ICON = { saved: 'check', error: 'error', empty: 'warn', 'load-error
  * removes every listener and timer. After that onChange stops. Until that last save lands, the
  * text is kept in memory: the next editor mounted on this page waits for that save (up to 3s),
  * then restores the text (and saves it) if the file still lacks it, with a notice and a Discard.
- * Closing or reloading the tab sends unsaved
- * text with a keepalive request; when the text is too big for one (over 60 KiB) or the last save
- * failed, the browser asks before leaving instead.
+ * Closing or reloading the tab sends unsaved text with a keepalive request; when the text is too
+ * big for one (over 60 KiB) or the last save failed, the browser asks before leaving instead.
+ *
+ * A stale session (401): the load card and the save state give the short "Reopen coldtrail from
+ * your terminal." (the shell's banner says the rest) and offer no Try again or Retry.
  *
  * @param {HTMLElement} root  Where the editor is appended.
- * @param {{ onChange?: (state: ProfileState) => void, store?: { refresh(): unknown } }} [opts]
+ * @param {{ onChange?: (state: ProfileState) => void, store?: { refresh(): unknown },
+ *   headingLevel?: number }} [opts]
  *   onChange runs after the load, on every edit and whenever the save status changes.
  *   `store` is refreshed after the first save of a previously empty profile (default: the
  *   shared store), so setup/onboarding state catches up.
+ *   `headingLevel`: the checklist title's heading level, 2–6 (default 2; anything else gives 2).
+ *   It looks the same at every level. Setup, whose step heading is an h2, passes 3.
  * @returns {{ el: HTMLElement, ready: Promise<ProfileState>, state(): ProfileState,
  *   flush(): Promise<ProfileState>, focus(): void, dispose(): void }}
  *   ready resolves once the profile has loaded (after a retry if the first load fails) or the
@@ -381,9 +409,13 @@ const STATUS_ICON = { saved: 'check', error: 'error', empty: 'warn', 'load-error
  *   error: string|null,
  *   checklist: { done: number, total: number, items: object[] } }} ProfileState
  *   `persisted`: the server holds a non-blank profile (what /api/status calls product_set).
+ *   `error`: why the last save failed, or (status 'load-error') why the load failed: the
+ *   request's message, which is api.js's SESSION_EXPIRED on a stale session; else null.
  */
-export function mountProfileEditor(root, { onChange, store = sharedStore } = {}) {
+export function mountProfileEditor(root, { onChange, store = sharedStore, headingLevel = 2 } = {}) {
   const id = `pe-${++uid}`;
+  const level = Number(headingLevel);
+  const titleTag = Number.isInteger(level) && level >= 2 && level <= 6 ? `h${level}` : 'h2';
   const ac = new AbortController();
   let disposed = false;
   let loaded = false;
@@ -392,7 +424,8 @@ export function mountProfileEditor(root, { onChange, store = sharedStore } = {})
   let pending = false; // a debounced save is waiting
   let inflight = null; // the running save loop
   let again = false;
-  let lastError = null;
+  let lastError = null; // why the last save failed
+  let loadFailure = null; // why the last load failed
   let status = 'loading';
   let analysis = analyzeProfile('');
   let checklistSig = '';
@@ -461,7 +494,7 @@ export function mountProfileEditor(root, { onChange, store = sharedStore } = {})
   const aside = h(
     'section',
     { class: 'pe-check cp-card', 'aria-labelledby': `${id}-check-title` },
-    h('div', { class: 'pe-check-head' }, h('h2', { class: 'pe-check-title', id: `${id}-check-title` }, 'Checklist'), progressEl),
+    h('div', { class: 'pe-check-head' }, h(titleTag, { class: 'pe-check-title', id: `${id}-check-title` }, 'Checklist'), progressEl),
     meter,
     h('p', { class: 'pe-check-desc' }, 'Sections the agent looks for, found by their headings. It only uses what you write here.'),
     checkSkeleton,
@@ -481,6 +514,7 @@ export function mountProfileEditor(root, { onChange, store = sharedStore } = {})
 
   function state() {
     const doc = loaded ? ta.value : '';
+    const err = lastError || (status === 'load-error' ? loadFailure : null);
     return {
       doc,
       loaded,
@@ -488,7 +522,7 @@ export function mountProfileEditor(root, { onChange, store = sharedStore } = {})
       template,
       persisted: persisted.trim() !== '',
       status,
-      error: lastError ? lastError.message || String(lastError) : null,
+      error: err ? err.message || String(err) : null,
       checklist: { done: analysis.done, total: analysis.total, items: analysis.items.map(({ fix, ...it }) => ({ ...it })) },
     };
   }
@@ -516,13 +550,15 @@ export function mountProfileEditor(root, { onChange, store = sharedStore } = {})
     status = computeStatus();
     statusEl.dataset.state = status;
     main.dataset.state = status;
-    const text = status === 'error' ? `Couldn’t save: ${(lastError && lastError.message) || lastError}` : STATUS_TEXT[status];
+    // A stale session: the short pointer (the banner says the rest) and no Retry, which can't
+    // work until the tab is reopened (typing still saves, should the session come back).
+    const text = status === 'error' ? `Couldn’t save: ${errorText(lastError)}` : STATUS_TEXT[status];
     if (statusText.textContent !== text) statusText.textContent = text;
     if (status === 'empty') statusEl.title = 'An empty profile would send coldtrail back to setup, so the last saved version is kept.';
     else if (status === 'error') statusEl.title = text;
     else statusEl.removeAttribute('title');
     statusIcon.replaceChildren(STATUS_ICON[status] ? icon(STATUS_ICON[status], 14) : '');
-    retryBtn.hidden = status !== 'error';
+    retryBtn.hidden = status !== 'error' || isStaleSession(lastError);
   }
 
   // ---- checklist ------------------------------------------------------------------------
@@ -761,21 +797,16 @@ export function mountProfileEditor(root, { onChange, store = sharedStore } = {})
   function loadFailed(err) {
     if (disposed || (err && err.name === 'AbortError')) return;
     status = 'load-error';
+    loadFailure = err;
     skeleton.hidden = true;
     checkSkeleton.hidden = true;
     checkNote.hidden = false;
-    loadError.replaceChildren(
-      h('span', { class: 'cp-load-error-icon' }, icon('error', 18)),
-      h(
-        'div',
-        { class: 'cp-load-error-text' },
-        h('p', { class: 'cp-load-error-title' }, 'Couldn’t load your profile.'),
-        h('p', { class: 'cp-load-error-detail' }, (err && err.message) || String(err)),
-        h('p', { class: 'cp-load-error-detail' }, 'Nothing was changed. Editing stays off until it loads, so the saved profile isn’t overwritten.'),
-      ),
-      h('button', { type: 'button', class: 'btn btn-secondary', onClick: load }, 'Try again'),
-    );
-    loadError.hidden = false;
+    showLoadError(loadError, {
+      title: 'Couldn’t load your profile.',
+      err,
+      note: 'Nothing was changed. Editing stays off until it loads, so the saved profile isn’t overwritten.',
+      retry: load,
+    });
     renderStatus();
     emit();
   }
@@ -1040,6 +1071,7 @@ function mountContacted(root) {
   const ac = new AbortController();
   let saved = null;
   let busy = false;
+  let loadFailed = false;
   let disposed = false;
 
   // A rejected save: the server's reason (an alert, so it's heard even though focus stays on
@@ -1200,9 +1232,9 @@ function mountContacted(root) {
       if (dirty) saveBtn.removeAttribute('aria-disabled');
       else saveBtn.setAttribute('aria-disabled', 'true');
     }
-    const state = busy ? 'saving' : dirty ? 'dirty' : saved !== null ? 'saved' : 'loading';
-    stateText.textContent = { saving: 'Saving…', dirty: 'Unsaved changes', saved: 'Saved', loading: '' }[state];
-    stateIcon.replaceChildren(state === 'saved' ? icon('check', 14) : '');
+    const state = busy ? 'saving' : dirty ? 'dirty' : saved !== null ? 'saved' : loadFailed ? 'load-error' : 'loading';
+    stateText.textContent = { saving: 'Saving…', dirty: 'Unsaved changes', saved: 'Saved', 'load-error': 'Not loaded', loading: '' }[state];
+    stateIcon.replaceChildren(state === 'saved' ? icon('check', 14) : state === 'load-error' ? icon('error', 14) : '');
     stateEl.dataset.state = state;
     if (!dirty) restoredNotice.hide();
   }
@@ -1226,7 +1258,8 @@ function mountContacted(root) {
       msg.replaceChildren(savedMessage(result, n), ...(n ? [' Run ', code('coldtrail seed'), ' to load them into the pipeline.'] : []));
     } catch (err) {
       if (disposed) return;
-      showError((err && err.message) || String(err), result);
+      // A stale session: the short pointer, since the shell's banner says the rest.
+      showError(errorText(err), result);
     } finally {
       busy = false;
       ta.readOnly = false;
@@ -1265,6 +1298,8 @@ function mountContacted(root) {
   function load() {
     skeleton.hidden = false;
     loadError.hidden = true;
+    loadFailed = false;
+    renderState();
     api.get('/api/onboarding/files', { signal: ac.signal }).then(
       (res) => {
         if (disposed) return;
@@ -1286,17 +1321,9 @@ function mountContacted(root) {
       (err) => {
         if (disposed || (err && err.name === 'AbortError')) return;
         skeleton.hidden = true;
-        loadError.replaceChildren(
-          h('span', { class: 'cp-load-error-icon' }, icon('error', 18)),
-          h(
-            'div',
-            { class: 'cp-load-error-text' },
-            h('p', { class: 'cp-load-error-title' }, 'Couldn’t load the list.'),
-            h('p', { class: 'cp-load-error-detail' }, (err && err.message) || String(err)),
-          ),
-          h('button', { type: 'button', class: 'btn btn-secondary', onClick: load }, 'Try again'),
-        );
-        loadError.hidden = false;
+        loadFailed = true;
+        showLoadError(loadError, { title: 'Couldn’t load the list.', err, retry: load });
+        renderState();
       },
     );
   }
@@ -1324,10 +1351,12 @@ const TABS = [
   { id: 'contacted', label: 'Already contacted' },
 ];
 const tabOf = (query) => (query && query.tab === 'contacted' ? 'contacted' : 'profile');
-/** The page description follows the tab: only the profile saves as you type. */
+/** The page description follows the tab: only the profile saves as you type. Each fits one line
+ *  wherever the editor and its side panel sit side by side (the screen is sized to fit then);
+ *  the help panel says the list stays on this machine. */
 const TAB_DESC = {
   profile: 'The agent writes every email and LinkedIn note from this profile. It stays on this machine and saves as you type.',
-  contacted: 'Companies you’ve already reached. Once loaded with coldtrail seed, sourcing skips them. The list stays on this machine and saves when you press Save.',
+  contacted: 'Companies you’ve already reached. Once loaded with coldtrail seed, sourcing skips them. The list saves when you press Save.',
 };
 
 let active = null; // the mounted view: { setTab, flush }
@@ -1347,7 +1376,10 @@ export default {
     const profilePane = h('div', { class: 'cp-pane' });
     const contactedPane = h('div', { class: 'cp-pane' });
     const panel = h('div', { class: 'cp-panel', id: panelId, role: 'tabpanel' }, profilePane, contactedPane);
-    const desc = h('p', { class: 'page-desc' });
+    // Both tabs' descriptions share one spot, the other tab's invisible: the header keeps the
+    // taller one's height, so the tabs below don't jump when one wraps to more lines.
+    const descs = TABS.map((t) => h('span', { class: 'cp-desc-text', 'data-tab': t.id }, TAB_DESC[t.id]));
+    const desc = h('p', { class: 'page-desc cp-desc' }, descs);
 
     root.append(
       h(
@@ -1364,7 +1396,7 @@ export default {
 
     function setTab(tab) {
       tabList.setActive(tab);
-      desc.textContent = TAB_DESC[tab];
+      for (const d of descs) d.toggleAttribute('data-off', d.dataset.tab !== tab);
       profilePane.hidden = tab !== 'profile';
       contactedPane.hidden = tab !== 'contacted';
       const btn = tabList.querySelector(`[data-id="${tab}"]`);

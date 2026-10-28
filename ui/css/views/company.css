@@ -2,6 +2,12 @@
    The editor (.pe) is also mounted by the Setup wizard, so its layout keys off its own width
    (container queries), never the page's. Tokens only: tokens.css colors, radii and spacing. */
 
+/* Each tab's description in the same cell: the other tab's is invisible (and unread) but keeps
+   its room, so switching tabs never moves the tabs. */
+.cp-desc { display: grid; }
+.cp-desc-text { grid-area: 1 / 1; }
+.cp-desc-text[data-off] { visibility: hidden; }
+
 .cp-tabs { margin-top: var(--space-4); }
 .cp-panel { margin-top: var(--space-6); }
 
@@ -141,6 +147,7 @@
 .pe-status[data-state="load-error"] { color: var(--danger); }
 .ac-state[data-state="saved"] .pe-status-icon { color: var(--ok); }
 .ac-state[data-state="dirty"] { color: var(--warn); }
+.ac-state[data-state="load-error"] { color: var(--danger); }
 
 /* A failed or refused save shows its whole reason (no tooltip-only text): the message follows
    the file name, wraps onto as many lines as it needs, and drops below the name when there's
@@ -253,7 +260,8 @@
   justify-content: space-between;
   gap: var(--space-2);
 }
-.pe-check-title { font-size: 15px; }
+/* The same look at whatever level the page gives it (h2 here, h3 under Setup's step heading). */
+.pe-check-title { font-size: 15px; font-weight: 600; line-height: 1.4; }
 
 .pe-progress {
   color: var(--text-3);

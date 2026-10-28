@@ -5,6 +5,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { SESSION_EXPIRED, SESSION_REOPEN } from '../../../ui/js/core/api.js';
 import { expectAccessible } from '../harness/a11y.mjs';
 import { test, expect } from '../harness/fixtures.mjs';
 import { PRODUCT_MD } from '../harness/seed.mjs';
@@ -622,6 +623,64 @@ test('loading, load errors and save errors', async ({ app, page, server }) => {
   expect(productOnDisk(server)).toBe(`${PRODUCT_MD}\nNew line.`);
 });
 
+test('a stale session is explained once, by the banner', async ({ app, page, context, server }) => {
+  app.allowConsole(/status of 401/);
+  /** How often the banner's sentence is in the page, hidden text included. */
+  const timesSaid = () => page.evaluate((s) => document.body.textContent.split(s).length - 1, SESSION_EXPIRED);
+  const banner = page.locator('.session-banner');
+
+  // Loading after a restart (the cookie no longer matches; here it's gone): each tab says what
+  // didn't load and points at the fix. No banner sentence again, no Try again that can't work
+  // until the tab is reopened, and the banner is the only alert.
+  await app.goto('#/company?tab=contacted');
+  await expect(contactedBox(page)).toHaveValue(CONTACTED_TEMPLATE);
+  await context.clearCookies();
+  await page.reload();
+  // The card's whole text: what didn't load and the pointer, nothing else.
+  const listError = page.locator('.ac-load-error');
+  await expect(listError).toHaveText(`Couldn’t load the list.${SESSION_REOPEN}`);
+  await expect(page.locator('.ac-state')).toHaveText('Not loaded');
+  await expect(banner).toHaveText(SESSION_EXPIRED);
+  await expect(page.getByRole('alert')).toHaveCount(1);
+  await expect(page.getByRole('button', { name: 'Try again' })).toHaveCount(0);
+  await page.getByRole('tab', { name: 'Profile' }).click();
+  const loadError = page.locator('.pe-load-error');
+  await expect(loadError).toHaveText(
+    `Couldn’t load your profile.${SESSION_REOPEN}Nothing was changed. Editing stays off until it loads, so the saved profile isn’t overwritten.`,
+  );
+  await expect(saveStatus(page)).toHaveText('Not loaded');
+  await expect(editor(page)).toBeHidden();
+  await expect(page.getByRole('alert')).toHaveCount(1);
+  await expect(page.getByRole('button', { name: 'Try again' })).toHaveCount(0);
+  expect(await timesSaid()).toBe(1);
+  await expectAccessible(page);
+
+  // Saving once the session has gone stale: the text stays, the save state says why in short,
+  // and there's no Retry. The same on the Already contacted tab.
+  await app.goto('#/company?tab=contacted');
+  await expect(contactedBox(page)).toHaveValue(CONTACTED_TEMPLATE);
+  await page.getByRole('tab', { name: 'Profile' }).click();
+  await expect(editor(page)).toHaveValue(PRODUCT_MD);
+  await context.clearCookies();
+  await typeAtEnd(page, '\nTyped after a restart.');
+  await expect(saveStatus(page)).toHaveText(`Couldn’t save: ${SESSION_REOPEN}`);
+  await expect(banner).toHaveText(SESSION_EXPIRED);
+  await expect(page.getByRole('button', { name: 'Retry', exact: true })).toHaveCount(0);
+  await expect(editor(page)).toHaveValue(`${PRODUCT_MD}\nTyped after a restart.`);
+  expect(productOnDisk(server)).toBe(PRODUCT_MD);
+  expect(await timesSaid()).toBe(1);
+
+  await page.getByRole('tab', { name: 'Already contacted' }).click();
+  await contactedBox(page).fill(`${CONTACTED_TEMPLATE}kept.example\n`);
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(page.locator('.ac-error')).toHaveText(`Not saved: ${SESSION_REOPEN}`);
+  await expect(page.getByRole('button', { name: /^Go to line/ })).toHaveCount(0);
+  await expect(page.locator('.ac-error-snippet')).toBeHidden();
+  expect(contactedOnDisk(server)).toBe(CONTACTED_TEMPLATE);
+  expect(await timesSaid()).toBe(1);
+  await expectAccessible(page);
+});
+
 test('picks up edits made elsewhere when the tab is shown again, never over unsaved work', async ({ app, page, request, server }) => {
   await openProfile(app, page);
   const elsewhere = `${PRODUCT_MD}\n## Team\nEdited in another tab.\n`;
@@ -951,8 +1010,14 @@ test('already contacted: loading and load error', async ({ app, page }) => {
   await expect(loadError).toContainText('Couldn’t load the list');
   await expect(loadError).toContainText('cannot read contacted.toml');
   await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeHidden();
+  // The file bar says so too, as on the profile tab.
+  const state = page.locator('.ac-state');
+  await expect(state).toHaveText('Not loaded');
+  await expect(state).toHaveAttribute('data-state', 'load-error');
+  await expect(state.locator('svg')).toBeVisible();
   await loadError.getByRole('button', { name: 'Try again' }).click();
   await expect(contactedBox(page)).toHaveValue(CONTACTED_TEMPLATE);
+  await expect(state).toHaveText('Saved');
 });
 
 test('tabs deep link, follow the URL and work from the keyboard', async ({ app, page }) => {
@@ -963,12 +1028,18 @@ test('tabs deep link, follow the URL and work from the keyboard', async ({ app, 
   await expect(contactedBox(page)).toBeVisible();
   await expect(editor(page)).toBeHidden();
   await expect(page.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', await contactedTab.getAttribute('id'));
-  // The page description follows the tab: only the profile saves as you type.
+  // The page description follows the tab: only the profile saves as you type. (The other tab's
+  // is there too, invisible, holding its room: only rendered text counts.)
   const desc = page.locator('#view .page-desc');
-  await expect(desc).toContainText('saves when you press Save');
-  await expect(desc).not.toContainText('as you type');
+  const shown = { useInnerText: true };
+  await expect(desc).toContainText('saves when you press Save', shown);
+  await expect(desc).not.toContainText('as you type', shown);
   // Saving only writes the file; skipping starts once it's loaded into the pipeline.
-  await expect(desc).toContainText('Once loaded with coldtrail seed, sourcing skips them.');
+  await expect(desc).toContainText('Once loaded with coldtrail seed, sourcing skips them.', shown);
+  // At 1024px this description takes two lines and the profile's one: the tabs stay put anyway.
+  await page.setViewportSize({ width: 1024, height: 768 });
+  const tabsTop = () => page.getByRole('tablist').evaluate((el) => el.getBoundingClientRect().top);
+  const top = await tabsTop();
 
   await contactedTab.focus();
   await page.keyboard.press('ArrowLeft');
@@ -977,7 +1048,10 @@ test('tabs deep link, follow the URL and work from the keyboard', async ({ app, 
   await expect(page).toHaveURL(hashIs('#/company'));
   await expect(editor(page)).toHaveValue(PRODUCT_MD);
   await expect(contactedBox(page)).toBeHidden();
-  await expect(desc).toContainText('saves as you type');
+  await expect(desc).toContainText('saves as you type', shown);
+  await expect(desc).not.toContainText('press Save', shown);
+  expect(await tabsTop()).toBe(top);
+  await page.setViewportSize({ width: 1440, height: 900 });
   // Tab moves from the tab list straight into the editor.
   await page.keyboard.press('Tab');
   await expect(editor(page)).toBeFocused();
@@ -1054,6 +1128,26 @@ test('mountProfileEditor works standalone and cleans up', async ({ app, page, se
     return host.childElementCount;
   });
   expect(left).toBe(0);
+
+  // The checklist heading fits the page around it (Setup puts the editor under an h2 step
+  // heading): an h2 unless `headingLevel` says 2–6 otherwise, and the same look at any level.
+  const levels = await page.evaluate(async () => {
+    const { mountProfileEditor } = await import('/assets/js/views/company.js');
+    const out = [];
+    for (const headingLevel of [3, 6, '4', 1, 7, 2.5, undefined]) {
+      const host = document.createElement('div');
+      document.body.append(host);
+      const ed = mountProfileEditor(host, headingLevel === undefined ? {} : { headingLevel });
+      await ed.ready;
+      const title = ed.el.querySelector('.pe-check-title');
+      const look = getComputedStyle(title);
+      out.push([title.tagName, title.textContent, look.fontSize, look.fontWeight, look.lineHeight].join(' '));
+      ed.dispose();
+    }
+    return out;
+  });
+  const look = levels[0].split(' ').slice(2).join(' ');
+  expect(levels).toEqual(['H3', 'H6', 'H4', 'H2', 'H2', 'H2', 'H2'].map((tag) => `${tag} Checklist ${look}`));
 });
 
 test('accessible in light and dark, and fits a phone', async ({ app, page, request, server }) => {
