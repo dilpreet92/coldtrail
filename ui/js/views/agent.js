@@ -6,22 +6,24 @@
 // Routes: #/agent is a new conversation, #/agent/<chat_id> an existing one, and
 // #/agent?prompt=<text> fills the composer without sending (the Pipeline hand-off).
 // Scheduled-run conversations are a read-only log, polled every 2s while the run is writing to
-// them. Leaving the screen closes the stream, stops the poll and aborts every pending request.
+// them. Leaving the screen closes the stream, stops the poll and aborts every pending request;
+// text typed but not sent waits in the composer for the screen to come back.
 // While a turn streams, links inside this screen (other conversations, New chat, Settings) ask
 // before they stop it; the sidebar can't be intercepted, so the composer says so instead.
 //
 // Server contract (inventory "Chat"): POST /api/chats/new clears the server's active
 // conversation and POST /api/chats/:id/activate selects one; POST /api/chat {message} → {run}
-// starts a turn in the active conversation, and /api/chat/stream?run= streams its events once.
-// So before each turn this view makes the conversation on screen the active one. A turn whose
-// stream nobody claims keeps running (holding the server's one-turn lock) until a 45s reaper, so
-// a turn this view gives up on is still claimed once and closed, which cancels it.
+// starts a turn in the conversation that is active when the request arrives (a new one if none
+// is), and /api/chat/stream?run= streams its events once. So before each turn this view makes
+// the conversation on screen the active one. A turn whose stream nobody claims keeps running
+// (holding the server's one-turn lock) until a 45s reaper, so a turn this view gives up on is
+// still claimed once and closed as soon as it connects, which cancels it.
 
 import { api, openStream } from '../core/api.js';
-import { fmtNum, fmtRelative, h } from '../core/dom.js';
+import { fmtNum, fmtRelative, h, runStatus } from '../core/dom.js';
 import { renderMarkdown } from '../core/markdown.js';
 import { href } from '../core/router.js';
-import { confirmDialog } from '../core/ui.js';
+import { confirmDialog, setBusy } from '../core/ui.js';
 import { badge } from '../components/badge.js';
 import { emptyState } from '../components/emptyState.js';
 import { listDetail } from '../components/listDetail.js';
@@ -32,10 +34,17 @@ const POLL_MS = 2000;
 // After `done` the server still saves the reply (or deletes a failed first turn) before it
 // closes the stream; wait for that close, but never longer than this.
 const SETTLE_MS = 2000;
+// A first turn stopped or cut off early may still be queued behind the server's one-turn lock,
+// so its conversation isn't saved yet: look for it this many more times, this far apart.
+const ADOPT_RETRIES = 3;
+const ADOPT_RETRY_MS = 700;
 const LIST_PAGE = 50;
 const MAX_INPUT_PX = 200;
+const TITLE_CHARS = 60;
 const RUN_TITLE = /^(Scheduled run|Manual run)\b/;
 const RUN_PREFIX = /^Scheduled run\s+—\s+/;
+// What keeps keyboard focus in the transcript (a poll redraw puts it back by position).
+const FOCUSABLE = 'a[href], button, summary';
 
 const STARTERS = [
   {
@@ -99,6 +108,20 @@ function listTitle(t) {
   return t.replace(RUN_PREFIX, '') || t;
 }
 
+/** The title the server gives a new conversation (chat_store::title_from): the first message,
+ *  trimmed, on one line, cut at 60 characters plus "…". */
+function titleFrom(text) {
+  const one = String(text).trim().replace(/\n/g, ' ');
+  const chars = [...one];
+  return chars.length > TITLE_CHARS ? `${chars.slice(0, TITLE_CHARS).join('')}…` : one;
+}
+
+/** A ?prompt= hand-off (Pipeline, Home), or ''. */
+function promptOf(query) {
+  const p = query && typeof query.prompt === 'string' ? query.prompt : '';
+  return p.trim() ? p : '';
+}
+
 /** What the composer footer says the turn runs on: [agent, model]. */
 function agentLabel(status) {
   if (!status) return null;
@@ -120,20 +143,17 @@ function agentProblem(status) {
   return null;
 }
 
-// The same words as the run history on Schedules.
-const RUN_STATUS = {
-  ok: ['Succeeded', 'ok'],
-  error: ['Failed', 'danger'],
-  auth_failed: ['Sign-in failed', 'warn'],
-  running: ['Running', 'accent'],
-};
-
 // The mounted screen's route handler, so update() can keep the DOM when only the chat changes.
 let instance = null;
+// Text typed but not sent when the screen went away: the composer gets it back next time (the
+// old UI kept its composer across views). A ?prompt= hand-off replaces it.
+let unsent = '';
 
 export default {
   title,
   css: true,
+  // mount() places focus itself: the composer for a ?prompt= hand-off, else the heading.
+  autofocus: false,
   /** Same screen, another conversation or a ?prompt=: keep the DOM (list, scroll, composer). */
   update(ctx) {
     return instance ? instance.update(ctx) : false;
@@ -143,11 +163,12 @@ export default {
     const ctl = new AbortController();
     const signal = ctl.signal;
     const timers = new Set();
-    const streams = new Set(); // every EventSource this screen opened, closed on unmount
+    const streams = new Set(); // every EventSource this screen opened, ended on unmount
 
     let gone = false;
     let currentId = null; // the conversation on screen; null = a new one
     let current = null; // { id, title, run, running, missing }
+    let pendingTitle = null; // a new conversation's title while its first message is on its way
     let mode = 'compose'; // compose | readonly | blocked | none
     let openSeq = 0; // bumps whenever the conversation on screen changes
     let chats = [];
@@ -158,6 +179,8 @@ export default {
     const shown = { mine: LIST_PAGE, runs: LIST_PAGE };
     let turn = null; // the live turn, if any
     let adopting = null; // settles once a new conversation's id is known
+    let activating = null; // settles once the last POST …/activate this screen sent has answered
+    let waiting = false; // a send() is waiting for one of those two
     let poll = null;
     let runInfo = null; // the /api/runs row of the open run conversation
 
@@ -321,19 +344,37 @@ export default {
 
     // ---- Small helpers ----
 
-    /** openStream, remembered so leaving the screen closes it whatever state the turn is in. */
-    function stream(url, handlers) {
+    /**
+     * openStream, remembered so leaving the screen ends it whatever state the turn is in.
+     * release() ends it once the server has claimed the run, at once if it already has: closing
+     * a stream that hasn't connected yet can leave the run unclaimed, running on until the
+     * server's reaper. Nothing is delivered after release().
+     */
+    function stream(url, { onEvent, onError } = {}) {
+      let open = false;
+      let released = false;
       const s = openStream(url, {
-        onEvent: handlers.onEvent,
+        onOpen: () => {
+          open = true;
+          if (released) s.close();
+        },
+        onEvent: (ev) => {
+          if (released) s.close();
+          else if (onEvent) onEvent(ev);
+        },
         onError: () => {
           streams.delete(s);
-          handlers.onError();
+          if (!released && onError) onError();
         },
       });
       const close = s.close;
       s.close = () => {
         streams.delete(s);
         close();
+      };
+      s.release = () => {
+        released = true;
+        if (open) s.close();
       };
       streams.add(s);
       return s;
@@ -352,6 +393,18 @@ export default {
       if (id == null) return;
       clearTimeout(id);
       timers.delete(id);
+    }
+
+    /** Resolves after `ms`; never, if the screen goes away first. */
+    function pause(ms) {
+      return new Promise((resolve) => later(resolve, ms));
+    }
+
+    /** Where the router would put focus: the screen's heading. */
+    function focusHeading() {
+      const h1 = wrap.querySelector('h1');
+      h1.setAttribute('tabindex', '-1');
+      h1.focus({ preventScroll: true });
     }
 
     function announce(text) {
@@ -402,10 +455,11 @@ export default {
       return el;
     }
 
-    function errorRow(message) {
+    /** A problem in the transcript; `live` (one that just happened) is announced. */
+    function errorRow(message, { live = true, cls = null } = {}) {
       return h(
         'div',
-        { class: 'agent-error', role: 'alert' },
+        { class: ['agent-error', ...[].concat(cls)], role: live ? 'alert' : null },
         icon('alert'),
         h('p', { class: 'agent-error-text' }, message),
       );
@@ -523,6 +577,13 @@ export default {
       headBadges.replaceChildren();
       headMeta.replaceChildren();
       headTitle.removeAttribute('title');
+      if (!currentId && pendingTitle) {
+        // The first message is on its way: the server saves the conversation under this title
+        // as the turn starts. The real details come once it has (settle()).
+        headTitle.textContent = pendingTitle;
+        headTitle.title = pendingTitle;
+        return;
+      }
       if (!currentId) {
         headTitle.textContent = 'New conversation';
         headMeta.textContent = 'Saved once you send the first message.';
@@ -540,29 +601,31 @@ export default {
       if (current.title) headTitle.title = current.title;
       const listed = chats.find((c) => c.id === currentId);
       if (current.run) {
-        const parts = [];
-        if (runInfo) {
-          // /api/runs `started_at` is written when the run ends: it is the finish time.
-          parts.push(`Finished ${fmtRelative(runInfo.started_at)}`);
-          parts.push(
-            `${fmtNum(runInfo.sourced)} sourced · ${fmtNum(runInfo.enriched)} enriched · ` +
-              `${fmtNum(runInfo.drafted)} drafted · ${fmtNum(runInfo.sent)} sent`,
-          );
-        } else if (listed && listed.updated_at) {
-          parts.push(`Updated ${fmtRelative(listed.updated_at)}`);
-        }
-        headMeta.textContent = parts.join(' · ') || (current.running ? 'Running now' : '');
         if (current.running) {
+          // The run history only gets this run's row when it ends.
+          headMeta.textContent = 'Updates as the run works';
           const live = badge('Running', 'accent');
           live.prepend(h('span', { class: 'agent-live-dot', 'aria-hidden': 'true' }));
           headBadges.append(live);
-        } else if (runInfo && RUN_STATUS[runInfo.status]) {
-          const [text, tone] = RUN_STATUS[runInfo.status];
+        } else if (runInfo) {
+          // /api/runs `started_at` is written when the run ends: it is the finish time. Each
+          // part stays on one line when a narrow header wraps them.
+          const parts = [
+            `Finished ${fmtRelative(runInfo.started_at)}`,
+            `${fmtNum(runInfo.sourced)} sourced`,
+            `${fmtNum(runInfo.enriched)} enriched`,
+            `${fmtNum(runInfo.drafted)} drafted`,
+            `${fmtNum(runInfo.sent)} sent`,
+          ];
+          // Each "·" stays with the part before it: a wrapped line never starts with one.
+          const last = parts.length - 1;
+          parts.forEach((p, i) => headMeta.append(i ? ' ' : '', h('span', { class: 'agent-meta-part' }, i < last ? `${p} ·` : p)));
+          const [text, tone] = runStatus(runInfo.status);
           headBadges.append(badge(text, tone));
-        } else if (runInfo && runInfo.status) {
-          headBadges.append(badge(runInfo.status, 'neutral'));
+          if (runInfo.trigger === 'dry') headBadges.append(badge('Dry run', 'neutral'));
+        } else if (listed && listed.updated_at) {
+          headMeta.textContent = `Updated ${fmtRelative(listed.updated_at)}`;
         }
-        if (runInfo && runInfo.trigger === 'dry') headBadges.append(badge('Dry run', 'neutral'));
         headBadges.append(badge('Read-only', 'neutral'));
       } else if (listed && listed.updated_at) {
         headMeta.textContent = `Updated ${fmtRelative(listed.updated_at)}`;
@@ -598,6 +661,7 @@ export default {
       foot.replaceChildren();
       if (next === 'compose') {
         foot.append(form);
+        grow(); // its height was measured while it was out of the page, if it was
       } else if (next === 'readonly') {
         foot.append(
           h(
@@ -621,7 +685,8 @@ export default {
       }
     }
 
-    function setBusy(busy) {
+    /** While a turn runs: Stop in place of Send, and the hint about leaving. */
+    function setLive(busy) {
       // Keep keyboard users on a control: Stop replaces Send under their focus, and back.
       const focused = document.activeElement;
       sendButton.hidden = busy;
@@ -824,7 +889,8 @@ export default {
       return h(
         'div',
         { class: 'agent-welcome' },
-        h('h2', { class: 'agent-welcome-title' }, 'What should the agent work on?'),
+        // Under the conversation's own h2 ("New conversation").
+        h('h3', { class: 'agent-welcome-title' }, 'What should the agent work on?'),
         welcomeBody(),
         h(
           'ul',
@@ -875,7 +941,24 @@ export default {
       logInner.replaceChildren(node);
     }
 
-    /** Render stored messages: tool rows fold into groups, a run's brief folds away. */
+    // The transcript's disclosures: "Worked · N steps" buttons and the run brief's summary.
+    const disclosures = () => [...logInner.querySelectorAll('.agent-tools-head, details.agent-brief > summary')];
+    const isOpen = (el) => (el.tagName === 'SUMMARY' ? el.parentElement.open : el.getAttribute('aria-expanded') === 'true');
+    function openDisclosure(el) {
+      if (el.tagName === 'SUMMARY') {
+        el.parentElement.open = true;
+        return;
+      }
+      el.setAttribute('aria-expanded', 'true');
+      const steps = el.parentElement.querySelector('.agent-steps');
+      if (steps) steps.hidden = false;
+    }
+
+    /**
+     * Render stored messages: tool rows fold into groups, a run's brief folds away. `keep` (a
+     * poll redraw of a run that is still writing): what the reader opened stays open, and the
+     * control they were on keeps focus. A run only ever adds to its log, so positions hold.
+     */
     function renderStored(d, { keep = false } = {}) {
       const run = isRun(d.title);
       const msgs = Array.isArray(d.messages) ? d.messages : [];
@@ -887,15 +970,13 @@ export default {
               ? 'It ended before the agent started. The run history in Schedules shows how it finished.'
               : 'Send a message to start this conversation.',
             action: run ? { label: 'Open Schedules', href: '#/schedules' } : null,
+            level: 3,
           }),
         );
         return;
       }
-      // A poll redraws everything: keep open whatever the reader opened.
-      const disclosures = () => [...logInner.querySelectorAll('.agent-tools-head, details.agent-brief')];
-      const opened = keep
-        ? disclosures().map((el) => (el.tagName === 'DETAILS' ? el.open : el.getAttribute('aria-expanded') === 'true'))
-        : [];
+      const opened = keep ? disclosures().map(isOpen) : [];
+      const focusAt = keep ? [...logInner.querySelectorAll(FOCUSABLE)].indexOf(document.activeElement) : -1;
 
       const els = [];
       let group = null;
@@ -932,10 +1013,10 @@ export default {
       logInner.replaceChildren(...els);
       if (keep) {
         disclosures().forEach((el, i) => {
-          if (!opened[i]) return;
-          if (el.tagName === 'DETAILS') el.open = true;
-          else el.click();
+          if (opened[i]) openDisclosure(el);
         });
+        const again = focusAt >= 0 ? logInner.querySelectorAll(FOCUSABLE)[focusAt] : null;
+        if (again) again.focus({ preventScroll: true });
       }
     }
 
@@ -946,16 +1027,16 @@ export default {
       poll = null;
     }
 
-    /** Close the live turn's stream without ceremony (switching conversations, leaving). */
+    /** End the live turn's stream without ceremony (switching conversations, leaving). */
     function dropTurn() {
       const t = turn;
       if (!t) return;
       turn = null;
       t.abandoned = true;
-      if (t.stream) t.stream.close();
+      if (t.stream) t.stream.release();
       cancel(t.settleTimer);
       if (t.resolveAdopt) t.resolveAdopt();
-      setBusy(false);
+      setLive(false);
       // The server keeps what the turn wrote so far: list it.
       loadList();
     }
@@ -969,6 +1050,7 @@ export default {
         confirmText: 'Stop and leave',
         cancelText: 'Stay',
         opener,
+        signal, // closes (as Stay) if the screen goes away meanwhile
       });
     }
 
@@ -992,6 +1074,7 @@ export default {
       stopPoll();
       currentId = null;
       current = null;
+      pendingTitle = null;
       runInfo = null;
       setMode('compose');
       renderHead();
@@ -1006,6 +1089,7 @@ export default {
       stopPoll();
       currentId = id;
       current = null;
+      pendingTitle = null;
       runInfo = null;
       setMode('none');
       renderHead();
@@ -1030,6 +1114,7 @@ export default {
               title: "Couldn't open this conversation",
               body: errText(err),
               action: { label: 'Try again', onClick: () => openChat(id) },
+              level: 3,
             }),
           ),
         );
@@ -1045,6 +1130,7 @@ export default {
             title: 'This conversation doesn’t exist',
             body: 'It may have been a link from another workspace. Start a new chat instead.',
             action: { label: 'Start a new chat', href: '#/agent' },
+            level: 3,
           }),
         );
         return;
@@ -1054,19 +1140,25 @@ export default {
       renderHead();
       renderStored(d);
       toBottom();
-      setMode(run ? 'readonly' : 'compose');
       if (d.running) startPoll(id, seq, d);
       if (run) {
+        setMode('readonly');
         loadRunInfo(id, seq);
         return;
       }
-      // As before: the conversation on screen becomes the server's active one.
-      try {
-        await api.post(`/api/chats/${enc(id)}/activate`, {}, { signal });
-      } catch (err) {
-        if (gone || isAbort(err) || seq !== openSeq) return;
-        setMode('blocked', errText(err));
-      }
+      // As before: the conversation on screen becomes the server's active one. The composer
+      // shows now; a message sent before this answers waits for it (send()), so it can't start
+      // a turn that a failed activation would then take the composer away from.
+      const p = api.post(`/api/chats/${enc(id)}/activate`, {}, { signal }).then(
+        () => null,
+        (err) => err,
+      );
+      activating = p;
+      setMode('compose');
+      const err = await p;
+      if (activating === p) activating = null;
+      if (!err || gone || isAbort(err) || seq !== openSeq) return;
+      setMode('blocked', errText(err));
     }
 
     async function loadRunInfo(id, seq) {
@@ -1075,9 +1167,21 @@ export default {
         if (gone || seq !== openSeq) return;
         runInfo = (Array.isArray(runs) ? runs : []).find((r) => r.chat_id === id) || null;
         renderHead();
+        showRunNote();
       } catch (_) {
         // Optional detail: the transcript stands without it.
       }
+    }
+
+    /** Why a finished run didn't succeed (the run history's note), at the end of its log. */
+    function showRunNote() {
+      const old = logInner.querySelector('.agent-run-note');
+      if (old) old.remove();
+      if (!current || !current.run || current.running || !runInfo || !runInfo.note) return;
+      if (runInfo.status === 'ok') return;
+      const [label, tone] = runStatus(runInfo.status);
+      const cls = ['agent-run-note', tone === 'warn' && 'is-warn'];
+      follow(() => logInner.append(errorRow(`${label}: ${runInfo.note}`, { live: false, cls })));
     }
 
     const signature = (d) => JSON.stringify([d.running, d.messages]);
@@ -1121,12 +1225,28 @@ export default {
     // ---- A turn: send, stream, stop, settle ----
 
     async function send() {
-      if (turn || mode !== 'compose') return;
+      if (turn || waiting || mode !== 'compose') return;
       if (!input.value.trim()) {
         input.focus();
         return;
       }
-      if (adopting) await adopting; // a conversation that just started is still getting its id
+      // A conversation that just started may still be getting its id, and the one just opened
+      // may still be becoming the server's active one: the message waits for both, so it lands
+      // in the conversation on screen. Send says it's busy meanwhile.
+      if (adopting || activating) {
+        const before = openSeq;
+        waiting = true;
+        setBusy(sendButton, true);
+        try {
+          await adopting;
+          await activating;
+        } finally {
+          waiting = false;
+          setBusy(sendButton, false);
+        }
+        // Another conversation was opened meanwhile: the text stays in the composer, unsent.
+        if (openSeq !== before) return;
+      }
       if (gone || turn || mode !== 'compose') return;
       const text = input.value.trim();
       if (!text) return;
@@ -1135,20 +1255,32 @@ export default {
       const t = {
         seq,
         fresh,
-        prevIds: new Set(chats.map((c) => c.id)),
+        text,
+        title: titleFrom(text),
+        // What the list held before this turn, if it had loaded: settle() may look for the new
+        // conversation among the rest.
+        known: listState === 'ready' ? new Set(chats.map((c) => c.id)) : null,
+        bubble: null,
         stream: null,
         group: null,
         live: null,
         working: null,
+        note: null,
         sawError: false,
         done: false,
         ok: false,
         stopped: false,
         dropped: false,
+        abandoned: false,
         settled: false,
         settleTimer: null,
+        sent: null, // settles true once the server has the message, false if it never will
+        resolveSent: null,
         resolveAdopt: null,
       };
+      t.sent = new Promise((resolve) => {
+        t.resolveSent = resolve;
+      });
       turn = t;
       if (fresh) {
         const p = new Promise((resolve) => {
@@ -1161,58 +1293,89 @@ export default {
       }
 
       clearWelcome();
-      const bubble = userMsg(text);
+      t.bubble = userMsg(text);
       t.working = workingRow();
-      logInner.append(bubble, t.working);
+      logInner.append(t.bubble, t.working);
       toBottom();
       input.value = '';
       grow();
-      setBusy(true);
+      setLive(true);
       announce('The agent is working.');
+      if (fresh) {
+        pendingTitle = t.title;
+        renderHead();
+      }
 
       let run;
       try {
         // New conversation → clear the server's active pointer; else make this one active.
         if (fresh) await api.post('/api/chats/new', {}, { signal });
         else await api.post(`/api/chats/${enc(currentId)}/activate`, {}, { signal });
-        if (gone || t.abandoned) return; // left before anything started: send nothing
+        if (gone || t.abandoned || t.stopped) {
+          // Left, or stopped, before anything started: send nothing.
+          t.resolveSent(false);
+          if (!gone && !t.abandoned) takeBack(t, null);
+          return;
+        }
         // Not on the screen's signal: once the server has the message the turn runs, so this
         // view needs its id even after it leaves, to claim it and so cancel it (below).
         ({ run } = await api.post('/api/chat', { message: text }));
       } catch (err) {
+        t.resolveSent(false);
         if (gone || isAbort(err) || t.abandoned) return;
-        // Nothing reached the agent: take the message back and say why. (Stop may have ended
-        // this turn already, and a newer one may be running.)
-        if (turn === t) {
-          turn = null;
-          setBusy(false);
-        }
-        bubble.remove();
-        hideWorking(t);
-        if (!input.value) {
-          input.value = text;
-          grow();
-        }
-        const row = errorRow(`Couldn't start the turn: ${errText(err)}`);
-        if (!logInner.children.length) {
-          showWelcome();
-          logInner.prepend(row);
-        } else {
-          follow(() => logInner.append(row));
-        }
-        announce('');
-        if (t.resolveAdopt) t.resolveAdopt();
+        takeBack(t, t.stopped ? null : `Couldn't start the turn: ${errText(err)}`);
         return;
       }
+      t.resolveSent(true);
       const url = `/api/chat/stream?run=${enc(run)}`;
       if (gone || t.abandoned || t.stopped) {
         // Stopped, or left for another conversation or screen, while it was starting: claim the
-        // stream once and close it at its first event, so the server cancels the turn there
-        // instead of running it unobserved until its reaper.
-        const s = stream(url, { onEvent: () => s.close(), onError: () => {} });
+        // stream and close it as soon as it connects, so the server cancels the turn at its
+        // first step instead of running it unobserved until its reaper.
+        stream(url).release();
         return;
       }
       t.stream = stream(url, { onEvent: (ev) => onEvent(t, ev), onError: () => onStreamEnd(t) });
+    }
+
+    /**
+     * Nothing reached the agent (the turn couldn't start, or Stop came first): the message goes
+     * back into the composer, unless something new is being typed there, in which case its
+     * bubble stays, marked as not sent. `error` says why; without one, it was stopped.
+     */
+    function takeBack(t, error) {
+      if (turn === t) {
+        turn = null;
+        setLive(false);
+      }
+      if (t.seq !== openSeq) {
+        // Stopped, then another conversation opened: that one isn't told about it.
+        settle(t);
+        return;
+      }
+      hideWorking(t);
+      if (t.note) t.note.remove();
+      t.note = null;
+      const restore = !input.value.trim();
+      if (restore) {
+        input.value = t.text;
+        grow();
+        t.bubble.remove();
+      } else {
+        t.bubble.classList.add('is-unsent');
+        t.bubble.append(h('span', { class: 'agent-unsent' }, 'Not sent'));
+      }
+      const row = error
+        ? errorRow(error)
+        : noteRow(restore ? 'Stopped before it was sent. Your message is back in the composer.' : 'Stopped before it was sent.');
+      if (!logInner.children.length) {
+        showWelcome();
+        logInner.prepend(row);
+      } else {
+        follow(() => logInner.append(row));
+      }
+      announce(error ? '' : 'Stopped before it was sent.');
+      settle(t);
     }
 
     function hideWorking(t) {
@@ -1301,42 +1464,83 @@ export default {
       closeGroup(t);
       hideWorking(t);
       if (turn === t) turn = null;
-      setBusy(false);
+      setLive(false);
     }
 
     function stop() {
       const t = turn;
       if (!t) return;
       t.stopped = true;
-      if (t.stream) t.stream.close();
+      if (t.stream) t.stream.release();
       follow(() => {
         endTurn(t);
-        logInner.append(noteRow('Stopped'));
+        t.note = noteRow('Stopped');
+        logInner.append(t.note);
       });
       announce('Stopped.');
       settle(t);
     }
 
-    /** After a turn: refresh counts and the list; a new conversation takes its address. */
+    // Still the new conversation this turn started on screen.
+    const onScreen = (t) => !gone && t.fresh && t.seq === openSeq && currentId === null;
+
+    /**
+     * After a turn: refresh counts and the list; a new conversation takes its id and address
+     * once the server has saved it. That needs the server to have taken the message, so a turn
+     * stopped while it was starting waits here to learn whether it did.
+     */
     async function settle(t) {
       if (t.settled) return;
       t.settled = true;
       cancel(t.settleTimer);
-      if (t.stream && !t.stopped) t.stream.close();
+      if (t.stream) t.stream.release();
       store.refresh();
+      const sent = await t.sent;
       if (gone) return;
-      const rows = await loadList();
-      if (!gone && t.fresh && t.seq === openSeq && currentId === null && (t.ok || t.stopped || t.dropped)) {
-        const hit = rows.find((c) => c.active) || rows.find((c) => !t.prevIds.has(c.id));
-        if (hit) {
-          currentId = hit.id;
-          current = { id: hit.id, title: hit.title, run: false, running: false, missing: false };
+      // A failed first turn leaves nothing behind (the server deletes it).
+      const saved = sent && (t.ok || t.stopped || t.dropped);
+      let hit = null;
+      if (saved && onScreen(t)) hit = await findChat(t);
+      else await loadList();
+      if (onScreen(t)) {
+        if (hit) adopt(hit);
+        else if (pendingTitle !== null) {
+          pendingTitle = null;
           renderHead();
-          markCurrent();
-          nav.navigate(href(['agent', hit.id]), { replace: true });
         }
       }
       if (t.resolveAdopt) t.resolveAdopt();
+    }
+
+    /**
+     * The conversation a new turn's message went to: the server's active one, with the title it
+     * gives the first message. If another tab has made something else active since, one with
+     * that title that wasn't listed before the turn (never a run's log). A turn stopped early
+     * may not be saved yet: look again a few times.
+     */
+    async function findChat(t) {
+      for (let tries = 0; ; tries++) {
+        const rows = await loadList();
+        if (!onScreen(t)) return null;
+        const hit =
+          rows.find((c) => c.active && c.title === t.title) ||
+          (t.known && rows.find((c) => c.title === t.title && !isRun(c.title) && !t.known.has(c.id)));
+        // A finished turn's conversation is there already, if it is anywhere.
+        if (hit || t.ok || tries >= ADOPT_RETRIES) return hit || null;
+        await pause(ADOPT_RETRY_MS);
+      }
+    }
+
+    /** The new conversation on screen is now `c`: its title, its place in the list, its address. */
+    function adopt(c) {
+      currentId = c.id;
+      current = { id: c.id, title: c.title, run: false, running: false, missing: false };
+      pendingTitle = null;
+      renderHead();
+      markCurrent();
+      // In place of #/agent, so Back doesn't return to an empty new conversation. Silent: the
+      // screen already shows it.
+      nav.navigate(href(['agent', c.id]), { replace: true, silent: true });
     }
 
     // ---- Routing ----
@@ -1346,35 +1550,24 @@ export default {
       return { id: m && m[1] ? decodeURIComponent(m[1]) : null };
     }
 
-    function applyPrompt(query) {
-      const prompt = query && typeof query.prompt === 'string' ? query.prompt : '';
-      if (!prompt.trim()) return;
-      if (mode !== 'compose') {
-        // A run log, a missing or a closed conversation can't take it: start a new one.
-        if (currentId === null) newConversation();
-        else {
-          // In place of this address, so Back skips it; after mount, so update() takes it.
-          queueMicrotask(() => {
-            if (!gone) nav.navigate(href(['agent'], { prompt }), { replace: true });
-          });
-          return;
-        }
-      }
-      // After the router's own focus move, and out of the address bar so a refresh won't refill it.
-      queueMicrotask(() => {
-        if (gone) return;
-        fill(prompt);
-        nav.setQuery({ prompt: null }, { replace: true });
-      });
+    /**
+     * The conversation a route shows: a ?prompt= hand-off always gets a new one (it fills the
+     * composer and never sends). The prompt leaves the address bar, so a refresh won't refill it,
+     * and #/agent takes the place of the address it came on, so Back skips that.
+     */
+    function target(c) {
+      const prompt = promptOf(c.query);
+      if (prompt) nav.navigate(href(['agent']), { replace: true, silent: true });
+      return { id: prompt ? null : c.path[1] || null, prompt };
     }
 
     function route(c) {
-      const id = c.path[1] || null;
+      const { id, prompt } = target(c);
       if (id !== currentId) {
         if (id) openChat(id);
         else newConversation();
       }
-      applyPrompt(c.query);
+      if (prompt) fill(prompt); // overwrites whatever was typed, as the old hand-off did
     }
 
     // ---- Start ----
@@ -1395,13 +1588,23 @@ export default {
 
     renderList();
     renderHead();
-    if (ctx.path[1]) {
-      openChat(ctx.path[1]);
+    const start = target(ctx);
+    if (start.id) {
+      openChat(start.id);
     } else {
       showWelcome();
       loadList();
     }
-    applyPrompt(ctx.query);
+    if (start.prompt) {
+      fill(start.prompt); // the hand-off: focus goes to the composer
+    } else {
+      if (unsent) {
+        input.value = unsent;
+        grow();
+      }
+      focusHeading();
+    }
+    unsent = '';
 
     const self = {
       update(c) {
@@ -1415,9 +1618,11 @@ export default {
     return () => {
       gone = true;
       if (instance === self) instance = null;
+      unsent = input.value.trim() ? input.value : '';
       openSeq++;
       turn = null;
-      for (const s of streams) s.close();
+      // A stream still connecting closes once it has (so its run is claimed, and cancelled).
+      for (const s of [...streams]) s.release();
       streams.clear();
       stopPoll();
       for (const id of timers) clearTimeout(id);

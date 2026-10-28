@@ -19,7 +19,8 @@
 .agent-body.list-detail {
   flex: 1;
   min-height: 0;
-  grid-template-columns: minmax(240px, 288px) minmax(0, 1fr);
+  /* The list gives up width first (down to 232px at laptop widths): the conversation needs it more. */
+  grid-template-columns: clamp(232px, 25%, 288px) minmax(0, 1fr);
 }
 
 .agent-body .ld-list { display: flex; flex-direction: column; }
@@ -105,7 +106,9 @@
 
 /* ---- Conversation: header, transcript, composer ---- */
 
-.agent-chat { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+/* The header, transcript and footer lay out by the pane's own width (beside the list it is as
+   narrow at 960px as on a phone). */
+.agent-chat { container: agent-chat / inline-size; display: flex; flex-direction: column; flex: 1; min-height: 0; }
 
 .agent-chat-head {
   display: flex;
@@ -130,6 +133,7 @@
   white-space: nowrap;
 }
 .agent-chat-meta:empty { display: none; }
+.agent-meta-part { white-space: nowrap; }
 .agent-chat-badges { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-2); }
 .agent-skel-title { width: 220px; max-width: 60%; height: 1.1em; }
 
@@ -165,7 +169,14 @@
 
 .agent-msg { min-width: 0; overflow-wrap: anywhere; }
 
-.agent-msg-user { align-self: flex-end; max-width: min(85%, 560px); }
+.agent-msg-user {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--space-1);
+  align-self: flex-end;
+  max-width: min(85%, 560px);
+}
 .agent-bubble {
   padding: var(--space-2) var(--space-3);
   background: var(--surface-2);
@@ -173,6 +184,9 @@
   border-radius: var(--radius-input);
   white-space: pre-wrap;
 }
+/* A message Stop kept from being sent, while something new is typed in the composer. */
+.agent-msg-user.is-unsent .agent-bubble { background: var(--surface); border-style: dashed; color: var(--text-2); }
+.agent-unsent { font-size: 12px; color: var(--text-3); }
 
 .agent-msg-agent { line-height: 1.55; }
 .agent-msg-agent > * + * { margin-top: var(--space-2); }
@@ -311,6 +325,9 @@
   color: var(--text);
 }
 .agent-error svg { margin-top: 2px; color: var(--danger); }
+/* A run that ended on a sign-in problem: the same tone as its "Sign-in failed" badge. */
+.agent-error.is-warn { border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); }
+.agent-error.is-warn svg { color: var(--warn); }
 .agent-error-text { min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 
 .agent-note { align-self: flex-start; font-size: 12px; color: var(--text-3); }
@@ -386,7 +403,17 @@
 }
 .agent-starter:hover { background: var(--surface-2); border-color: var(--border-strong); }
 .agent-starter-title { font-weight: 500; }
-.agent-starter-text { font-size: 13px; color: var(--text-2); }
+/* Two lines at most, so the four fit beside the list at laptop sizes; a starter puts its whole
+   text in the composer. */
+.agent-starter-text {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  font-size: 13px;
+  color: var(--text-2);
+}
 
 /* ---- Composer ---- */
 
@@ -491,9 +518,10 @@
 .agent-warn svg { color: var(--warn); }
 .agent-warn a { margin-left: auto; font-weight: 500; }
 
+/* Lock · why · action on one line; on a narrow pane the action goes under the text. */
 .agent-readonly {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: var(--space-2) var(--space-3);
   padding: var(--space-3) var(--space-4);
@@ -503,7 +531,25 @@
   color: var(--text-2);
 }
 .agent-readonly svg { color: var(--text-3); }
-.agent-readonly p { flex: 1 1 240px; min-width: 0; }
+.agent-readonly p { min-width: 0; overflow-wrap: anywhere; }
+
+/* ---- A narrow conversation pane (beside the list up to ~1200px, and on phones) ---- */
+
+@container agent-chat (max-width: 619px) {
+  /* The title and its details get the whole width and wrap; the badges go under them. */
+  .agent-chat-head { flex-wrap: wrap; row-gap: var(--space-2); }
+  .agent-chat-titles { flex-basis: 100%; }
+  .agent-chat-title { white-space: normal; overflow-wrap: anywhere; }
+  .agent-chat-meta { white-space: normal; }
+  .agent-chat-badges { justify-content: flex-start; }
+  .agent-readonly { grid-template-columns: auto minmax(0, 1fr); align-items: start; }
+  .agent-readonly svg { margin-top: 2px; }
+  .agent-readonly .btn { grid-column: 2; justify-self: start; }
+}
+
+@container agent-chat (max-width: 479px) {
+  .agent-starters { grid-template-columns: minmax(0, 1fr); }
+}
 
 /* ---- Motion ---- */
 
@@ -535,10 +581,4 @@
 
 @media (max-width: 599px) {
   .agent .page-desc { display: none; }
-  .agent-starters { grid-template-columns: minmax(0, 1fr); }
-  /* The title gets the full width; the badges go under it. */
-  .agent-chat-head { flex-wrap: wrap; row-gap: var(--space-2); }
-  .agent-chat-titles { flex-basis: 100%; }
-  .agent-chat-badges { justify-content: flex-start; }
-  .agent-chat-meta { white-space: normal; }
 }

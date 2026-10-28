@@ -151,6 +151,8 @@ const idFromUrl = (page) => decodeURIComponent(new URL(page.url()).hash.split('/
 test('lists conversations in sections, opens one by URL, and filters by search', async ({ app, page }) => {
   await openAgent(app, page);
   await expect(page).toHaveTitle('Agent · coldtrail');
+  // Without a ?prompt= hand-off, focus lands on the heading, as on every screen.
+  await expect(page.locator('#view h1')).toBeFocused();
   const mine = section(page, 'Your chats');
   const runs = section(page, 'Scheduled runs');
   // Most recently updated first; runs drop the "Scheduled run —" prefix their section says.
@@ -276,6 +278,38 @@ test('scheduled run conversation opens read-only', async ({ app, page }) => {
   await expect(composer(page)).toBeFocused();
 });
 
+test('a failed run says why it ended', async ({ app, page, server }) => {
+  // The seeded failed run has no conversation: give it one that recorded nothing.
+  const id = 'run-failed-log';
+  dbRun(
+    server,
+    "INSERT INTO chat_sessions (id, agent_session_id, title, created_at, updated_at) VALUES (?, 'ses-run-failed', 'Scheduled run — Lunch Source', datetime('now', '-1 day'), datetime('now', '-1 day'))",
+    id,
+  );
+  dbRun(server, "UPDATE scheduled_runs SET chat_id = ? WHERE status = 'error'", id);
+  try {
+    await openAgent(app, page, `#/agent/${id}`);
+    const head = page.locator('.agent-chat-head');
+    await expect(head.getByText('Failed', { exact: true })).toBeVisible();
+    const log = transcript(page);
+    // Inside the conversation, under its h2.
+    await expect(log.getByRole('heading', { level: 3, name: 'This run recorded nothing' })).toBeVisible();
+    await expect(log.locator('.agent-run-note')).toHaveText('Failed: opencode exited with status 1');
+    await expect(log.getByRole('alert')).toHaveCount(0); // stored, not news: not announced
+
+    // A sign-in failure reads, and is toned, like its badge.
+    dbRun(server, "UPDATE scheduled_runs SET status = 'auth_failed' WHERE chat_id = ?", id);
+    await page.reload();
+    await expect(head.getByText('Sign-in failed', { exact: true })).toBeVisible();
+    await expect(log.locator('.agent-run-note')).toHaveText('Sign-in failed: opencode exited with status 1');
+    await expect(log.locator('.agent-run-note')).toHaveClass(/\bis-warn\b/);
+  } finally {
+    dbRun(server, "UPDATE scheduled_runs SET status = 'error' WHERE chat_id = ?", id);
+    dbRun(server, "UPDATE scheduled_runs SET chat_id = NULL WHERE chat_id = ?", id);
+    dbRun(server, 'DELETE FROM chat_sessions WHERE id = ?', id);
+  }
+});
+
 test('a running scheduled run polls until it finishes and stops polling when you leave', async ({ app, page, server }) => {
   await trackIntervals(page);
   dbRun(server, 'UPDATE chat_sessions SET running = 1 WHERE id = ?', scheduled.id);
@@ -288,10 +322,22 @@ test('a running scheduled run polls until it finishes and stops polling when you
     await chip.click();
     await expect(page).toHaveURL(new RegExp(`#/agent/${scheduled.id}$`));
     const head = page.locator('.agent-chat-head');
+    const meta = page.locator('.agent-chat-meta');
     await expect(head.getByText('Running', { exact: true })).toBeVisible();
+    // A live run has no outcome yet: no finish time or status from an earlier row.
+    await expect(meta).toHaveText('Updates as the run works');
+    await expect(head.getByText('Succeeded', { exact: true })).toHaveCount(0);
     await expect(page.locator('.agent-readonly')).toBeVisible();
     await expect(transcript(page).locator('.agent-working')).toBeVisible();
     await expect.poll(() => runPolls(page)).toBe(1);
+
+    // The reader opens the brief, and the steps with the keyboard.
+    const log = transcript(page);
+    await log.locator('details.agent-brief summary').click();
+    const worked = log.getByRole('button', { name: 'Worked · 3 steps' });
+    await worked.focus();
+    await page.keyboard.press('Enter');
+    await expect(worked).toHaveAttribute('aria-expanded', 'true');
 
     // The run writes a new step: the poll shows it as live work.
     added = dbRun(
@@ -299,12 +345,19 @@ test('a running scheduled run polls until it finishes and stops polling when you
       "INSERT INTO chat_messages (session_id, role, content, created_at) VALUES (?, 'tool', '$ coldtrail status', datetime('now'))",
       scheduled.id,
     ).lastInsertRowid;
-    const live = transcript(page).getByRole('button', { name: 'Working… · 1 step' });
+    const live = log.getByRole('button', { name: 'Working… · 1 step' });
     await expect(live).toBeVisible();
+    // The redraw kept what the reader opened, and their place: focus is still on the steps.
+    await expect(worked).toBeFocused();
+    await expect(worked).toHaveAttribute('aria-expanded', 'true');
+    await expect(log.locator('.agent-step-name').first()).toBeVisible();
+    await expect(log.locator('details.agent-brief')).toHaveAttribute('open', '');
 
     // The run finishes: the badge goes, the group closes, the poll stops.
     dbRun(server, 'UPDATE chat_sessions SET running = 0 WHERE id = ?', scheduled.id);
     await expect(head.getByText('Running', { exact: true })).toHaveCount(0);
+    await expect(head.getByText('Succeeded', { exact: true })).toBeVisible();
+    await expect(meta).toHaveText(/^Finished /);
     await expect(transcript(page).getByRole('button', { name: 'Worked · 1 step' })).toBeVisible();
     await expect(transcript(page).locator('.agent-working')).toHaveCount(0);
     await expect.poll(() => runPolls(page)).toBe(0);
@@ -430,6 +483,9 @@ test('Stop ends a SLOW turn and re-enables the composer', async ({ app, page }) 
   await send(page, 'Please go SLOW today');
   const log = transcript(page);
   await expect(log.locator('.agent-msg-user')).toHaveText(['Please go SLOW today']);
+  // The header names the conversation the message is starting, not "Saved once you send…".
+  await expect(chatTitle(page)).toHaveText('Please go SLOW today');
+  await expect(page.locator('.agent-chat-meta')).toBeHidden();
   // Live: the group counts steps as they land and says it is working.
   await expect(log.getByRole('button', { name: /^Working… · ([2-9]|1\d) steps$/ })).toBeVisible();
   await expect(sendBtn(page)).toHaveCount(0);
@@ -446,10 +502,122 @@ test('Stop ends a SLOW turn and re-enables the composer', async ({ app, page }) 
   await expect(page).toHaveURL(CHAT_URL);
   const id = idFromUrl(page);
 
+  await expect(chatTitle(page)).toHaveText('Please go SLOW today');
+  await expect(page.locator('.agent-chat-meta')).toHaveText(/^Updated /);
+
   // The server cancelled the turn, so the next one is answered right away, in the same chat.
   await send(page, 'Next question');
   await expect(log.locator('.agent-msg-agent').last()).toHaveText('Fake agent reply: Next question');
   await expect(page).toHaveURL(new RegExp(`#/agent/${id}$`));
+});
+
+test('Stop before the message is sent keeps it from the agent and gives it back', async ({ app, page }) => {
+  const posts = chatPosts(page);
+  /** Hold POST /api/chats/new (the step before the message goes out) until release(). */
+  const holdNew = async () => {
+    let release = () => {};
+    const gate = new Promise((r) => (release = r));
+    let onHeld = () => {};
+    const held = new Promise((r) => (onHeld = r));
+    await page.route('**/api/chats/new', async (route) => {
+      onHeld();
+      await gate;
+      await route.fallback();
+    });
+    return { held, release };
+  };
+  await openAgent(app, page);
+  const log = transcript(page);
+  const note = log.locator('.agent-note');
+
+  let gate = await holdNew();
+  await send(page, 'Not yet, stop me');
+  await gate.held;
+  await stopBtn(page).click();
+  await expect(note).toHaveText('Stopped');
+  gate.release();
+  // Nothing went out: the message is back in the composer, the conversation is still new.
+  await expect(note).toHaveText('Stopped before it was sent. Your message is back in the composer.');
+  await expect(composer(page)).toHaveValue('Not yet, stop me');
+  await expect(log.locator('.agent-msg-user')).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: 'What should the agent work on?' })).toBeVisible();
+  await expect(chatTitle(page)).toHaveText('New conversation');
+  await expect(page).toHaveURL(/#\/agent$/);
+  await page.unroute('**/api/chats/new');
+  expect(posts).toEqual([]);
+
+  // Sending it now works, in a conversation of its own.
+  await composer(page).press('Enter');
+  await expect(log.locator('.agent-msg-agent')).toHaveText('Fake agent reply: Not yet, stop me');
+  await expect(page).toHaveURL(CHAT_URL);
+  expect(posts).toEqual([{ message: 'Not yet, stop me' }]);
+
+  // Stopped while something new is being typed: that stays, and the bubble says it wasn't sent.
+  await page.getByRole('button', { name: 'New chat', exact: true }).click();
+  gate = await holdNew();
+  await send(page, 'Second thoughts');
+  await gate.held;
+  await stopBtn(page).click();
+  await composer(page).fill('Something else');
+  gate.release();
+  await expect(note).toHaveText('Stopped before it was sent.');
+  await expect(log.locator('.agent-msg-user.is-unsent')).toContainText('Second thoughts');
+  await expect(log.locator('.agent-msg-user.is-unsent .agent-unsent')).toHaveText('Not sent');
+  await expect(composer(page)).toHaveValue('Something else');
+  await expect(page).toHaveURL(/#\/agent$/);
+  await page.unroute('**/api/chats/new');
+  expect(posts).toEqual([{ message: 'Not yet, stop me' }]);
+});
+
+test('Stop while the message is on its way: the conversation it started stays on screen', async ({ app, page, server }) => {
+  // More than 60 characters and two lines: the server titles it with the first 60 on one line.
+  const text = 'Hold this SLOW message while a scheduled run starts, then stop it\nplease';
+  const title = `${text.replace('\n', ' ').slice(0, 60)}…`;
+  const sneaky = 'run-started-meanwhile';
+  const turn = await holdTurn(page, 'Hold this SLOW message');
+  try {
+    await openAgent(app, page);
+    await send(page, text);
+    await turn.held; // the server hasn't got it yet
+    await expect(chatTitle(page)).toHaveText(title);
+    await stopBtn(page).click();
+    await expect(sendBtn(page)).toBeVisible();
+    // A scheduled run starts meanwhile: a new conversation too, but not this one.
+    dbRun(
+      server,
+      "INSERT INTO chat_sessions (id, agent_session_id, title, created_at, updated_at) VALUES (?, 'ses-sneaky', 'Scheduled run — Sneaky', datetime('now'), datetime('now'))",
+      sneaky,
+    );
+    const claimed = streamClaimed(page);
+    turn.release();
+    await claimed; // the view claims the turn, which cancels it
+    await expect(page).toHaveURL(CHAT_URL);
+    const id = idFromUrl(page);
+    expect(id).not.toBe(sneaky);
+    expect(dbAll(server, 'SELECT title FROM chat_sessions WHERE id = ?', id)).toEqual([{ title }]);
+    await expect(chatTitle(page)).toHaveText(title);
+    await expect(section(page, 'Your chats').locator('[aria-current="page"]')).toHaveAttribute('href', `#/agent/${id}`);
+    await expect(section(page, 'Scheduled runs').locator('[aria-current="page"]')).toHaveCount(0);
+
+    // The next message continues that conversation.
+    await page.unroute('**/api/chat');
+    await send(page, 'Next after stop');
+    await expect(transcript(page).locator('.agent-msg-agent').last()).toHaveText('Fake agent reply: Next after stop');
+    expect(dbAll(server, "SELECT session_id FROM chat_messages WHERE role = 'user' AND content = 'Next after stop'")).toEqual([
+      { session_id: id },
+    ]);
+    await expect(page).toHaveURL(new RegExp(`#/agent/${id}$`));
+    // The stopped turn kept its message but was cancelled before it wrote a reply.
+    await expect
+      .poll(() => dbAll(server, 'SELECT role, content FROM chat_messages WHERE session_id = ? ORDER BY id', id))
+      .toEqual([
+        { role: 'user', content: text },
+        { role: 'user', content: 'Next after stop' },
+        { role: 'assistant', content: 'Fake agent reply: Next after stop' },
+      ]);
+  } finally {
+    dbRun(server, 'DELETE FROM chat_sessions WHERE id = ?', sneaky);
+  }
 });
 
 test('FAIL turn shows the error', async ({ app, page, server }) => {
@@ -459,6 +627,8 @@ test('FAIL turn shows the error', async ({ app, page, server }) => {
   await expect(log.getByRole('alert')).toContainText('Fake failure');
   await expect(sendBtn(page)).toBeEnabled();
   await expect(log.locator('.agent-working')).toHaveCount(0);
+  // The server discarded the failed first turn: the header is back to a new conversation.
+  await expect(chatTitle(page)).toHaveText('New conversation');
   // A failed first turn leaves no conversation behind, so the address stays "new".
   await expect
     .poll(() => dbAll(server, "SELECT count(*) AS n FROM chat_sessions WHERE title = 'Please FAIL now'"))
@@ -480,9 +650,11 @@ test('navigating away mid-stream leaves no console errors', async ({ app, page }
   await expect(page.locator('#view h1')).toHaveText('Home');
   await expect.poll(() => openStreams(page)).toBe(0);
 
-  // Coming back works, and the server is free again (the abandoned turn was cancelled).
+  // Coming back works, and the server is free again (the abandoned turn was cancelled). The
+  // message that was sent isn't offered again.
   await page.goBack();
   await expect(page.locator('#view h1')).toHaveText('Agent');
+  await expect(composer(page)).toHaveValue('');
   await send(page, 'Back again');
   await expect(transcript(page).locator('.agent-msg-agent').last()).toHaveText('Fake agent reply: Back again');
   // The fixture fails this test on any console error or uncaught page error.
@@ -590,6 +762,47 @@ test('a prompt on a conversation address opens a new chat, and Back skips that a
   await page.goBack();
   await expect(page).toHaveURL(/#\/home$/);
   await expect(page.locator('#view h1')).toHaveText('Home');
+});
+
+test('text typed but not sent waits in the composer while you are away', async ({ app, page }) => {
+  const mainNav = page.getByRole('navigation', { name: 'Main' });
+  const away = async () => {
+    await mainNav.getByRole('link', { name: /^Home/ }).click();
+    await expect(page.locator('#view h1')).toHaveText('Home');
+  };
+  const back = async () => {
+    await mainNav.getByRole('link', { name: 'Agent', exact: true }).click();
+    await expect(page.locator('#view h1')).toHaveText('Agent');
+  };
+  await openAgent(app, page);
+  await composer(page).fill('Half a thought about\nBerlin');
+  await away();
+  await back();
+  await expect(composer(page)).toHaveValue('Half a thought about\nBerlin');
+  expect(await composer(page).evaluate((el) => el.getBoundingClientRect().height)).toBeGreaterThan(44);
+  await expect(page.locator('#view h1')).toBeFocused(); // focus still lands on the heading
+
+  // Also when coming back to a conversation that opens first.
+  await away();
+  await page.evaluate((id) => {
+    location.hash = `#/agent/${id}`;
+  }, notes.id);
+  await expect(chatTitle(page)).toHaveText(notes.title);
+  await expect(composer(page)).toHaveValue('Half a thought about\nBerlin');
+
+  // A hand-off from another screen replaces it, as the old composer did.
+  await away();
+  await page.evaluate(() => {
+    location.hash = `#/agent?prompt=${encodeURIComponent('Enrich gamma.example')}`;
+  });
+  await expect(composer(page)).toHaveValue('Enrich gamma.example');
+  await expect(composer(page)).toBeFocused();
+
+  // Cleared text stays cleared.
+  await composer(page).fill('');
+  await away();
+  await back();
+  await expect(composer(page)).toHaveValue('');
 });
 
 test('starter prompts and Shift+Enter fill the composer; only Enter sends', async ({ app, page }) => {
@@ -708,6 +921,31 @@ test('loading, error and retry states', async ({ app, page }) => {
   await expect(log.locator('.agent-msg-user')).toHaveCount(0);
   await expect(sendBtn(page)).toBeEnabled();
   await page.unroute('**/api/chat');
+});
+
+test('a message sent while the conversation is still being opened waits for it', async ({ app, page }) => {
+  app.allowConsole(/Failed to load resource: the server responded with a status of 500/);
+  const posts = chatPosts(page);
+  let release = () => {};
+  const gate = new Promise((r) => (release = r));
+  await page.route(`**/api/chats/${notes.id}/activate`, async (route) => {
+    await gate;
+    await route.fulfill({ status: 500, body: `conversation ${notes.id} not found or has no session` });
+  });
+  await openAgent(app, page, `#/agent/${notes.id}`);
+  const log = transcript(page);
+  await expect(log.locator('.agent-msg-agent')).toBeVisible();
+  // The composer is there while the server makes this conversation active; Send waits for it.
+  await send(page, 'Too early');
+  await expect(sendBtn(page)).toHaveAttribute('aria-busy', 'true');
+  await expect(stopBtn(page)).toBeHidden();
+  await expect(log.locator('.agent-msg-user')).toHaveCount(1);
+  // It can't be: no turn starts, and the footer says why.
+  release();
+  await expect(page.locator('.agent-readonly')).toContainText("This conversation can't be continued");
+  await expect(log.locator('.agent-msg-user')).toHaveCount(1); // only the stored message
+  await expect(log.locator('.agent-working')).toHaveCount(0);
+  expect(posts).toEqual([]);
 });
 
 test('an agent that is not ready says so above the composer', async ({ app, page }) => {
@@ -831,6 +1069,30 @@ test('the composer footer keeps "<agent> · <model>" beside the list at laptop w
   await stopBtn(page).click();
   await expect(sendBtn(page)).toBeVisible();
   await expect(page.locator('.agent-model')).toBeVisible();
+});
+
+test('a run conversation header shows whole beside the list at laptop widths', async ({ app, page }) => {
+  const run = SEED.runs.find((r) => r.chat_id === scheduled.id);
+  /** Each header line's box: is it cut, and does it stay inside the header? */
+  const lines = () =>
+    page.evaluate(() => {
+      const head = /** @type {HTMLElement} */ (document.querySelector('.agent-chat-head')).getBoundingClientRect();
+      return ['.agent-chat-title', '.agent-chat-meta', '.agent-chat-badges'].map((sel) => {
+        const el = /** @type {HTMLElement} */ (document.querySelector(sel));
+        const r = el.getBoundingClientRect();
+        return { sel, cut: el.scrollWidth > el.clientWidth + 1, inside: r.left >= head.left && r.right <= head.right + 0.5 };
+      });
+    });
+  for (const width of [960, 1024, 1100, 1280, 1440]) {
+    await page.setViewportSize({ width, height: 800 });
+    await openAgent(app, page, `#/agent/${scheduled.id}`);
+    await expect(page.locator('.agent-chat-head').getByText('Succeeded', { exact: true })).toBeVisible();
+    await expect(page.locator('.agent-chat-meta')).toContainText(`${run.sent} sent`);
+    for (const line of await lines()) {
+      expect(line.cut, `${line.sel} cut at ${width}px`).toBe(false);
+      expect(line.inside, `${line.sel} outside the header at ${width}px`).toBe(true);
+    }
+  }
 });
 
 test('phone width: conversations toggle, no horizontal scroll', async ({ app, page }) => {
