@@ -1,0 +1,393 @@
+/* Company profile (spec §5.8): the product.md editor + checklist, and the Already contacted list.
+   The editor (.pe) is also mounted by the Setup wizard, so its layout keys off its own width
+   (container queries), never the page's. Tokens only: tokens.css colors, radii and spacing. */
+
+.cp-tabs { margin-top: var(--space-4); }
+.cp-panel { margin-top: var(--space-6); }
+
+/* ---- Shared layout: a main card and a 300px side panel from 860px of available width ---- */
+
+.pe,
+.ac { container-type: inline-size; }
+
+.cp-grid {
+  /* Editor heights. Narrow: leave room to see the panel below. Wide: fill the screen under the
+     page header (top bar, title, tabs, file bar) without scrolling the page. */
+  --pe-h: clamp(320px, 55dvh, 720px);
+  --ac-h: clamp(240px, 45dvh, 600px);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-4);
+  align-items: start;
+}
+
+@container (min-width: 860px) {
+  .cp-grid {
+    --pe-h: clamp(360px, calc(100dvh - 296px), 1400px);
+    --ac-h: clamp(280px, calc(100dvh - 372px), 1400px);
+    grid-template-columns: minmax(0, 1fr) 300px;
+    gap: var(--space-6);
+  }
+}
+
+.cp-card {
+  min-width: 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-input);
+}
+
+/* File bar on top of each editor: file name left, save state right. */
+.cp-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: 44px;
+  padding: var(--space-1) var(--space-3) var(--space-1) var(--space-4);
+  border-bottom: 1px solid var(--border);
+}
+
+/* The file name never shrinks: the save state beside it truncates or wraps instead. */
+.cp-file {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+.cp-file .mono { font-size: 12.5px; }
+.cp-file svg { color: var(--text-3); }
+
+.cp-bar-end {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  margin-left: auto;
+}
+
+/* ---- Editors ---- */
+
+.pe-text,
+.ac-text {
+  display: block;
+  width: 100%;
+  min-height: 240px;
+  margin: 0;
+  padding: var(--space-4);
+  border: 0;
+  border-radius: 0 0 var(--radius-input) var(--radius-input);
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-variant-ligatures: none;
+  line-height: 1.65;
+  tab-size: 4;
+  resize: vertical;
+}
+.pe-text { height: var(--pe-h); }
+.ac-text { height: var(--ac-h); border-radius: 0; }
+/* While loading, the placeholder takes the editor's height so nothing jumps when it arrives. */
+.pe-main[data-state="loading"] .pe-body { height: var(--pe-h); overflow: hidden; }
+.pe-text::placeholder,
+.ac-text::placeholder { color: var(--text-3); opacity: 1; }
+.pe-text:read-only,
+.ac-text:read-only { color: var(--text-2); }
+
+/* Focus: the ring goes around the whole card (file bar included), like the top-bar search. */
+.pe-text:focus-visible,
+.ac-text:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+@supports selector(:has(*)) {
+  .pe-text:focus-visible,
+  .ac-text:focus-visible { outline: none; }
+  .pe-main:has(.pe-text:focus-visible),
+  .ac-main:has(.ac-text:focus-visible) {
+    border-color: var(--accent);
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+}
+
+/* ---- Save state ---- */
+
+.pe-status,
+.ac-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--text-3);
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+.pe-status-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.pe-status-icon { display: inline-flex; }
+.pe-status-icon:empty { display: none; }
+.pe-status[data-state="saved"] .pe-status-icon { color: var(--ok); }
+.pe-status[data-state="template"] { color: var(--text-2); }
+.pe-status[data-state="empty"] { color: var(--warn); }
+.pe-status[data-state="error"],
+.pe-status[data-state="load-error"] { color: var(--danger); }
+.ac-state[data-state="dirty"] { color: var(--warn); }
+
+/* A failed or refused save shows its whole reason (no tooltip-only text): the message follows
+   the file name, wraps onto as many lines as it needs, and drops below the name when there's
+   no room beside it; Retry stays at the end. */
+.pe-main:is([data-state="error"], [data-state="empty"]) .cp-bar {
+  flex-wrap: wrap;
+  row-gap: var(--space-1);
+  padding-block: var(--space-2);
+}
+.pe-main:is([data-state="error"], [data-state="empty"]) .cp-bar-end { flex: 1 1 240px; }
+.pe-main:is([data-state="error"], [data-state="empty"]) .pe-status {
+  flex: 1;
+  align-items: flex-start;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.pe-main:is([data-state="error"], [data-state="empty"]) .pe-status-text { overflow: visible; }
+.pe-main:is([data-state="error"], [data-state="empty"]) .pe-status-icon { margin-top: 2px; }
+.cp-bar-end .btn { flex: none; }
+
+/* A call to action still on the template's example site: every LinkedIn note would end with it.
+   Beside the file name, so it's seen while typing; selects the link in the editor. */
+.pe-flag {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: var(--space-1);
+  min-height: 28px;
+  padding: 0 10px 0 var(--space-2);
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--warn);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.pe-flag:hover { background: color-mix(in srgb, var(--warn) 10%, transparent); }
+.pe-flag svg { flex: none; }
+/* The words fit the bar's width beside "product.md" and the save state: the whole phrase on a
+   laptop, "Example link" on a phone, only the icon below that (its name says the rest). */
+.pe-flag-short { display: none; }
+@container (max-width: 439px) {
+  .pe-flag-long { display: none; }
+  .pe-flag-short { display: inline; }
+}
+@container (max-width: 319px) {
+  .pe-flag { padding-inline: 6px; }
+  .pe-flag-short { display: none; }
+}
+
+/* Text restored from an editor that closed before it was saved, with a way back. */
+.pe-restored {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: var(--space-2);
+  padding: var(--space-2) var(--space-4);
+  border-bottom: 1px solid var(--border);
+  color: var(--warn);
+  font-size: 12.5px;
+}
+
+/* ---- Loading and load errors ---- */
+
+.cp-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: var(--space-4);
+}
+.cp-skeleton .skeleton { height: 12px; }
+
+.cp-load-error {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-6) var(--space-4);
+}
+.cp-load-error-icon { display: inline-flex; margin-top: 1px; color: var(--danger); }
+.cp-load-error-text {
+  display: flex;
+  flex: 1 1 240px;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.cp-load-error-title { font-weight: 500; }
+.cp-load-error-detail { color: var(--text-2); overflow-wrap: anywhere; }
+
+/* ---- Checklist and help panels ---- */
+
+.pe-check,
+.ac-help { padding: var(--space-4); }
+
+@container (min-width: 860px) {
+  .pe-check,
+  .ac-help { position: sticky; top: calc(var(--topbar-h) + var(--space-4)); }
+}
+
+.pe-check-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+.pe-check-title { font-size: 15px; }
+
+.pe-progress {
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.pe-meter {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: var(--space-1);
+  margin-top: var(--space-3);
+}
+.pe-meter:empty { display: none; }
+.pe-meter-seg { height: 4px; border-radius: 2px; background: var(--border); }
+.pe-meter-seg[data-state="done"] { background: var(--ok); }
+.pe-meter-seg[data-state="warn"] { background: var(--warn); }
+
+.pe-check-desc {
+  margin-top: var(--space-3);
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+.pe-check .cp-skeleton { padding: var(--space-4) 0 var(--space-1); }
+.pe-check-note { margin-top: var(--space-4); color: var(--text-3); font-size: 12.5px; }
+
+.pe-list { list-style: none; margin: var(--space-3) 0 0; padding: 0; }
+
+.pe-item {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) auto;
+  column-gap: 10px;
+  row-gap: var(--space-2);
+  padding: var(--space-3) 0;
+  border-top: 1px solid var(--border);
+}
+.pe-item:last-child { padding-bottom: 0; }
+
+.pe-item-icon { display: inline-flex; margin-top: 2px; color: var(--text-3); }
+.pe-item[data-state="done"] .pe-item-icon { color: var(--ok); }
+.pe-item[data-state="done"] .pe-item-hint { color: var(--text-3); }
+.pe-item[data-state="warn"] .pe-item-icon { color: var(--warn); }
+
+.pe-item-text { grid-column: 2; min-width: 0; }
+.pe-item-label { font-weight: 500; }
+.pe-item-hint {
+  margin-top: 2px;
+  color: var(--text-2);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+.pe-item-link {
+  overflow: hidden;
+  color: var(--text-2);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pe-item-fix { grid-column: 2 / -1; justify-self: start; }
+/* "+ Add" sits beside the label; pulled into the row's padding so it doesn't make it taller. */
+.pe-item-add {
+  grid-column: 3;
+  grid-row: 1;
+  align-self: start;
+  gap: var(--space-1);
+  margin: -6px -10px 0 0;
+  padding: var(--space-1) 10px;
+  color: var(--accent);
+}
+.pe-item-add:not(:disabled):hover { color: var(--accent-ink); background: var(--accent-soft); }
+
+.ac-help-text,
+.ac-help-label {
+  margin-top: var(--space-3);
+  color: var(--text-2);
+  font-size: 13px;
+}
+.ac-help-label + .ac-example { margin-top: var(--space-2); }
+
+.ac-example {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.ac-help code,
+.ac-msg code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+/* ---- Already contacted footer: messages left, Save right ---- */
+
+.ac-foot {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border-top: 1px solid var(--border);
+}
+.ac-feedback {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.ac-msg { color: var(--text); font-size: 12.5px; overflow-wrap: anywhere; }
+.ac-msg:empty { display: none; }
+/* Unsaved text kept from an earlier visit, with a way back to the saved file. */
+.ac-restored {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: var(--space-2);
+  color: var(--warn);
+  font-size: 12.5px;
+}
+.ac-restored[hidden] { display: none; }
+/* An inline text action (Discard), so it lines up with the sentence when it wraps on a phone. */
+.cp-text-btn {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+.cp-text-btn:hover { color: var(--accent); }
+.ac-error { overflow-wrap: anywhere; }
+.ac-foot .btn { flex: none; }
