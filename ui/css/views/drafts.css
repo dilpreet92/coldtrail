@@ -17,7 +17,20 @@
 }
 
 .drafts .page-head { flex: none; }
-.drafts .page-desc { max-width: 72ch; }
+/* The description keeps room for two lines (three on a phone), the most any tab's takes, so the
+   tabs, the list and Send all stay put when the queue lands (the loading line is one), the tab
+   changes, or a connection does. */
+.drafts .page-desc {
+  max-width: 72ch;
+  min-height: calc(2 * 1.45em);
+  min-height: 2lh;
+}
+@media (max-width: 599px) {
+  .drafts .page-desc {
+    min-height: calc(3 * 1.45em);
+    min-height: 3lh;
+  }
+}
 
 /* ---- Tabs + caps line ---- */
 
@@ -448,6 +461,12 @@
   #app[data-route="drafts"] ~ #toasts {
     bottom: max(var(--space-4), var(--drafts-toast-lift, 0px));
   }
+}
+/* Phone: the bar is the last thing on the page, so while toasts show drafts.js sets
+   --drafts-toast-room to the stack's height, and the page gets that much room below the draft:
+   scrolled to the end, Send and Discard sit clear above the stack. */
+@media (max-width: 899px) {
+  #app[data-route="drafts"] .drafts { padding-bottom: var(--drafts-toast-room, 0px); }
 }
 
 /* ---- Send all dialog (rendered in #overlays) ---- */

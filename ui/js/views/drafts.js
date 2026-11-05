@@ -10,7 +10,8 @@
 // drafts. The LinkedIn pollers (one row, or the bulk sender) stop when the screen unmounts and
 // pick up again when it comes back. coldtrail's own LinkedIn sends (Send invite, Send all) mirror
 // the sender's stops: none are offered while LinkedIn is signed out or outside 08:00–20:00 local.
-// Open in LinkedIn, the manual path, never waits.
+// Open in LinkedIn, the manual path, has no hours and never waits, but it drives the same Chrome
+// profile, so it too is off until LinkedIn is connected.
 //
 // Data: GET /api/drafts (the queue, with each draft's contact and company names),
 // /api/companies/:domain (the selected draft's source query and its contact's role), the shared
@@ -27,6 +28,7 @@ import { listDetail } from '../components/listDetail.js';
 import { tabs } from '../components/tabs.js';
 
 const TITLE = 'Drafts';
+const ERROR_DESC = 'Drafts the agent writes wait here for your review.'; // the header when the queue couldn't load
 const PAGE = 100; // list rows rendered at a time
 const SAVE_MS = 600;
 const FILTER_URL_MS = 250;
@@ -45,6 +47,7 @@ const BULK_KEY = 'ct-li-bulk';
 const WIDE = '(min-width: 900px)';
 // A refusal that applies to every email, not just one: stop the bulk loop instead of repeating it.
 const EMAIL_GATE = /dry run|cap reached|auto-send is off|isn't connected|not connected/i;
+const CONTACTED = ['sent', 'replied', 'bounced']; // outreach statuses that mean something went out
 
 // Page-lifetime state (kept across remounts, gone on reload — except what sessionStorage holds).
 const staged = new Set(); // LinkedIn drafts opened with assist, waiting for "Did it send?"
@@ -52,7 +55,7 @@ const rowSends = new Map(); // key -> { at, timedOut }: per-row LinkedIn sends b
 const pushing = new Set(); // email drafts being sent / put in Gmail one at a time (Send now)
 const details = new Map(); // domain -> { source_query, contacts } from /api/companies/:domain
 const sendConfirmed = new Set(); // channels whose first send this session was confirmed
-let active = null; // the mounted view: { update, beforeLeave, destroy, runChanged, reload }
+let active = null; // the mounted view: { update, beforeLeave, destroy, runChanged, stateChanged, reload, saveFirst }
 // The Send all run while it goes: { auto, i, n, li } (email send mode, the email being sent, how
 // many, whether it starts the LinkedIn sender after them). It outlives the view that started it,
 // so a remount still sees it: Send all and Send now stay disabled until it ends.
@@ -60,6 +63,12 @@ let run = null;
 
 const runChanged = () => {
   if (active) active.runChanged();
+};
+
+// A send started by an earlier mount of the screen landed after it was left (and maybe opened
+// again): the screen showing now shows it.
+const stateChanged = () => {
+  if (active) active.stateChanged();
 };
 
 const ICONS = {
@@ -137,7 +146,19 @@ function liGate(status, now = new Date()) {
   return hour >= LI_HOURS[0] && hour < LI_HOURS[1] ? null : 'window';
 }
 
+/**
+ * Why nothing can be done in LinkedIn from here, Open in LinkedIn included, or null: 'reconnect'
+ * or 'connect' as above. Both buttons drive coldtrail's own Chrome profile, which is signed in to
+ * LinkedIn only once it's connected; without that the server finds LinkedIn's sign-in page and
+ * answers "signed out". Taken as connected until /api/status has loaded (the server says so if not).
+ */
+function liSession(status) {
+  const gate = status ? liGate(status) : null;
+  return gate === 'reconnect' || gate === 'connect' ? gate : null;
+}
+
 const connectionsLink = () => h('a', { href: '#/settings?tab=connections' }, 'Settings → Connections');
+const sendingLink = () => h('a', { href: '#/settings?tab=sending' }, 'Settings → Sending');
 
 /** A gate as a sentence ending in `tail` (strings and nodes, for h()). */
 function gateText(gate, tail) {
@@ -154,6 +175,13 @@ function gatePlain(gate) {
 }
 /** Email sends wait while a Send all works through the emails (and until the queue reloads). */
 const emailBlocked = () => !!(run && run.n);
+
+/**
+ * Whether coldtrail can reach Gmail to create a draft there or send: a Gmail app password or
+ * sign-in (`destination_connected`), or a gcloud login, which `gmail::token` falls back to. Taken
+ * as yes until /api/status has loaded (the server says so if it can't).
+ */
+const gmailReady = (status) => !status || !!status.destination_connected || !!status.gcloud_available;
 
 const enc = encodeURIComponent;
 const lower = (v) => (v == null ? '' : String(v).toLowerCase());
@@ -427,17 +455,24 @@ function createView(root, ctx) {
 
   function caps() {
     const st = s.status || {};
+    const auto = !!st.auto_send;
+    const cap = st.daily_send_cap || 20;
+    // Emails sent today (deliver::sent_today), or null from a server that doesn't report it.
+    const emailToday = Number.isFinite(st.email_sent_today) ? st.email_sent_today : null;
     return {
-      auto: !!st.auto_send,
-      cap: st.daily_send_cap || 20,
-      // Emails sent today, or null: /api/status doesn't report it yet (deliver::sent_today).
-      emailToday: Number.isFinite(st.email_sent_today) ? st.email_sent_today : null,
+      auto,
+      cap,
+      emailToday,
+      // Why an email's own send (Create Gmail draft, Send now) can't go now, or null: 'gmail' when
+      // Gmail can't be reached, 'cap' when auto-send has used up today's cap.
+      emailGate: !gmailReady(s.status) ? 'gmail' : auto && emailToday != null && emailToday >= cap ? 'cap' : null,
       liAuto: !!st.linkedin_auto_send,
       daily: st.linkedin_daily_cap || 15,
       weekly: st.linkedin_weekly_cap || 80,
       today: st.linkedin_sent_today || 0,
-      week: st.linkedin_sent_7d || 0,
+      week: st.linkedin_sent_7d || 0, // in the last 7 days (the weekly cap is a rolling one)
       gate: liGate(s.status), // why coldtrail can't send LinkedIn invites now, or null
+      session: liSession(s.status), // why nothing can be done in LinkedIn from here, or null
     };
   }
 
@@ -449,19 +484,41 @@ function createView(root, ctx) {
     if (!n) return 'Nothing waiting for review.';
     const lead = `${fmtNum(n)} waiting for review.`;
     const liCaps = `${c.daily} a day, ${c.weekly} a week`;
+    // Emails waiting to go to Gmail while it can't be reached (one already in Gmail needs no
+    // connection: it's sent from Gmail, then marked sent here).
+    const gmailOff = c.emailGate === 'gmail' && (s.items || []).some((it) => it.channel === 'email' && it.status === 'draft_pending');
+    // LinkedIn notes waiting while LinkedIn isn't connected (or is signed out): none can be opened
+    // or sent from here.
+    const liOff = !!c.session && (s.items || []).some((it) => it.channel === 'linkedin');
+    const liVerb = c.session === 'reconnect' ? 'Reconnect' : 'Connect';
+    const them = n === 1 ? 'it' : 'them';
     if (s.tab === 'email') {
+      if (gmailOff) {
+        return `${lead} Connect Gmail in Settings → Connections to ${c.auto ? `send ${them}` : `put ${them} in your Gmail Drafts`} from here.`;
+      }
       return c.auto
         ? `${lead} Send now emails it from your Gmail right away, up to ${c.cap} a day.`
         : `${lead} Create Gmail draft puts it in your Gmail Drafts; you send it from there. Pace a new mailbox at about 5 a day.`;
     }
     if (s.tab === 'linkedin') {
+      if (liOff) {
+        return `${lead} ${liVerb} LinkedIn in Settings → Connections to ${c.liAuto ? `send ${them}` : `open ${them} in LinkedIn`} from here.`;
+      }
       return c.liAuto
         ? `${lead} Send invite sends it from your LinkedIn within your caps: ${liCaps}.`
         : `${lead} Open in LinkedIn fills in your note; you click Send there.`;
     }
     const parts = [lead];
-    if (c.liAuto) parts.push(`LinkedIn invites send within your caps: ${liCaps}.`);
-    if (c.auto) parts.push(`Email sends stop at ${c.cap} a day.`);
+    if (c.liAuto && !liOff) parts.push(`LinkedIn invites send within your caps: ${liCaps}.`);
+    if (gmailOff && liOff) {
+      const li = c.session === 'reconnect' ? 'reconnect LinkedIn' : 'LinkedIn';
+      parts.push(`Connect Gmail and ${li} in Settings → Connections to use them from here.`);
+    } else if (gmailOff) {
+      parts.push(`Connect Gmail in Settings → Connections to ${c.auto ? 'send emails' : 'put emails in your Gmail Drafts'} from here.`);
+    } else if (liOff) {
+      parts.push(`${liVerb} LinkedIn in Settings → Connections to ${c.liAuto ? 'send invites' : 'open notes in LinkedIn'} from here.`);
+    }
+    if (!gmailOff && c.auto) parts.push(`Email sends stop at ${c.cap} a day.`);
     if (!c.liAuto && !c.auto) parts.push('Nothing goes out until you send it.');
     return parts.join(' ');
   }
@@ -470,11 +527,14 @@ function createView(root, ctx) {
     if (!s.status) return [];
     const c = caps();
     const num = (t) => h('span', { class: 'num' }, t);
-    const email = c.auto ? ['Email auto-send on · cap ', num(`${c.cap}/day`)] : ['Email auto-send off'];
+    // Today's sends against the cap, as LinkedIn's are; the plain cap from a server that doesn't
+    // report them.
+    const emailUse = () => (c.emailToday != null ? [num(`${c.emailToday}/${c.cap}`), ' today'] : ['cap ', num(`${c.cap}/day`)]);
+    if (s.tab === 'email') return c.auto ? ['Auto-send on · ', ...emailUse()] : ['Auto-send off'];
+    const email = c.auto ? ['Email auto-send on · ', ...emailUse()] : ['Email auto-send off'];
     const li = [
-      num(`${c.today}/${c.daily}`), ' today · ', num(`${c.week}/${c.weekly}`), ' this week',
+      num(`${c.today}/${c.daily}`), ' today · ', num(`${c.week}/${c.weekly}`), ' in the last 7 days',
     ];
-    if (s.tab === 'email') return c.auto ? ['Auto-send on · cap ', num(`${c.cap}/day`)] : ['Auto-send off'];
     if (s.tab === 'linkedin') return [`Auto-send ${c.liAuto ? 'on' : 'off'} · `, ...li];
     return [...email, ' · LinkedIn ', ...li];
   }
@@ -504,8 +564,8 @@ function createView(root, ctx) {
 
   function renderHeader() {
     tabBar.setCounts(tabCounts());
-    // (A failed first load says so in the body.)
-    desc.textContent = s.items ? describe() : s.error ? '' : 'Loading the review queue…';
+    // (A failed first load says so in the body; the header keeps its place.)
+    desc.textContent = s.items ? describe() : s.error ? ERROR_DESC : 'Loading the review queue…';
     desc.hidden = !desc.textContent;
     stats.replaceChildren(...statsLine());
     renderSendAll();
@@ -530,8 +590,10 @@ function createView(root, ctx) {
     );
   }
 
+  const sentSoFar = () => (s.summary && s.summary.counts && s.summary.counts.sent) || 0;
+
   function emptyPanel() {
-    const sent = s.summary && s.summary.counts ? s.summary.counts.sent : 0;
+    const sent = sentSoFar();
     return h(
       'div',
       { class: 'drafts-panel' },
@@ -549,8 +611,13 @@ function createView(root, ctx) {
     );
   }
 
+  // What the empty state shows now (the count it names), or null when it isn't showing: a refresh
+  // that changes none of it (every status poll) leaves it, and the keyboard on its link, alone.
+  let emptySig = null;
+
   function renderBody() {
     if (!s.items || !s.items.length) listSig = null; // the list pane shows something else: rebuild next time
+    if (!s.items || s.items.length) emptySig = null;
     if (s.error && !s.items) {
       body.removeAttribute('aria-busy');
       body.replaceChildren(errorPanel());
@@ -576,7 +643,11 @@ function createView(root, ctx) {
     }
     body.removeAttribute('aria-busy');
     if (!s.items.length) {
-      body.replaceChildren(emptyPanel());
+      const sig = String(sentSoFar());
+      if (sig !== emptySig) {
+        emptySig = sig;
+        body.replaceChildren(emptyPanel());
+      }
       return;
     }
     renderList();
@@ -820,7 +891,11 @@ function createView(root, ctx) {
     if (!vis.length) return;
     let i = vis.findIndex((it) => it.key === s.key);
     i = i < 0 ? (delta > 0 ? 0 : vis.length - 1) : Math.max(0, Math.min(vis.length - 1, i + delta));
+    const fromDetail = !!d && d.el.contains(document.activeElement);
     select(vis[i].key, { focusList: focusList || listbox.contains(document.activeElement) });
+    // From the draft (one of its actions, say), the keyboard moves on with it, onto the next
+    // draft's heading, rather than dropping back to the top of the page.
+    if (fromDetail && d && !d.el.contains(document.activeElement)) d.name.focus({ preventScroll: true });
   }
 
   // Phone: back from the draft to the list (history back when the draft pushed an entry).
@@ -1048,6 +1123,20 @@ function createView(root, ctx) {
     return isDirty(find(key)) ? failedSaves.get(key) || 'it couldn’t be saved' : null;
   }
 
+  /**
+   * Before Send all sends a draft: any edit to it saved first → null, or why it couldn't be. The
+   * run outlives the screen that started it, so the edit is looked for where the user made it:
+   * once this screen has been left and opened again, on the new one (an edit still in its
+   * debounce, or one whose save failed). An edit this screen couldn't save as it was left (it
+   * said so then) still keeps the draft back.
+   */
+  async function unsavedEdit(key) {
+    if (alive || !active) return isDirty(find(key)) ? saveBeforeAction(key) : null;
+    await flushSave(); // the saves this screen made as it was left
+    if (isDirty(find(key))) return failedSaves.get(key) || 'it couldn’t be saved';
+    return active.saveFirst(key);
+  }
+
   function edit(key, fieldName, value) {
     const it = find(key);
     if (!it) return;
@@ -1099,7 +1188,8 @@ function createView(root, ctx) {
     const c = caps();
     return [
       detailSig(it), staged.has(it.key), rowSendState(it.key), pushing.has(it.key),
-      emailBlocked(), liBlocked(), !!bulkStart(), c.auto, c.liAuto, c.gate,
+      emailBlocked(), liBlocked(), !!bulkStart(), c.auto, c.liAuto, c.gate, c.session,
+      c.emailGate, c.emailGate === 'cap' ? `${c.emailToday}/${c.cap}` : '', // (the cap hint names them)
     ].join('|');
   }
 
@@ -1191,7 +1281,7 @@ function createView(root, ctx) {
         rows: '8',
         spellcheck: 'true',
         'data-editor': '',
-        'aria-describedby': 'draft-count draft-note-err',
+        'aria-describedby': 'draft-count', // + the error while it shows (updateNote)
         value: it.body,
         onInput: (e) => edit(it.key, 'body', e.target.value),
       });
@@ -1317,6 +1407,9 @@ function createView(root, ctx) {
     d.count.textContent = `${it.body.length} / ${NOTE_MAX}`;
     d.count.classList.toggle('is-over', over);
     d.noteErr.hidden = !over;
+    // A hidden element named in aria-describedby is still read out, so the error is named only
+    // while it shows.
+    d.note.setAttribute('aria-describedby', over ? 'draft-count draft-note-err' : 'draft-count');
     if (over) d.note.setAttribute('aria-invalid', 'true');
     else d.note.removeAttribute('aria-invalid');
     const link = noteLink(it.body);
@@ -1393,13 +1486,24 @@ function createView(root, ctx) {
             return who ? `Send now to ${who}` : 'Send now';
           }
         : () => 'Create Gmail draft';
-      const blocked = emailBlocked();
+      // Off while it can't work (Gmail can't be reached; auto-send has used up today's cap), and
+      // waiting while Send all works through the emails: the hint beside it says which.
+      let hint = null;
+      if (c.emailGate === 'gmail') {
+        hint = [`Gmail isn’t connected, so ${c.auto ? 'Send now' : 'Create Gmail draft'} is off. Connect it in `, connectionsLink(), '.'];
+      } else if (c.emailGate === 'cap') {
+        hint = [
+          `The daily email cap is reached (${fmtNum(c.emailToday)} of ${fmtNum(c.cap)} sent), so Send now waits until tomorrow. Raise the cap in `,
+          sendingLink(),
+          '.',
+        ];
+      } else if (emailBlocked()) {
+        hint = [run.auto ? 'Send all is sending your emails, one at a time.' : 'Send all is creating your Gmail drafts, one at a time.'];
+      }
       return [
-        blocked
-          ? h('span', { class: 'draft-hint' }, run.auto ? 'Send all is sending your emails, one at a time.' : 'Send all is creating your Gmail drafts, one at a time.')
-          : null,
+        hint ? h('span', { class: 'draft-hint' }, hint) : null,
         discardBtn,
-        actionBtn('', 'primary', 'push', (e) => pushEmail(key, e.currentTarget), { label, blocked }),
+        actionBtn('', 'primary', 'push', (e) => pushEmail(key, e.currentTarget), { label, blocked: !!hint }),
       ].filter(Boolean);
     }
     if (staged.has(key)) {
@@ -1426,15 +1530,18 @@ function createView(root, ctx) {
       ];
     }
     const canSend = c.liAuto && !it.parked;
-    // Send invite stays off when the sender would stop before sending (signed out, outside its
-    // hours), and waits while a bulk send runs (it may send this one). Open in LinkedIn is the
-    // manual path: it never waits (the server answers "busy" if the window is in use).
+    // Neither button works while LinkedIn is signed out or was never connected: both are off, and
+    // the hint says where to connect it. Send invite also stays off outside the sender's hours,
+    // and waits while a bulk send runs (it may send this one). Open in LinkedIn is the manual
+    // path: it has no hours and never waits (the server answers "busy" if the window is in use).
+    const { session } = c;
     const gate = canSend ? c.gate : null;
     const waits = canSend && !gate && liBlocked();
     let hint = null;
-    if (gate) {
-      const tail = gate === 'window' ? 'Send invite waits until then. Open in LinkedIn works any time.' : 'Send invite is off.';
-      hint = h('span', { class: 'draft-hint' }, gateText(gate, tail));
+    if (session) {
+      hint = h('span', { class: 'draft-hint' }, gateText(session, canSend ? 'Open in LinkedIn and Send invite are off.' : 'Open in LinkedIn is off.'));
+    } else if (gate) {
+      hint = h('span', { class: 'draft-hint' }, gateText(gate, 'Send invite waits until then. Open in LinkedIn works any time.'));
     } else if (waits) {
       hint = h(
         'span',
@@ -1449,7 +1556,10 @@ function createView(root, ctx) {
     const out = [
       hint,
       discardBtn,
-      actionBtn('Open in LinkedIn', ready ? 'secondary' : 'primary', 'assist', (e) => assist(key, e.currentTarget), { needsNote: true }),
+      actionBtn('Open in LinkedIn', ready ? 'secondary' : 'primary', 'assist', (e) => assist(key, e.currentTarget), {
+        needsNote: true,
+        blocked: !!session,
+      }),
     ].filter(Boolean);
     if (canSend) {
       out.push(
@@ -1536,10 +1646,15 @@ function createView(root, ctx) {
   // "Email not sent — your edit couldn't be saved: disk full".
   const unsaved = (what, reason) => toast(`${what} — your edit couldn’t be saved: ${reason}`, 'err');
 
+  /** Reload the queue on the screen showing now: this one, or, once it has been left, the one
+   *  opened since (if any). Resolves true when fresh data landed. */
+  const reloadQueue = (opts) => (alive ? load(opts) : active ? active.reload(opts) : Promise.resolve(false));
+
   async function pushEmail(key, btn) {
     const it = find(key);
-    // One send per draft at a time, and none while Send all works through the emails.
-    if (!it || pushing.has(key) || emailBlocked()) return;
+    // One send per draft at a time, none while Send all works through the emails, and none that
+    // can't work (Gmail can't be reached, today's cap is used up).
+    if (!it || pushing.has(key) || emailBlocked() || caps().emailGate) return;
     const auto = caps().auto;
     if (auto) {
       const ok = await confirmFirstSend('email', {
@@ -1548,7 +1663,7 @@ function createView(root, ctx) {
         confirmText: 'Send now',
         opener: btn,
       });
-      if (!ok || pushing.has(key) || emailBlocked()) return;
+      if (!ok || pushing.has(key) || emailBlocked() || caps().emailGate) return;
     }
     pushing.add(key);
     const restore = busy(btn, auto ? 'Sending…' : 'Creating…');
@@ -1561,9 +1676,20 @@ function createView(root, ctx) {
       }
       const r = await api.post(`/api/drafts/${enc(it.domain)}/send`, {});
       if (r && r.ok) {
-        toast(r.message || (auto ? 'Sent.' : 'Created in your Gmail Drafts.'), 'ok');
+        // (A send's own message is the CLI's status line, "sent to … (3/20 today)": the toast
+        // says it in this screen's words.)
+        const l = labelsOf(it);
+        toast(auto ? `Sent to ${l.person || it.to || l.org}.` : r.message || 'Created in your Gmail Drafts.', 'ok');
         store.refresh();
-        await load();
+        // Onto the screen showing now: this one may have been left (and opened again) while the
+        // send was on its way, and an email now in Gmail moves no count that would reload it.
+        // A sent email leaves the queue: the keyboard goes on to the draft that took its place.
+        await reloadQueue({ focusOnVanish: true });
+        // One still here, now In Gmail (or the next of several on this channel), was rendered
+        // again: the keyboard goes back to it, at its heading, rather than to the top of the page.
+        if (alive && d && d.key === key && (!document.activeElement || document.activeElement === document.body)) {
+          d.name.focus({ preventScroll: true });
+        }
       } else {
         toast(`${what} — ${(r && r.message) || 'it could not be completed'}`, 'err');
       }
@@ -1573,6 +1699,7 @@ function createView(root, ctx) {
       pushing.delete(key);
       restore();
       if (alive) refreshActions();
+      else stateChanged();
     }
   }
 
@@ -1584,7 +1711,8 @@ function createView(root, ctx) {
       await api.post(`/api/followups/${enc(it.domain)}/mark`, { value: 'sent' });
       toast(`Marked ${labelsOf(it).org} as sent.`, 'ok');
       store.refresh();
-      await load();
+      // It leaves the queue: the keyboard goes on to the draft that took its place.
+      await load({ focusOnVanish: true });
       restore();
     } catch (err) {
       restore();
@@ -1592,18 +1720,50 @@ function createView(root, ctx) {
     }
   }
 
+  /**
+   * Whether anything has gone out to `domain` yet (sent, replied or bounced, on either channel):
+   * what decides whether Discard skips the company (`mark::contacted`) → true / false, or null
+   * when that can't be told. Asked fresh, since a send since the details loaded changes it.
+   */
+  async function contactedNow(domain) {
+    try {
+      const res = await api.get(`/api/companies/${enc(domain)}`, { signal: ctl.signal });
+      const rows = res && Array.isArray(res.outreach) ? res.outreach : null;
+      return rows ? rows.some((o) => CONTACTED.includes(o.status)) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  let discardAsking = false; // Discard is finding out what it will do, before its confirm opens
+
   async function discard(key, btn) {
     const it = find(key);
-    if (!it) return;
+    if (!it || discardAsking) return;
     const l = labelsOf(it);
     const what = it.channel === 'linkedin' ? 'LinkedIn note' : 'email';
     const n = it.extra + 1;
-    // Discard deletes every pending draft on this domain + channel, folded rows included.
+    // Discard deletes every pending draft on this domain + channel, folded rows included. A
+    // company nothing has gone out to yet is then marked Skip; one already written to (this is a
+    // follow-up) keeps its stage and stays in Follow-ups.
+    let contacted;
+    discardAsking = true;
+    try {
+      contacted = await contactedNow(it.domain);
+    } finally {
+      discardAsking = false;
+    }
+    if (!alive || !find(key)) return;
     const lead = it.extra ? `${n === 2 ? 'Both' : `All ${fmtNum(n)}`} ${what}s` : `The ${what}`;
-    const gmail = it.channel === 'email' && it.status === 'drafted' ? ' The copy in your Gmail Drafts stays there.' : '';
+    const gone = `${lead} to ${l.person || l.recipient} ${it.extra ? 'are' : 'is'} deleted`;
+    let body;
+    if (contacted === false) body = `${gone} and ${l.org} is marked Skip, so it isn’t drafted again.`;
+    else if (contacted) body = `${gone}. You’ve already been in touch with ${l.org}, so it stays in Follow-ups.`;
+    else body = `${gone}. If nothing has gone out to ${l.org} yet, it’s marked Skip, so it isn’t drafted again.`;
+    if (it.channel === 'email' && it.status === 'drafted') body += ' The copy in your Gmail Drafts stays there.';
     const ok = await confirmDialog({
       title: it.extra ? `Discard ${n === 2 ? 'both' : `all ${fmtNum(n)}`} drafts?` : 'Discard this draft?',
-      body: `${lead} to ${l.person || l.recipient} ${it.extra ? 'are' : 'is'} deleted and ${l.org} is marked Skip, so it isn’t drafted again.${gmail}`,
+      body,
       confirmText: it.extra ? `Discard ${n === 2 ? 'both' : `all ${fmtNum(n)}`}` : 'Discard draft',
       danger: true,
       opener: btn,
@@ -1630,7 +1790,9 @@ function createView(root, ctx) {
       } else {
         staged.delete(key);
         rowSends.delete(key);
-        toast(`${it.extra ? `${fmtNum(n)} drafts` : 'Draft'} discarded. ${l.org} is now skipped.`, 'ok');
+        // The server says which it did (`skipped`; one that doesn't say always skipped).
+        const after = r && r.skipped === false ? `${l.org} stays in Follow-ups.` : `${l.org} is now skipped.`;
+        toast(`${it.extra ? `${fmtNum(n)} drafts` : 'Draft'} discarded. ${after}`, 'ok');
       }
       store.refresh();
       await load({ focusOnVanish: true });
@@ -1644,7 +1806,7 @@ function createView(root, ctx) {
 
   async function assist(key, btn) {
     const it = find(key);
-    if (!it || overLimit(it)) return;
+    if (!it || overLimit(it) || caps().session) return;
     const restore = busy(btn, 'Opening…');
     const reason = await saveBeforeAction(key);
     if (reason) {
@@ -1657,7 +1819,11 @@ function createView(root, ctx) {
       if (r && r.staged) {
         staged.add(key);
         toast('Opened in LinkedIn — review the note and click Send there.', 'ok');
-        if (!alive) return;
+        if (!alive) {
+          // Left (and maybe opened again) while LinkedIn opened: the screen showing now asks.
+          stateChanged();
+          return;
+        }
         renderList();
         refreshActions(true);
         const yes = d && d.key === key ? d.actions.querySelector('[data-action="yes"]') : null;
@@ -1665,7 +1831,7 @@ function createView(root, ctx) {
       } else if (r && r.already_invited) {
         toast('Already invited on LinkedIn (Pending) — marked as sent.', 'ok');
         store.refresh();
-        await load({ focusOnVanish: true });
+        await reloadQueue({ focusOnVanish: true });
         restore();
       } else {
         restore();
@@ -1734,7 +1900,10 @@ function createView(root, ctx) {
       }
       rowSends.set(key, { at: Date.now(), timedOut: false });
       toast('Sending on LinkedIn — coldtrail is driving the browser…', 'ok');
-      if (!alive) return;
+      if (!alive) {
+        stateChanged(); // the screen showing now watches it
+        return;
+      }
       renderList();
       refreshActions(true);
       scheduleRowPoll();
@@ -1770,8 +1939,9 @@ function createView(root, ctx) {
     const liUpTo = Math.min(sendable, room);
     const running = liBlocked();
     // Auto-send stops at the daily cap, counting what already went out today when that's known.
+    // None go anywhere while Gmail can't be reached.
     const emailRoom = Math.max(0, c.cap - (c.emailToday || 0));
-    const emails = c.auto ? emailPending.slice(0, emailRoom) : emailPending;
+    const emails = c.emailGate === 'gmail' ? [] : c.auto ? emailPending.slice(0, emailRoom) : emailPending;
     return {
       tab: s.tab, c, emailSide, liSide, emailPending, emails, inGmail, li, parked, sending, queued, sendable, liUpTo, running,
       // The sender exits at once, sending nothing, when signed out or outside its hours.
@@ -1788,6 +1958,15 @@ function createView(root, ctx) {
     const known = c.emailToday != null;
     let text;
     let off = !n;
+    if (n && c.emailGate === 'gmail') {
+      const what = c.auto ? 'no emails can be sent' : 'no Gmail drafts can be created';
+      return h(
+        'li',
+        { class: ['sendall-email', 'is-off'] },
+        h('strong', {}, 'Email'),
+        h('span', {}, `Gmail isn’t connected, so ${what}. Connect it in `, connectionsLink(), '.'),
+      );
+    }
     if (!n) {
       text = 'No email drafts to send.';
     } else if (c.auto && !p.emails.length) {
@@ -1805,7 +1984,7 @@ function createView(root, ctx) {
 
   function linkedinLine(p) {
     const { c } = p;
-    const usage = `${c.today}/${c.daily} today, ${c.week}/${c.weekly} this week`;
+    const usage = `${c.today}/${c.daily} today, ${c.week}/${c.weekly} in the last 7 days`;
     const left = [p.parked ? pluralize(p.parked, 'parked draft') : null, p.sending ? `${fmtNum(p.sending)} already sending` : null];
     const parkedNote = left.some(Boolean) ? `; ${left.filter(Boolean).join(' and ')} excluded` : '';
     let content;
@@ -1816,11 +1995,15 @@ function createView(root, ctx) {
     } else if (p.running) {
       content = ['A LinkedIn bulk send is already running; it works through these invites one at a time.'];
       off = true;
+    } else if (c.session) {
+      // (Opening them one by one needs LinkedIn too: nothing to suggest until it's connected.)
+      content = gateText(c.session, 'none go out now.');
+      off = true;
     } else if (!c.liAuto) {
       const n = p.sendable;
       content = [
         `LinkedIn auto-send is off, so ${pluralize(n, 'invite')} ${n === 1 ? 'stays' : 'stay'} here. Turn it on in `,
-        h('a', { href: '#/settings?tab=sending' }, 'Settings → Sending'),
+        sendingLink(),
         ' to send them in bulk, or open each one in LinkedIn.',
       ];
       off = true;
@@ -1845,7 +2028,8 @@ function createView(root, ctx) {
   function confirmLabel(p) {
     const parts = [];
     const emailVerb = p.c.auto ? 'send' : 'create';
-    // (With auto-send on and today's cap used up, no email goes out: nothing to confirm there.)
+    // (With Gmail out of reach, or auto-send on and today's cap used up, no email goes out:
+    // nothing to confirm there.)
     if (p.emails.length) {
       parts.push(p.c.auto ? `send ${pluralize(p.emails.length, 'email')}` : `create ${pluralize(p.emailPending.length, 'Gmail draft')}`);
     }
@@ -1921,12 +2105,10 @@ function createView(root, ctx) {
         step(`${auto ? 'Sending' : 'Creating'} ${fmtNum(i + 1)} of ${fmtNum(emails.length)}…`);
         // The server sends what it has stored: an edit it doesn't have yet (its save failed, or
         // is still on the way) is saved first, and an email whose edit can't be saved stays here.
-        if (isDirty(find(it.key))) {
-          const reason = await saveBeforeAction(it.key);
-          if (reason) {
-            failed.push(`${name}: your edit couldn’t be saved (${reason})`);
-            continue;
-          }
+        const reason = await unsavedEdit(it.key);
+        if (reason) {
+          failed.push(`${name}: your edit couldn’t be saved (${reason})`);
+          continue;
         }
         try {
           const r = await api.post(`/api/drafts/${enc(it.domain)}/send`, {});
@@ -1986,8 +2168,7 @@ function createView(root, ctx) {
     step('Starting the LinkedIn sender…');
     const unsavedNotes = [];
     for (const it of queue) {
-      if (!isDirty(find(it.key))) continue;
-      const reason = await saveBeforeAction(it.key);
+      const reason = await unsavedEdit(it.key);
       if (reason) unsavedNotes.push(`${labelsOf(it).org} (${reason})`);
     }
     if (unsavedNotes.length) {
@@ -2252,40 +2433,54 @@ function createView(root, ctx) {
     if (it) fillHead(it);
   }
 
-  // ---- Toasts clear of the actions (desktop) ----
+  // ---- Toasts clear of the actions ----
   //
   // Toasts stack up from the bottom right, which is where a draft's action bar can be: pinned to
   // the pane's bottom edge under a long draft, or anywhere mid-pane under a short one (a LinkedIn
   // note), in one row or two. When the stack in its usual place would cover the bar, it moves to
   // just above the bar instead (an error toast stays until dismissed: it would block Send and
   // Discard). drafts.css reads the lift; it's set on <html> because #toasts is #app's sibling.
+  //
+  // On a phone the bar is the last thing on the page, under the toasts wherever it's scrolled:
+  // the page gets room below it as tall as the stack (--drafts-toast-room), so scrolled to the
+  // end the bar sits clear above them.
   const LIFT_VAR = '--drafts-toast-lift';
+  const ROOM_VAR = '--drafts-toast-room';
   const rootStyle = document.documentElement.style;
   const tokenPx = (name, fallback) => parseFloat(getComputedStyle(document.documentElement).getPropertyValue(name)) || fallback;
   const TOAST_EDGE = tokenPx('--space-4', 16); // components.css: #toasts' usual distance from the bottom
   const TOAST_GAP = tokenPx('--space-2', 8); // between the bar and the lifted stack
   const ldDetail = ld.querySelector('.ld-detail');
   const liftRO = typeof ResizeObserver === 'function' ? new ResizeObserver(() => placeToasts()) : null;
-  let lift = '';
+  const varNow = { [LIFT_VAR]: '', [ROOM_VAR]: '' }; // what each one is set to now
   let liftFrame = 0;
 
-  function setLift(px) {
+  function setVar(name, px) {
     const v = px > 0 ? `${Math.ceil(px)}px` : '';
-    if (v === lift) return;
-    lift = v;
-    if (v) rootStyle.setProperty(LIFT_VAR, v);
-    else rootStyle.removeProperty(LIFT_VAR);
+    if (v === varNow[name]) return;
+    varNow[name] = v;
+    if (v) rootStyle.setProperty(name, v);
+    else rootStyle.removeProperty(name);
   }
+  const setLift = (px) => setVar(LIFT_VAR, px);
+  const setRoom = (px) => setVar(ROOM_VAR, px);
 
   function placeToasts() {
     const host = document.getElementById('toasts');
-    const foot = alive && wide.matches && d && d.foot && d.foot.isConnected ? d.foot : null;
+    const foot = alive && d && d.foot && d.foot.isConnected ? d.foot : null;
     if (!host || !foot || !host.firstElementChild) {
       // (No toast showing: nothing to move. The next one resizes the stack, which calls back here
       // before it's painted.)
       setLift(0);
+      setRoom(0);
       return;
     }
+    if (!wide.matches) {
+      setLift(0);
+      setRoom(TOAST_EDGE + host.offsetHeight + TOAST_GAP);
+      return;
+    }
+    setRoom(0);
     const vh = document.documentElement.clientHeight;
     const bar = foot.getBoundingClientRect();
     const col = host.getBoundingClientRect();
@@ -2329,6 +2524,7 @@ function createView(root, ctx) {
     window.removeEventListener('resize', placeToastsSoon);
     window.removeEventListener('scroll', placeToastsSoon, { capture: true });
     setLift(0);
+    setRoom(0);
   }
 
   // ---- Store, URL updates, unmount ----
@@ -2430,6 +2626,16 @@ function createView(root, ctx) {
     if (bulkStart() && !bulkTimer) scheduleBulkPoll();
   }
 
+  // A send an earlier mount of this screen started landed after it was left: show what it left
+  // behind (opened in LinkedIn, an email no longer on its way, an invite to watch). Until the
+  // queue first loads there's nothing to show it on; that load shows it.
+  function onStateChanged() {
+    if (!alive || !s.items) return;
+    renderBody();
+    refreshActions();
+    if (!rowTimer) scheduleRowPoll();
+  }
+
   function destroy() {
     alive = false;
     // Normally beforeLeave has saved everything already; this catches typing since then.
@@ -2464,7 +2670,15 @@ function createView(root, ctx) {
   renderBody();
   start();
 
-  return { update, beforeLeave: saveOnLeave, destroy, runChanged: onRunChanged, reload: () => load() };
+  return {
+    update,
+    beforeLeave: saveOnLeave,
+    destroy,
+    runChanged: onRunChanged,
+    stateChanged: onStateChanged,
+    reload: (opts) => load(opts),
+    saveFirst: saveBeforeAction,
+  };
 }
 
 export default {
