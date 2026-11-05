@@ -4,15 +4,17 @@
 // sections the agent drafts from. The checklist reads headings the way the backend does — the
 // call-to-action check mirrors `product::cta_link()` line for line, so a ticked CTA is one the
 // LinkedIn note path will really pick up. Already contacted: contacted.toml, validated by the
-// server on save; plain domains (one per line) are turned into entries first.
+// server on save; plain domains, links and email addresses are turned into entries first. The
+// file is read again before each save and when the tab is shown again: it is edited by hand too,
+// and a save never writes over a change made there.
 //
 // `mountProfileEditor` is exported for the Setup wizard's company step, with PROFILE_TEMPLATE:
 // it needs only the app's tokens and base styles around it (it loads its own stylesheet), and
 // cleans up when its root leaves the document or when dispose() is called.
 
 import { api, errorText, isStaleSession } from '../core/api.js';
-import { debounce, h, pluralize } from '../core/dom.js';
-import { ensureViewCss } from '../core/router.js';
+import { debounce, fmtNum, h, pluralize } from '../core/dom.js';
+import { ensureViewCss, href } from '../core/router.js';
 import { store as sharedStore } from '../core/store.js';
 import { setBusy } from '../core/ui.js';
 import { tabs } from '../components/tabs.js';
@@ -286,11 +288,17 @@ function skeletonLines(widths) {
   return h('div', { class: 'cp-skeleton', 'aria-hidden': 'true' }, widths.map((w) => h('span', { class: 'skeleton', style: `width:${w}%` })));
 }
 
+/** Focus has nowhere to be: the control that had it was hidden or replaced (a Try again that
+ *  reloads), and nothing else took it meanwhile. */
+const focusLost = () => !document.activeElement || document.activeElement === document.body;
+
 /** Fill `box` with a failed load: what didn't load, why, an optional note, and Try again. On a
  *  stale session the shell's banner (an alert) already says what happened, once: the card gives
  *  the short pointer at the fix, isn't an alert itself, and has no Try again (nothing loads
- *  until the tab is reopened). */
-function showLoadError(box, { title, err, note, retry }) {
+ *  until the tab is reopened). `retry(refocus)`: `refocus` is whether Try again had focus when
+ *  pressed, so the load can hand focus on to what replaces it; `focus` puts it on this card's
+ *  Try again (the last one had it, and this load failed too). */
+function showLoadError(box, { title, err, note, retry, focus = false }) {
   const stale = isStaleSession(err);
   if (stale) box.removeAttribute('role');
   else box.setAttribute('role', 'alert');
@@ -304,9 +312,11 @@ function showLoadError(box, { title, err, note, retry }) {
       note ? h('p', { class: 'cp-load-error-detail' }, note) : null,
     ),
   ];
-  if (!stale) parts.push(h('button', { type: 'button', class: 'btn btn-secondary', onClick: retry }, 'Try again'));
+  const again = stale ? null : h('button', { type: 'button', class: 'btn btn-secondary', onClick: (e) => retry(e.currentTarget === document.activeElement) }, 'Try again');
+  if (again) parts.push(again);
   box.replaceChildren(...parts);
   box.hidden = false;
+  if (focus && again) again.focus();
 }
 
 const isSave = (e) => (e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && String(e.key).toLowerCase() === 's';
@@ -314,6 +324,27 @@ const isSave = (e) => (e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && St
 /** Browsers cap the bodies of in-flight keepalive requests at 64 KiB in total; leave headroom. */
 const KEEPALIVE_MAX_BYTES = 60 * 1024;
 const fitsKeepalive = (doc) => new Blob([JSON.stringify({ doc })]).size <= KEEPALIVE_MAX_BYTES;
+
+/** Save `doc` as product.md from a page that is going away: with keepalive, so it outlives the
+ *  page. Resolves to whether it landed (only seen if the page comes back from the back/forward
+ *  cache). */
+function saveOnExit(doc) {
+  try {
+    return fetch('/api/company', {
+      method: 'POST',
+      credentials: 'same-origin',
+      // Over the budget the browser refuses keepalive outright; a plain request may still land.
+      keepalive: fitsKeepalive(doc),
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ doc }),
+    }).then(
+      (r) => r.ok,
+      () => false,
+    );
+  } catch (_) {
+    return Promise.resolve(false); // the page is going away
+  }
+}
 
 /** Start offset of line `n` in `text` (lines split on "\n"). */
 function lineStart(text, n) {
@@ -352,8 +383,8 @@ function replaceRange(ta, start, end, text, select = null) {
 // ---------------------------------------------------------------------------------------------
 // Profile editor
 
-/** Profile text an editor was closed with before the server had it; the next editor offers it
- *  back unless the file has it by then. */
+/** Profile text an editor was closed with before the server had it ({ doc, failed }: `failed`
+ *  once its exit save has failed); the next editor offers it back unless the file has it by then. */
 let profileDraft = null;
 /** The save a closing editor started (settles, never rejects): the next editor loads after it,
  *  so it neither reads the file from before that save nor offers back text that just landed. */
@@ -383,7 +414,8 @@ const STATUS_ICON = { saved: 'check', error: 'error', empty: 'warn', 'load-error
  * edit the server doesn't have yet (one waiting, or one whose save failed), aborts loads and
  * removes every listener and timer. After that onChange stops. Until that last save lands, the
  * text is kept in memory: the next editor mounted on this page waits for that save (up to 3s),
- * then restores the text (and saves it) if the file still lacks it, with a notice and a Discard.
+ * then restores the text (and saves it) if the file still lacks it, with a notice and a Discard
+ * that stay until the next edit.
  * Closing or reloading the tab sends unsaved text with a keepalive request; when the text is too
  * big for one (over 60 KiB) or the last save failed, the browser asks before leaving instead.
  *
@@ -447,7 +479,19 @@ export function mountProfileEditor(root, { onChange, store = sharedStore, headin
   const statusIcon = h('span', { class: 'pe-status-icon' });
   const statusText = h('span', { class: 'pe-status-text' });
   const statusEl = h('span', { class: 'pe-status', id: `${id}-status`, role: 'status', 'data-state': 'loading' }, statusIcon, statusText);
-  const retryBtn = h('button', { type: 'button', class: 'btn btn-secondary btn-sm', onClick: () => saveNow() }, 'Retry');
+  // Retry hides as soon as its save starts: focus goes on into the text rather than to the page.
+  const retryBtn = h(
+    'button',
+    {
+      type: 'button',
+      class: 'btn btn-secondary btn-sm',
+      onClick: () => {
+        if (document.activeElement === retryBtn) ta.focus();
+        saveNow();
+      },
+    },
+    'Retry',
+  );
   retryBtn.hidden = true;
   const flagBtn = h(
     'button',
@@ -464,6 +508,7 @@ export function mountProfileEditor(root, { onChange, store = sharedStore, headin
   );
   flagBtn.hidden = true;
   let restoredFrom = null; // what the file held when a restored draft replaced it
+  let refocus = false; // Try again had focus: hand it on to what the load shows
   const discardBtn = h('button', { type: 'button', class: 'cp-text-btn', onClick: () => discardRestored() }, 'Discard');
   const restored = h('p', { class: 'pe-restored' }, h('span', {}, 'Your unsaved changes from earlier are back.'), discardBtn);
   const restoredNotice = liveNotice('pe-restored');
@@ -721,6 +766,9 @@ export function mountProfileEditor(root, { onChange, store = sharedStore, headin
 
   ta.addEventListener('input', () => {
     if (!loaded) return;
+    // Typing after a restore makes the text the user's own: Discard would put the file from
+    // before the restore back over this edit too, so the notice goes with it.
+    forgetRestored();
     template = false;
     pending = true;
     queueSave();
@@ -744,6 +792,7 @@ export function mountProfileEditor(root, { onChange, store = sharedStore, headin
     // has it by now (load() waited for that editor's last save).
     const draft = profileDraft;
     profileDraft = null;
+    guardLeftDrafts();
     if (draft && !same(draft.doc, doc)) {
       // A blank file can't be saved back, so there's nothing to discard to.
       restoredFrom = doc.trim() ? doc : null;
@@ -760,6 +809,8 @@ export function mountProfileEditor(root, { onChange, store = sharedStore, headin
     checkNote.hidden = true;
     loadError.hidden = true;
     ta.hidden = false;
+    if (refocus && focusLost()) ta.focus();
+    refocus = false;
     for (const node of [progressEl, meter, list]) node.hidden = false;
     analyze();
     renderStatus();
@@ -772,12 +823,18 @@ export function mountProfileEditor(root, { onChange, store = sharedStore, headin
   function discardRestored() {
     if (restoredFrom === null) return;
     const doc = restoredFrom;
-    restoredFrom = null;
-    restoredNotice.hide();
+    forgetRestored();
     replaceRange(ta, 0, ta.value.length, doc, [0, 0]);
   }
 
-  function load() {
+  function forgetRestored() {
+    restoredFrom = null;
+    restoredNotice.hide();
+  }
+
+  /** `again`: Try again was pressed while it had focus. */
+  function load(again = false) {
+    refocus = again;
     status = 'loading';
     skeleton.hidden = false;
     checkSkeleton.hidden = false;
@@ -806,7 +863,9 @@ export function mountProfileEditor(root, { onChange, store = sharedStore, headin
       err,
       note: 'Nothing was changed. Editing stays off until it loads, so the saved profile isn’t overwritten.',
       retry: load,
+      focus: refocus && focusLost(),
     });
+    refocus = false;
     renderStatus();
     emit();
   }
@@ -829,6 +888,7 @@ export function mountProfileEditor(root, { onChange, store = sharedStore, headin
         persisted = doc;
         template = false;
         ta.value = doc;
+        forgetRestored(); // its Discard would put back a version older than this one
         analyze();
         renderStatus();
         emit();
@@ -858,28 +918,13 @@ export function mountProfileEditor(root, { onChange, store = sharedStore, headin
     if (!doc.trim() || (!pending && !inflight && !lastError)) return;
     queueSave.cancel();
     pending = false;
-    try {
-      fetch('/api/company', {
-        method: 'POST',
-        credentials: 'same-origin',
-        // Over the budget the browser refuses keepalive outright; a plain request may still land.
-        keepalive: fitsKeepalive(doc),
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ doc }),
-      }).then(
-        // Only seen when the page comes back from the back/forward cache.
-        (r) => {
-          if (!r.ok || disposed) return;
-          persisted = doc.trimStart();
-          lastError = null;
-          renderStatus();
-          emit();
-        },
-        () => {},
-      );
-    } catch (_) {
-      /* the page is going away */
-    }
+    saveOnExit(doc).then((ok) => {
+      if (!ok || disposed) return;
+      persisted = doc.trimStart();
+      lastError = null;
+      renderStatus();
+      emit();
+    });
   }
 
   let wasConnected = el.isConnected;
@@ -896,18 +941,24 @@ export function mountProfileEditor(root, { onChange, store = sharedStore, headin
     if (disposed) return;
     // Leaving with text the server doesn't have yet (a save waiting, running or failed): save it
     // now. No question can be asked here, so until that save lands the text is also kept for the
-    // next editor, which waits for this save and puts the text back only if it failed.
+    // next editor, which waits for this save and puts the text back only if it failed. Meanwhile
+    // a close or reload from any screen still sends it or asks (guardLeftDrafts).
     const doc = loaded && !template ? ta.value : '';
     if (doc.trim() && (pending || inflight || lastError || !same(doc, persisted))) {
       queueSave.cancel();
       pending = false;
-      const draft = { doc };
+      const draft = { doc, failed: false };
       profileDraft = draft;
       const saving = saveNow().then(() => {
-        if (!lastError && profileDraft === draft) profileDraft = null;
+        if (profileDraft === draft) {
+          if (lastError) draft.failed = true;
+          else profileDraft = null;
+          guardLeftDrafts();
+        }
         if (exitSave === saving) exitSave = null;
       });
       exitSave = saving;
+      guardLeftDrafts();
     }
     disposed = true;
     queueSave.cancel();
@@ -945,28 +996,40 @@ const KEY_LINE = /^\s*(?:"([^"\n]+)"|'([^'\n]+)'|([A-Za-z0-9_.-]+))\s*=/;
 const TABLE_LINE = /^\s*\[\s*(?:"([^"\n]+)"|'([^'\n]+)'|([A-Za-z0-9_.-]+))\s*\]\s*(?:#.*)?$/;
 /** Any table or array-of-tables header: past the first one, a `key = …` line is no longer top level. */
 const HEADER_LINE = /^\s*\[\[?[^\]\n]*\]\]?\s*(?:#.*)?$/;
+/** An email address, as pasted from a mail export: "jane@acme.com", "<jane@acme.com>",
+ *  "mailto:jane@acme.com". Its domain is the company's. */
+const EMAIL_TOKEN = /^<?(?:mailto:)?[^\s@<>/]+@([^\s@<>/]+?)>?$/i;
 const isComment = (line) => line.trim().startsWith('#');
 
-/** The domains on a line that holds only domains or links, else null. A link's "?query" or
- *  "#fragment" is dropped first, so "acme.com/p?x=1" is a link, not a `key = value` line. */
+/** The domains on a line that holds only domains, links or email addresses, and the note after
+ *  them in the file's own comment style ("acme.com  # old client"), else null. A link's "?query"
+ *  or "#fragment" is dropped first, so "acme.com/p?x=1" is a link, not a `key = value` line. */
 function lineDomains(line) {
-  const t = line.trim();
+  let t = line.trim();
   if (!t || t.startsWith('#')) return null;
+  let comment = '';
+  const note = t.search(/\s#/); // a "#" that starts a word; one inside a link is its fragment
+  if (note >= 0) {
+    comment = t.slice(note).trim();
+    t = t.slice(0, note);
+  }
   const bare = t.replace(/[?#][^\s,;]*/g, '');
   if (/[=[\]{}"']/.test(bare)) return null;
   const domains = bare.split(/[\s,;]+/).filter(Boolean).map((tok) => {
-    const m = tok.match(DOMAIN_TOKEN);
+    const email = tok.match(EMAIL_TOKEN);
+    const m = (email ? email[1] : tok).match(DOMAIN_TOKEN);
     return m ? m[1].toLowerCase() : null;
   });
-  return domains.length && domains.every(Boolean) ? domains : null;
+  return domains.length && domains.every(Boolean) ? { domains, comment } : null;
 }
 
 /**
- * Turn lines that are only domains ("acme.com", "https://www.acme.com/x?ref=1", "a.com, b.io")
- * into contacted.toml entries with status "sent"; every other line is left for the server to
- * judge. Domains already listed (or repeated) are dropped and counted in `skipped`. Entries made
- * from lines below a `[table]` header move up above it: there they would be keys of that table,
- * which the parser accepts and seeding then ignores.
+ * Turn lines that are only domains, links or email addresses ("acme.com",
+ * "https://www.acme.com/x?ref=1", "jane@acme.com", "a.com, b.io") into contacted.toml entries
+ * with status "sent"; a note after them ("# old client") stays on the line's last entry. Every
+ * other line is left for the server to judge. Domains already listed (or repeated) are dropped
+ * and counted in `skipped`. Entries made from lines below a `[table]` header move up above it:
+ * there they would be keys of that table, which the parser accepts and seeding then ignores.
  * @returns {{ text: string, added: number, skipped: number, from: number[] }} `from[k]`: the line
  *   of `raw` that line k of `text` came from (-1 for a blank line put between moved entries), so
  *   a parse error's line number can be found in what the user typed.
@@ -988,16 +1051,18 @@ export function normalizeContacted(raw) {
   const hoistedFrom = [];
   lines.forEach((line, i) => {
     if (i === firstHeader) headerAt = out.length;
-    const domains = lineDomains(line);
-    if (!domains) {
+    const found = lineDomains(line);
+    if (!found) {
       out.push(line);
       from.push(i);
       return;
     }
+    const { domains, comment } = found;
     const fresh = domains.filter((d) => !known.has(d) && known.add(d));
     added += fresh.length;
     skipped += domains.length - fresh.length;
     const entries = fresh.map((d) => `"${d}" = { status = "sent" }`);
+    if (comment && entries.length) entries[entries.length - 1] += ` ${comment}`;
     const hoist = firstHeader >= 0 && i > firstHeader;
     (hoist ? hoisted : out).push(...entries);
     (hoist ? hoistedFrom : from).push(...entries.map(() => i));
@@ -1039,40 +1104,165 @@ function renumber(snippet, from, to) {
     .join('\n');
 }
 
-/** Entries in a contacted.toml: top-level `key = …` lines plus `[table]` headers. */
-function countEntries(text) {
-  let n = 0;
+/** The domains a contacted.toml lists, lowercased: its top-level `key = …` lines plus its
+ *  `[table]` headers. */
+function entryKeys(text) {
+  const keys = [];
   let inTable = false;
   for (const line of String(text).split('\n')) {
-    if (TABLE_LINE.test(line)) {
-      n++;
-      inTable = true;
-    } else if (!inTable && KEY_LINE.test(line)) {
-      n++;
-    }
+    const table = line.match(TABLE_LINE);
+    const key = !table && !inTable ? line.match(KEY_LINE) : null;
+    if (table) inTable = true;
+    const m = table || key;
+    if (m) keys.push((m[1] || m[2] || m[3]).toLowerCase());
   }
-  return n;
+  return keys;
 }
 
-/** "Saved: 1 domain added, 1 already listed. The list has 3 domains." (counts from normalizeContacted). */
+/** Past this many cells, the lines two texts don't share at their start and end are compared as
+ *  a block (all of one replaced by all of the other) rather than line by line. */
+const DIFF_MAX_CELLS = 4_000_000;
+
+/** How `b` differs from `a`, line by line: `keep[i]`, whether line i of `a` is still in `b`;
+ *  `ins[i]`, the lines of `b` that come before line i of `a` (`ins[a.length]`: after the last).
+ *  A longest common subsequence, so a line both texts have is never counted as changed. */
+function lineDiff(a, b) {
+  const keep = new Array(a.length).fill(false);
+  const ins = Array.from({ length: a.length + 1 }, () => []);
+  // The lines both start and end with are kept; only those between are compared.
+  let s = 0;
+  while (s < a.length && s < b.length && a[s] === b[s]) {
+    keep[s] = true;
+    s++;
+  }
+  let ea = a.length;
+  let eb = b.length;
+  while (ea > s && eb > s && a[ea - 1] === b[eb - 1]) {
+    ea--;
+    eb--;
+    keep[ea] = true;
+  }
+  const n = ea - s;
+  const m = eb - s;
+  if (n * m > DIFF_MAX_CELLS) {
+    ins[ea].push(...b.slice(s, eb));
+    return { keep, ins };
+  }
+  // lcs[i * w + j]: the longest common subsequence of a[s + i..ea) and b[s + j..eb).
+  const w = m + 1;
+  const lcs = new Uint16Array((n + 1) * w);
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      lcs[i * w + j] = a[s + i] === b[s + j] ? lcs[(i + 1) * w + j + 1] + 1 : Math.max(lcs[(i + 1) * w + j], lcs[i * w + j + 1]);
+    }
+  }
+  let i = 0;
+  let j = 0;
+  while (i < n || j < m) {
+    if (i < n && j < m && a[s + i] === b[s + j]) {
+      keep[s + i++] = true;
+      j++;
+    } else if (i < n && (j === m || lcs[(i + 1) * w + j] >= lcs[i * w + j + 1])) {
+      i++; // removed
+    } else {
+      ins[s + i].push(b[s + j++]);
+    }
+  }
+  return { keep, ins };
+}
+
+/**
+ * This tab's changes to contacted.toml (`mine`, typed over `base`) put on top of the file's new
+ * version (`theirs`, edited elsewhere meanwhile), line by line: a line stays if neither side
+ * removed it, and every line either side added is kept, theirs first where both added at the
+ * same spot (a line both added, once). Nothing is ever dropped for a clash: a line both changed
+ * comes out in both versions, for the user to settle before saving.
+ * @param {string} base  @param {string} mine  @param {string} theirs
+ * @returns {string}
+ */
+export function mergeContacted(base, mine, theirs) {
+  const lines = String(base ?? '').split('\n');
+  const m = lineDiff(lines, String(mine ?? '').split('\n'));
+  const t = lineDiff(lines, String(theirs ?? '').split('\n'));
+  const out = [];
+  for (let i = 0; i <= lines.length; i++) {
+    const theirsHere = [...t.ins[i]];
+    out.push(...t.ins[i]);
+    for (const line of m.ins[i]) {
+      const k = theirsHere.indexOf(line);
+      if (k >= 0) theirsHere.splice(k, 1);
+      else out.push(line);
+    }
+    if (i < lines.length && m.keep[i] && t.keep[i]) out.push(lines[i]);
+  }
+  return out.join('\n');
+}
+
+/** "Saved: 1 domain added, 1 already listed. The list has 3 domains." `added`: the domains new to
+ *  the list, however they were typed; `skipped`: normalizeContacted's count of domains dropped as
+ *  already listed. */
 function savedMessage({ added, skipped }, total) {
   const what = [];
   if (added) what.push(`${pluralize(added, 'domain')} added`);
-  if (skipped) what.push(`${added ? skipped : pluralize(skipped, 'domain')} already listed`);
+  if (skipped) what.push(`${added ? fmtNum(skipped) : pluralize(skipped, 'domain')} already listed`);
   const head = what.length ? `Saved: ${what.join(', ')}.` : 'Saved.';
   return total ? `${head} The list has ${pluralize(total, 'domain')}.` : `${head} The list is empty.`;
 }
 
-/** Unsaved Already contacted text from a screen the user left; offered back on the next visit. */
+/** At most this many domains new to the list are looked up in the pipeline after a save (one
+ *  request each); past that, the save message's seed hint and the help panel say it in general. */
+const LOOKUP_MAX = 25;
+const LOOKUP_WAIT_MS = 3000;
+/** Pipeline stages where nothing has gone out yet: sourcing, drafting or sending can still reach
+ *  the company, and seeding won't stop it. (A sent one has been contacted already.) */
+const NOT_CONTACTED = new Set(['sourced', 'named', 'emailed', 'drafted']);
+
+/** Unsaved Already contacted text from a screen the user left, with the file it was typed over
+ *  (`base`); offered back on the next visit, on top of the file as it is by then. */
 let contactedDraft = null;
 
-function mountContacted(root) {
+// Text kept from a screen the user left lives only in this page, and each editor's own close and
+// reload guards went with it. Until it is saved or shown again, a close or reload from any screen
+// still keeps it: a profile draft is sent with keepalive as the page goes (as the editor itself
+// does), and the user is asked first when that can't be relied on (its exit save failed, or it's
+// over the keepalive budget) or when Already contacted text is waiting (no autosave there).
+function onLeftBeforeUnload(e) {
+  const p = profileDraft;
+  if (contactedDraft === null && !(p && (p.failed || !fitsKeepalive(p.doc)))) return;
+  e.preventDefault();
+  e.returnValue = '';
+}
+
+function onLeftPageHide() {
+  const draft = profileDraft;
+  if (!draft) return;
+  saveOnExit(draft.doc).then((ok) => {
+    if (!ok || profileDraft !== draft) return;
+    profileDraft = null;
+    guardLeftDrafts();
+  });
+}
+
+/** Listen for a close or reload while a draft is held, and only then. */
+function guardLeftDrafts() {
+  const on = profileDraft !== null || contactedDraft !== null;
+  const method = on ? 'addEventListener' : 'removeEventListener';
+  window[method]('beforeunload', onLeftBeforeUnload);
+  window[method]('pagehide', onLeftPageHide);
+}
+
+/**
+ * Mount the Already contacted list (contacted.toml) into `root`. `onState()` runs whenever its
+ * saved / unsaved state may have changed (the returned `dirty()` tells which).
+ */
+function mountContacted(root, { onState } = {}) {
   const id = `ac-${++uid}`;
   const ac = new AbortController();
-  let saved = null;
+  let saved = null; // the file as it was last read or written here
   let busy = false;
   let loadFailed = false;
   let disposed = false;
+  let refocus = false; // Try again had focus: hand it on to what the load shows
 
   // A rejected save: the server's reason (an alert, so it's heard even though focus stays on
   // Save), then the parser's snippet as it printed it, and a way to the line it names.
@@ -1101,6 +1291,14 @@ function mountContacted(root) {
   const msg = h('p', { class: 'ac-msg', role: 'status' });
   const discardBtn = h('button', { type: 'button', class: 'cp-text-btn', onClick: () => discard() }, 'Discard');
   const restored = h('p', { class: 'ac-restored' }, h('span', {}, 'Your unsaved changes from earlier are back.'), discardBtn);
+  const code = (s) => h('code', {}, s);
+  // A save that found the file changed on disk since it was read here: nothing was written.
+  const changed = h(
+    'p',
+    { class: 'ac-restored' },
+    h('span', {}, code('contacted.toml'), ' changed since you opened it, so nothing was saved. Your changes are now on top of its new version: check them, then save.'),
+    h('button', { type: 'button', class: 'cp-text-btn', onClick: () => discard() }, 'Discard your changes'),
+  );
   const restoredNotice = liveNotice('ac-restored');
   // aria-disabled rather than disabled while there's nothing to save, so focus stays on it after a
   // save (a disabled button drops focus to the page).
@@ -1134,16 +1332,23 @@ function mountContacted(root) {
     foot,
   );
 
-  const code = (s) => h('code', {}, s);
+  // What seeding really does: it adds companies the pipeline doesn't have (sourcing then never
+  // brings them in), and leaves the stage of one already there alone.
   const help = h(
     'section',
     { class: 'ac-help cp-card', 'aria-labelledby': `${id}-help-title` },
     h('h2', { class: 'pe-check-title', id: `${id}-help-title` }, 'How this list works'),
-    h('p', { class: 'ac-help-text' }, 'Domains you contacted before or outside coldtrail. Once they’re loaded into the pipeline, sourcing skips them, so nobody hears from you twice.'),
-    h('p', { class: 'ac-help-label' }, 'Paste domains or links, or write entries:'),
-    h('pre', { class: 'ac-example' }, 'acme.com\nhttps://www.beta.io/about\n"gamma.dev" = { status = "skip" }'),
-    h('p', { class: 'ac-help-text' }, 'Domains and links are saved as ', code('status = "sent"'), ', already contacted. Use ', code('"skip"'), ' for companies you never want to contact.'),
-    h('p', { class: 'ac-help-text' }, 'Saving writes ', code('contacted.toml'), ' on this machine. Run ', code('coldtrail seed'), ' in a terminal to load it into the pipeline.'),
+    h(
+      'p',
+      { class: 'ac-help-text' },
+      'Domains you contacted before or outside coldtrail. Seeding adds the ones that aren’t in your pipeline yet, so sourcing never brings them in. Seeding doesn’t change a company that’s already there: skip it on ',
+      h('a', { href: href(['pipeline']) }, 'Pipeline'),
+      ' instead.',
+    ),
+    h('p', { class: 'ac-help-label' }, 'Paste domains, links or email addresses, or write entries:'),
+    h('pre', { class: 'ac-example' }, 'acme.com\nhttps://www.beta.io/about\njane@delta.co\n"gamma.dev" = { status = "skip" }'),
+    h('p', { class: 'ac-help-text' }, 'Domains, links and addresses are saved as ', code('status = "sent"'), ', already contacted. Use ', code('"skip"'), ' for companies you never want to contact.'),
+    h('p', { class: 'ac-help-text' }, 'Saving writes ', code('contacted.toml'), ' on this machine. Then run ', code('coldtrail seed'), ' in a terminal.'),
   );
 
   const el = h('div', { class: 'ac' }, h('div', { class: 'cp-grid' }, main, help));
@@ -1179,7 +1384,14 @@ function mountContacted(root) {
     let first = head;
     let snippet = rest.join('\n');
     errorAt = locate(head, result);
-    if (errorAt && errorAt.line !== errorAt.sent) {
+    const typed = errorAt ? ta.value.split('\n')[errorAt.line] : '';
+    if (errorAt && errorAt.exact && typed.trim() && !isComment(typed) && !/[=[\]{}]/.test(typed)) {
+      // Not a domain, link or address, and not trying to be an entry ("Jane Doe <jane@acme.com>",
+      // "acme"): the parser's "expected `.`, `=`" would point at TOML the user never meant to
+      // write, so say what's wrong in words.
+      first = `line ${errorAt.line + 1} isn’t a domain, a link, an email address or a contacted.toml entry.`;
+      snippet = '';
+    } else if (errorAt && errorAt.line !== errorAt.sent) {
       // Domain lines above it became several entries (or moved): the parser counted lines of
       // text the user never sees. Give the line as typed, so the reason, its snippet and "Go to
       // line" all name the line the textarea shows.
@@ -1208,7 +1420,7 @@ function mountContacted(root) {
    *  was sent unchanged (`exact`). `sent`: the line in the text that was sent. */
   function locate(message, result) {
     const m = /\bline (\d+), column (\d+)/.exec(message);
-    if (!m) return null;
+    if (!m || !result) return null;
     const k = Number(m[1]) - 1;
     const line = result.from[k];
     if (line == null || line < 0) return null;
@@ -1236,28 +1448,51 @@ function mountContacted(root) {
     stateText.textContent = { saving: 'Saving…', dirty: 'Unsaved changes', saved: 'Saved', 'load-error': 'Not loaded', loading: '' }[state];
     stateIcon.replaceChildren(state === 'saved' ? icon('check', 14) : state === 'load-error' ? icon('error', 14) : '');
     stateEl.dataset.state = state;
+    // While loading, the footer keeps its room (unseen, nothing to press) so nothing below moves
+    // when the list arrives; a failed load has no footer.
+    main.dataset.state = state;
+    foot.hidden = state === 'load-error';
     if (!dirty) restoredNotice.hide();
+    if (onState) onState();
   }
 
   async function save() {
     if (busy || !isDirty()) return;
-    const result = normalizeContacted(ta.value);
-    const { text } = result;
     busy = true;
     ta.readOnly = true;
     setBusy(saveBtn, true);
     msg.replaceChildren();
     clearError();
     renderState();
+    let result = null;
     try {
-      await api.post('/api/onboarding/contacted', { toml: text });
+      // The text here was typed over the file as it was read. The file invites edits by hand
+      // (its header says so): read it again first, and never write over a change made there.
+      const res = await api.get('/api/onboarding/files', { signal: ac.signal });
       if (disposed) return;
-      saved = text;
-      ta.value = text;
-      const n = countEntries(text);
-      msg.replaceChildren(savedMessage(result, n), ...(n ? [' Run ', code('coldtrail seed'), ' to load them into the pipeline.'] : []));
+      const disk = lf(res && res.contacted);
+      if (disk !== saved) {
+        changedOnDisk(disk);
+        return;
+      }
+      result = normalizeContacted(ta.value);
+      const before = saved;
+      await api.post('/api/onboarding/contacted', { toml: result.text });
+      if (disposed) return;
+      saved = result.text;
+      ta.value = result.text;
+      const keys = entryKeys(result.text);
+      const listed = new Set(entryKeys(before));
+      const added = keys.filter((d) => !listed.has(d));
+      const named = await inPipeline(added);
+      if (disposed) return;
+      msg.replaceChildren(
+        savedMessage({ added: added.length, skipped: result.skipped }, keys.length),
+        ...(keys.length ? [' Run ', code('coldtrail seed'), ' to add the ones that aren’t in your pipeline yet.'] : []),
+        ...pipelineNote(named),
+      );
     } catch (err) {
-      if (disposed) return;
+      if (disposed || (err && err.name === 'AbortError')) return;
       // A stale session: the short pointer, since the shell's banner says the rest.
       showError(errorText(err), result);
     } finally {
@@ -1268,6 +1503,44 @@ function mountContacted(root) {
     }
   }
 
+  /** The file changed on disk after it was read here: nothing is written. This tab's changes go
+   *  on top of its new version, to check and save again, or to discard. */
+  function changedOnDisk(disk) {
+    const merged = mergeContacted(saved, ta.value, disk);
+    saved = disk;
+    ta.value = merged;
+    if (merged === disk) msg.replaceChildren(code('contacted.toml'), ' changed since you opened it and already has your changes, so nothing was saved.');
+    else restoredNotice.show(changed);
+  }
+
+  /** Which of `domains` (new to the list) the pipeline already has at a stage where nothing has
+   *  gone out yet: seeding leaves those as they are. Only up to LOOKUP_MAX of them are looked up
+   *  (else none are); a lookup that fails, or all of them taking too long, counts as not there. */
+  function inPipeline(domains) {
+    if (!domains.length || domains.length > LOOKUP_MAX) return Promise.resolve([]);
+    const lookups = domains.map((d) =>
+      api.get(`/api/companies?q=${encodeURIComponent(d)}&per=50`, { signal: ac.signal }).then(
+        (res) => ((res && res.rows) || []).some((c) => c.domain === d && NOT_CONTACTED.has(c.status)),
+        () => false,
+      ),
+    );
+    let timer;
+    const late = new Promise((resolve) => {
+      timer = setTimeout(() => resolve([]), LOOKUP_WAIT_MS);
+    });
+    const found = Promise.all(lookups).then((hits) => domains.filter((_, i) => hits[i]));
+    return Promise.race([found, late]).finally(() => clearTimeout(timer));
+  }
+
+  /** The save message's last sentence: the companies `inPipeline` found, each a link to it on
+   *  Pipeline, where it can be skipped. */
+  function pipelineNote(named) {
+    const link = (d) => h('a', { class: 'mono', href: href(['pipeline', d]) }, d);
+    if (!named.length) return [];
+    if (named.length === 1) return [' ', link(named[0]), ' is already in your pipeline, so seeding won’t change it. Open it to skip it.'];
+    return [' Already in your pipeline, so seeding won’t change them: ', ...named.flatMap((d, i) => (i ? [', ', link(d)] : [link(d)])), '. Open each to skip it.'];
+  }
+
   function discard() {
     ta.value = saved;
     clearError();
@@ -1276,13 +1549,39 @@ function mountContacted(root) {
     ta.focus();
   }
 
+  /** Read the file again (the browser tab shown again, or this tab picked again), so an edit made
+   *  in a text editor meanwhile shows here. Never over unsaved text or a save; anything that
+   *  happens here before the answer comes wins over it. */
+  function refresh() {
+    if (disposed || saved === null || busy || isDirty()) return;
+    const shown = ta.value;
+    api.get('/api/onboarding/files', { signal: ac.signal }).then(
+      (res) => {
+        const disk = lf(res && res.contacted);
+        if (disposed || busy || ta.value !== shown || saved !== shown || disk === saved) return;
+        const { selectionStart, selectionEnd } = ta;
+        saved = disk;
+        ta.value = disk;
+        if (document.activeElement === ta) ta.setSelectionRange(Math.min(selectionStart, disk.length), Math.min(selectionEnd, disk.length));
+        msg.replaceChildren();
+        renderState();
+      },
+      () => {},
+    );
+  }
+  const onVisibility = () => {
+    if (!document.hidden) refresh();
+  };
+  document.addEventListener('visibilitychange', onVisibility);
+
   ta.addEventListener('input', () => {
     if (!errorEl.hidden) clearError();
     if (msg.firstChild) msg.replaceChildren();
     renderState();
   });
   // There is no autosave here (the server may reject the text), so ask before a close or reload
-  // drops it. Leaving for another screen keeps it instead (see dispose).
+  // drops it. Leaving for another screen keeps it instead (see dispose), and a close or reload
+  // from there still asks (guardLeftDrafts).
   const onBeforeUnload = (e) => {
     if (!isDirty()) return;
     e.preventDefault();
@@ -1295,7 +1594,9 @@ function mountContacted(root) {
     save();
   });
 
-  function load() {
+  /** `again`: Try again was pressed while it had focus. */
+  function load(again = false) {
+    refocus = again;
     skeleton.hidden = false;
     loadError.hidden = true;
     loadFailed = false;
@@ -1306,38 +1607,49 @@ function mountContacted(root) {
         // The textarea turns "\r\n" into "\n": compare the file's text the same way.
         saved = lf(res && res.contacted);
         ta.value = saved;
-        // Edits left unsaved on an earlier visit come back, unless the file already has them.
+        // Edits left unsaved on an earlier visit come back, on top of the file as it is now (it
+        // may have been edited since), unless the file already has them.
         const draft = contactedDraft;
         contactedDraft = null;
-        if (draft !== null && draft !== saved && normalizeContacted(draft).text !== saved) {
-          ta.value = draft;
-          restoredNotice.show(restored);
+        guardLeftDrafts();
+        if (draft !== null) {
+          const text = draft.base === saved ? draft.text : mergeContacted(draft.base, draft.text, saved);
+          if (text !== saved && normalizeContacted(text).text !== saved) {
+            ta.value = text;
+            restoredNotice.show(restored);
+          }
         }
         skeleton.hidden = true;
         ta.hidden = false;
-        foot.hidden = false;
         renderState();
+        if (refocus && focusLost()) ta.focus();
+        refocus = false;
       },
       (err) => {
         if (disposed || (err && err.name === 'AbortError')) return;
         skeleton.hidden = true;
         loadFailed = true;
-        showLoadError(loadError, { title: 'Couldn’t load the list.', err, retry: load });
         renderState();
+        showLoadError(loadError, { title: 'Couldn’t load the list.', err, retry: load, focus: refocus && focusLost() });
+        refocus = false;
       },
     );
   }
 
   load();
   return {
+    refresh,
+    dirty: isDirty,
     dispose() {
       if (disposed) return;
-      // Leaving the screen (no prompt is possible there): keep unsaved text for the next visit.
-      // An unsaved draft that never loaded stays as it was.
-      if (saved !== null) contactedDraft = isDirty() ? ta.value : null;
+      // Leaving the screen (no prompt is possible there): keep unsaved text for the next visit,
+      // with the file it was typed over. An unsaved draft that never loaded stays as it was.
+      if (saved !== null) contactedDraft = isDirty() ? { text: ta.value, base: saved } : null;
+      guardLeftDrafts();
       disposed = true;
       ac.abort();
       if (resized) resized.disconnect();
+      document.removeEventListener('visibilitychange', onVisibility);
       window.removeEventListener('beforeunload', onBeforeUnload);
     },
   };
@@ -1394,14 +1706,36 @@ export default {
     const editor = mountProfileEditor(profilePane, { store: ctx.store });
     let contacted = null;
 
+    // Unsaved Already contacted text (kept from an earlier visit, or typed there before switching
+    // tabs) is marked on its tab, a dot seen and words heard: the sidebar brings you back to the
+    // Profile tab, where nothing else says it's waiting.
+    const contactedTab = tabList.querySelector('[data-id="contacted"]');
+    const unsavedDot = h('span', { class: 'cp-tab-unsaved', 'aria-hidden': 'true', title: 'Unsaved changes' });
+    function markUnsaved() {
+      const on = contactedDraft !== null || Boolean(contacted && contacted.dirty());
+      if (on === (unsavedDot.parentNode !== null)) return;
+      if (on) {
+        contactedTab.querySelector('.tab-label').append(unsavedDot);
+        contactedTab.setAttribute('aria-label', 'Already contacted, unsaved changes');
+      } else {
+        unsavedDot.remove();
+        contactedTab.removeAttribute('aria-label');
+      }
+    }
+    markUnsaved();
+
+    let shownTab = null;
     function setTab(tab) {
+      const was = shownTab;
+      shownTab = tab;
       tabList.setActive(tab);
       for (const d of descs) d.toggleAttribute('data-off', d.dataset.tab !== tab);
       profilePane.hidden = tab !== 'profile';
       contactedPane.hidden = tab !== 'contacted';
       const btn = tabList.querySelector(`[data-id="${tab}"]`);
       if (btn) panel.setAttribute('aria-labelledby', btn.id);
-      if (tab === 'contacted' && !contacted) contacted = mountContacted(contactedPane);
+      if (tab === 'contacted' && !contacted) contacted = mountContacted(contactedPane, { onState: markUnsaved });
+      else if (tab === 'contacted' && was !== 'contacted') contacted.refresh(); // edited elsewhere meanwhile?
     }
     setTab(tabOf(ctx.query));
 

@@ -2,13 +2,13 @@
 // corrected template), the "Already contacted" list (contacted.toml), and the exported
 // `mountProfileEditor` that the Setup wizard mounts on its own. Every test starts from the seeded
 // profile (PRODUCT_MD) and the stock contacted.toml, and asserts what reached the disk.
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { SESSION_EXPIRED, SESSION_REOPEN } from '../../../ui/js/core/api.js';
 import { expectAccessible } from '../harness/a11y.mjs';
 import { test, expect } from '../harness/fixtures.mjs';
-import { PRODUCT_MD } from '../harness/seed.mjs';
+import { COMPANIES, PRODUCT_MD } from '../harness/seed.mjs';
 import { REPO_DIR } from '../harness/server.mjs';
 
 /** The stock contacted.toml every workspace starts with (src/setup.rs writes it). */
@@ -18,6 +18,10 @@ const EXAMPLE_LINK = 'https://yourproduct.com/?utm_content={slug}';
 
 const productOnDisk = (server) => readFileSync(join(server.home, 'product.md'), 'utf8');
 const contactedOnDisk = (server) => readFileSync(join(server.home, 'contacted.toml'), 'utf8');
+/** Edit contacted.toml the way a text editor would: straight on disk, nothing told. */
+const editContactedOnDisk = (server, text) => writeFileSync(join(server.home, 'contacted.toml'), text);
+/** What a save's message adds when the list isn't empty. */
+const SEED_HINT = ' Run coldtrail seed to add the ones that aren’t in your pipeline yet.';
 
 const reEscape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const hashIs = (hash) => new RegExp(`${reEscape(hash)}$`);
@@ -88,6 +92,32 @@ async function openProfile(app, page, hash = '#/company') {
   await app.goto(hash);
   await expect(page.locator('#view h1')).toHaveText('Company profile');
   await expect(editor(page)).toHaveValue(PRODUCT_MD);
+}
+
+/** Reload the tab and answer the "leave site?" question if one comes: accepted, or dismissed with
+ *  `stay` (the page stays as it is). Resolves to the question's type, or null if none was asked. */
+async function reloadAnswering(page, { stay = false } = {}) {
+  let asked = null;
+  const answer = (dialog) => {
+    asked = dialog.type();
+    return stay ? dialog.dismiss() : dialog.accept();
+  };
+  page.on('dialog', answer);
+  try {
+    if (stay) {
+      // A reload the question cancels never finishes: start it from the page, and wait for the
+      // question instead.
+      const question = page.waitForEvent('dialog');
+      await page.evaluate(() => setTimeout(() => location.reload(), 0));
+      await question;
+      await expect.poll(() => asked).not.toBe(null);
+    } else {
+      await page.reload();
+    }
+  } finally {
+    page.off('dialog', answer);
+  }
+  return asked;
 }
 
 /** Replace another screen's module with a bare stub, so leaving this one doesn't depend on it. */
@@ -494,6 +524,76 @@ test('an edit whose save failed is saved on leaving, or kept for the next visit'
   await comeBack();
   await expect(editor(page)).toHaveValue(first);
   await expect(restored).toBeHidden();
+
+  // Typing after a restore makes the text the user's own: the notice goes with its Discard,
+  // which would otherwise put back the file from before the restore over the new typing.
+  failures = 3;
+  const third = `${first}\nThird try.`;
+  await editor(page).fill(third);
+  await expect(saveStatus(page)).toContainText('Couldn’t save: disk full');
+  await leave();
+  await expect.poll(() => failures).toBe(0);
+  await comeBack();
+  await expect(editor(page)).toHaveValue(third);
+  await expect(restored).toBeVisible();
+  await expect.poll(() => productOnDisk(server)).toBe(third);
+  const more = '\n## Team\nTwo founders, typed after the restore.';
+  await typeAtEnd(page, more);
+  await expect(restored).toBeHidden();
+  await expect.poll(() => productOnDisk(server)).toBe(third + more);
+  await expect(saveStatus(page)).toHaveText('Saved');
+  await expect(editor(page)).toHaveValue(third + more);
+});
+
+test('a profile edit kept from a screen you left still asks before a close, from any screen, while its save fails', async ({ app, page, server }) => {
+  app.allowConsole(/status of 500/);
+  await stubView(page, 'home', 'Home');
+  let failures = 0;
+  await page.route('**/api/company', (route) => {
+    if (route.request().method() !== 'POST' || failures === 0) return route.fallback();
+    failures--;
+    return route.fulfill({ status: 500, contentType: 'text/plain', body: 'disk full' });
+  });
+  const restored = page.locator('.pe-restored');
+  /** Type `doc` while every save on the way out fails (the autosave, the router's beforeLeave
+   *  flush and the unmount's own try), and leave for Home: the text is held in memory only. */
+  const typeAndLeave = async (doc) => {
+    failures = 3;
+    await editor(page).fill(doc);
+    await editor(page).press('End'); // a real key press: browsers only ask after user input
+    await expect(saveStatus(page)).toContainText('Couldn’t save: disk full');
+    await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: /^Home\b/ }).click();
+    await expect(page.locator('#view h1')).toHaveText('Home');
+    await expect.poll(() => failures).toBe(0);
+  };
+  await openProfile(app, page);
+
+  // Reloading from Home asks; staying keeps the text, which comes back (and saves) on the next visit.
+  const first = `${PRODUCT_MD}\nHeld while the disk was full.`;
+  await typeAndLeave(first);
+  expect(productOnDisk(server)).toBe(PRODUCT_MD);
+  expect(await reloadAnswering(page, { stay: true })).toBe('beforeunload');
+  await expect(page.locator('#view h1')).toHaveText('Home');
+  await page.goBack();
+  await expect(editor(page)).toHaveValue(first);
+  await expect(restored).toHaveText(/^Your unsaved changes from earlier are back\./);
+  await expect.poll(() => productOnDisk(server)).toBe(first);
+  await expect(saveStatus(page)).toHaveText('Saved');
+
+  // Leaving anyway: the page sends the text as it goes (the disk is back by then).
+  const second = `${first}\nSent on the way out.`;
+  await typeAndLeave(second);
+  expect(productOnDisk(server)).toBe(first);
+  expect(await reloadAnswering(page)).toBe('beforeunload');
+  await expect.poll(() => productOnDisk(server)).toBe(second);
+  await page.goBack();
+  await expect(editor(page)).toHaveValue(second);
+  await expect(restored).toBeHidden();
+
+  // Nothing held: leaving and reloading asks nothing.
+  await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: /^Home\b/ }).click();
+  await expect(page.locator('#view h1')).toHaveText('Home');
+  expect(await reloadAnswering(page)).toBe(null);
 });
 
 test('empty profile shows the corrected template', async ({ app, page, server }) => {
@@ -574,14 +674,14 @@ test('loading, load errors and save errors', async ({ app, page, server }) => {
   const gate = new Promise((resolve) => {
     release = resolve;
   });
-  let failLoad = true;
+  let failLoads = 2;
   let failSave = true;
   await page.route('**/api/company', async (route) => {
     const method = route.request().method();
     if (method === 'GET') {
       await gate;
-      if (failLoad) {
-        failLoad = false;
+      if (failLoads > 0) {
+        failLoads--;
         return route.fulfill({ status: 500, contentType: 'text/plain', body: 'disk unavailable' });
       }
     } else if (method === 'POST' && failSave) {
@@ -603,8 +703,18 @@ test('loading, load errors and save errors', async ({ app, page, server }) => {
   await expect(loadError).toContainText('Couldn’t load your profile');
   await expect(loadError).toContainText('disk unavailable');
   await expect(editor(page)).toBeHidden();
-  await loadError.getByRole('button', { name: 'Try again' }).click();
+  // Try again from the keyboard: focus stays with it (on a new Try again if it fails again), and
+  // goes on into the text once it loads, never back to the page.
+  const tryAgain = loadError.getByRole('button', { name: 'Try again' });
+  await tryAgain.focus();
+  await page.keyboard.press('Enter');
+  await expect.poll(() => failLoads).toBe(0);
+  await expect(tryAgain).not.toHaveAttribute('aria-busy', 'true'); // the new one
+  await expect(loadError).toContainText('disk unavailable');
+  await expect(tryAgain).toBeFocused();
+  await page.keyboard.press('Enter');
   await expect(editor(page)).toHaveValue(PRODUCT_MD);
+  await expect(editor(page)).toBeFocused();
   expect(saves).toEqual([]);
 
   // Save error: shown in the status with a retry; the text is kept.
@@ -618,8 +728,11 @@ test('loading, load errors and save errors', async ({ app, page, server }) => {
     expect(await fileBarLayout(page), `file bar at ${width}px`).toEqual({ nameClear: true, textCut: false, sideScroll: false });
   }
   await page.setViewportSize({ width: 1440, height: 900 });
-  await page.getByRole('button', { name: 'Retry', exact: true }).click();
+  // Retry hides as the save starts: from the keyboard, focus goes on into the text.
+  await page.getByRole('button', { name: 'Retry', exact: true }).focus();
+  await page.keyboard.press('Enter');
   await expect(saveStatus(page)).toHaveText('Saved');
+  await expect(editor(page)).toBeFocused();
   expect(productOnDisk(server)).toBe(`${PRODUCT_MD}\nNew line.`);
 });
 
@@ -759,7 +872,7 @@ test('already contacted saves and rejects invalid input', async ({ app, page, se
   const saved =
     '"acme.example" = { status = "sent" }\n"beta.example" = { status = "sent" }\n' +
     '"gamma.example" = { status = "sent" }\n';
-  const seedHint = ' Run coldtrail seed to load them into the pipeline.';
+  const seedHint = SEED_HINT;
   await expect(page.locator('.ac-msg')).toHaveText(`Saved: 3 domains added, 1 already listed. The list has 3 domains.${seedHint}`);
   await expect(box).toHaveValue(saved);
   expect(contactedOnDisk(server)).toBe(saved);
@@ -772,18 +885,19 @@ test('already contacted saves and rejects invalid input', async ({ app, page, se
 
   // Domains pasted under existing TOML entries join them; ones already listed are skipped, and
   // the message says so rather than counting them as saved.
-  await box.fill(`${CONTACTED_TEMPLATE}delta.example\nanother-co.io\n`);
+  await box.fill(`${saved}delta.example\ngamma.example\n`);
   await save.click();
-  await expect(page.locator('.ac-msg')).toHaveText(`Saved: 1 domain added, 1 already listed. The list has 3 domains.${seedHint}`);
-  const merged = `${CONTACTED_TEMPLATE}"delta.example" = { status = "sent" }\n`;
+  await expect(page.locator('.ac-msg')).toHaveText(`Saved: 1 domain added, 1 already listed. The list has 4 domains.${seedHint}`);
+  const merged = `${saved}"delta.example" = { status = "sent" }\n`;
   await expect(box).toHaveValue(merged);
   expect(contactedOnDisk(server)).toBe(merged);
 
   // A link with a query string is still a domain. Pasted below a [table] header, its entry moves
-  // above the header: inside the table it would be a key that seeding silently ignores.
+  // above the header: inside the table it would be a key that seeding silently ignores. An entry
+  // typed in contacted.toml form (the table) counts as added too.
   await box.fill(`${merged}["table.example"]\nstatus = "skip"\nhttps://query.example/pricing?plan=pro&ref=x\n`);
   await save.click();
-  await expect(page.locator('.ac-msg')).toHaveText(`Saved: 1 domain added. The list has 5 domains.${seedHint}`);
+  await expect(page.locator('.ac-msg')).toHaveText(`Saved: 2 domains added. The list has 6 domains.${seedHint}`);
   const hoisted = `${merged}"query.example" = { status = "sent" }\n\n["table.example"]\nstatus = "skip"\n`;
   await expect(box).toHaveValue(hoisted);
   expect(contactedOnDisk(server)).toBe(hoisted);
@@ -965,6 +1079,50 @@ test('already contacted keeps unsaved edits when you leave, and asks before a cl
   await expect(contactedBox(page)).toHaveValue(savedText);
 });
 
+test('already contacted text kept from a visit still asks before a close, from any screen, and its tab says it’s waiting', async ({ app, page, server }) => {
+  await stubView(page, 'pipeline', 'Pipeline');
+  await app.goto('#/company?tab=contacted');
+  const box = contactedBox(page);
+  await expect(box).toHaveValue(CONTACTED_TEMPLATE);
+  const marked = page.getByRole('tab', { name: 'Already contacted, unsaved changes' });
+  await expect(page.getByRole('tab', { name: 'Already contacted' })).toBeVisible();
+  await expect(marked).toHaveCount(0);
+
+  // Typed (real keys: browsers only ask after user input), then left by the help panel's link.
+  await box.focus();
+  await box.evaluate((el) => el.setSelectionRange(el.value.length, el.value.length));
+  await page.keyboard.type('kept.example');
+  const draft = `${CONTACTED_TEMPLATE}kept.example`;
+  await expect(page.locator('.ac-state')).toHaveText('Unsaved changes');
+  await expect(marked).toBeVisible();
+  await page.locator('.ac-help').getByRole('link', { name: 'Pipeline' }).click();
+  await expect(page.locator('#view h1')).toHaveText('Pipeline');
+
+  // The text lives only in this page now: reloading from there asks, and staying keeps it.
+  expect(await reloadAnswering(page, { stay: true })).toBe('beforeunload');
+  await expect(page.locator('#view h1')).toHaveText('Pipeline');
+
+  // Back through the sidebar, the Profile tab opens: the list's tab says its changes are waiting.
+  await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: /^Company profile\b/ }).click();
+  await expect(page).toHaveURL(hashIs('#/company'));
+  await expect(page.getByRole('tab', { name: 'Profile' })).toHaveAttribute('aria-selected', 'true');
+  await expect(marked).toBeVisible();
+  await expect(page.locator('.cp-tab-unsaved')).toBeVisible();
+  await expectAccessible(page);
+  await marked.click();
+  await expect(box).toHaveValue(draft);
+  await expect(page.locator('.ac-restored')).toHaveText(/^Your unsaved changes from earlier are back\./);
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(page.locator('.ac-msg')).toContainText('Saved: 1 domain added.');
+  await expect(marked).toHaveCount(0);
+  expect(contactedOnDisk(server)).toBe(`${CONTACTED_TEMPLATE}"kept.example" = { status = "sent" }`);
+
+  // Saved: nothing is held any more, so leaving and reloading asks nothing.
+  await page.locator('.ac-help').getByRole('link', { name: 'Pipeline' }).click();
+  await expect(page.locator('#view h1')).toHaveText('Pipeline');
+  expect(await reloadAnswering(page)).toBe(null);
+});
+
 test('a contacted.toml with Windows line endings loads as saved', async ({ app, page, request, server }) => {
   await stubView(page, 'home', 'Home');
   const crlf = CONTACTED_TEMPLATE.replace(/\n/g, '\r\n');
@@ -984,17 +1142,206 @@ test('a contacted.toml with Windows line endings loads as saved', async ({ app, 
   expect(contactedOnDisk(server)).toBe(crlf);
 });
 
+test('already contacted picks up edits made to the file elsewhere, and never saves over them', async ({ app, page, server }) => {
+  await stubView(page, 'home', 'Home');
+  await app.goto('#/company?tab=contacted');
+  const box = contactedBox(page);
+  const state = page.locator('.ac-state');
+  const save = page.getByRole('button', { name: 'Save', exact: true });
+  const notice = page.locator('.ac-restored');
+  const msg = page.locator('.ac-msg');
+  const visible = () => page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await expect(box).toHaveValue(CONTACTED_TEMPLATE);
+
+  // Edited in a text editor while the tab was in the background: shown once it's back.
+  const v1 = `${CONTACTED_TEMPLATE}"hand-added.example" = { status = "skip" }\n`;
+  editContactedOnDisk(server, v1);
+  await visible();
+  await expect(box).toHaveValue(v1);
+  await expect(state).toHaveText('Saved');
+  // ...and when the tab comes back from the Profile tab.
+  const v2 = `${v1}"second-hand.example" = { status = "sent" }\n`;
+  await page.getByRole('tab', { name: 'Profile' }).click();
+  await expect(editor(page)).toBeVisible();
+  editContactedOnDisk(server, v2);
+  await page.getByRole('tab', { name: 'Already contacted' }).click();
+  await expect(box).toHaveValue(v2);
+
+  // Changed on disk while there are unsaved edits here: those edits stay on screen, and Save
+  // writes nothing. It shows the file's new version with these edits added, to check and save.
+  await box.fill(`${v2}new-one.example\n`);
+  const v3 = `${v2}"third-hand.example" = { status = "skip" }\n`;
+  editContactedOnDisk(server, v3);
+  await visible();
+  await expect(box).toHaveValue(`${v2}new-one.example\n`);
+  await save.click();
+  // (Changed since it was read here, by whatever changed it: another coldtrail tab, the agent,
+  // a text editor. The notice doesn't guess which.)
+  await expect(notice).toHaveText(/^contacted\.toml changed since you opened it, so nothing was saved\./);
+  await expect(page.getByRole('status').filter({ has: notice })).toBeVisible();
+  expect(contactedOnDisk(server)).toBe(v3);
+  await expect(box).toHaveValue(`${v3}new-one.example\n`);
+  await expect(state).toHaveText('Unsaved changes');
+  await expect(save).toBeEnabled();
+  await expect(save).toBeFocused();
+  await expectAccessible(page);
+  await save.click();
+  const v4 = `${v3}"new-one.example" = { status = "sent" }\n`;
+  await expect(msg).toHaveText(`Saved: 1 domain added. The list has 6 domains.${SEED_HINT}`);
+  expect(contactedOnDisk(server)).toBe(v4);
+  await expect(notice).toBeHidden();
+
+  // A domain removed here and one added on disk: both changes are kept. "Discard your changes"
+  // keeps the file as it is on disk instead.
+  await box.fill(v4.replace('"second-hand.example" = { status = "sent" }\n', ''));
+  const v5 = `${v4}"fourth-hand.example" = { status = "sent" }\n`;
+  editContactedOnDisk(server, v5);
+  await save.click();
+  await expect(notice).toBeVisible();
+  await expect(box).toHaveValue(v5.replace('"second-hand.example" = { status = "sent" }\n', ''));
+  await notice.getByRole('button', { name: 'Discard your changes' }).click();
+  await expect(box).toHaveValue(v5);
+  await expect(box).toBeFocused();
+  await expect(state).toHaveText('Saved');
+  await expect(notice).toBeHidden();
+  expect(contactedOnDisk(server)).toBe(v5);
+
+  // Unsaved text kept from an earlier visit comes back on top of what the file holds by then.
+  await box.fill(`${v5}kept.example\n`);
+  await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: /^Home\b/ }).click();
+  await expect(page.locator('#view h1')).toHaveText('Home');
+  const v6 = `${v5}"fifth-hand.example" = { status = "skip" }\n`;
+  editContactedOnDisk(server, v6);
+  await page.goBack();
+  await expect(box).toHaveValue(`${v6}kept.example\n`);
+  await expect(notice).toHaveText(/^Your unsaved changes from earlier are back\./);
+  await save.click();
+  await expect(msg).toContainText('Saved: 1 domain added. The list has 9 domains.');
+  const v7 = `${v6}"kept.example" = { status = "sent" }\n`;
+  expect(contactedOnDisk(server)).toBe(v7);
+
+  // Changed on disk to just what was typed here (another tab saved the same entry first):
+  // nothing is written, and the message says the file has it already.
+  const v8 = `${v7}"twice.example" = { status = "skip" }\n`;
+  await box.fill(v8);
+  editContactedOnDisk(server, v8);
+  await save.click();
+  await expect(msg).toHaveText('contacted.toml changed since you opened it and already has your changes, so nothing was saved.');
+  await expect(state).toHaveText('Saved');
+  await expect(notice).toBeHidden();
+  expect(contactedOnDisk(server)).toBe(v8);
+});
+
+test('mergeContacted puts this tab’s changes on top of the file’s new version', async ({ app, page }) => {
+  await app.goto('#/company?tab=contacted');
+  await expect(contactedBox(page)).toHaveValue(CONTACTED_TEMPLATE);
+  const merged = await page.evaluate(async () => {
+    const { mergeContacted } = await import('/assets/js/views/company.js');
+    const base = 'a\nb\nc\nd\n';
+    return {
+      // Nothing changed on one side: the other side as it is.
+      onlyMine: mergeContacted(base, 'a\nb\nx\nc\nd\n', base),
+      onlyTheirs: mergeContacted(base, base, 'a\nb\nc\nd\ny\n'),
+      // Added at the same spot: theirs first, then mine.
+      sameSpot: mergeContacted(base, 'a\nb\nx\nc\nd\n', 'a\nb\ny\nc\nd\n'),
+      // Mine removes b and adds at the end; theirs adds at the top and removes d.
+      both: mergeContacted(base, 'a\nc\nd\nx\n', 'y\na\nb\nc\n'),
+      // A line both changed comes out twice, for the user to settle before saving.
+      clash: mergeContacted(base, 'a\nB1\nc\nd\n', 'a\nB2\nc\nd\n'),
+    };
+  });
+  expect(merged).toEqual({
+    onlyMine: 'a\nb\nx\nc\nd\n',
+    onlyTheirs: 'a\nb\nc\nd\ny\n',
+    sameSpot: 'a\nb\ny\nx\nc\nd\n',
+    both: 'y\na\nc\nx\n',
+    clash: 'a\nB2\nB1\nc\nd\n',
+  });
+});
+
+test('pasted email addresses and notes become entries; other words get a plain reason', async ({ app, page, server }) => {
+  app.allowConsole(/status of 500/);
+  await app.goto('#/company?tab=contacted');
+  const box = contactedBox(page);
+  await expect(box).toHaveValue(CONTACTED_TEMPLATE);
+  const save = page.getByRole('button', { name: 'Save', exact: true });
+  const msg = page.locator('.ac-msg');
+
+  // An email address stands for its domain; a note after a domain, in the file's own comment
+  // style, stays with its entry.
+  await box.fill(`${CONTACTED_TEMPLATE}john@acme-mail.example\nold-client.example  # met at SaaStr\n<jane@beta-mail.example>, mailto:sam@gamma-mail.example\n`);
+  await save.click();
+  await expect(msg).toHaveText(`Saved: 4 domains added. The list has 6 domains.${SEED_HINT}`);
+  const saved =
+    `${CONTACTED_TEMPLATE}"acme-mail.example" = { status = "sent" }\n` +
+    '"old-client.example" = { status = "sent" } # met at SaaStr\n' +
+    '"beta-mail.example" = { status = "sent" }\n"gamma-mail.example" = { status = "sent" }\n';
+  expect(contactedOnDisk(server)).toBe(saved);
+  await expect(box).toHaveValue(saved);
+
+  // A line that's neither: said in words, not as the parser's TOML expectations.
+  await box.fill('acme.example\nJane Doe <jane@delta.example>\n');
+  await save.click();
+  await expect(page.locator('.ac-error')).toHaveText('Not saved: line 2 isn’t a domain, a link, an email address or a contacted.toml entry.');
+  await expect(page.locator('.ac-error-snippet')).toBeHidden();
+  await page.getByRole('button', { name: 'Go to line 2' }).click();
+  await expect(box).toBeFocused();
+  expect(contactedOnDisk(server)).toBe(saved);
+
+  // Big pastes: every count with thousands separators.
+  const fresh = Array.from({ length: 1500 }, (_, i) => `co-${i}.example`);
+  await box.fill(`${[...fresh, ...fresh.slice(0, 1200)].join('\n')}\n`);
+  await save.click();
+  await expect(msg).toHaveText(`Saved: 1,500 domains added, 1,200 already listed. The list has 1,500 domains.${SEED_HINT}`);
+});
+
+test('after a save, companies already in the pipeline are named: seeding won’t change them', async ({ app, page, server }) => {
+  // (Not the seed's hostile-text company: a plain domain reads better in the message.)
+  const at = (status) => COMPANIES.find((c) => c.status === status && c.domain !== 'xss.example').domain;
+  const [drafted, sourced, skipped] = [at('drafted'), at('sourced'), at('skip')];
+  await app.goto('#/company?tab=contacted');
+  const box = contactedBox(page);
+  await expect(box).toHaveValue(CONTACTED_TEMPLATE);
+  // The help says what seeding does, and what it doesn't.
+  const help = page.locator('.ac-help');
+  await expect(help).toContainText('Seeding adds the ones that aren’t in your pipeline yet, so sourcing never brings them in.');
+  await expect(help).toContainText('Seeding doesn’t change a company that’s already there: skip it on Pipeline instead.');
+  await expect(help).not.toContainText('nobody hears from you twice');
+  await expect(help.getByRole('link', { name: 'Pipeline' })).toHaveAttribute('href', '#/pipeline');
+
+  // A company that's skipped there already isn't named; nor is one the pipeline doesn't have.
+  await box.fill(`${CONTACTED_TEMPLATE}${drafted}\n"${sourced}" = { status = "skip" }\n${skipped}\nbrand-new.example\n`);
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  const msg = page.locator('.ac-msg');
+  await expect(msg).toHaveText(
+    `Saved: 4 domains added. The list has 6 domains.${SEED_HINT} Already in your pipeline, so seeding won’t change them: ${drafted}, ${sourced}. Open each to skip it.`,
+  );
+  await expect(msg.getByRole('link', { name: drafted })).toHaveAttribute('href', `#/pipeline/${drafted}`);
+  await expect(msg.getByRole('link', { name: sourced })).toHaveAttribute('href', `#/pipeline/${sourced}`);
+  expect(contactedOnDisk(server)).toContain(`"${sourced}" = { status = "skip" }`);
+
+  // Only what this save added is looked up.
+  await box.focus();
+  await box.evaluate((el) => el.setSelectionRange(el.value.length, el.value.length));
+  await page.keyboard.type(at('emailed'));
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(msg).toHaveText(
+    `Saved: 1 domain added. The list has 7 domains.${SEED_HINT} ${at('emailed')} is already in your pipeline, so seeding won’t change it. Open it to skip it.`,
+  );
+  await expectAccessible(page);
+});
+
 test('already contacted: loading and load error', async ({ app, page }) => {
   app.allowConsole(/status of 500/);
   let release;
   const gate = new Promise((resolve) => {
     release = resolve;
   });
-  let fail = true;
+  let fails = 2;
   await page.route('**/api/onboarding/files', async (route) => {
     await gate;
-    if (fail) {
-      fail = false;
+    if (fails > 0) {
+      fails--;
       return route.fulfill({ status: 500, contentType: 'text/plain', body: 'cannot read contacted.toml' });
     }
     return route.fallback();
@@ -1005,6 +1352,8 @@ test('already contacted: loading and load error', async ({ app, page }) => {
   await expect(page).toHaveURL(hashIs('#/company?tab=contacted'));
   await expect(page.locator('.ac-main .skeleton').first()).toBeVisible();
   await expect(contactedBox(page)).toBeHidden();
+  // Nothing to press while it loads (the footer only keeps its room).
+  await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeHidden();
   release();
   const loadError = page.locator('.ac-load-error');
   await expect(loadError).toContainText('Couldn’t load the list');
@@ -1015,9 +1364,40 @@ test('already contacted: loading and load error', async ({ app, page }) => {
   await expect(state).toHaveText('Not loaded');
   await expect(state).toHaveAttribute('data-state', 'load-error');
   await expect(state.locator('svg')).toBeVisible();
-  await loadError.getByRole('button', { name: 'Try again' }).click();
+  // Try again from the keyboard: focus stays with it (on a new Try again if it fails again), and
+  // goes on into the list once it loads, never back to the page.
+  const tryAgain = loadError.getByRole('button', { name: 'Try again' });
+  await tryAgain.focus();
+  await page.keyboard.press('Enter');
+  await expect.poll(() => fails).toBe(0);
+  await expect(tryAgain).not.toHaveAttribute('aria-busy', 'true'); // the new one
+  await expect(loadError).toContainText('cannot read contacted.toml');
+  await expect(tryAgain).toBeFocused();
+  await page.keyboard.press('Enter');
   await expect(contactedBox(page)).toHaveValue(CONTACTED_TEMPLATE);
+  await expect(contactedBox(page)).toBeFocused();
   await expect(state).toHaveText('Saved');
+  await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeVisible();
+});
+
+test('already contacted keeps its layout while it loads, so the help panel doesn’t jump on a phone', async ({ app, page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  await page.route('**/api/onboarding/files', async (route) => {
+    await gate;
+    return route.fallback();
+  });
+  await app.goto('#/company?tab=contacted');
+  await expect(page.locator('.ac-main .skeleton').first()).toBeVisible();
+  const helpTop = () => page.locator('.ac-help').evaluate((el) => el.getBoundingClientRect().top + window.scrollY);
+  const loading = await helpTop();
+  release();
+  await expect(contactedBox(page)).toHaveValue(CONTACTED_TEMPLATE);
+  await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeVisible();
+  expect(Math.abs((await helpTop()) - loading)).toBeLessThanOrEqual(1);
 });
 
 test('tabs deep link, follow the URL and work from the keyboard', async ({ app, page }) => {

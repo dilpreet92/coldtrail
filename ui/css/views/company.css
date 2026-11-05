@@ -9,6 +9,18 @@
 .cp-desc-text[data-off] { visibility: hidden; }
 
 .cp-tabs { margin-top: var(--space-4); }
+/* Unsaved Already contacted text waiting: a dot after the tab's label, in the colour of the file
+   bar's "Unsaved changes". Drawn as a border, which forced-colors mode keeps (it drops
+   backgrounds). Screen readers get it in the tab's name instead (company.js). */
+.cp-tab-unsaved {
+  display: inline-block;
+  width: 0;
+  height: 0;
+  margin-left: 6px;
+  border: 3px solid var(--warn);
+  border-radius: 50%;
+  vertical-align: middle;
+}
 .cp-panel { margin-top: var(--space-6); }
 
 /* ---- Shared layout: a main card and a 300px side panel from 860px of available width ---- */
@@ -103,8 +115,11 @@
    notice), set by company.js; the text box gives that up so the card keeps the height it was
    sized to. min-height above is the floor. */
 .ac-text { height: calc(var(--ac-h) - var(--ac-extra-h, 0px)); border-radius: 0; }
-/* While loading, the placeholder takes the editor's height so nothing jumps when it arrives. */
+/* While loading, the placeholder takes the editor's height so nothing jumps when it arrives (on a
+   phone, the side panel below it). The list's footer keeps its room too, unseen (company.js). */
 .pe-main[data-state="loading"] .pe-body { height: var(--pe-h); overflow: hidden; }
+.ac-main[data-state="loading"] .ac-body { height: var(--ac-h); overflow: hidden; }
+.ac-main[data-state="loading"] .ac-foot { visibility: hidden; }
 .pe-text::placeholder,
 .ac-text::placeholder { color: var(--text-3); opacity: 1; }
 .pe-text:read-only,
@@ -363,7 +378,8 @@
 }
 
 .ac-help code,
-.ac-msg code {
+.ac-msg code,
+.ac-restored code {
   padding: 1px 5px;
   border-radius: 4px;
   background: var(--surface-2);
