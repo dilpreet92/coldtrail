@@ -32,6 +32,13 @@
 .pl-tabs .tab.is-zero { color: var(--text-3); }
 .pl-tabs .tab[aria-selected="true"].is-zero { color: var(--text); }
 
+/* Nine tabs with counts need ~850px. Beside the sidebar (900px windows and up) one that
+   doesn't fit wraps onto a second row, so every stage stays in reach of a mouse (a wheel
+   doesn't scroll sideways); phones keep the sideways scroll. */
+@media (min-width: 900px) {
+  .pl-tabs .tabs { flex-wrap: wrap; row-gap: 0; overflow-x: visible; }
+}
+
 /* ---- Toolbar: filter, Sourced by, Clear filters ---- */
 
 .pl-toolbar {
@@ -86,6 +93,8 @@
   margin-top: var(--space-3);
   min-width: 0;
 }
+/* Focused from script only (Try again holds focus here while the list reloads). */
+.pl-results:focus { outline: none; }
 
 /* Column widths (every cell has pl-col-<key>): Company and Sourced by take a share of the width,
    Stage and First seen what their longest value needs, Contact the rest. Company gets the larger
@@ -216,6 +225,9 @@
   gap: var(--space-6);
 }
 .company-drawer .drawer-body > .empty-state { padding-top: var(--space-8); }
+/* Focused from script only: the drawer's Try again holds focus here while it reloads, as does
+   a refresh that redrew the control that had it. */
+.company-drawer .drawer-body:focus { outline: none; }
 
 .cd-head { display: flex; flex-direction: column; gap: var(--space-4); }
 
@@ -239,6 +251,8 @@
 .cd-site { font-size: 13px; }
 
 .cd-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+/* Why Skip isn't offered while a draft waits: tucked under the actions it explains. */
+.cd-note { margin-top: calc(var(--space-2) - var(--space-4)); font-size: 13px; color: var(--text-2); }
 
 .cd-section { display: flex; flex-direction: column; gap: var(--space-2); }
 .cd-section-title {

@@ -2,11 +2,13 @@
 // debounced search, stage tabs and a "Sourced by" picker, all mirrored in the URL
 // (#/pipeline?q=&stage=&query=&page=). #/pipeline/<domain> opens the company drawer: website,
 // stage, contacts, outreach history and source, with Ask agent (prefills Agent, never sends)
-// and Skip / Restore (POST /api/companies/:domain/status).
+// and Skip / Restore (POST /api/companies/:domain/status); a company with a draft waiting is
+// sent to Drafts instead.
 //
 // The URL is the single source of truth: controls only call nav.setQuery / nav.navigate, and
 // update(ctx) applies whatever the address now says (typing, tabs, pager, back/forward, deep
-// links). Every dynamic string reaches the page through h() / textContent.
+// links). Every dynamic string reaches the page through h() / textContent. Work done elsewhere
+// (a scheduled run, an agent turn) reaches the open list through the shared store.
 //
 // ⌘K over the drawer is the shell's (keys.js closes the drawer as Esc would, then search takes
 // focus); the drawer's onClose puts the list back in the URL like any other user close.
@@ -14,7 +16,7 @@
 import { api, errorText, isStaleSession } from '../core/api.js';
 import { debounce, fmtDate, fmtNum, fmtRelative, h, pluralize, safeUrl, toDate } from '../core/dom.js';
 import { bindKeys } from '../core/keys.js';
-import { href } from '../core/router.js';
+import { href, parseHash } from '../core/router.js';
 import { isBusy, openDrawer, setBusy, toast } from '../core/ui.js';
 import { badge } from '../components/badge.js';
 import { emptyState } from '../components/emptyState.js';
@@ -170,6 +172,9 @@ const listQuery = (s) => ({ q: s.q.trim() || null, stage: s.stage || null, query
 
 const isAbort = (err) => err && err.name === 'AbortError';
 
+// The history.state key on a drawer's entry: the list address it was opened over.
+const DRAWER_FROM = 'pipelineDrawerFrom';
+
 // ---- The view ----
 
 let current = null; // the mounted instance (update() needs it)
@@ -183,6 +188,7 @@ function createView(root, ctx) {
   let listCtl = null;
   let listSeq = 0;
   let listLoading = null; // the list load in flight (loadList)
+  let shownPage = null; // the page on screen as JSON (null: none yet, or an error)
   const rowsByDomain = new Map(); // the rows on screen, by lowercased domain
 
   // ---- Header ----
@@ -205,7 +211,8 @@ function createView(root, ctx) {
   let stageIds = STAGES.map((s) => s.id);
   let stageTabs = null;
   const tabsSlot = h('div', { class: 'pl-tabs' });
-  const results = h('div', { class: 'pl-results', id: `pl-results-${++panelUid}`, role: 'tabpanel' });
+  // Focusable from script only: Try again parks focus here while the list it replaces reloads.
+  const results = h('div', { class: 'pl-results', id: `pl-results-${++panelUid}`, role: 'tabpanel', tabindex: '-1' });
 
   function buildTabs(extra = []) {
     const hadFocus = stageTabs && stageTabs.contains(document.activeElement);
@@ -329,7 +336,9 @@ function createView(root, ctx) {
     const all = { value: '', label: 'All sources', pinned: true };
     if (allSources && allSources.q === state.q.trim()) all.count = allSources.n;
     source.setOptions([all, ...opts]);
-    source.setValue(state.query);
+    // Not while the field has focus: setOptions keeps what is being typed there, and apply()
+    // has already set a choice that came from the URL.
+    if (document.activeElement !== source.input) source.setValue(state.query);
   }
 
   // ---- Footer: pager + keyboard hint ----
@@ -347,9 +356,12 @@ function createView(root, ctx) {
     ' to filter',
   );
   const footer = h('div', { class: 'pl-footer', hidden: true }, hint, pg);
+  // The pager's range is what a screen reader hears after a search ("1–24 of 24"); with nothing
+  // to show it is hidden with the footer, so this says so instead.
+  const announce = h('p', { class: 'sr-only pl-announce', role: 'status' });
 
   const controls = h('div', { class: 'pl-controls' }, tabsSlot, toolbar);
-  const container = h('div', { class: 'pipeline' }, head, controls, results, footer);
+  const container = h('div', { class: 'pipeline' }, head, controls, results, footer, announce);
   root.append(container);
   buildTabs();
   clearBtn.hidden = !filtersOn();
@@ -441,8 +453,18 @@ function createView(root, ctx) {
   }
 
   function showError(err) {
+    shownPage = null;
     results.classList.remove('is-loading');
-    results.replaceChildren(errorBox('Couldn’t load companies', err, () => loadList()));
+    // The count from the last list that loaded would sit above a different, failed one.
+    desc.textContent = 'Every company you’ve sourced, newest first.';
+    announce.textContent = '';
+    results.replaceChildren(
+      errorBox('Couldn’t load companies', err, () => {
+        // The button goes with the box: focus waits on the list, so Tab carries on into it.
+        results.focus({ preventScroll: true });
+        loadList();
+      }),
+    );
     footer.hidden = true;
   }
 
@@ -450,16 +472,44 @@ function createView(root, ctx) {
     return !!(state.q.trim() || state.stage || state.query);
   }
 
-  function renderList(page) {
+  /** The list's empty state: `workspace` (no companies at all) or `filtered` (none match). Each
+   *  carries the action it hides above the list, the header's Find companies or the toolbar's
+   *  Clear filters. */
+  function emptyList(kind) {
+    const el =
+      kind === 'workspace'
+        ? emptyState({
+            title: 'No companies yet',
+            body: 'Ask the agent to find companies that match your company profile. They land here, deduped by domain, with their contacts and outreach.',
+            action: h('a', { class: 'btn btn-primary', href: href(['agent'], { prompt: FIND_PROMPT }) }, 'Find companies'),
+          })
+        : emptyState({
+            title: 'No companies match these filters',
+            body: 'Try a shorter search, another stage or source, or clear the filters.',
+            action: h('button', { type: 'button', class: 'btn btn-secondary', onClick: clearFilters }, 'Clear filters'),
+          });
+    el.dataset.kind = kind;
+    return el;
+  }
+
+  /** Show a page of the list. `keepScroll` (a reload of the same list for changes made
+   *  elsewhere) leaves the table scrolled where it was, and the empty state already shown (and
+   *  the focus on its action) as it is when the list is still that one: only the counts move. */
+  function renderList(page, { keepScroll = false } = {}) {
+    shownPage = JSON.stringify(page);
     rowsByDomain.clear();
     for (const r of page.rows) rowsByDomain.set(String(r.domain).toLowerCase(), r);
     const stagesTotal = (page.stages || []).reduce((n, [, c]) => n + c, 0);
     const workspaceEmpty = !state.q.trim() && !state.query && stagesTotal === 0;
+    const empty = workspaceEmpty ? 'workspace' : page.rows.length ? null : 'filtered';
+    const oldEmpty = results.querySelector('.empty-state');
+    const emptyFocused = oldEmpty && oldEmpty.contains(document.activeElement) ? oldEmpty.dataset.kind : null;
+    const keepEmpty = keepScroll && !!empty && !!oldEmpty && oldEmpty.dataset.kind === empty;
 
     controls.hidden = workspaceEmpty;
     footer.hidden = workspaceEmpty || page.total === 0;
-    clearBtn.hidden = !filtersOn();
-    findBtn.hidden = workspaceEmpty; // the empty state carries the same action
+    clearBtn.hidden = !filtersOn() || empty === 'filtered'; // the empty states carry these two
+    findBtn.hidden = workspaceEmpty;
     if (workspaceEmpty) desc.textContent = 'Every company you source lands here, deduped by domain.';
     else if (filtersOn() && page.total > 0) desc.textContent = `${pluralize(page.total, 'company', 'companies')} ${page.total === 1 ? 'matches' : 'match'} these filters, newest first.`;
     else if (filtersOn()) desc.textContent = 'Every company you’ve sourced, newest first.';
@@ -474,24 +524,13 @@ function createView(root, ctx) {
     const focusedTr = results.contains(document.activeElement) ? document.activeElement.closest('tr') : null;
     const focusedKey = focusedTr ? focusedTr.dataset.key : null;
     const focusedAt = focusedTr ? rowEls().indexOf(focusedTr) : -1;
+    const oldWrap = keepScroll ? results.querySelector('.table-wrap') : null;
+    const scrolled = oldWrap ? { top: oldWrap.scrollTop, left: oldWrap.scrollLeft } : null;
+    // Not said again for a kept empty state: nothing the user did, and nothing new to hear.
+    if (!keepEmpty) announce.textContent = empty === 'filtered' ? 'No companies match these filters' : '';
 
-    if (workspaceEmpty) {
-      results.replaceChildren(
-        emptyState({
-          title: 'No companies yet',
-          body: 'Ask the agent to find companies that match your company profile. They land here, deduped by domain, with their contacts and outreach.',
-          action: h('a', { class: 'btn btn-primary', href: href(['agent'], { prompt: FIND_PROMPT }) }, 'Find companies'),
-        }),
-      );
-    } else if (!page.rows.length) {
-      clearBtn.hidden = true; // the empty state carries it
-      results.replaceChildren(
-        emptyState({
-          title: 'No companies match these filters',
-          body: 'Try a shorter search, another stage or source, or clear the filters.',
-          action: h('button', { type: 'button', class: 'btn btn-secondary', onClick: clearFilters }, 'Clear filters'),
-        }),
-      );
+    if (empty) {
+      if (!keepEmpty) results.replaceChildren(emptyList(empty));
     } else {
       const wrap = table({
         label: 'Companies',
@@ -502,6 +541,10 @@ function createView(root, ctx) {
         onRowClick: (row, e) => openCompany(row.domain, e.currentTarget),
       });
       results.replaceChildren(wrap);
+      if (scrolled) {
+        wrap.scrollTop = scrolled.top;
+        wrap.scrollLeft = scrolled.left;
+      }
       if (drawer) {
         markRow(drawer.domain);
         const at = rowEls().indexOf(rowFor(drawer.domain));
@@ -511,14 +554,23 @@ function createView(root, ctx) {
     // A focused row that left the list (skipped, filtered out) hands focus to the row now in its
     // place, not to <body>.
     if (focusedKey && !focusRow(focusedKey)) focusListAt(focusedAt);
+    else if (emptyFocused && !keepEmpty) {
+      // A replaced empty state's action hands focus to the same action where it is now, so Enter
+      // still does what it would have: its twin above the list, else what the list now holds.
+      const twin = emptyFocused === 'filtered' ? clearBtn : findBtn;
+      if (!twin.closest('[hidden]')) twin.focus();
+      else focusListAt(0);
+    }
     results.classList.remove('is-loading');
     setListBusy(false);
   }
 
   /** Load the list for the current route → a Promise that settles (never rejects) once it is
-   *  shown, failed or superseded. `listLoading` holds it meanwhile, for the drawer. */
-  function loadList() {
-    const p = fetchList();
+   *  shown, failed or superseded. `listLoading` holds it meanwhile, for the drawer. `quiet` (a
+   *  check for changes made elsewhere): no skeleton, nothing redrawn when the page came back
+   *  the same, and a failure leaves the list on screen as it is. */
+  function loadList({ quiet = false } = {}) {
+    const p = fetchList(quiet);
     listLoading = p;
     p.then(() => {
       if (listLoading === p) listLoading = null;
@@ -526,17 +578,17 @@ function createView(root, ctx) {
     return p;
   }
 
-  async function fetchList() {
+  async function fetchList(quiet) {
     if (listCtl) listCtl.abort();
     const ctl = new AbortController();
     listCtl = ctl;
     const seq = ++listSeq;
     const want = { ...state };
     // Rows on screen stay (marked busy) while the next page loads; anything else becomes a
-    // skeleton (first load, or after an empty / error state).
+    // skeleton (first load, or after an empty / error state), unless the load is quiet.
     const shown = results.querySelector('table');
     if (shown && shown.getAttribute('aria-busy') !== 'true') setListBusy(true);
-    else if (!shown) showSkeleton();
+    else if (!shown && !quiet) showSkeleton();
 
     const qs = new URLSearchParams({ per: String(PER) });
     if (want.q.trim()) qs.set('q', want.q.trim());
@@ -553,11 +605,13 @@ function createView(root, ctx) {
         nav.setQuery({ page: last > 1 ? last : null });
         return;
       }
-      renderList(page);
+      if (quiet && JSON.stringify(page) === shownPage) setListBusy(false);
+      else renderList(page, { keepScroll: quiet });
     } catch (err) {
       if (dead || seq !== listSeq || isAbort(err)) return;
       listCtl = null;
-      showError(err);
+      if (quiet) setListBusy(false);
+      else showError(err);
     }
   }
 
@@ -629,9 +683,20 @@ function createView(root, ctx) {
     // debounced search doesn't fire later behind the drawer.
     pushSearch.flush();
     const target = href(['pipeline', domain], listQuery(state));
+    const from = location.hash;
     pendingOpener = opener || null;
-    pushedFrom = location.hash;
+    pushedFrom = from;
     nav.navigate(target);
+    // The new entry remembers the list it was pushed over, so closing the drawer can go Back to
+    // it even after the screen is mounted afresh on that entry (Back from another screen).
+    if (location.hash === target) history.replaceState({ ...(history.state || {}), [DRAWER_FROM]: from }, '', location.href);
+  }
+
+  /** Is `hash` this list as it stands now (the same filters, in any order)? */
+  function isListNow(hash) {
+    if (!hash) return false;
+    const { path, query } = parseHash(hash);
+    return path.length === 1 && path[0] === 'pipeline' && sameList(readQuery(query), state);
   }
 
   function closeDrawer() {
@@ -647,11 +712,13 @@ function createView(root, ctx) {
   function onUserClose(d) {
     if (d.ctl) d.ctl.abort();
     markRow(null);
-    const listHash = href(['pipeline'], listQuery(state));
-    if (d.pushedFrom === listHash && location.hash === d.hash) {
+    // Pushed over this very list (the filters may sit in another order in its address): go Back
+    // to that entry rather than adding another, so the next Back leaves the Pipeline.
+    const from = d.pushedFrom || (history.state && history.state[DRAWER_FROM]) || null;
+    if (location.hash === d.hash && isListNow(from)) {
       history.back();
     } else if (parseDomain() === d.domain) {
-      nav.navigate(listHash, { replace: true });
+      nav.navigate(href(['pipeline'], listQuery(state)), { replace: true });
     }
     // Focus the row it came from (the table may have been re-rendered meanwhile); if that row
     // has left the list (skipped under a stage filter), the row now in its place. A deep link
@@ -740,11 +807,13 @@ function createView(root, ctx) {
 
   /**
    * Load the drawer's company. `refresh` re-reads it after a change (Skip / Restore) with the
-   * current content left up, and `focusAction` then puts focus back on the action slot. Every
-   * load runs under the drawer's AbortController, so moving the drawer to another company (or
-   * closing it) drops whatever was still on its way for this one.
+   * current content left up, and `focusAction` then puts focus back on the action slot. `quiet`
+   * (with refresh: a check for changes made elsewhere) redraws only if the company changed,
+   * keeps focus on the same control where it can, and leaves the drawer as it is on a failure.
+   * Every load runs under the drawer's AbortController, so moving the drawer to another company
+   * (or closing it) drops whatever was still on its way for this one.
    */
-  async function loadDetail({ refresh = false, focusAction = false } = {}) {
+  async function loadDetail({ refresh = false, focusAction = false, quiet = false } = {}) {
     const d = drawer;
     if (!d) return;
     if (d.ctl) d.ctl.abort();
@@ -777,6 +846,8 @@ function createView(root, ctx) {
       const detail = await api.get(`/api/companies/${encodeURIComponent(domain)}`, { signal: ctl.signal });
       if (!fresh()) return;
       d.ctl = null;
+      if (quiet && JSON.stringify(detail) === JSON.stringify(d.detail)) return;
+      const had = quiet && d.handle.body.contains(document.activeElement) ? document.activeElement : null;
       d.detail = detail;
       d.company = detail.company;
       d.handle.setTitle(displayName(detail.company, domain));
@@ -784,10 +855,19 @@ function createView(root, ctx) {
       if (focusAction) {
         const next = d.handle.el.querySelector('.cd-actions .btn:last-child') || d.handle.el;
         next.focus({ preventScroll: true });
+      } else if (had) {
+        // The same control in the redrawn drawer (by what it says and where it goes), else the
+        // drawer's body: focus never drops out of the dialog.
+        const same = [...d.handle.body.querySelectorAll(had.tagName)].find(
+          (el) => el.textContent === had.textContent && el.getAttribute('href') === had.getAttribute('href'),
+        );
+        if (!same) d.handle.body.tabIndex = -1;
+        (same || d.handle.body).focus({ preventScroll: true });
       }
     } catch (err) {
       if (!fresh() || isAbort(err)) return;
       d.ctl = null;
+      if (quiet) return;
       if (err && err.status === 404) renderNotFound(d);
       else renderDrawerError(d, err);
     }
@@ -830,18 +910,32 @@ function createView(root, ctx) {
         level: 3,
         title: `No company at ${d.domain}`,
         body: 'It isn’t in this workspace. The link may have a typo, or the company was never sourced here.',
-        action: h('button', { type: 'button', class: 'btn btn-secondary', onClick: () => d.handle.close('button') }, 'Back to pipeline'),
+        action: h('button', { type: 'button', class: 'btn btn-secondary', onClick: () => d.handle.close('button') }, 'Back to Pipeline'),
       }),
     );
   }
 
   function renderDrawerError(d, err) {
     d.handle.body.removeAttribute('aria-busy');
-    d.handle.body.replaceChildren(drawerTop(d, d.company), errorBox('Couldn’t load this company', err, () => loadDetail()));
+    const retry = () => {
+      // The button goes with the box: focus waits on the drawer's body (inside the dialog), so
+      // Tab carries on into what loads there.
+      d.handle.body.tabIndex = -1;
+      d.handle.body.focus({ preventScroll: true });
+      loadDetail();
+    };
+    d.handle.body.replaceChildren(drawerTop(d, d.company), errorBox('Couldn’t load this company', err, retry));
   }
 
+  /** The drawer's actions, and a line on why Skip isn't one of them while a draft waits. */
   function actionsFor(d, company) {
     const st = company.status;
+    const before = st === 'sourced' || st === 'named' || st === 'emailed'; // nothing sent yet
+    // Writing a draft doesn't move the company's stage, so a "Contact found" company (or any
+    // other) can have one waiting in Drafts: reviewing it there is the next step. Asking the
+    // agent again would replace it and any edits made to it, and a Skip here would leave it
+    // queued to send; Discard in Drafts drops the draft and skips the company in one go.
+    const waiting = ((d.detail && d.detail.outreach) || []).filter((o) => o.status === 'draft_pending' || o.status === 'drafted').length;
     const ask = (mode, primary) =>
       h(
         'button',
@@ -852,19 +946,35 @@ function createView(root, ctx) {
         },
         mode === 'draft' ? 'Ask agent to draft' : 'Ask agent to enrich',
       );
+    // Sent, replied, bounced or a status this screen doesn't know: its history is in
+    // Follow-ups. A sent company may be Due or Awaiting there; the filter finds it in either.
+    const followups = (primary) =>
+      h(
+        'a',
+        {
+          class: ['btn', primary ? 'btn-primary' : 'btn-secondary'],
+          href: href(['followups'], { tab: st === 'replied' || st === 'bounced' ? st : null, q: company.domain }),
+        },
+        'Open in Follow-ups',
+      );
     const out = [];
-    if (st === 'sourced' || st === 'named') out.push(ask('enrich', true));
+    if (waiting || st === 'drafted') {
+      out.push(h('a', { class: 'btn btn-primary', href: href(['drafts', company.domain]) }, 'Open in Drafts'));
+      if (!before && st !== 'drafted' && st !== 'skip') out.push(followups(false));
+    } else if (st === 'sourced' || st === 'named') out.push(ask('enrich', true));
     else if (st === 'emailed') out.push(ask('draft', true));
-    else if (st === 'drafted') out.push(h('a', { class: 'btn btn-primary', href: href(['drafts', company.domain]) }, 'Open in Drafts'));
-    else if (st !== 'skip') {
-      // Sent, replied, bounced or a status this screen doesn't know: its next step is in
-      // Follow-ups. A sent company may be Due or Awaiting there; the filter finds it in either.
-      const tab = st === 'replied' || st === 'bounced' ? st : null;
-      out.push(h('a', { class: 'btn btn-primary', href: href(['followups'], { tab, q: company.domain }) }, 'Open in Follow-ups'));
-    }
+    else if (st !== 'skip') out.push(followups(true));
     if (st === 'skip') out.push(statusButton(d, company, 'restore'));
-    else if (st === 'sourced' || st === 'named' || st === 'emailed') out.push(statusButton(d, company, 'skip'));
-    return out.length ? h('div', { class: 'cd-actions' }, out) : null;
+    else if (before && !waiting) out.push(statusButton(d, company, 'skip'));
+    if (!out.length) return null;
+
+    const actions = h('div', { class: 'cd-actions' }, out);
+    const its = waiting > 1 ? 'Its drafts are' : 'Its draft is';
+    const them = waiting > 1 ? 'them' : 'it';
+    let note = null;
+    if (waiting && before) note = `${its} waiting in Drafts. To skip this company, discard ${them} there.`;
+    else if (waiting && st === 'skip') note = `${its} still waiting in Drafts and can be sent from there.`;
+    return note ? [actions, h('p', { class: 'cd-note' }, note)] : actions;
   }
 
   function statusButton(d, company, value) {
@@ -879,19 +989,20 @@ function createView(root, ctx) {
           setBusy(btn, true);
           const domain = d.domain;
           const name = displayName(company, domain);
+          // The toast and the store are the app's: the outcome is told even when the screen has
+          // been left meanwhile. Only the screen's own refresh needs it still mounted.
           try {
             await api.post(`/api/companies/${encodeURIComponent(company.domain)}/status`, { value });
-            if (dead) return;
             toast(value === 'skip' ? `Skipped ${name}. It won’t be contacted.` : `Restored ${name} to the pipeline.`, 'ok');
             ctx.store.refresh();
+            if (dead) return;
             loadList();
             // Re-read it unless the drawer has moved on to another company meanwhile.
             if (drawer === d && d.domain === domain) {
               loadDetail({ refresh: true, focusAction: d.handle.el.contains(document.activeElement) });
             }
           } catch (err) {
-            if (dead) return;
-            setBusy(btn, false);
+            if (!dead) setBusy(btn, false);
             toast(`Couldn’t ${value === 'skip' ? 'skip' : 'restore'} ${name}: ${errorText(err)}`, 'err');
           }
         },
@@ -1004,6 +1115,27 @@ function createView(root, ctx) {
     syncDrawer(domain);
   }
 
+  // ---- Changes made elsewhere ----
+
+  // A scheduled run or an agent turn sources, enriches, drafts or sends while the list is open.
+  // Each moves the shared summary (its counts and funnel, the last run, the chat running), so
+  // when a store refresh brings a different one the list is asked again, quietly: the rows stay
+  // up under the busy bar, focus and scroll stay put, and nothing is redrawn if the page came
+  // back the same. Skip / Restore here don't move the summary; they reload the list themselves.
+  const summaryKey = (sum) => (sum ? JSON.stringify([sum.counts, sum.funnel, sum.last_run, sum.running]) : null);
+  let summarySeen = summaryKey(ctx.store.get().summary);
+  const unsubscribe = ctx.store.subscribe(({ summary }) => {
+    const key = summaryKey(summary);
+    // Not while a load is on its way, nor over a failed one (Try again is the user's): the
+    // change is still unseen on the next refresh.
+    if (dead || key == null || key === summarySeen || listLoading || shownPage == null) return;
+    summarySeen = key;
+    loadList({ quiet: true });
+    // The open drawer too (a draft may have been written for its company): once it has loaded,
+    // and not while it is re-reading after a Skip / Restore.
+    if (drawer && drawer.detail && !drawer.ctl) loadDetail({ refresh: true, quiet: true });
+  });
+
   loadList();
   syncDrawer(ctx.path[1] || null);
 
@@ -1015,6 +1147,7 @@ function createView(root, ctx) {
     },
     unmount() {
       dead = true;
+      unsubscribe();
       pushSearch.cancel();
       unbindKeys();
       if (listCtl) listCtl.abort();
