@@ -68,6 +68,10 @@
 .st-card-body:not(:has(> :not([hidden]))) { display: none; }
 
 .st-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+/* A sign-in held while another one waits stays focusable (aria-disabled), so it keeps its colour
+   on hover. A busy button (setBusy) is styled by components.css. */
+.settings .btn-primary[aria-disabled="true"]:not([aria-busy="true"]):hover { background: var(--accent); }
+.settings .btn-secondary[aria-disabled="true"]:not([aria-busy="true"]):hover { background: var(--surface); }
 
 /* ---- Messages (live regions that stay in the DOM; empty ones take no space) ---- */
 

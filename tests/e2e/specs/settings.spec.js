@@ -2,12 +2,16 @@
 // and their addresses; Agent (Setup's agentPanel: cards, the opencode model, Test connection, a
 // save confirmed without waiting for the store, and the warning when opencode no longer offers
 // the saved model, read from the picker's own list); Connections (Canonical, Gmail with the app
-// password first and more options folded, LinkedIn connect / reconnect / disconnect and its
-// sign-in poll; connect requests outlive the screen); Sending (email and LinkedIn auto-send
-// switches that confirm before turning on, caps that save on commit, refuse bad values, ask
+// password first and more options folded, your own OAuth client saved and Google sign-in through
+// it, LinkedIn connect / reconnect / disconnect and its sign-in poll; connect requests outlive the
+// screen, and a sign-in wait can be cancelled, is picked up again on return, holds the other
+// sign-ins meanwhile and never stops the screen following status; a LinkedIn sign-in already open
+// is picked up again); Sending (email and LinkedIn auto-send switches that confirm before turning
+// on, never on an Enter pressed twice or held, caps that save on commit, refuse bad values, ask
 // before going up while auto-send is on and never turn it back on, today's usage, a consequence
-// line for each, caps saved on the way out but a raise not, with a toast saying so, and a leave
-// that Back overtakes still asking); Enrichment (the OSINT installers, intercepted);
+// line for each, caps saved on the way out but a raise not, with a toast saying so, a leave that
+// Back overtakes still asking, and the Connect link keeping keyboard focus through a save);
+// Enrichment (the OSINT installers, intercepted; an install still running is picked up again);
 // Appearance (System / Light / Dark, kept in this browser). Also: loading, error and stale-session
 // states, keyboard use, hostile text, the poll stopping on unmount and on a stale session, and
 // every tab accessible in light and dark and at phone width.
@@ -42,6 +46,10 @@ const toasts = (page) => page.locator('#toasts .toast-text');
 const goHome = (page) => page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Home' }).click();
 const EMAIL_ON = (cap) =>
   `Send now on the Drafts screen emails people right away, and the agent can send email itself in chats and scheduled runs — up to ${cap} emails a day in total.`;
+const DRAFTS_ONLY = 'Drafts only: each email is saved to your Gmail drafts for you to review and send.';
+const STOPPED = 'Stopped waiting. If connecting again fails, restart coldtrail and try once more.';
+const CANONICAL_WAIT = "Approve coldtrail in the browser tab that opened. This page updates when you're done.";
+const refreshStore = (page) => page.evaluate(async () => (await import('/assets/js/core/store.js')).store.refresh());
 
 /** GET a token-guarded API path from the test (not the page). */
 async function getJSON(request, server, path) {
@@ -174,6 +182,33 @@ test('status that fails to load shows the error and a retry; Appearance still wo
   await expect(alert).toHaveCount(0);
 });
 
+test('Try again keeps keyboard focus in the tab', async ({ app, page }) => {
+  app.allowConsole(/status of 500/);
+  let fail = true;
+  let reads = 0;
+  await page.route(statusPath, (route) => {
+    reads++;
+    return fail ? route.fulfill({ status: 500, contentType: 'text/plain', body: 'workspace is not readable' }) : route.fallback();
+  });
+  await app.goto('#/settings?tab=sending');
+  const retry = panel(page).getByRole('button', { name: 'Try again' });
+  await expect(retry).toBeVisible({ timeout: 15_000 });
+
+  // Fails again: the next Try again has focus.
+  const before = reads;
+  await retry.focus();
+  await page.keyboard.press('Enter');
+  await expect.poll(() => reads).toBeGreaterThan(before);
+  await expect(panel(page).locator('.st-load-error')).toBeVisible();
+  await expect(retry).toBeFocused();
+
+  // Works: focus lands on the tab's first card.
+  fail = false;
+  await page.keyboard.press('Enter');
+  await expect(emailSwitch(page)).toBeVisible();
+  await expect(region(page, 'Email').getByRole('heading', { name: 'Email' })).toBeFocused();
+});
+
 test('stale session points at the fix once', async ({ app, page, context }) => {
   app.allowConsole(/status of 401/);
   await app.goto('#/settings?tab=connections');
@@ -247,6 +282,25 @@ test('tabs deep link', async ({ app, page }) => {
   await expect(marks.connections()).toBeVisible();
   await expect(view(page)).toHaveAttribute('data-mark', 'kept');
   await expect(view(page).locator('.page-desc')).toHaveText('Where companies come from and where your outreach goes.');
+});
+
+test('ids stay unique with every tab built', async ({ app, page }) => {
+  await app.goto('#/settings?tab=agent');
+  await agentReady(page);
+  for (const label of TAB_LABELS.slice(1)) await tab(page, label).click();
+  await expect(panel(page).getByRole('radiogroup', { name: 'Theme' })).toBeVisible();
+  const dupes = await page.evaluate(() => {
+    const seen = {};
+    for (const el of document.querySelectorAll('[id]')) seen[el.id] = (seen[el.id] || 0) + 1;
+    return Object.entries(seen).filter(([, n]) => n > 1);
+  });
+  expect(dupes).toEqual([]);
+  // Connections and Sending both have a LinkedIn card: each is named by its own title.
+  for (const label of ['Connections', 'Sending']) {
+    await tab(page, label).click();
+    const own = await region(page, 'LinkedIn').evaluate((card) => card.contains(document.getElementById(card.getAttribute('aria-labelledby'))));
+    expect(own, label).toBe(true);
+  }
 });
 
 test('opencode model change persists', async ({ app, page, request, server }) => {
@@ -363,6 +417,30 @@ test('a saved model opencode no longer offers is called out by the picker', asyn
   }
 });
 
+test('leaving with your own model filled in but not saved says so', async ({ app, page, request, server }) => {
+  await app.goto('#/settings?tab=agent');
+  await agentReady(page);
+  // Nothing left unsaved: nothing to say.
+  await goHome(page);
+  await expect(view(page).locator('.settings')).toHaveCount(0);
+  await expect(toasts(page)).toHaveCount(0);
+
+  await page.goBack();
+  await agentReady(page);
+  await panel(page).locator('.ap-card[data-kind="openai"] .ap-pick').click();
+  const form = panel(page).getByRole('form', { name: 'Your own model' });
+  await form.getByLabel('Base URL').fill('https://api.example.com/v1');
+  await form.getByLabel('Model').fill('gpt-test');
+  await form.getByLabel('API key').fill('sk-test-123456');
+  // Left without Save: a toast (it outlives the screen) says nothing changed, and where to finish.
+  await goHome(page);
+  await expect(view(page).locator('.settings')).toHaveCount(0);
+  await expect(toasts(page)).toHaveText([
+    "Your own model wasn't saved, so coldtrail still uses the same agent. To switch, fill it in under Settings → Agent and press Save.",
+  ]);
+  expect((await getJSON(request, server, '/api/status')).provider).toBe('opencode');
+});
+
 test('enabling email auto-send asks to confirm and persists', async ({ app, page, request, server }) => {
   await resetSending(request, server);
   await app.goto('#/settings?tab=sending');
@@ -464,6 +542,17 @@ test('email daily cap saves and refuses bad values', async ({ app, page, request
   let status = await getJSON(request, server, '/api/status');
   expect(status.daily_send_cap).toBe(35);
   expect(status.auto_send).toBe(false);
+
+  // A value refused after that: the green "Saved." line goes (it no longer holds), and the
+  // refusal is announced (focus stays in the field, so only an alert is read out).
+  await cap.fill('0');
+  await cap.press('Enter');
+  await expect(email.locator('.field-error')).toHaveText('Enter a whole number from 1 to 500.');
+  await expect(email.locator('.field-error')).toHaveRole('alert');
+  await expect(email.locator('.st-msg')).toHaveText('');
+  await expect(email.locator('.st-msg')).not.toHaveAttribute('data-tone', /./);
+  expect(posts).toEqual([{ enabled: false, daily_cap: 35 }]);
+  await cap.fill('35');
 
   // The confirm names the cap that will apply.
   await emailSwitch(page).click();
@@ -672,6 +761,149 @@ test('raising a cap while auto-send is on asks first', async ({ app, page, reque
   }
 });
 
+test('an Enter pressed twice or held never confirms auto-send or a raise', async ({ app, page, request, server }) => {
+  await resetSending(request, server);
+  try {
+    const posts = countRequests(page, '/api/destination/auto-send');
+    const liPosts = countRequests(page, '/api/destination/linkedin/auto-send');
+    await app.goto('#/settings?tab=sending');
+    const email = region(page, 'Email');
+    const dialog = confirmBox(page);
+    const cancel = dialog.getByRole('button', { name: 'Cancel' });
+
+    // The confirm opens on Cancel: a second Enter meant for the switch lands there.
+    await emailSwitch(page).focus();
+    await page.keyboard.press('Enter');
+    await page.keyboard.press('Enter');
+    await expect(dialog).toHaveCount(0);
+    await expect(emailSwitch(page)).toHaveAttribute('aria-checked', 'false');
+    await expect(emailSwitch(page)).toBeFocused();
+
+    // Held: the key's repeat lands on Cancel too.
+    await page.keyboard.down('Enter');
+    await page.keyboard.down('Enter');
+    await page.keyboard.up('Enter');
+    await expect(dialog).toHaveCount(0);
+    await expect(emailSwitch(page)).toHaveAttribute('aria-checked', 'false');
+    await expect(emailSwitch(page)).toBeFocused();
+
+    // LinkedIn's switch asks the same way.
+    await linkedinSwitch(page).focus();
+    await page.keyboard.press('Enter');
+    await expect(dialog.getByRole('heading')).toHaveText('Turn on LinkedIn auto-send?');
+    await expect(cancel).toBeFocused();
+    await page.keyboard.press('Enter');
+    await expect(dialog).toHaveCount(0);
+    await expect(linkedinSwitch(page)).toHaveAttribute('aria-checked', 'false');
+
+    // A raise with auto-send on: the Enter that saves the cap, pressed again as the confirm
+    // opens, keeps the cap where it was.
+    await postJSON(request, server, '/api/destination/auto-send', { enabled: true, daily_cap: 20 });
+    await refreshStore(page);
+    await expect(emailSwitch(page)).toHaveAttribute('aria-checked', 'true');
+    const cap = email.getByLabel('Daily cap');
+    await cap.fill('200');
+    await cap.press('Enter');
+    await expect(dialog.getByRole('heading')).toHaveText('Raise the email cap to 200 a day?');
+    await expect(cancel).toBeFocused();
+    await page.keyboard.press('Enter');
+    await expect(dialog).toHaveCount(0);
+    await expect(email.locator('.st-msg')).toHaveText('Not changed. Up to 20 emails a day.');
+    await expect(cap).toHaveValue('20');
+
+    // Twice, 120ms apart, before the confirm is even up: still nothing raised.
+    await cap.fill('200');
+    await cap.press('Enter');
+    await page.waitForTimeout(120);
+    await page.keyboard.press('Enter');
+    // The second Enter reached the field (the confirm wasn't up yet: a no-op) or Cancel.
+    await expect(dialog.or(email.locator('.st-msg').filter({ hasText: 'Not changed.' })).first()).toBeVisible();
+    if (await dialog.count()) {
+      await expect(cancel).toBeFocused();
+      await page.keyboard.press('Enter');
+    }
+    await expect(email.locator('.st-msg')).toHaveText('Not changed. Up to 20 emails a day.');
+
+    expect(posts).toEqual([]);
+    expect(liPosts).toEqual([]);
+    const status = await getJSON(request, server, '/api/status');
+    expect([status.auto_send, status.daily_send_cap, status.linkedin_auto_send]).toEqual([true, 20, false]);
+  } finally {
+    await resetSending(request, server);
+  }
+});
+
+test('a Connect link under the caps keeps keyboard focus through a save and a status refresh', async ({ app, page, request, server }) => {
+  await resetSending(request, server);
+  try {
+    await app.goto('#/settings?tab=sending');
+    const email = region(page, 'Email');
+    const cap = email.getByLabel('Daily cap');
+    const link = email.getByRole('link', { name: 'Connect Gmail' });
+    await expect(link).toBeVisible();
+    await link.evaluate((el) => {
+      el.dataset.mark = 'kept';
+    });
+    // Typed, then Tab to the link (Gmail isn't connected): the cap saves as it's left, then the
+    // screen re-reads status, shows it, and refreshes the store.
+    let saved = false;
+    page.on('request', (req) => {
+      if (req.method() === 'POST' && new URL(req.url()).pathname === '/api/destination/auto-send') saved = true;
+    });
+    const shown = page.waitForRequest((req) => saved && new URL(req.url()).pathname === '/api/summary');
+    await cap.fill('25');
+    await page.keyboard.press('Tab');
+    await expect(link).toBeFocused();
+    await expect(email.locator('.st-msg')).toHaveText('Saved. Up to 25 emails a day.');
+    await shown;
+    // The same link, still focused: Enter follows it.
+    await expect(email.locator('a[data-mark="kept"]')).toBeFocused();
+
+    // LinkedIn's, through the store's refresh (as every 30s).
+    const liLink = region(page, 'LinkedIn').getByRole('link', { name: 'Connect LinkedIn' });
+    await liLink.focus();
+    await refreshStore(page);
+    await expect(liLink).toBeFocused();
+    await page.keyboard.press('Enter');
+    await expect(page).toHaveURL(hashIs('#/settings?tab=connections'));
+  } finally {
+    await resetSending(request, server);
+  }
+});
+
+test('a link that opens another tab takes keyboard focus to the card it is about', async ({ app, page, request, server }) => {
+  await resetSending(request, server);
+  try {
+    await app.goto('#/settings?tab=sending');
+    // Email's notice (Gmail isn't connected) opens Connections, on the Gmail card; Tab goes on
+    // into that card.
+    await region(page, 'Email').getByRole('link', { name: 'Connect Gmail' }).focus();
+    await page.keyboard.press('Enter');
+    await expect(page).toHaveURL(hashIs('#/settings?tab=connections'));
+    await expect(region(page, 'Gmail').getByRole('heading', { name: 'Gmail' })).toBeFocused();
+    await page.keyboard.press('Tab');
+    await expect(region(page, 'Gmail').getByLabel('Gmail address', { exact: true })).toBeFocused();
+
+    // LinkedIn's, on the LinkedIn card.
+    await tab(page, 'Sending').click();
+    await region(page, 'LinkedIn').getByRole('link', { name: 'Connect LinkedIn' }).focus();
+    await page.keyboard.press('Enter');
+    await expect(page).toHaveURL(hashIs('#/settings?tab=connections'));
+    await expect(region(page, 'LinkedIn').getByRole('heading', { name: 'LinkedIn' })).toBeFocused();
+
+    // The Gmail note's (auto-send on), on Sending's Email card.
+    await patchStatus(page, (s) => ({ ...s, destination_connected: true, auto_send: true }));
+    await page.reload();
+    const change = region(page, 'Gmail').getByRole('link', { name: 'Change it under Sending' });
+    await change.focus();
+    await page.keyboard.press('Enter');
+    await expect(page).toHaveURL(hashIs('#/settings?tab=sending'));
+    await expect(region(page, 'Email').getByRole('heading', { name: 'Email' })).toBeFocused();
+  } finally {
+    await resetSending(request, server);
+  }
+});
+
 test('leaving the screen saves a cap that was typed and left', async ({ app, page, request, server }) => {
   await resetSending(request, server);
   try {
@@ -807,6 +1039,54 @@ test('osint install calls the (intercepted) endpoint', async ({ app, page }) => 
   await panel(page).getByRole('button', { name: 'Check again' }).click();
   await expect(harvester).toContainText('Needs pipx to install.');
   await expect(spiderfoot.locator('.badge')).toHaveText('Installed');
+
+  // Both installed: nothing is left to check for, so the offer goes (and keyboard focus, on it,
+  // moves to the first card).
+  osint = { the_harvester: true, the_harvester_can_install: false, spiderfoot: true, spiderfoot_can_install: false, pipx: true };
+  const recheck = panel(page).getByRole('button', { name: 'Check again' });
+  await recheck.focus();
+  await page.keyboard.press('Enter');
+  await expect(harvester.locator('.badge')).toHaveText('Installed');
+  await expect(panel(page).locator('.st-recheck')).toBeHidden();
+  await expect(harvester.getByRole('heading', { name: 'theHarvester' })).toBeFocused();
+  await page.reload();
+  await expect(spiderfoot.locator('.badge')).toHaveText('Installed');
+  await expect(panel(page).locator('.st-recheck')).toBeHidden();
+});
+
+test('an install still running when the screen comes back is shown, not started again', async ({ app, page }) => {
+  await patchStatus(page, (s) => ({
+    ...s,
+    osint: { the_harvester: false, the_harvester_can_install: true, spiderfoot: false, spiderfoot_can_install: true, pipx: true },
+  }));
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  await page.route('**/api/onboarding/osint/install', async (route) => {
+    await held;
+    await route.fallback(); // the harness's intercept answers {ok:true, message:"installed"}
+  });
+  await app.goto('#/settings?tab=enrichment');
+  const harvester = region(page, 'theHarvester');
+  const install = harvester.getByRole('button', { name: 'Install theHarvester' });
+  await install.click();
+  await expect(install).toHaveAttribute('aria-busy', 'true');
+
+  // The install runs inside its request, which leaving doesn't drop: back on the screen, the
+  // card still says it's installing, and pressing again doesn't start a second one.
+  await goHome(page);
+  await expect(view(page).locator('.settings')).toHaveCount(0);
+  await page.goBack();
+  await expect(install).toHaveAttribute('aria-busy', 'true');
+  await expect(harvester.locator('.st-msg')).toHaveText('Installing theHarvester. This can take a few minutes.');
+  await install.click({ force: true });
+  // The other tool's install is its own.
+  await expect(region(page, 'SpiderFoot').getByRole('button', { name: 'Install SpiderFoot' })).not.toHaveAttribute('aria-busy', /.*/);
+  release();
+  await expect(harvester.locator('.st-msg')).toHaveText('installed');
+  await expect(install).not.toHaveAttribute('aria-busy', /.*/);
+  expect(app.calls).toEqual([{ method: 'POST', path: '/api/onboarding/osint/install', body: { tool: 'the_harvester' } }]);
 });
 
 test('connections connect through the intercepted routes', async ({ app, page, request, server }) => {
@@ -880,6 +1160,60 @@ test('connections connect through the intercepted routes', async ({ app, page, r
   expect(app.calls[1].body).toEqual({ email: 'dee@example.com', app_password: 'abcd efgh ijkl mnop' });
 });
 
+test('your own OAuth client is saved, then Google sign-in goes through it', async ({ app, page, request, server }) => {
+  // The client is written to this server's sandboxed secrets file; it's put back afterwards.
+  const secretsFile = join(server.secretsDir, 'secrets.toml');
+  const before = readFileSync(secretsFile, 'utf8');
+  const connect = { method: 'POST', path: '/api/destination/gmail/connect', body: { callback_port: 8765 } };
+  try {
+    expect((await getJSON(request, server, '/api/status')).gmail_client_configured).toBe(false);
+    const saves = countRequests(page, '/api/destination/gmail/client');
+    await app.goto('#/settings?tab=connections');
+    const gmail = region(page, 'Gmail');
+    await gmail.getByText('More options').click();
+    // Google sign-in needs a client first.
+    await expect(gmail.getByRole('button', { name: 'Sign in with Google' })).toHaveCount(0);
+
+    await gmail.getByLabel('Client ID', { exact: true }).fill('999-e2e.apps.googleusercontent.com');
+    await gmail.getByLabel('Client secret', { exact: true }).fill('GOCSPX-e2e');
+    await gmail.getByRole('button', { name: 'Save and connect' }).click();
+    await expect(gmail.locator('.st-msg')).toHaveText('Gmail is connected.');
+    await expect(gmail.locator('.badge').first()).toHaveText('Connected');
+    // The form folded away under "Use different credentials": focus lands on the card.
+    await expect(gmail.getByRole('heading', { name: 'Gmail' })).toBeFocused();
+    expect(saves).toEqual([{ client_id: '999-e2e.apps.googleusercontent.com', client_secret: 'GOCSPX-e2e' }]);
+    const secrets = readFileSync(secretsFile, 'utf8');
+    expect(secrets).toContain('999-e2e.apps.googleusercontent.com');
+    expect(secrets).toContain('GOCSPX-e2e');
+    expect((await getJSON(request, server, '/api/status')).gmail_client_configured).toBe(true);
+    // Then the (intercepted) sign-in, once.
+    expect(app.calls).toEqual([connect]);
+
+    // With a client saved, Sign in with Google is offered, and signs in through it.
+    await page.reload();
+    await gmail.getByText('More options').click();
+    const google = gmail.getByRole('button', { name: 'Sign in with Google' });
+    await google.click();
+    await expect(gmail.locator('.st-msg')).toHaveText('Gmail is connected.');
+    await expect(gmail.locator('.badge').first()).toHaveText('Connected');
+    expect(app.calls).toEqual([connect, connect]);
+
+    // A sign-in that didn't work says why, and can be tried again.
+    await page.route('**/api/destination/gmail/connect', (route) =>
+      route.fulfill({ json: { ok: false, message: 'Google said: access_denied' } }),
+    );
+    await page.reload();
+    await gmail.getByText('More options').click();
+    await google.click();
+    await expect(gmail.locator('.st-msg')).toHaveText('Google said: access_denied');
+    await expect(google).not.toHaveAttribute('aria-busy', /.*/);
+    await expect(gmail.locator('.badge').first()).toHaveText('Not connected');
+    expect(saves).toHaveLength(1);
+  } finally {
+    writeFileSync(secretsFile, before, { mode: 0o600 });
+  }
+});
+
 test('LinkedIn disconnect asks first; reconnect-needed says so', async ({ app, page, server }) => {
   setLinkedinState(server, { connected: true, reconnect_needed: false });
   try {
@@ -931,12 +1265,20 @@ test('leaving settings stops the LinkedIn poll', async ({ app, page }) => {
       return orig.call(this, input, init);
     };
   });
+  // No sign-in open until Connect starts one; then it stays open.
+  let waiting = false;
   await page.route('**/api/destination/linkedin/status', (route) =>
-    route.fulfill({ json: { connected: false, reconnect_needed: false, waiting: true } }),
+    route.fulfill({ json: { connected: false, reconnect_needed: false, waiting } }),
   );
+  await page.route('**/api/destination/linkedin/connect', (route) => {
+    waiting = true;
+    return route.fallback(); // the harness's intercept answers {status:"waiting"}
+  });
   const polls = () => page.evaluate(() => window.__liPolls);
   await app.goto('#/settings?tab=connections');
   const linkedin = region(page, 'LinkedIn');
+  // The card's own first read (is a sign-in already open?) found none.
+  await expect.poll(polls).toBe(1);
   await linkedin.getByRole('button', { name: 'Connect LinkedIn' }).click();
   await expect(linkedin.locator('.badge').first()).toHaveText('Waiting for sign-in');
   await page.clock.runFor(2_100);
@@ -968,6 +1310,8 @@ test('a stale session stops the LinkedIn sign-in poll', async ({ app, page }) =>
   });
   await app.goto('#/settings?tab=connections');
   const linkedin = region(page, 'LinkedIn');
+  // The card's own first read (is a sign-in already open?) is refused too: nothing to wait for.
+  await expect.poll(() => polls).toBe(1);
   await linkedin.getByRole('button', { name: 'Connect LinkedIn' }).click();
   await expect(linkedin.locator('.badge').first()).toHaveText('Waiting for sign-in');
   await page.clock.runFor(2_100);
@@ -975,9 +1319,52 @@ test('a stale session stops the LinkedIn sign-in poll', async ({ app, page }) =>
   await expect(linkedin.locator('.st-msg')).toHaveText('Reopen coldtrail from your terminal.');
   await expect(linkedin.locator('.badge').first()).toHaveText('Not connected');
   await expect(linkedin.getByRole('button', { name: 'Connect LinkedIn' })).toBeVisible();
-  expect(polls).toBe(1);
+  expect(polls).toBe(2);
   await page.clock.runFor(20_000);
-  expect(polls).toBe(1);
+  expect(polls).toBe(2);
+});
+
+test('a LinkedIn sign-in already open is picked up again', async ({ app, page }) => {
+  // The server's side, as linkedin.rs answers: connect starts the sign-in task, which holds
+  // Chrome (a second connect meanwhile is "busy"), and status says while it waits.
+  let li = { connected: false, reconnect_needed: false, waiting: false };
+  await page.route('**/api/destination/linkedin/status', (route) => route.fulfill({ json: li }));
+  await page.route('**/api/destination/linkedin/connect', (route) => {
+    if (li.waiting) return route.fulfill({ json: { status: 'busy' } });
+    li = { ...li, waiting: true };
+    return route.fallback(); // the harness's intercept answers {status:"waiting"}
+  });
+  await app.goto('#/settings?tab=connections');
+  const linkedin = region(page, 'LinkedIn');
+  const badge = linkedin.locator('.badge').first();
+  const connect = linkedin.getByRole('button', { name: 'Connect LinkedIn' });
+  await connect.click();
+  await expect(badge).toHaveText('Waiting for sign-in');
+
+  // Away while the sign-in window is open, and back: the card keeps waiting, and follows it.
+  await goHome(page);
+  await expect(view(page).locator('.settings')).toHaveCount(0);
+  await page.goBack();
+  await expect(badge).toHaveText('Waiting for sign-in');
+  await expect(linkedin.locator('.st-msg')).toContainText('Sign in to LinkedIn in the Chrome window');
+  await expect(connect).toHaveCount(0);
+  li = { connected: true, reconnect_needed: false, waiting: false };
+  await expect(badge).toHaveText('Connected', { timeout: 15_000 });
+  await expect(linkedin.locator('.st-msg')).toHaveText('LinkedIn is connected.');
+
+  // Connect answers "busy" because this user's own window is still open (the card missed it):
+  // wait for that sign-in instead of calling Chrome busy.
+  li = { connected: false, reconnect_needed: false, waiting: false };
+  await page.reload();
+  await expect(badge).toHaveText('Not connected');
+  li = { ...li, waiting: true };
+  await connect.click();
+  await expect(badge).toHaveText('Waiting for sign-in');
+  await expect(linkedin.locator('.st-msg')).toContainText('Sign in to LinkedIn in the Chrome window');
+  await expect(linkedin).not.toContainText('Chrome is busy');
+  li = { connected: true, reconnect_needed: false, waiting: false };
+  await expect(badge).toHaveText('Connected', { timeout: 15_000 });
+  expect(app.calls.map((c) => c.path)).toEqual(['/api/destination/linkedin/connect']);
 });
 
 test('connect requests outlive the screen', async ({ app, page }) => {
@@ -1008,6 +1395,232 @@ test('connect requests outlive the screen', async ({ app, page }) => {
   await finished;
   expect(failed).toEqual([]);
   expect(app.calls.map((c) => c.path)).toEqual(['/api/discovery/canonical/connect']);
+  // Approved in the browser: nothing more to say.
+  await page.waitForTimeout(200);
+  await expect(toasts(page)).toHaveCount(0);
+});
+
+test('an install or sign-in that ends while Settings is away says how it went', async ({ app, page }) => {
+  await patchStatus(page, (s) => ({
+    ...s,
+    gmail_client_configured: true,
+    osint: { the_harvester: false, the_harvester_can_install: true, spiderfoot: false, spiderfoot_can_install: true, pipx: true },
+  }));
+  // Each request waits for the test to answer it.
+  const held = async (glob) => {
+    const routes = [];
+    await page.route(glob, (route) => {
+      routes.push(route);
+    });
+    return routes;
+  };
+  const installs = await held('**/api/onboarding/osint/install');
+  const canonicalConnects = await held('**/api/discovery/canonical/connect');
+  const googleConnects = await held('**/api/destination/gmail/connect');
+  const toast = (text) => toasts(page).filter({ hasText: text });
+
+  await app.goto('#/settings?tab=enrichment');
+  const harvester = region(page, 'theHarvester');
+  const spiderfoot = region(page, 'SpiderFoot');
+  await harvester.getByRole('button', { name: 'Install theHarvester' }).click();
+  await expect.poll(() => installs.length).toBe(1);
+  await tab(page, 'Connections').click();
+  await region(page, 'Canonical').getByRole('button', { name: 'Reconnect' }).click();
+  await expect.poll(() => canonicalConnects.length).toBe(1);
+
+  // Both fail while another screen is up: their cards are gone, so a toast says what happened.
+  await goHome(page);
+  await expect(view(page).locator('.settings')).toHaveCount(0);
+  await installs[0].fulfill({ json: { ok: false, message: 'pipx install theHarvester failed: no network' } });
+  await canonicalConnects[0].fulfill({ json: { ok: false, message: 'Canonical said: access_denied' } });
+  await expect(toast('theHarvester')).toHaveText(["theHarvester didn't install: pipx install theHarvester failed: no network"]);
+  await expect(toast('Canonical')).toHaveText(["Canonical didn't reconnect: Canonical said: access_denied"]);
+  await expect(page.locator('#toasts .toast-err')).toHaveCount(2);
+
+  // One that ends with Settings back on screen is shown on its card, and only there.
+  await page.goBack();
+  await tab(page, 'Enrichment').click();
+  await spiderfoot.getByRole('button', { name: 'Install SpiderFoot' }).click();
+  await expect.poll(() => installs.length).toBe(2);
+  await goHome(page);
+  await page.goBack();
+  await expect(spiderfoot.getByRole('button', { name: 'Install SpiderFoot' })).toHaveAttribute('aria-busy', 'true');
+  await installs[1].fulfill({ json: { ok: false, message: 'SpiderFoot needs Python 3.10–3.12' } });
+  await expect(spiderfoot.locator('.st-msg')).toHaveText('SpiderFoot needs Python 3.10–3.12');
+  await expect(toast('SpiderFoot')).toHaveCount(0);
+
+  // Left, back and left again: one toast, from the screen that followed it last. A success too.
+  await harvester.getByRole('button', { name: 'Install theHarvester' }).click();
+  await expect.poll(() => installs.length).toBe(3);
+  await goHome(page);
+  await page.goBack();
+  await expect(harvester.getByRole('button', { name: 'Install theHarvester' })).toHaveAttribute('aria-busy', 'true');
+  await goHome(page);
+  await expect(view(page).locator('.settings')).toHaveCount(0);
+  await installs[2].fulfill({ json: { ok: true, message: 'Installed theHarvester via pipx — new enrichment runs will use it.' } });
+  await expect(toast('Installed theHarvester')).toHaveText(['Installed theHarvester via pipx — new enrichment runs will use it.']);
+
+  // A Google sign-in too.
+  await page.goBack();
+  await tab(page, 'Connections').click();
+  const gmail = region(page, 'Gmail');
+  await gmail.getByText('More options').click();
+  await gmail.getByRole('button', { name: 'Sign in with Google' }).click();
+  await expect.poll(() => googleConnects.length).toBe(1);
+  await goHome(page);
+  await expect(view(page).locator('.settings')).toHaveCount(0);
+  await googleConnects[0].fulfill({ json: { ok: false, message: 'Google said: access_denied' } });
+  await expect(toast('Gmail')).toHaveText(["Gmail didn't connect: Google said: access_denied"]);
+  await expect(page.locator('#toasts .toast-err')).toHaveCount(3);
+});
+
+test('a sign-in wait can be cancelled, is picked up on return and holds the other sign-ins', async ({ app, page }) => {
+  // Approval that never comes (the consent tab was closed): the request hangs until cancelled.
+  const connects = [];
+  await page.route('**/api/discovery/canonical/connect', (route) => {
+    connects.push(route.request().postDataJSON());
+  });
+  const dropped = [];
+  page.on('requestfailed', (req) => {
+    if (new URL(req.url()).pathname === '/api/discovery/canonical/connect') dropped.push(req.failure().errorText);
+  });
+  const clientSaves = countRequests(page, '/api/destination/gmail/client');
+  await app.goto('#/settings?tab=connections');
+  const canonical = region(page, 'Canonical');
+  const gmail = region(page, 'Gmail');
+  const reconnect = canonical.getByRole('button', { name: 'Reconnect' });
+  const waiting = canonical.getByRole('button', { name: 'Waiting for approval…' });
+  const cancel = canonical.getByRole('button', { name: 'Cancel' });
+  const byo = gmail.getByRole('button', { name: 'Save and connect' });
+  await expect(cancel).toHaveCount(0);
+  await reconnect.click();
+  await expect(waiting).toHaveAttribute('aria-busy', 'true');
+  await expect(canonical.locator('.st-msg')).toHaveText(CANONICAL_WAIT);
+  await expect(cancel).toBeVisible();
+
+  // Every sign-in comes back to the same callback port: Google's wait for this one to end.
+  await gmail.getByText('More options').click();
+  await expect(byo).toHaveAttribute('aria-disabled', 'true');
+  await gmail.getByLabel('Client ID', { exact: true }).fill('999-e2e.apps.googleusercontent.com');
+  await byo.click({ force: true });
+  await expect(gmail.locator('.st-msg')).toHaveText('Finish or cancel the Canonical approval first: only one sign-in can wait at a time.');
+  expect(clientSaves).toEqual([]);
+
+  // Away and back (the request lives on): still waiting, with its Cancel, and still holding.
+  await goHome(page);
+  await expect(view(page).locator('.settings')).toHaveCount(0);
+  await page.goBack();
+  await expect(waiting).toHaveAttribute('aria-busy', 'true');
+  await expect(canonical.locator('.st-msg')).toHaveText(CANONICAL_WAIT);
+  await expect(cancel).toBeVisible();
+  await gmail.getByText('More options').click();
+  await expect(byo).toHaveAttribute('aria-disabled', 'true');
+  await byo.click({ force: true });
+  await expect(gmail.locator('.st-msg')).toHaveText('Finish or cancel the Canonical approval first: only one sign-in can wait at a time.');
+  expect(connects).toEqual([{}]);
+
+  // Cancel drops the request (so the server stops listening) and says what to do if it sticks.
+  await cancel.click();
+  await expect(canonical.locator('.st-msg')).toHaveText(STOPPED);
+  await expect(reconnect).toBeFocused();
+  await expect(reconnect).not.toHaveAttribute('aria-busy', /.*/);
+  await expect(cancel).toHaveCount(0);
+  await expect.poll(() => dropped).toEqual(['net::ERR_ABORTED']);
+  await expect(byo).not.toHaveAttribute('aria-disabled', /.*/);
+  // Gmail's "finish or cancel it first" no longer holds: it goes.
+  await expect(gmail.locator('.st-msg')).toHaveText('');
+  await expect(gmail.locator('.st-msg')).not.toHaveAttribute('data-tone', /./);
+  expect(clientSaves).toEqual([]);
+  // Still connected from before: the cancelled try changes nothing.
+  await expect(canonical.locator('.badge')).toHaveText('Connected');
+
+  // A port the server can't listen on (a wait in another tab still holds it) says what to do.
+  await page.unroute('**/api/discovery/canonical/connect');
+  await page.route('**/api/discovery/canonical/connect', (route) =>
+    route.fulfill({ json: { ok: false, message: 'could not bind callback port 8765' } }),
+  );
+  await reconnect.click();
+  await expect(canonical.locator('.st-msg')).toHaveText(
+    'could not bind callback port 8765. Another sign-in may still be waiting, maybe in another coldtrail tab: finish or cancel it, or restart coldtrail, then try again.',
+  );
+  await expect(cancel).toHaveCount(0);
+  await expect(reconnect).toBeVisible();
+});
+
+test('connecting Gmail with an app password stops a Google sign-in still waiting', async ({ app, page }) => {
+  let connected = false;
+  await patchStatus(page, (s) => ({ ...s, gmail_client_configured: true, destination_connected: connected }));
+  await page.route('**/api/destination/gmail/app-password', (route) => {
+    connected = true;
+    return route.fallback(); // the harness's intercept answers {ok:true}
+  });
+  // Stuck on Google's consent screen: the request hangs.
+  await page.route('**/api/destination/gmail/connect', () => {});
+  const dropped = [];
+  page.on('requestfailed', (req) => {
+    if (new URL(req.url()).pathname === '/api/destination/gmail/connect') dropped.push(req.failure().errorText);
+  });
+  await app.goto('#/settings?tab=connections');
+  const gmail = region(page, 'Gmail');
+  const canonical = region(page, 'Canonical');
+  const reconnect = canonical.getByRole('button', { name: 'Reconnect' });
+  await gmail.getByText('More options').click();
+  await gmail.getByRole('button', { name: 'Sign in with Google' }).click();
+  await expect(gmail.getByRole('button', { name: 'Waiting for Google…' })).toHaveAttribute('aria-busy', 'true');
+  await expect(reconnect).toHaveAttribute('aria-disabled', 'true');
+
+  // Connected another way, the forms fold away; the wait (and its Cancel) would fold with them,
+  // still holding Canonical. It's moot now: it's dropped, without a word over "connected".
+  await gmail.getByLabel('Gmail address', { exact: true }).fill('dee@example.com');
+  await gmail.getByLabel('App password', { exact: true }).fill('abcd efgh ijkl mnop');
+  await gmail.getByRole('button', { name: 'Connect Gmail' }).click();
+  await expect(gmail.locator('.badge').first()).toHaveText('Connected');
+  await expect.poll(() => dropped).toEqual(['net::ERR_ABORTED']);
+  await expect(reconnect).not.toHaveAttribute('aria-disabled', /.*/);
+  await expect(gmail.locator('.st-msg')).toHaveText('Gmail is connected.');
+  await gmail.getByText('Use different credentials').click();
+  await expect(gmail.getByRole('button', { name: 'Sign in with Google' })).not.toHaveAttribute('aria-busy', /.*/);
+  await expect(gmail.getByRole('button', { name: 'Cancel' })).toHaveCount(0);
+
+  // Canonical can sign in again.
+  await reconnect.click();
+  await expect(canonical.locator('.st-msg')).toHaveText('Canonical is connected.');
+  expect(app.calls.map((c) => c.path)).toEqual(['/api/destination/gmail/app-password', '/api/discovery/canonical/connect']);
+  await expect(toasts(page)).toHaveCount(0);
+});
+
+test('an open sign-in wait never stops the screen following status', async ({ app, page, request, server }) => {
+  await resetSending(request, server);
+  // Approval that never comes: the request hangs (cancelled at the end).
+  await page.route('**/api/discovery/canonical/connect', () => {});
+  try {
+    await app.goto('#/settings?tab=connections');
+    const canonical = region(page, 'Canonical');
+    await canonical.getByRole('button', { name: 'Reconnect' }).click();
+    await expect(canonical.getByRole('button', { name: 'Waiting for approval…' })).toHaveAttribute('aria-busy', 'true');
+
+    // Auto-send turned on elsewhere (the CLI, another tab): the store's refresh brings it here.
+    await postJSON(request, server, '/api/destination/auto-send', { enabled: true, daily_cap: 44 });
+    await refreshStore(page);
+    await tab(page, 'Sending').click();
+    const email = region(page, 'Email');
+    await expect(emailSwitch(page)).toHaveAttribute('aria-checked', 'true');
+    await expect(email.getByLabel('Daily cap')).toHaveValue('44');
+    await expect(email.locator('.switch-desc')).toHaveText(EMAIL_ON(44));
+
+    // … and on a tab already built, too.
+    await postJSON(request, server, '/api/destination/auto-send', { enabled: false, daily_cap: 30 });
+    await refreshStore(page);
+    await expect(emailSwitch(page)).toHaveAttribute('aria-checked', 'false');
+    await expect(email.getByLabel('Daily cap')).toHaveValue('30');
+    await expect(email.locator('.switch-desc')).toHaveText(DRAFTS_ONLY);
+
+    await tab(page, 'Connections').click();
+    await canonical.getByRole('button', { name: 'Cancel' }).click();
+    await expect(canonical.locator('.st-msg')).toHaveText(STOPPED);
+  } finally {
+    await resetSending(request, server);
+  }
 });
 
 test('appearance persists across reload', async ({ app, page }) => {
@@ -1055,10 +1668,13 @@ test('keyboard-only: tabs, switch and confirm', async ({ app, page, request, ser
   await page.keyboard.press('ArrowRight');
   await expect(tab(page, 'Sending')).toBeFocused();
   await expect(emailSwitch(page)).toBeVisible();
-  // Tab moves into the panel and on to the switch; Space asks, Enter confirms.
+  // Tab moves into the panel and on to the switch; Space asks. The confirm opens on Cancel (an
+  // Enter pressed twice never turns auto-send on); Tab reaches Turn on, and Enter confirms.
   await tabTo(page, emailSwitch(page));
   await page.keyboard.press('Space');
   await expect(confirmBox(page)).toBeVisible();
+  await expect(confirmBox(page).getByRole('button', { name: 'Cancel' })).toBeFocused();
+  await page.keyboard.press('Tab');
   await expect(confirmBox(page).getByRole('button', { name: 'Turn on' })).toBeFocused();
   await page.keyboard.press('Enter');
   await expect(region(page, 'Email').locator('.st-msg')).toHaveText('Email auto-send is on.');
@@ -1106,7 +1722,7 @@ test('hostile text from the server renders as text', async ({ app, page }) => {
   expect(await page.evaluate(() => window.__xss)).toBeUndefined();
 });
 
-test('every tab is accessible in light and dark and fits a phone', async ({ app, page, request, server }) => {
+test('every tab is accessible in light and dark', async ({ app, page, request, server }) => {
   await resetSending(request, server);
   for (const scheme of ['light', 'dark']) {
     await page.emulateMedia({ colorScheme: scheme });
@@ -1142,7 +1758,10 @@ test('every tab is accessible in light and dark and fits a phone', async ({ app,
     await expectAccessible(page);
     await page.keyboard.press('Escape');
   }
+});
 
+test('every tab fits a phone and is accessible there in light and dark', async ({ app, page, request, server }) => {
+  await resetSending(request, server);
   await page.setViewportSize({ width: 390, height: 844 });
   for (const scheme of ['light', 'dark']) {
     await page.emulateMedia({ colorScheme: scheme });
@@ -1156,10 +1775,11 @@ test('every tab is accessible in light and dark and fits a phone', async ({ app,
       if (id === 'connections') await region(page, 'Gmail').getByText('More options').click();
       if (id === 'sending') {
         await expect(linkedinSwitch(page)).toBeVisible();
-        // The usage line wraps between its parts, never inside one.
+        // The usage line wraps between its parts, never inside one. Read until it holds: the
+        // mount's status refresh can replace the parts between the query and the read.
         const parts = region(page, 'LinkedIn').locator('.st-usage-part');
         await expect(parts).toHaveCount(2);
-        expect(await parts.evaluateAll((els) => els.map((el) => el.getClientRects().length))).toEqual([1, 1]);
+        await expect.poll(() => parts.evaluateAll((els) => els.map((el) => el.getClientRects().length))).toEqual([1, 1]);
       }
       if (id === 'enrichment') await expect(region(page, 'SpiderFoot')).toBeVisible();
       if (id === 'appearance') await expect(panel(page).getByRole('radio', { name: 'Dark' })).toBeVisible();

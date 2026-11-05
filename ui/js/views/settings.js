@@ -2,10 +2,13 @@
 //
 //   agent        Setup's agentPanel: the agent cards, opencode's model, your own model, Test
 //                connection (one module, so both screens behave the same), plus a warning when
-//                the saved opencode model is no longer one opencode offers (every run would fail)
+//                the saved opencode model is no longer one opencode offers (every run would fail),
+//                and a toast when the screen goes with "Your own model" chosen but not saved
 //   connections  Canonical (coldtrail's own OAuth), Gmail (app password first; Google sign-in
 //                and your own OAuth client under "More options"), LinkedIn (connect, reconnect,
-//                disconnect, and the poll that follows a sign-in in Chrome)
+//                disconnect, and the poll that follows a sign-in in Chrome, picking up one
+//                already open). A sign-in wait has a Cancel, and holds the other sign-ins (they
+//                share one callback port) until it ends
 //   sending      email and LinkedIn auto-send: switches that ask before turning ON (never before
 //                OFF), caps that save on Enter or when the field is left (asking first when a cap
 //                goes up while auto-send is on; a raise nobody could confirm because the screen
@@ -18,8 +21,11 @@
 // once, since it can be 30s old), else its own request, with loading and error states. Saves,
 // connects and installs are sent without the view's AbortSignal, so leaving the screen never
 // drops one (Canonical and Google sign-in hold their request open until the browser approval
-// comes back); reads, the probe and the LinkedIn poll stop on unmount. Leaving waits briefly
-// (router beforeLeave) for switch, cap and model saves, so the next screen sees them.
+// comes back; only their Cancel drops it); reads, the probe and the LinkedIn poll stop on
+// unmount. Sign-in waits and installs are kept by the module, not the screen: shown again, a
+// card picks its own up instead of offering a second, and one that ends while the screen is gone
+// says how it went in a toast. Leaving waits briefly (router beforeLeave) for switch, cap and
+// model saves, so the next screen sees them. A link to another tab takes focus to its card.
 // Everything dynamic reaches the DOM through h() (text nodes); nothing here parses HTML.
 
 import { api, errorText, isStaleSession } from '../core/api.js';
@@ -91,6 +97,7 @@ function icon(name, size = 16) {
 
 /** One line into a live region that stays in the DOM: tone '' | 'ok' | 'err' | 'busy'; '' clears. */
 function say(el, text, tone = '') {
+  holds.delete(el);
   el.dataset.tone = text ? tone : '';
   if (!text) {
     el.replaceChildren();
@@ -115,6 +122,153 @@ function extLink(url, text) {
 
 let uid = 0;
 
+// ---- Jobs that outlive the screen ----
+//
+// A sign-in wait (Canonical, Google, your own client) holds its request open until the browser
+// approval comes back, and the server listens for that approval on one callback port (8765) for
+// as long as the request lives. An install runs inside its request, for minutes. Leaving the
+// screen drops neither, so they're kept here: shown again, a card follows its job (busy, a wait
+// with its Cancel) instead of offering to start a second one.
+
+const waits = new Map(); // 'canonical' | 'gmail-google' | 'gmail-client' → job
+const installs = new Map(); // tool key → job
+const waitWatchers = new Set(); // fn() when a wait starts or ends (the Connections tab, while up)
+const holds = new WeakMap(); // a card's message → the sign-in whose press held() turned away
+const WAIT_NAMES = { canonical: 'Canonical approval', 'gmail-google': 'Google sign-in', 'gmail-client': 'Google sign-in' };
+
+/** A sign-in wait the user stopped. The server may still hold the callback port meanwhile. */
+const STOPPED = 'Stopped waiting. If connecting again fails, restart coldtrail and try once more.';
+const PORT_HELD = 'Another sign-in may still be waiting, maybe in another coldtrail tab: finish or cancel it, or restart coldtrail, then try again.';
+
+/**
+ * Send `send(signal)` as the job `key` of `jobs` → { ctl, done }. done never rejects: it settles
+ * to { r } or { err } once the job has left `jobs`. With `cancellable`, signal is ctl's (aborting
+ * it drops the request); else there is none. onChange() runs as the job starts and as it ends.
+ */
+function startJob(jobs, key, send, { cancellable = false, onChange = () => {} } = {}) {
+  const ctl = cancellable ? new AbortController() : null;
+  const job = { ctl, done: null };
+  job.done = Promise.resolve()
+    .then(() => send(ctl ? ctl.signal : undefined))
+    .then(
+      (r) => ({ r }),
+      (err) => ({ err }),
+    )
+    .finally(() => {
+      if (jobs.get(key) === job) jobs.delete(key);
+      onChange();
+    });
+  jobs.set(key, job);
+  onChange();
+  return job;
+}
+
+/**
+ * A card being built follows `job` → mine(): whether it is still the last card to have done so.
+ * A job that ends after its screen has gone is told in a toast by the last screen that followed
+ * it, and only that one (a screen shown again follows it too, and says it on its card instead).
+ */
+function followJob(job) {
+  const token = {};
+  job.follower = token;
+  return () => job.follower === token;
+}
+
+/**
+ * The toast for a sign-in that ended, without connecting, after its screen had gone: `lead`,
+ * with the reason when there is one. None for one that was stopped (Cancel, or moot), nor for a
+ * stale session (the app's banner says that).
+ */
+function signInAway(o, lead) {
+  if (o.err && (aborted(o.err) || isStaleSession(o.err))) return;
+  const failed = failure(o, '');
+  if (failed) toast(failed[0] ? `${lead}: ${failed[0]}` : `${lead}.`, 'err');
+}
+
+function waitsChanged() {
+  for (const fn of [...waitWatchers]) {
+    try {
+      fn();
+    } catch (err) {
+      console.error(err);
+    }
+  }
+}
+
+/** A sign-in wait under `key`: Cancel aborts it. */
+const startWait = (key, send) => startJob(waits, key, send, { cancellable: true, onChange: waitsChanged });
+
+/** The wait other than `key`'s that is open now, if any: one at a time, as they share the port. */
+const otherWait = (key) => [...waits.keys()].find((k) => k !== key) || null;
+
+/**
+ * A sign-in button while another sign-in waits: it stays focusable, dimmed (aria-disabled), and
+ * a press says why (held()). A busy button is left alone (setBusy owns it meanwhile).
+ */
+function holdFor(btn, key) {
+  if (isBusy(btn)) return;
+  if (otherWait(key)) btn.setAttribute('aria-disabled', 'true');
+  else btn.removeAttribute('aria-disabled');
+}
+
+/** True, saying so in `msg`, when another sign-in's wait keeps `key` from starting now. */
+function held(key, msg) {
+  const other = otherWait(key);
+  if (!other) return false;
+  say(msg, `Finish or cancel the ${WAIT_NAMES[other]} first: only one sign-in can wait at a time.`, 'err');
+  holds.set(msg, key);
+  return true;
+}
+
+/** held()'s message in `msg` goes once the wait it named has ended (anything said since stays). */
+function unhold(msg) {
+  const key = holds.get(msg);
+  if (key && !otherWait(key)) say(msg, '');
+}
+
+/** A Cancel for a sign-in wait: hidden until start(ctl); aborts ctl, and keeps focus on `btn`. */
+function waitCancel(btn) {
+  let ctl = null;
+  const cancelBtn = h(
+    'button',
+    {
+      type: 'button',
+      class: 'btn btn-ghost',
+      hidden: true,
+      onClick: () => {
+        if (!ctl) return;
+        if (document.activeElement === cancelBtn) btn.focus({ preventScroll: true });
+        ctl.abort();
+      },
+    },
+    'Cancel',
+  );
+  return {
+    el: cancelBtn,
+    start(waitCtl) {
+      ctl = waitCtl;
+      cancelBtn.hidden = false;
+    },
+    end() {
+      ctl = null;
+      // Hidden, it would drop focus to <body>.
+      if (document.activeElement === cancelBtn) btn.focus({ preventScroll: true });
+      cancelBtn.hidden = true;
+    },
+  };
+}
+
+/** What a landed sign-in that didn't connect says, as say()'s [text, tone]; null when it did. */
+function failure(o, fallback) {
+  if (o.err) return aborted(o.err) ? [STOPPED] : [errorText(o.err), 'err'];
+  if (o.r && o.r.ok === false) {
+    const msg = o.r.message || fallback;
+    // The server couldn't listen for the approval: another wait still holds the port.
+    return [/callback port/i.test(msg) ? `${msg.replace(/\.\s*$/, '')}. ${PORT_HELD}` : msg, 'err'];
+  }
+  return null;
+}
+
 // ---- The screen ----
 
 let active = null; // the mounted screen: { stay(query), beforeLeave() }
@@ -129,7 +283,11 @@ function mountSettings(root, ctx) {
   let status = (store && store.get().status) || null;
   let loadError = null; // the error of the last failed status read, while there is no status
   let loading = false;
-  let saving = 0; // saves in flight: the store's periodic copy may predate them, so it waits
+  // Saves in flight: the store's periodic copy may predate them, so it waits. Only quick saves
+  // count, never a sign-in wait or an install (they can run for minutes, or until a browser tab
+  // nobody answers is closed: the screen would stop following status all that time). Their
+  // outcome comes through `local` and a re-read instead.
+  let saving = 0;
   let tab = tabOf(ctx.query);
   let gone = false;
   // The router asked to leave: nothing new may ask a question now. Cleared when the route change
@@ -212,9 +370,14 @@ function mountSettings(root, ctx) {
 
   async function load() {
     if (loading) return;
+    // Try again keeps its card (busy, and focused) until the answer; then focus goes to what took
+    // its place: the tab's first card, or the next Try again.
+    const retry = panes.get(tab).el.querySelector('.st-load-error .btn');
+    const refocus = !!retry && document.activeElement === retry;
     loading = true;
     loadError = null;
-    showPane(tab);
+    if (refocus) setBusy(retry, true, { label: 'Trying again…' });
+    else showPane(tab);
     try {
       apply(await api.get('/api/status', { signal }));
     } catch (err) {
@@ -223,7 +386,9 @@ function mountSettings(root, ctx) {
     } finally {
       loading = false;
     }
-    if (!gone) showPane(tab);
+    if (gone) return;
+    showPane(tab);
+    if (refocus && (!document.activeElement || document.activeElement === document.body)) focusPane(tab);
   }
 
   /**
@@ -250,7 +415,7 @@ function mountSettings(root, ctx) {
     }
   }
 
-  /** Run a save: the store's periodic copy is ignored while it is in flight. */
+  /** Run a quick save: the store's periodic copy is ignored while it is in flight. */
   async function saveWith(fn) {
     saving++;
     try {
@@ -269,6 +434,12 @@ function mountSettings(root, ctx) {
   // ---- Tabs ----
 
   function setTab(t) {
+    // Focus in the pane going away (a link to another tab, such as Sending's "Connect Gmail", or
+    // Back) would drop to <body> as it hides: it moves to the card the link names (data-goto),
+    // else to the new tab's first card.
+    const at = document.activeElement;
+    const refocus = t !== tab && !!at && panes.get(tab).el.contains(at);
+    const goto = refocus ? at.getAttribute('data-goto') : null;
     tab = t;
     tabList.setActive(t);
     desc.textContent = TAB_DESC[t];
@@ -276,6 +447,17 @@ function mountSettings(root, ctx) {
     if (btn) panel.setAttribute('aria-labelledby', btn.id);
     for (const [k, p] of panes) p.el.hidden = k !== t;
     showPane(t);
+    if (refocus) focusPane(t, goto);
+  }
+
+  /** Focus into tab t: card `key`'s title, else its Try again or first card title, else the tab itself. */
+  function focusPane(t, key = null) {
+    const el = panes.get(t).el;
+    const target =
+      (key && el.querySelector(`[data-card="${key}"] .st-card-title`)) ||
+      el.querySelector('.st-load-error .btn, .st-card-title') ||
+      tabList.querySelector(`[data-id="${t}"]`);
+    if (target) target.focus();
   }
 
   function showPane(t) {
@@ -321,8 +503,9 @@ function mountSettings(root, ctx) {
 
   // ---- A card: icon, title + state badge, note, body, message ----
 
-  function card({ key, iconName, iconNode = null, title }) {
-    const titleId = `${id}-${key}-title`;
+  /** A card on tab `tabId`. Its key is unique within the tab only: Connections and Sending both have 'linkedin'. */
+  function card({ tabId, key, iconName, iconNode = null, title }) {
+    const titleId = `${id}-${tabId}-${key}-title`;
     const badgeSlot = h('span', { class: 'st-card-state' });
     const note = h('p', { class: 'st-card-note' });
     const body = h('div', { class: 'st-card-body' });
@@ -371,6 +554,8 @@ function mountSettings(root, ctx) {
       },
       // Model and provider saves the panel has sent (it saves without the view's signal).
       settled: () => (panelApi ? panelApi.settled() : Promise.resolve(true)),
+      // "Your own model" chosen (and maybe filled in) but not saved: leaving drops it.
+      pending: () => !!panelApi && panelApi.pending(),
     };
 
     // The panel draws itself once setup.css is in (usually already, so no skeleton flashes).
@@ -484,13 +669,22 @@ function mountSettings(root, ctx) {
       linkedin.render();
     };
     update();
-    return { update, destroy: () => linkedin.stop() };
+    // A wait starting or ending (on this card or another) holds or frees the other sign-ins.
+    waitWatchers.add(update);
+    return {
+      update,
+      destroy: () => {
+        waitWatchers.delete(update);
+        linkedin.stop();
+      },
+    };
   }
 
   function canonicalCard() {
-    const c = card({ key: 'canonical', iconName: 'search', title: 'Canonical' });
+    const c = card({ tabId: 'connections', key: 'canonical', iconName: 'search', title: 'Canonical' });
     const btn = h('button', { type: 'button', class: 'btn', onClick: connect });
-    c.body.append(h('div', { class: 'st-row' }, btn));
+    const cancel = waitCancel(btn);
+    c.body.append(h('div', { class: 'st-row' }, btn, cancel.el));
 
     function render() {
       const on = canonicalOn();
@@ -502,36 +696,47 @@ function mountSettings(root, ctx) {
         btn.className = on ? 'btn btn-secondary' : 'btn btn-primary';
         btn.textContent = on ? 'Reconnect' : 'Connect Canonical';
       }
+      holdFor(btn, 'canonical');
+      unhold(c.msg);
     }
 
-    async function connect() {
-      if (isBusy(btn)) return;
+    /** Show a wait (started here, or before this card was) until it lands. */
+    function wait(job) {
+      const mine = followJob(job);
+      cancel.start(job.ctl);
       setBusy(btn, true, { label: 'Waiting for approval…' });
       say(c.msg, "Approve coldtrail in the browser tab that opened. This page updates when you're done.", 'busy');
-      await saveWith(async () => {
-        try {
-          // No signal: the server holds this request open for the whole browser approval, and
-          // dropping it would stop the callback listener the approval comes back to.
-          const r = await api.post('/api/discovery/canonical/connect', {});
-          if (gone) return;
-          setBusy(btn, false);
-          if (r && r.ok === false) {
-            say(c.msg, r.message || "Couldn't connect to Canonical.", 'err');
-          } else {
-            local.canonical = true;
-            say(c.msg, 'Canonical is connected.', 'ok');
-          }
-        } catch (err) {
-          if (gone) return;
-          setBusy(btn, false);
-          say(c.msg, errorText(err), 'err');
+      job.done.then((o) => {
+        if (gone) {
+          if (mine()) signInAway(o, `Canonical didn't ${canonicalOn() ? 'reconnect' : 'connect'}`);
+          return;
         }
+        cancel.end();
+        setBusy(btn, false);
+        const failed = failure(o, "Couldn't connect to Canonical.");
+        if (failed) {
+          say(c.msg, ...failed);
+        } else {
+          local.canonical = true;
+          say(c.msg, 'Canonical is connected.', 'ok');
+        }
+        render();
+        if (!(o.err && aborted(o.err))) sync();
       });
-      if (gone) return;
-      render();
-      await sync();
     }
 
+    function connect() {
+      if (isBusy(btn) || held('canonical', c.msg)) return;
+      // Not the view's signal: the server holds this request open for the whole browser approval,
+      // and dropping it would stop the callback listener the approval comes back to. Only Cancel
+      // drops it.
+      wait(startWait('canonical', (sig) => api.post('/api/discovery/canonical/connect', {}, { signal: sig })));
+    }
+
+    render();
+    // Left while the consent tab was open, and back: still waiting on that approval.
+    const running = waits.get('canonical');
+    if (running) wait(running);
     return { el: c.el, render };
   }
 
@@ -547,7 +752,7 @@ function mountSettings(root, ctx) {
   }
 
   function gmailCard() {
-    const c = card({ key: 'gmail', iconName: 'mail', title: 'Gmail' });
+    const c = card({ tabId: 'connections', key: 'gmail', iconName: 'mail', title: 'Gmail' });
 
     const email = textField(`${id}-gmail-email`, 'Gmail address', { type: 'email', autocomplete: 'email', placeholder: 'you@gmail.com' });
     const pw = textField(`${id}-gmail-pw`, 'App password', { type: 'password', autocomplete: 'new-password', placeholder: '16 characters, spaces are fine' });
@@ -573,10 +778,21 @@ function mountSettings(root, ctx) {
     );
 
     const googleBtn = h('button', { type: 'button', class: 'btn btn-secondary', onClick: connectGoogle }, 'Sign in with Google');
-    const googleBlock = h('div', { class: 'st-more-block' }, h('p', {}, 'Sign in with Google instead of an app password.'), h('div', { class: 'st-row' }, googleBtn));
+    const googleCancel = waitCancel(googleBtn);
+    const googleBlock = h(
+      'div',
+      { class: 'st-more-block' },
+      h('p', {}, 'Sign in with Google instead of an app password.'),
+      h('div', { class: 'st-row' }, googleBtn, googleCancel.el),
+    );
     const clientId = textField(`${id}-gmail-client-id`, 'Client ID', { type: 'text', placeholder: '….apps.googleusercontent.com' });
     const clientSecret = textField(`${id}-gmail-client-secret`, 'Client secret', { type: 'password', autocomplete: 'new-password', placeholder: 'GOCSPX-…' });
     const byoBtn = h('button', { type: 'submit', class: 'btn btn-secondary' }, 'Save and connect');
+    const byoCancel = waitCancel(byoBtn);
+    const ways = {
+      'gmail-google': { btn: googleBtn, cancel: googleCancel },
+      'gmail-client': { btn: byoBtn, cancel: byoCancel },
+    };
     const byoForm = h(
       'form',
       { class: 'st-form st-more-block', novalidate: true, 'aria-label': 'Connect Gmail with your own OAuth client', onSubmit: connectOwnClient },
@@ -589,7 +805,7 @@ function mountSettings(root, ctx) {
         h('li', {}, 'Create an OAuth client ID of type Desktop app and paste its ID and secret here.'),
       ),
       h('div', { class: 'st-fields' }, clientId.el, clientSecret.el),
-      h('div', { class: 'st-row' }, byoBtn),
+      h('div', { class: 'st-row' }, byoBtn, byoCancel.el),
     );
     const more = h('details', { class: 'st-details' }, h('summary', {}, 'More options'), h('div', { class: 'st-more' }, googleBlock, byoForm));
     const forms = h('div', { class: 'st-gmail-forms' }, apForm, howTo, more);
@@ -603,7 +819,7 @@ function mountSettings(root, ctx) {
       if (on && status.auto_send) {
         c.note.replaceChildren(
           `Auto-send is on: Send now on the Drafts screen and the agent email people right away, up to ${fmtNum(status.daily_send_cap)} a day in total. `,
-          h('a', { href: SENDING_TAB }, 'Change it under Sending'),
+          h('a', { href: SENDING_TAB, 'data-goto': 'email' }, 'Change it under Sending'),
           '.',
         );
       } else {
@@ -611,6 +827,8 @@ function mountSettings(root, ctx) {
           ? 'coldtrail saves each email as a draft in your Gmail. You review and send it there.'
           : 'coldtrail puts each email in your Gmail drafts. An app password is the quickest way in: no Google Cloud project needed.';
       }
+      for (const [key, way] of Object.entries(ways)) holdFor(way.btn, key);
+      unhold(c.msg);
       if (shownOn === on) return;
       shownOn = on;
       if (on) {
@@ -623,11 +841,21 @@ function mountSettings(root, ctx) {
 
     async function connected(text) {
       local.gmail = true;
+      // A Google sign-in still waiting (say, stuck on Google's consent screen while an app
+      // password went in) is moot now. Left open it would fold away below, Cancel and all, and go
+      // on holding the other sign-ins: stop it. Its card says nothing more about it (moot).
+      for (const key of Object.keys(ways)) {
+        const job = waits.get(key);
+        if (!job) continue;
+        job.moot = true;
+        job.ctl.abort();
+      }
       say(c.msg, text, 'ok');
       render();
-      // The form that had focus folded away under "Use different credentials": land on the card.
+      // The form that had focus folded away under "Use different credentials" (or its Cancel
+      // went): land on the card. Focus elsewhere on the screen stays where it is.
       const at = document.activeElement;
-      if (!c.el.contains(at) || at.closest('details:not([open])')) c.focusTitle();
+      if (!at || at === document.body || (c.el.contains(at) && at.closest('details:not([open])'))) c.focusTitle();
       await sync();
     }
 
@@ -664,34 +892,41 @@ function mountSettings(root, ctx) {
       await connected('Gmail is connected.');
     }
 
-    async function oauth(btn) {
+    /** Show a Google wait (started here, or before this card was) until it lands. */
+    function waitGoogle(key, job) {
+      const mine = followJob(job);
+      const { btn, cancel } = ways[key];
+      cancel.start(job.ctl);
       setBusy(btn, true, { label: 'Waiting for Google…' });
       say(c.msg, "Approve coldtrail in the Google tab that opened. This page updates when you're done.", 'busy');
-      let ok = false;
-      await saveWith(async () => {
-        try {
-          // No signal: the server holds this request open until Google's approval comes back.
-          const r = await api.post('/api/destination/gmail/connect', { callback_port: 8765 });
-          if (gone) return;
-          setBusy(btn, false);
-          if (r && r.ok === false) say(c.msg, r.message || "Couldn't connect Gmail.", 'err');
-          else ok = true;
-        } catch (err) {
-          if (gone) return;
-          setBusy(btn, false);
-          say(c.msg, errorText(err), 'err');
+      job.done.then((o) => {
+        if (gone) {
+          if (mine()) signInAway(o, `Gmail didn't ${gmailOn() ? 'reconnect' : 'connect'}`);
+          return;
         }
+        cancel.end();
+        setBusy(btn, false);
+        if (job.moot) return; // Gmail connected another way, and the card says so
+        const failed = failure(o, "Couldn't connect Gmail.");
+        if (failed) say(c.msg, ...failed);
+        else connected('Gmail is connected.');
       });
-      if (ok && !gone) await connected('Gmail is connected.');
+    }
+
+    function oauth(key) {
+      // Not the view's signal: the server holds this request open until Google's approval comes
+      // back, and leaving the screen mustn't drop it. Only Cancel does.
+      const send = (sig) => api.post('/api/destination/gmail/connect', { callback_port: 8765 }, { signal: sig });
+      waitGoogle(key, startWait(key, send));
     }
 
     function connectGoogle() {
-      if (!isBusy(googleBtn)) oauth(googleBtn);
+      if (!isBusy(googleBtn) && !held('gmail-google', c.msg)) oauth('gmail-google');
     }
 
     async function connectOwnClient(e) {
       e.preventDefault();
-      if (isBusy(byoBtn)) return;
+      if (isBusy(byoBtn) || held('gmail-client', c.msg)) return;
       const cid = clientId.input.value.trim();
       invalid(clientId.input, !cid);
       if (!cid) {
@@ -710,14 +945,32 @@ function mountSettings(root, ctx) {
         return;
       }
       if (gone) return;
-      await oauth(byoBtn); // stays busy straight on, now waiting for Google
+      if (held('gmail-client', c.msg)) {
+        // Another sign-in started while this saved: the client is saved; this waits its turn.
+        setBusy(byoBtn, false);
+        return;
+      }
+      oauth('gmail-client'); // stays busy straight on, now waiting for Google
     }
 
+    /** Open the folds around `node` (Use different credentials, More options). */
+    function unfold(node) {
+      for (let d = node.closest('details'); d; d = d.parentElement && d.parentElement.closest('details')) d.open = true;
+    }
+
+    render();
+    // Left while a Google sign-in was waiting, and back: still waiting on it, in view.
+    for (const key of Object.keys(ways)) {
+      const job = waits.get(key);
+      if (!job) continue;
+      unfold(ways[key].btn);
+      waitGoogle(key, job);
+    }
     return { el: c.el, render };
   }
 
   function linkedinCard() {
-    const c = card({ key: 'linkedin', iconName: 'person', title: 'LinkedIn' });
+    const c = card({ tabId: 'connections', key: 'linkedin', iconName: 'person', title: 'LinkedIn' });
     const connectBtn = h('button', { type: 'button', class: 'btn btn-primary', onClick: connect }, 'Connect LinkedIn');
     const disconnectBtn = h('button', { type: 'button', class: 'btn btn-secondary', onClick: disconnect }, 'Disconnect');
     const row = h('div', { class: 'st-row' }, connectBtn, disconnectBtn);
@@ -799,30 +1052,49 @@ function mountSettings(root, ctx) {
       }
     }
 
+    /** The server's view of the sign-in (null when it can't be read). */
+    function signInState() {
+      return api.get('/api/destination/linkedin/status', { signal }).catch(() => null);
+    }
+
+    /** A sign-in window is open (just now, or since before this card): wait for it to finish. */
+    function startWaiting() {
+      phase = 'waiting';
+      setBusy(connectBtn, false);
+      say(c.msg, "Sign in to LinkedIn in the Chrome window that opened. This page updates when you're done.", 'busy');
+      // The buttons hide while waiting: keep keyboard focus on the card.
+      const hadFocus = document.activeElement === connectBtn;
+      render();
+      if (hadFocus) c.focusTitle();
+      stop();
+      schedule(pollSeq);
+    }
+
     async function connect() {
       if (phase !== 'idle' || isBusy(connectBtn)) return;
       phase = 'starting';
       setBusy(connectBtn, true, { label: 'Opening Chrome…' });
       say(c.msg, '');
       try {
-        // No signal: this starts the sign-in task on the server, which should start either way.
+        // No signal: this starts the sign-in task on the server, which should start either way
+        // (shown again, the card picks it up: signInState below).
         const r = await api.post('/api/destination/linkedin/connect', {});
         if (gone) return;
         if (r && r.status === 'busy') {
+          // Chrome may be busy with this user's own sign-in, started before the screen was left
+          // and opened again (or in another tab): then wait for it instead.
+          const s = await signInState();
+          if (gone) return;
+          if (s && s.waiting) {
+            startWaiting();
+            return;
+          }
           finish();
           say(c.msg, 'Chrome is busy with another LinkedIn task. Try again in a moment.', 'err');
           render();
           return;
         }
-        phase = 'waiting';
-        setBusy(connectBtn, false);
-        say(c.msg, "Sign in to LinkedIn in the Chrome window that opened. This page updates when you're done.", 'busy');
-        // The buttons hide while waiting: keep keyboard focus on the card.
-        const hadFocus = document.activeElement === connectBtn;
-        render();
-        if (hadFocus) c.focusTitle();
-        stop();
-        schedule(pollSeq);
+        startWaiting();
       } catch (err) {
         if (gone) return;
         finish();
@@ -865,6 +1137,11 @@ function mountSettings(root, ctx) {
     }
 
     render();
+    // A sign-in started before (the screen was left while its window was open) is picked up again.
+    signInState().then((s) => {
+      if (!s || !s.waiting || phase !== 'idle' || gone) return;
+      startWaiting();
+    });
     return { el: c.el, render, stop };
   }
 
@@ -907,10 +1184,11 @@ function mountSettings(root, ctx) {
    * while on), unraised(saved) → the toast when a raise is dropped on the way out (nobody was
    * there to confirm it), body(on, caps) → the request body, limit(caps) → "Up to …",
    * usage(caps) → today's sends as [part, …] ([] = none known), connected() and notConnected()
-   * → { text, link }: the notice shown while the channel can't send.
+   * → { text, link }: the notice shown while the channel can't send, linking to Connections'
+   * card `connect` (it takes the focus there).
    */
   function sendingCard(cfg) {
-    const c = card({ key: cfg.key, iconName: cfg.icon, title: cfg.title });
+    const c = card({ tabId: 'sending', key: cfg.key, iconName: cfg.icon, title: cfg.title });
     const errId = `${id}-${cfg.key}-cap-error`;
     const hintId = `${id}-${cfg.key}-cap-hint`;
     let on = cfg.enabled(status);
@@ -941,9 +1219,14 @@ function mountSettings(root, ctx) {
     }
     const swDesc = sw.querySelector('.switch-desc');
     const fields = cfg.fields.map((f) => ({ ...f, ...capInput(`${id}-${cfg.key}-${f.key}`, f.label, f.unit, [hintId, errId]) }));
-    const capError = h('p', { class: 'field-error', id: errId, hidden: true });
+    // An alert: the field keeps focus when a value is refused, so its description isn't read again.
+    const capError = h('p', { class: 'field-error', id: errId, role: 'alert', hidden: true });
     const usage = h('p', { class: 'st-usage', hidden: true });
-    const notice = h('p', { class: 'st-notice', hidden: true });
+    // Built once and updated in place (renderText): a link rebuilt on every save and status
+    // refresh would drop the keyboard focus parked on it.
+    const noticeWhy = h('span', {});
+    const noticeLink = h('a', { href: CONNECTIONS_TAB, 'data-goto': cfg.connect });
+    const notice = h('p', { class: 'st-notice', hidden: true }, icon('alert', 14), h('span', {}, noticeWhy, ' ', noticeLink));
     c.body.append(
       sw,
       h(
@@ -977,6 +1260,12 @@ function mountSettings(root, ctx) {
       for (const f of fields) invalid(f.input, !!text && culprits.includes(f.key));
     }
 
+    /** A value that can't be saved: the field says why, and the last "Saved." no longer holds. */
+    function refuse(text, culprits) {
+      say(c.msg, '');
+      setError(text, culprits);
+    }
+
     function renderText() {
       const caps = effectiveCaps();
       swDesc.textContent = cfg.describe(on, caps);
@@ -988,7 +1277,8 @@ function mountSettings(root, ctx) {
       notice.hidden = !off;
       if (off) {
         const why = cfg.notConnected();
-        notice.replaceChildren(icon('alert', 14), h('span', {}, why.text, ' ', h('a', { href: CONNECTIONS_TAB }, why.link)));
+        noticeWhy.textContent = why.text;
+        noticeLink.textContent = why.link;
       }
     }
 
@@ -1051,12 +1341,12 @@ function mountSettings(root, ctx) {
       const typed = shownCaps();
       const bad = fields.filter((f) => typed[f.key] == null).map((f) => f.key);
       if (bad.length) {
-        setError(`Enter a whole number from ${CAP_MIN} to ${CAP_MAX}.`, bad);
+        refuse(`Enter a whole number from ${CAP_MIN} to ${CAP_MAX}.`, bad);
         return;
       }
       const problem = cfg.check(typed);
       if (problem) {
-        setError(problem.text, problem.fields);
+        refuse(problem.text, problem.fields);
         return;
       }
       setError('');
@@ -1171,6 +1461,7 @@ function mountSettings(root, ctx) {
       body: (on, caps) => ({ enabled: on, daily_cap: caps.daily }),
       limit: (caps) => `Up to ${fmtNum(caps.daily)} ${caps.daily === 1 ? 'email' : 'emails'} a day.`,
       usage: (caps) => (typeof status.email_sent_today === 'number' ? [`${fmtNum(status.email_sent_today)} of ${fmtNum(caps.daily)} sent today`] : []),
+      connect: 'gmail',
       connected: () => gmailOn() || !!status.gcloud_available,
       notConnected: () => ({ text: "Gmail isn't connected, so there's nothing to send through yet.", link: 'Connect Gmail' }),
     });
@@ -1212,6 +1503,7 @@ function mountSettings(root, ctx) {
         `${fmtNum(status.linkedin_sent_today)} of ${fmtNum(caps.daily)} sent today`,
         `${fmtNum(status.linkedin_sent_7d)} of ${fmtNum(caps.weekly)} in the last 7 days`,
       ],
+      connect: 'linkedin',
       connected: () => linkedinOn(),
       notConnected: () =>
         linkedinReconnect()
@@ -1256,11 +1548,8 @@ function mountSettings(root, ctx) {
     const rows = TOOLS.map(toolCard);
     const recheckBtn = h('button', { type: 'button', class: 'btn btn-ghost btn-sm', onClick: recheck }, 'Check again');
     const recheckMsg = h('p', { class: 'st-msg', role: 'status' });
-    el.append(
-      h('div', { class: 'st-stack' }, rows.map((r) => r.el)),
-      h('div', { class: 'st-recheck' }, h('span', {}, 'Installed something from your terminal?'), recheckBtn),
-      recheckMsg,
-    );
+    const recheckRow = h('div', { class: 'st-recheck' }, h('span', {}, 'Installed something from your terminal?'), recheckBtn);
+    el.append(h('div', { class: 'st-stack' }, rows.map((r) => r.el)), recheckRow, recheckMsg);
 
     async function recheck() {
       if (isBusy(recheckBtn)) return;
@@ -1275,13 +1564,20 @@ function mountSettings(root, ctx) {
       }
     }
 
-    const update = () => rows.forEach((r) => r.render());
+    const update = () => {
+      rows.forEach((r) => r.render());
+      // Every tool installed: nothing is left to check for (as on the Agent tab).
+      const done = TOOLS.every((t) => t.installed(status.osint || {}));
+      if (done && recheckRow.contains(document.activeElement)) rows[0].focusTitle();
+      recheckRow.hidden = done;
+      if (done) say(recheckMsg, '');
+    };
     update();
     return { update };
   }
 
   function toolCard(tool) {
-    const c = card({ key: tool.key, iconName: tool.icon, title: tool.title });
+    const c = card({ tabId: 'enrichment', key: tool.key, iconName: tool.icon, title: tool.title });
     c.note.textContent = tool.desc;
     const btn = h('button', { type: 'button', class: 'btn btn-secondary', 'aria-label': `Install ${tool.title}`, onClick: install }, 'Install');
     const reason = h('p', { class: 'st-reason' });
@@ -1296,31 +1592,51 @@ function mountSettings(root, ctx) {
       reason.textContent = installed ? 'Ready. New enrichment runs use it.' : can ? tool.how : tool.missing(o);
     }
 
-    async function install() {
-      if (isBusy(btn)) return;
+    /** Show an install (started here, or before this card was) until it lands. */
+    function follow(job) {
+      const mine = followJob(job);
       setBusy(btn, true, { label: 'Installing…' });
       say(c.msg, `Installing ${tool.title}. This can take a few minutes.`, 'busy');
-      let ok = false;
-      await saveWith(async () => {
-        try {
-          // No signal: the install runs inside this request; leaving mustn't cut it off.
-          const r = await api.post('/api/onboarding/osint/install', { tool: tool.key });
-          if (gone) return;
-          ok = !!(r && r.ok);
-          say(c.msg, (r && r.message) || (ok ? `${tool.title} is installed.` : `${tool.title} didn't install.`), ok ? 'ok' : 'err');
-        } catch (err) {
-          if (gone) return;
-          say(c.msg, errorText(err), 'err');
-        } finally {
-          if (!gone) setBusy(btn, false);
-        }
-      });
-      if (gone) return;
       render();
-      if (ok) await sync();
+      job.done.then(({ r, err }) => {
+        if (gone) {
+          if (mine()) installedAway(r, err);
+          return;
+        }
+        setBusy(btn, false);
+        const ok = !err && !!(r && r.ok);
+        if (err) say(c.msg, errorText(err), 'err');
+        else say(c.msg, (r && r.message) || (ok ? `${tool.title} is installed.` : `${tool.title} didn't install.`), ok ? 'ok' : 'err');
+        render();
+        if (ok) sync();
+      });
     }
 
-    return { el: c.el, render };
+    /**
+     * An install that ended after the screen had gone (it can take minutes, so people move on):
+     * a toast says how it went. A stale session is left to the app's banner.
+     */
+    function installedAway(r, err) {
+      if (err) {
+        if (!isStaleSession(err)) toast(`${tool.title} didn't install: ${errorText(err)}`, 'err');
+      } else if (r && r.ok) {
+        toast(r.message || `${tool.title} is installed.`, 'ok');
+      } else {
+        toast(r && r.message ? `${tool.title} didn't install: ${r.message}` : `${tool.title} didn't install.`, 'err');
+      }
+    }
+
+    function install() {
+      // One at a time per tool: two would build into the same directory.
+      if (isBusy(btn) || installs.has(tool.key)) return;
+      // No signal: the install runs inside this request; leaving mustn't cut it off.
+      follow(startJob(installs, tool.key, () => api.post('/api/onboarding/osint/install', { tool: tool.key })));
+    }
+
+    // Left mid-install, and back: still installing.
+    const running = installs.get(tool.key);
+    if (running) follow(running);
+    return { el: c.el, render, focusTitle: c.focusTitle };
   }
 
   // ---- Appearance ----
@@ -1361,7 +1677,7 @@ function mountSettings(root, ctx) {
       }),
     );
     const hint = h('p', { class: 'field-hint st-theme-hint', id: hintId });
-    const c = card({ key: 'theme', iconNode: themeIcon(), title: 'Theme' });
+    const c = card({ tabId: 'appearance', key: 'theme', iconNode: themeIcon(), title: 'Theme' });
     c.note.textContent = 'Saved in this browser.';
     c.body.append(
       h(
@@ -1444,12 +1760,22 @@ function mountSettings(root, ctx) {
     setTab(tabOf(query));
   }
 
+  /** The toast when the screen goes with "Your own model" chosen or edited but never saved. */
+  function ownModelUnsaved() {
+    return status && status.provider === 'openai'
+      ? "Your changes to your own model weren't saved. To keep them, make them again under Settings → Agent and press Save."
+      : "Your own model wasn't saved, so coldtrail still uses the same agent. To switch, fill it in under Settings → Agent and press Save.";
+  }
+
   const me = { stay, beforeLeave };
   active = me;
   return () => {
     gone = true;
     if (active === me) active = null;
     unsubscribe();
+    // Nothing on the next screen would say it (and the form, API key included, isn't kept).
+    const agent = panes.get('agent').built;
+    if (agent && agent.pending()) toast(ownModelUnsaved());
     for (const p of panes.values()) {
       if (p.built && p.built.destroy) {
         try {
