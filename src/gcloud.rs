@@ -36,9 +36,15 @@ pub fn adc_path() -> Option<std::path::PathBuf> {
         .filter(|p| p.is_file())
 }
 
-/// Is gcloud ADC set up on this machine?
+/// Is there a gcloud user login (ADC with a user refresh token) on this machine — what Gmail can
+/// use keylessly? An ADC file without one (a service account, a half-finished login) can never
+/// mint a Gmail token, so it doesn't count.
 pub fn available() -> bool {
-    adc_path().is_some()
+    load().is_ok_and(|a| usable(&a))
+}
+
+fn usable(a: &Adc) -> bool {
+    a.client_id.is_some() && a.client_secret.is_some() && a.refresh_token.is_some()
 }
 
 fn load() -> Result<Adc> {
@@ -110,5 +116,19 @@ mod tests {
     fn missing_refresh_token_is_none() {
         let a: Adc = serde_json::from_str(r#"{"client_id":"x"}"#).unwrap();
         assert!(a.refresh_token.is_none());
+        assert!(!usable(&a));
+    }
+
+    /// Only a user login counts: its client and refresh token are what mint a Gmail token.
+    #[test]
+    fn only_a_user_login_is_usable() {
+        let a: Adc = serde_json::from_str(
+            r#"{"client_id":"gc.apps","client_secret":"sek","refresh_token":"rt","type":"authorized_user"}"#,
+        )
+        .unwrap();
+        assert!(usable(&a));
+        let sa: Adc =
+            serde_json::from_str(r#"{"type":"service_account","client_id":"1"}"#).unwrap();
+        assert!(!usable(&sa));
     }
 }

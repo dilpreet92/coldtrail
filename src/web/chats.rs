@@ -41,7 +41,11 @@ pub async fn detail(Path(id): Path<String>) -> Result<Json<ChatDetail>, ApiErr> 
         })
         .optional()?
         .flatten();
-    let running = crate::db::chat_running(&id)?;
+    // A run that died mid-turn never cleared its flag; only a live one keeps the UI polling.
+    // Looking records a dead one as a failed run, so its run history note says it stopped.
+    let running = crate::scheduled::running_chats(&c)?
+        .iter()
+        .any(|r| r.chat_id == id);
     let mut stmt = c.prepare(
         "SELECT role, content, COALESCE(created_at,'') FROM chat_messages \
          WHERE session_id=?1 ORDER BY id",

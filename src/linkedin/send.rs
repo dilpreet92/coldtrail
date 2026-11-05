@@ -66,7 +66,7 @@ pub const MAX_AUTO_FAILURES: i64 = 3;
 
 /// The `auto_skip` reason for a draft LinkedIn won't let us send without the member's email.
 const NEEDS_EMAIL_REASON: &str =
-    "LinkedIn asks for their email to connect — use Open in LinkedIn and enter it there, or delete this draft";
+    "LinkedIn asks for their email to connect. Use Open in LinkedIn and enter it there, or discard this draft.";
 
 /// The human part of a driver failure reason: `failed()` appends " — screenshot: …" and
 /// " — html: …" debug paths, which don't belong in the Drafts UI.
@@ -119,15 +119,13 @@ fn record_auto_failure(domain: &str, reason: &str) -> anyhow::Result<()> {
 
 /// Mark this domain's LinkedIn invite as sent, scoped to the `linkedin` channel so a same-domain
 /// row on another channel (e.g. an email follow-up created by `draft::followup_add`) is never
-/// false-marked. Mirrors the company-status bump the email path does via `mark::run`. Shared by
-/// the auto path (`deliver` below) and the web assist `confirm` route.
+/// false-marked. Only the newest note waiting is the invite that went out (the one Drafts shows
+/// and `deliver::reviewable` sends); an older one stays for later. Mirrors the company-status
+/// bump the email path does via `mark::sent`. Shared by the auto path (`deliver` below) and the
+/// web assist `confirm` route.
 pub fn mark_linkedin_sent(domain: &str) -> anyhow::Result<()> {
     let conn = crate::db::open()?;
-    conn.execute(
-        "UPDATE outreach SET status='sent', sent_at=datetime('now') \
-         WHERE domain=?1 AND channel='linkedin' AND status IN ('draft_pending','drafted')",
-        [domain],
-    )?;
+    crate::mark::mark_newest_sent(&conn, domain, "linkedin")?;
     crate::db::set_status(&conn, domain, "sent")?;
     Ok(())
 }
@@ -277,14 +275,22 @@ mod tests {
         assert!(err.contains("LinkedIn auto-send is off"), "got: {err}");
     }
 
-    #[tokio::test]
-    async fn refuses_outside_window() {
-        let b = FakeBrowser::default();
-        let err = deliver("acme.com", &li_draft(), &b, &cfg_on(), 23)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("window"), "got: {err}");
+    // The cap gates before the window check count this week's LinkedIn sends in the outreach db,
+    // so this holds a temp home with an empty db: unguarded, it read whatever db COLDTRAIL_HOME
+    // pointed at (the real ~/.coldtrail when unset) and failed on "cap reached" once that db had
+    // a week's worth of sends. Same `with_home` + `block_on` shape as the tests below.
+    #[test]
+    fn refuses_outside_window() {
+        crate::testutil::with_home("ct-lisend-window", |_| {
+            crate::db::init().unwrap();
+            let b = FakeBrowser::default();
+            let err = tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(deliver("acme.com", &li_draft(), &b, &cfg_on(), 23))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("window"), "got: {err}");
+        });
     }
 
     // `deliver` on the LoggedOut/Sent paths touches the on-disk profile lock, LinkedinState, and

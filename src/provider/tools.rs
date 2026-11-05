@@ -49,7 +49,10 @@ pub fn defs(canonical_connected: bool) -> Value {
         json!({"type":"function","function":{
             "name":"send_outreach",
             "description":"SEND a stored draft for real. Only works if the human enabled auto-send (else it refuses); enforces a daily cap. Only call after the human confirms in chat that they want these sent.",
-            "parameters":{"type":"object","properties":{"domain":{"type":"string"}},"required":["domain"]}}}),
+            "parameters":{"type":"object","properties":{
+                "domain":{"type":"string"},
+                "channel":{"type":"string","enum":["email","linkedin"],"description":"which draft to send when the company has both an email and a LinkedIn note waiting (default: the newest)"}},
+                "required":["domain"]}}}),
         json!({"type":"function","function":{
             "name":"mark",
             "description":"Advance a company's status: a gmail draft id, or 'sent' / 'bounced'.",
@@ -137,7 +140,13 @@ pub async fn exec(name: &str, args: &Value) -> String {
         "discover_companies" => discover(args).await,
         "send_outreach" => {
             let domain = s(args, "domain").trim().to_lowercase();
-            match crate::deliver::reviewable(&domain) {
+            let channel = s(args, "channel");
+            let channel = match channel.trim() {
+                "" => None,
+                ch @ ("email" | "linkedin") => Some(ch),
+                other => return format!("error: channel must be email or linkedin, not '{other}'"),
+            };
+            match crate::deliver::reviewable(&domain, channel) {
                 Ok(d) => match crate::deliver::send(&domain, &d).await {
                     Ok(m) => format!("{domain}: {m}"),
                     Err(e) => format!("error: {e}"),

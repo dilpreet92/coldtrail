@@ -38,8 +38,12 @@ pub fn init() -> Result<()> {
             "ALTER TABLE chat_sessions ADD COLUMN running INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
-    // These exist in the schema template but predate their features on old DBs.
+    // Columns that predate their features on old DBs. The outreach and contacts ones are in the
+    // schema template too; a run chat's schedule and trigger (so a run that died can still be
+    // recorded as its own) are only added here, like `running` above.
     for (table, col, decl) in [
+        ("chat_sessions", "schedule_id", "TEXT"),
+        ("chat_sessions", "run_trigger", "TEXT"),
         ("outreach", "channel", "TEXT DEFAULT 'email'"),
         ("contacts", "linkedin_url", "TEXT"),
         ("outreach", "auto_failures", "INTEGER NOT NULL DEFAULT 0"),
@@ -165,7 +169,7 @@ pub fn last_run() -> Result<Option<RunRow>> {
         .query_row(
             "SELECT started_at, status, sourced, enriched, drafted, sent, chat_id, note, \
                     schedule_id, trigger \
-             FROM scheduled_runs ORDER BY id DESC LIMIT 1",
+             FROM scheduled_runs ORDER BY started_at DESC, id DESC LIMIT 1",
             [],
             |r| {
                 Ok(RunRow {
@@ -279,6 +283,16 @@ pub fn set_chat_running(chat_id: &str, running: bool) -> Result<()> {
     Ok(())
 }
 
+/// Flag `chat_id` as the chat a run is writing to now, and which schedule (None for a manual
+/// `coldtrail run`) and trigger the run is.
+pub fn set_chat_run(chat_id: &str, schedule_id: Option<&str>, trigger: &str) -> Result<()> {
+    open()?.execute(
+        "UPDATE chat_sessions SET running=1, schedule_id=?2, run_trigger=?3 WHERE id=?1",
+        params![chat_id, schedule_id, trigger],
+    )?;
+    Ok(())
+}
+
 /// Whether a chat session currently has a live run in progress. Not yet wired into a
 /// command (later task).
 #[allow(dead_code)]
@@ -295,7 +309,8 @@ pub fn chat_running(chat_id: &str) -> Result<bool> {
 }
 
 /// List recent scheduled runs, newest first, with the triggering schedule's name joined in.
-/// Not yet wired into a command (later task).
+/// Newest by when each ended (`started_at` is written when the row is): a run that died is
+/// recorded later, at the time it last wrote, and sorts there.
 #[allow(dead_code)]
 pub fn list_runs(limit: i64) -> Result<Vec<RunRow>> {
     let c = open()?;
@@ -303,7 +318,7 @@ pub fn list_runs(limit: i64) -> Result<Vec<RunRow>> {
         "SELECT r.started_at,r.status,r.sourced,r.enriched,r.drafted,r.sent,r.chat_id,r.note,\
                 r.schedule_id,r.trigger,s.name \
          FROM scheduled_runs r LEFT JOIN schedules s ON s.id=r.schedule_id \
-         ORDER BY r.id DESC LIMIT ?1",
+         ORDER BY r.started_at DESC, r.id DESC LIMIT ?1",
     )?;
     let out = st
         .query_map([limit], |r| {

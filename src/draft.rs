@@ -47,11 +47,28 @@ pub fn add(domain: &str, subject: &str, body: &str) -> Result<()> {
 }
 
 /// Store a follow-up as a NEW touch (outreach row) for a domain that was already
-/// contacted. Always inserts — a domain can have several touches over time.
+/// contacted. Always inserts — a domain can have several touches over time. Refused once the
+/// company replied or bounced: that ends its sequence (`mark` drops what was waiting then), and
+/// a follow-up written meanwhile (a Draft follow-up turn still going when a reply check marks
+/// it) must not land in Drafts afterwards.
 pub fn followup_add(domain: &str, subject: &str, body: &str) -> Result<()> {
     let domain = domain.trim().to_lowercase();
     crate::db::init()?;
     let conn = crate::db::open()?;
+    let ended: Option<String> = conn
+        .query_row(
+            "SELECT CASE WHEN EXISTS (SELECT 1 FROM outreach WHERE domain=?1 AND status='replied') \
+                           OR EXISTS (SELECT 1 FROM companies WHERE domain=?1 AND status='replied') \
+                         THEN 'replied' \
+                         WHEN EXISTS (SELECT 1 FROM outreach WHERE domain=?1 AND status='bounced') \
+                           OR EXISTS (SELECT 1 FROM companies WHERE domain=?1 AND status='bounced') \
+                         THEN 'bounced' END",
+            [&domain],
+            |r| r.get(0),
+        )?;
+    if let Some(how) = ended {
+        anyhow::bail!("{domain} already {how}, so its sequence is over: no follow-up was stored");
+    }
     let contact_id: Option<i64> = conn
         .query_row(
             "SELECT id FROM contacts WHERE domain=?1 AND email IS NOT NULL ORDER BY found_at DESC LIMIT 1",
@@ -110,4 +127,58 @@ pub fn run(max: usize) -> Result<()> {
         println!("  {domain:<28} -> {email}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn outreach(domain: &str) -> Vec<String> {
+        crate::db::open()
+            .unwrap()
+            .prepare("SELECT status FROM outreach WHERE domain=?1 ORDER BY id")
+            .unwrap()
+            .query_map([domain], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// A follow-up stored after its company replied or bounced (a reply check that finished
+    /// while the follow-up was being written) is refused, so nothing waits in Drafts for a
+    /// founder who already answered. One still awaiting a reply is stored as before.
+    #[test]
+    fn followup_refused_once_the_company_replied_or_bounced() {
+        crate::testutil::with_home("ct-draft-followup-ended", |_| {
+            crate::db::init().unwrap();
+            crate::db::open()
+                .unwrap()
+                .execute_batch(
+                    "INSERT INTO companies (domain, status) VALUES \
+                     ('r.com','sent'), ('b.com','bounced'), ('o.com','sent'); \
+                     INSERT INTO contacts (domain, email) VALUES \
+                     ('r.com','ann@r.com'), ('b.com','ben@b.com'), ('o.com','olu@o.com'); \
+                     INSERT INTO outreach (domain, channel, status, sent_at) VALUES \
+                     ('r.com','email','sent',datetime('now','-6 days')), \
+                     ('b.com','email','sent',datetime('now','-6 days')), \
+                     ('o.com','email','sent',datetime('now','-6 days'));",
+                )
+                .unwrap();
+            crate::mark::run("r.com", "replied").unwrap();
+
+            let err = followup_add("r.com", "Re: idea", "Following up.")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("already replied"), "{err}");
+            assert_eq!(outreach("r.com"), ["replied"]);
+            let err = followup_add("B.com", "Re: idea", "Following up.")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("already bounced"), "{err}");
+            assert_eq!(outreach("b.com"), ["sent"]);
+
+            followup_add("o.com", "Re: idea", "Following up.").unwrap();
+            assert_eq!(outreach("o.com"), ["sent", "draft_pending"]);
+        });
+    }
 }

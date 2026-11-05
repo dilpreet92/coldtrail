@@ -57,6 +57,10 @@ pub enum Commands {
     Send {
         /// The company domain whose draft to send
         domain: String,
+        /// Send this channel's draft (a company can have an email and a LinkedIn note waiting
+        /// at once); without it, the newest draft on either channel
+        #[arg(long, value_parser = ["email", "linkedin"])]
+        channel: Option<String>,
     },
     /// Sequentially send every pending draft on a channel — paced and cap-aware; a real send,
     /// same gates as `send` (currently only the `linkedin` channel is supported: it drives a real

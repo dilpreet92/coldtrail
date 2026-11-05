@@ -16,7 +16,7 @@ pub mod summary;
 use axum::{
     body::Body,
     extract::{Request, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, patch, post},
@@ -188,7 +188,22 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/drafts/:domain/send", post(send::send))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
+        .layer(middleware::map_response(no_framing))
         .with_state(state)
+}
+
+/// No response may be framed. A page on another 127.0.0.1 port is same-site, so the session
+/// cookie goes with a frame of the app and its requests carry the app's own Origin: framed
+/// invisibly, the app could have clicks steered onto Skip, Discard or Send. The page's `<meta>`
+/// CSP can't set `frame-ancestors`, so the headers say it, on every response.
+async fn no_framing(mut resp: Response) -> Response {
+    let h = resp.headers_mut();
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    resp
 }
 
 /// Read the session token from the `ct_token` cookie or a `?t=` query param.
@@ -375,5 +390,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// The page, its assets and the API all refuse to be framed (a page on another local port
+    /// could otherwise overlay the signed-in app and steer clicks).
+    #[tokio::test]
+    async fn every_response_refuses_framing() {
+        for uri in ["/", "/assets/js/main.js", "/assets/nope.js", "/api/status"] {
+            let resp = router(state())
+                .oneshot(HttpRequest::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let h = resp.headers();
+            assert_eq!(h[header::X_FRAME_OPTIONS], "DENY", "{uri}");
+            assert_eq!(
+                h[header::CONTENT_SECURITY_POLICY],
+                "frame-ancestors 'none'",
+                "{uri}"
+            );
+        }
     }
 }

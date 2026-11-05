@@ -20,19 +20,24 @@ pub async fn followups() -> Result<Json<Vec<FollowupDto>>, ApiErr> {
     Ok(Json(followup_rows(&c)?))
 }
 
-/// The Follow-ups rows, most recent send first. Shared with `/api/summary`, whose "due" count
-/// must agree with the list it links to.
-pub fn followup_rows(c: &rusqlite::Connection) -> anyhow::Result<Vec<FollowupDto>> {
-    let mut stmt = c.prepare(
-        "SELECT o.domain, MAX(k.email), \
+/// One pass over outreach, grouped by domain: a domain is listed once anything went out to it.
+/// `to` is the address an email went to, so a company reached only on LinkedIn has none, even
+/// with an email on file, and gets no drafted email follow-up. `/api/summary` runs this on
+/// every poll, so no per-row subquery (that rescans outreach for each row).
+const FOLLOWUPS_SQL: &str = "SELECT o.domain, \
+                MAX(CASE WHEN COALESCE(o.channel,'email')='email' \
+                          AND o.status IN ('sent','replied','bounced') THEN k.email END), \
                 CAST(julianday('now') - julianday(MAX(o.sent_at)) AS INTEGER), \
-                SUM(CASE WHEN o.status IN ('sent','replied','bounced') THEN 1 ELSE 0 END), \
+                SUM(CASE WHEN o.status IN ('sent','replied','bounced') THEN 1 ELSE 0 END) AS sends, \
                 MAX(CASE WHEN o.status='replied' THEN 1 ELSE 0 END), \
                 MAX(CASE WHEN o.status='bounced' THEN 1 ELSE 0 END) \
          FROM outreach o LEFT JOIN contacts k ON k.id = o.contact_id \
-         WHERE EXISTS (SELECT 1 FROM outreach s WHERE s.domain=o.domain AND s.status IN ('sent','replied','bounced')) \
-         GROUP BY o.domain ORDER BY MAX(o.sent_at) DESC",
-    )?;
+         GROUP BY o.domain HAVING sends > 0 ORDER BY MAX(o.sent_at) DESC";
+
+/// The Follow-ups rows, most recent send first. Shared with `/api/summary`, whose "due" count
+/// must agree with the list it links to.
+pub fn followup_rows(c: &rusqlite::Connection) -> anyhow::Result<Vec<FollowupDto>> {
+    let mut stmt = c.prepare(FOLLOWUPS_SQL)?;
     let rows: Vec<FollowupDto> = stmt
         .query_map([], |r| {
             let days: Option<i64> = r.get(2)?;
@@ -61,15 +66,21 @@ pub fn followup_rows(c: &rusqlite::Connection) -> anyhow::Result<Vec<FollowupDto
     Ok(rows)
 }
 
-/// Manually mark a contact replied / bounced (fallback to the agent reply-check).
+/// Manually mark a contact replied / bounced (fallback to the agent reply-check), or Drafts'
+/// Mark sent on an email in Gmail: that records the email only, never a LinkedIn note beside
+/// it, and fails when no email waits (e.g. it was discarded in another tab).
 pub async fn mark_touch(
     axum::extract::Path(domain): axum::extract::Path<String>,
     Json(req): Json<MarkReq>,
 ) -> Result<Json<MsgResp>, ApiErr> {
-    if !["sent", "replied", "bounced"].contains(&req.value.as_str()) {
-        return Err(anyhow::anyhow!("mark value must be 'sent', 'replied' or 'bounced'").into());
+    let domain = domain.to_lowercase();
+    match req.value.as_str() {
+        "sent" => crate::mark::sent(&domain, Some("email"))?,
+        "replied" | "bounced" => crate::mark::run(&domain, &req.value)?,
+        _ => {
+            return Err(anyhow::anyhow!("mark value must be 'sent', 'replied' or 'bounced'").into())
+        }
     }
-    crate::mark::run(&domain.to_lowercase(), &req.value)?;
     Ok(Json(MsgResp::ok()))
 }
 
@@ -113,8 +124,10 @@ pub struct DiscardQuery {
 
 /// `DELETE /api/drafts/:domain?channel=email|linkedin` — throw away a domain's pending draft on
 /// one channel: its reviewable rows there go (never sent history, never the other channel's
-/// draft) and the company is set to `skip` (excluded from outreach). DB-only: a Gmail draft
-/// already created for a `drafted` row stays in Gmail.
+/// draft). A company never written to is set to `skip` (excluded from outreach); one with sent
+/// history keeps its stage, since dropping a follow-up doesn't undo what went out. `skipped`
+/// says which happened. DB-only: a Gmail draft already created for a `drafted` row stays in
+/// Gmail.
 pub async fn discard_draft(
     Path(domain): Path<String>,
     Query(q): Query<DiscardQuery>,
@@ -143,9 +156,15 @@ pub async fn discard_draft(
         })
         .into_response());
     }
-    crate::db::set_status(&tx, &domain, "skip")?;
+    let skipped = !crate::mark::contacted(&tx, &domain)?;
+    if skipped {
+        crate::db::set_status(&tx, &domain, "skip")?;
+    }
     tx.commit()?;
-    Ok(Json(MsgResp::ok()).into_response())
+    Ok(
+        Json(serde_json::json!({ "ok": true, "message": null, "skipped": skipped }))
+            .into_response(),
+    )
 }
 
 /// Pipeline summary: totals, the company-status funnel, and per-ICP query counts.
@@ -472,7 +491,7 @@ pub async fn drafts() -> Result<Json<Vec<DraftDto>>, ApiErr> {
          FROM outreach o LEFT JOIN contacts k ON k.id = o.contact_id \
          LEFT JOIN companies co ON co.domain = o.domain \
          WHERE o.status IN ('draft_pending','drafted') \
-         ORDER BY o.created_at DESC",
+         ORDER BY o.created_at DESC, o.id DESC",
     )?;
     let rows = stmt
         .query_map([], |r| {
@@ -965,25 +984,30 @@ mod tests {
     }
 
     /// Discard deletes only the reviewable (draft_pending/drafted) rows on the named channel for
-    /// that domain — the other channel's draft, sent history and other domains are untouched —
-    /// and skips the company so it leaves the queue. A legacy NULL channel counts as email.
+    /// that domain — the other channel's draft, sent history and other domains are untouched.
+    /// A company never contacted is skipped so it leaves the queue; one with sent history keeps
+    /// its stage. A legacy NULL channel counts as email.
     #[test]
     fn discard_removes_only_pending_rows_on_that_channel() {
         crate::testutil::with_home("ct-web-pipeline-discard", |_| {
             seed(
                 "INSERT INTO companies (domain, status) VALUES \
-                 ('acme.com','drafted'), ('other.com','drafted'); \
+                 ('acme.com','sent'), ('other.com','drafted'), ('fresh.com','drafted'); \
                  INSERT INTO outreach (domain, channel, body, status) VALUES \
                  ('acme.com','linkedin','note','draft_pending'), \
                  ('acme.com','email','hi','draft_pending'), \
                  ('acme.com','linkedin','old note','sent'), \
                  ('acme.com',NULL,'legacy','drafted'), \
-                 ('other.com','linkedin','theirs','draft_pending');",
+                 ('other.com','linkedin','theirs','draft_pending'), \
+                 ('fresh.com','email','first','draft_pending');",
             );
             let (status, body) = call("DELETE", "/api/drafts/ACME.com?channel=linkedin");
             assert_eq!(status, axum::http::StatusCode::OK, "{body}");
             let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-            assert_eq!(v, serde_json::json!({"ok": true, "message": null}));
+            assert_eq!(
+                v,
+                serde_json::json!({"ok": true, "message": null, "skipped": false})
+            );
             assert_eq!(
                 outreach_of("acme.com"),
                 rows(&[
@@ -992,7 +1016,7 @@ mod tests {
                     ("email", "drafted")
                 ])
             );
-            assert_eq!(status_of("acme.com"), "skip");
+            assert_eq!(status_of("acme.com"), "sent");
             assert_eq!(
                 outreach_of("other.com"),
                 rows(&[("linkedin", "draft_pending")])
@@ -1005,6 +1029,96 @@ mod tests {
             let v: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert_eq!(v["ok"], true);
             assert_eq!(outreach_of("acme.com"), rows(&[("linkedin", "sent")]));
+            assert_eq!(status_of("acme.com"), "sent");
+
+            // A company never written to leaves the queue as skipped, and the reply says so.
+            let (status, body) = call("DELETE", "/api/drafts/fresh.com?channel=email");
+            assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!((&v["ok"], &v["skipped"]), (&true.into(), &true.into()));
+            assert!(outreach_of("fresh.com").is_empty());
+            assert_eq!(status_of("fresh.com"), "skip");
+        });
+    }
+
+    /// Discarding the follow-up `coldtrail followup` stored for an emailed company leaves the
+    /// company `sent`: it stays on Pipeline's Sent tab, and Follow-ups still lists it.
+    #[test]
+    fn discarding_a_follow_up_keeps_the_company_sent() {
+        crate::testutil::with_home("ct-web-pipeline-discard-followup", |_| {
+            seed(
+                "INSERT INTO companies (domain, status) VALUES ('acme.com','sent'); \
+                 INSERT INTO contacts (domain, founder_name, email) VALUES ('acme.com','Ann','ann@acme.com'); \
+                 INSERT INTO outreach (domain, contact_id, channel, subject, status, sent_at) VALUES \
+                 ('acme.com',1,'email','Quick idea','sent',datetime('now','-6 days'));",
+            );
+            crate::draft::followup_add("acme.com", "Re: Quick idea", "Following up").unwrap();
+            let (status, body) = call("DELETE", "/api/drafts/acme.com?channel=email");
+            assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["skipped"], false, "{body}");
+            assert_eq!(outreach_of("acme.com"), rows(&[("email", "sent")]));
+            assert_eq!(status_of("acme.com"), "sent");
+            let c = crate::db::open().unwrap();
+            let f = followup_rows(&c).unwrap();
+            assert_eq!(
+                f.iter()
+                    .map(|f| (f.domain.as_str(), f.state.as_str()))
+                    .collect::<Vec<_>>(),
+                [("acme.com", "due")]
+            );
+        });
+    }
+
+    /// `to` is the address an email went to. A company reached only on LinkedIn has no email
+    /// to follow up, even with an address on file, so it offers no drafted email follow-up.
+    #[test]
+    fn followups_to_is_only_an_address_that_was_emailed() {
+        crate::testutil::with_home("ct-web-pipeline-followups-to", |_| {
+            seed(
+                "INSERT INTO companies (domain, status) VALUES ('li.com','sent'), ('em.com','sent'); \
+                 INSERT INTO contacts (id, domain, founder_name, email, linkedin_url) VALUES \
+                 (1,'li.com','Lee','lee@li.com','https://www.linkedin.com/in/lee'), \
+                 (2,'em.com','Em','em@em.com',NULL); \
+                 INSERT INTO outreach (domain, contact_id, channel, status, sent_at) VALUES \
+                 ('li.com',1,'linkedin','sent',datetime('now','-6 days')), \
+                 ('em.com',2,NULL,'sent',datetime('now','-5 days')), \
+                 ('em.com',2,'linkedin','draft_pending',NULL);",
+            );
+            let c = crate::db::open().unwrap();
+            let got: Vec<(String, Option<String>, i64, String)> = followup_rows(&c)
+                .unwrap()
+                .into_iter()
+                .map(|f| (f.domain, f.to, f.touches, f.state))
+                .collect();
+            assert_eq!(
+                got,
+                [
+                    ("em.com".into(), Some("em@em.com".into()), 1, "due".into()),
+                    ("li.com".into(), None, 1, "due".into()),
+                ]
+            );
+        });
+    }
+
+    /// `/api/summary` reads the follow-ups on every poll, so the query is one pass over
+    /// outreach: no per-row subquery rescanning the table (quadratic on a big workspace).
+    #[test]
+    fn followups_query_has_no_correlated_subquery() {
+        crate::testutil::with_home("ct-web-pipeline-followups-plan", |_| {
+            seed("");
+            let c = crate::db::open().unwrap();
+            let plan: Vec<String> = c
+                .prepare(&format!("EXPLAIN QUERY PLAN {FOLLOWUPS_SQL}"))
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert!(
+                plan.iter().all(|step| !step.contains("CORRELATED")),
+                "{plan:?}"
+            );
         });
     }
 

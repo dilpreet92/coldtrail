@@ -42,7 +42,9 @@ pub async fn fetch_and_import_many(
 ) -> Result<(u32, u32, usize)> {
     let token = crate::oauth::valid_access("canonical")
         .await
-        .ok_or_else(|| anyhow!("Canonical isn't connected — connect it in Settings → Discovery"))?;
+        .ok_or_else(|| {
+            anyhow!("Canonical isn't connected — connect it in Settings → Connections")
+        })?;
     let top_k = limit.unwrap_or(25);
 
     // Parallel fetch — each angle gets its own connection.

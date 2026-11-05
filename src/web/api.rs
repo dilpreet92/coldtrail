@@ -29,7 +29,11 @@ pub struct StatusDto {
     pub opencode_model: Option<String>,
     /// Unified connected state for the chosen provider (MCP-wired for CLI, token for BYOK).
     pub discovery_connected: bool,
+    /// Gmail is connected, through any of `gmail_via`.
     pub destination_connected: bool,
+    /// How Gmail is connected, the way delivery uses it: "app_password", "google" (coldtrail's
+    /// own Google sign-in) or "gcloud" (a gcloud login); null when it isn't.
+    pub gmail_via: Option<String>,
     /// Opt-in auto-send is enabled (default false = draft-only).
     pub auto_send: bool,
     /// The per-day auto-send cap in effect.
@@ -41,7 +45,8 @@ pub struct StatusDto {
     pub osint: crate::osint::OsintStatus,
     /// coldtrail's own Google client is configured (COLDTRAIL_GOOGLE_CLIENT_ID/SECRET).
     pub gmail_client_configured: bool,
-    /// gcloud Application Default Credentials are present (keyless Gmail path).
+    /// A gcloud user login (Application Default Credentials with a refresh token) is present:
+    /// the keyless Gmail path. It counts in `destination_connected`.
     pub gcloud_available: bool,
     /// A LinkedIn session is connected (`linkedin::LinkedinState`).
     pub linkedin_connected: bool,
@@ -229,8 +234,12 @@ pub struct SummaryDto {
     pub last_run: Option<LastRun>,
     /// The enabled schedule that fires soonest.
     pub next_schedule: Option<NextSchedule>,
-    /// A conversation a run is writing to right now.
+    /// A conversation a run is writing to right now (the most recently updated of
+    /// `running_runs`).
     pub running: Option<RunningChat>,
+    /// Every conversation a run is writing to right now, most recently updated first, each
+    /// with its schedule: Schedules marks rows by id (names repeat, and can change mid-run).
+    pub running_runs: Vec<RunningChat>,
     /// Problems only the human can fix, each linking to where they fix it.
     pub attention: Vec<Attention>,
 }
@@ -295,10 +304,12 @@ pub struct NextSchedule {
     pub next_at: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct RunningChat {
     pub chat_id: String,
     pub title: String,
+    /// The schedule the run runs; null for a manual run.
+    pub schedule_id: Option<String>,
 }
 
 #[derive(Serialize)]

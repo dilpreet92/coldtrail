@@ -164,6 +164,7 @@ fn last_run_for<'a>(runs: &'a [crate::db::RunRow], id: &str) -> Option<&'a crate
 }
 
 pub async fn list(State(_s): State<Arc<AppState>>) -> Result<Json<Vec<ScheduleDto>>, ApiErr> {
+    crate::scheduled::reap_dead_runs(&crate::db::open()?)?;
     let schedules = crate::db::list_schedules().map_err(ApiErr)?;
     // A generous window covers "last run" for every schedule without one query per row.
     let runs = crate::db::list_runs(500).map_err(ApiErr)?;
@@ -259,9 +260,11 @@ pub async fn run_now(
     let (chat_id, _agent_sid) =
         crate::chat_store::create_session(&format!("Scheduled run — {}", sched.name))
             .map_err(ApiErr)?;
-    let _ = crate::db::set_chat_running(&chat_id, true);
-    let exe = std::env::current_exe().map_err(|e| ApiErr(anyhow::anyhow!(e)))?;
     let trigger = if draft_only { "dry" } else { "manual" };
+    // The chat knows its schedule, so Schedules can tell which row is running (names repeat and
+    // change), and a run that dies before it records itself is still recorded as this one's.
+    let _ = crate::db::set_chat_run(&chat_id, Some(&id), trigger);
+    let exe = std::env::current_exe().map_err(|e| ApiErr(anyhow::anyhow!(e)))?;
     let cid = chat_id.clone();
     // Detached: a background task awaits the child so it's reaped, but the HTTP handler returns now.
     tokio::spawn(async move {
@@ -282,6 +285,8 @@ pub async fn run_now(
 }
 
 pub async fn runs(State(_s): State<Arc<AppState>>) -> Result<Json<Vec<RunDto>>, ApiErr> {
+    // A run that died is in the history from the first look after it.
+    crate::scheduled::reap_dead_runs(&crate::db::open()?)?;
     let rows = crate::db::list_runs(50).map_err(ApiErr)?;
     Ok(Json(rows.into_iter().map(RunDto::from).collect()))
 }

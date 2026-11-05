@@ -5,10 +5,22 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::PathBuf;
 
+/// `$COLDTRAIL_HOME`, if set. In unit tests it is never unset: the variable is process-global
+/// and `testutil::with_home` removes it when its closure ends, so a test that doesn't hold a
+/// temp home (or runs just after one let go) would otherwise read and write the real
+/// `~/.coldtrail` and the real secrets. Such a test gets a throwaway dir under the OS temp dir.
+fn home_override() -> Option<PathBuf> {
+    let set = std::env::var_os("COLDTRAIL_HOME").map(PathBuf::from);
+    if cfg!(test) {
+        return set.or_else(|| Some(std::env::temp_dir().join("coldtrail-unit-test-home")));
+    }
+    set
+}
+
 /// Resolve (and create) the workspace directory.
 pub fn workspace() -> Result<PathBuf> {
-    let dir = match std::env::var_os("COLDTRAIL_HOME") {
-        Some(v) => PathBuf::from(v),
+    let dir = match home_override() {
+        Some(v) => v,
         None => dirs::home_dir()
             .context("could not resolve home directory")?
             .join(".coldtrail"),
@@ -27,7 +39,7 @@ pub fn path(name: &str) -> Result<PathBuf> {
 /// cwd. With `COLDTRAIL_HOME` set (tests) it's a sibling of that home for isolation;
 /// otherwise the OS config dir (`~/.config/coldtrail`, `~/Library/Application Support/…`).
 pub fn secret_path() -> Result<PathBuf> {
-    let dir = match std::env::var_os("COLDTRAIL_HOME") {
+    let dir = match home_override() {
         Some(v) => PathBuf::from(format!("{}.secrets", v.to_string_lossy())),
         None => dirs::config_dir()
             .or_else(dirs::home_dir)
@@ -63,6 +75,23 @@ mod tests {
             assert_eq!(&ws, tmp);
             assert!(tmp.exists());
         });
+    }
+
+    #[test]
+    fn unit_tests_never_resolve_the_real_workspace_or_secrets() {
+        let _guard = crate::testutil::env_guard();
+        std::env::remove_var("COLDTRAIL_HOME");
+        let tmp = std::env::temp_dir();
+        let ws = workspace().unwrap();
+        let secrets = secret_path().unwrap();
+        assert!(ws.starts_with(&tmp), "workspace {ws:?} is outside {tmp:?}");
+        assert!(
+            secrets.starts_with(&tmp),
+            "secrets {secrets:?} is outside {tmp:?}"
+        );
+        if let Some(home) = dirs::home_dir() {
+            assert!(!ws.starts_with(home.join(".coldtrail")));
+        }
     }
 
     #[test]

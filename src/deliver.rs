@@ -22,18 +22,22 @@ pub struct Draft {
     pub body: String,
 }
 
-/// The latest reviewable (`draft_pending`|`drafted`) outreach for a domain, with its recipient.
-/// Recipient is the contact email for the email channel, or the contact's linkedin_url for the
-/// linkedin channel.
-pub fn reviewable(domain: &str) -> Result<Draft> {
+/// The latest reviewable (`draft_pending`|`drafted`) outreach for a domain on `channel` (a
+/// legacy NULL channel is email), with its recipient. A company can have an email and a
+/// LinkedIn note waiting at once, so every route that acts on one channel names it; only
+/// callers that name none (`coldtrail send <domain>`, the `send_outreach` tool) take the newest
+/// on either. Recipient is the contact email for the email channel, or the contact's
+/// linkedin_url for the linkedin channel.
+pub fn reviewable(domain: &str, channel: Option<&str>) -> Result<Draft> {
     let c = crate::db::open()?;
     let row = c
         .query_row(
             "SELECT COALESCE(o.channel,'email'), o.subject, o.body, k.email, k.linkedin_url \
              FROM outreach o LEFT JOIN contacts k ON k.id = o.contact_id \
              WHERE o.domain=?1 AND o.status IN ('draft_pending','drafted') \
-             ORDER BY o.created_at DESC LIMIT 1",
-            [domain],
+               AND (?2 IS NULL OR COALESCE(o.channel,'email')=?2) \
+             ORDER BY o.created_at DESC, o.id DESC LIMIT 1",
+            rusqlite::params![domain, channel],
             |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -45,8 +49,11 @@ pub fn reviewable(domain: &str) -> Result<Draft> {
             },
         )
         .optional()?;
-    let (channel, subject, body, email, linkedin) =
-        row.ok_or_else(|| anyhow!("no reviewable draft for {domain}"))?;
+    let (channel, subject, body, email, linkedin) = row.ok_or_else(|| match channel {
+        Some("linkedin") => anyhow!("no LinkedIn draft waiting for {domain}"),
+        Some(_) => anyhow!("no email draft waiting for {domain}"),
+        None => anyhow!("no reviewable draft for {domain}"),
+    })?;
     let to = if channel == "linkedin" {
         linkedin.ok_or_else(|| anyhow!("no LinkedIn URL on file for {domain}"))?
     } else {
@@ -58,6 +65,16 @@ pub fn reviewable(domain: &str) -> Result<Draft> {
         subject: subject.unwrap_or_default(),
         body: body.unwrap_or_default(),
     })
+}
+
+/// Whether `domain` has a draft waiting for review on `channel` (a legacy NULL channel is email).
+pub fn waiting(domain: &str, channel: &str) -> Result<bool> {
+    Ok(crate::db::open()?.query_row(
+        "SELECT EXISTS (SELECT 1 FROM outreach WHERE domain=?1 \
+         AND status IN ('draft_pending','drafted') AND COALESCE(channel,'email')=?2)",
+        [domain, channel],
+        |r| r.get(0),
+    )?)
 }
 
 /// Create a Gmail DRAFT (never sends): keyless IMAP app-password APPEND, else the Gmail API.
@@ -145,7 +162,7 @@ pub async fn send(domain: &str, d: &Draft) -> Result<String> {
     let cfg = crate::config::load();
     if !cfg.auto_send {
         return Err(anyhow!(
-            "auto-send is off — the human must enable it in Settings → Destination first. \
+            "auto-send is off — the human must enable it in Settings → Sending first. \
              Leave the draft for them to send from the Drafts tab."
         ));
     }
@@ -166,15 +183,16 @@ pub async fn send(domain: &str, d: &Draft) -> Result<String> {
         let (token, quota) = crate::gmail::token().await?;
         crate::gmail::send_message(&token, quota.as_deref(), &d.to, &d.subject, &d.body).await?;
     }
-    crate::mark::run(domain, "sent")?; // status='sent', sent_at=now
+    crate::mark::sent(domain, Some("email"))?; // status='sent', sent_at=now
     Ok(format!("sent to {} ({}/{cap} today)", d.to, n + 1))
 }
 
-/// CLI entry: `coldtrail send <domain>` — send a reviewed draft (requires auto-send on).
-pub async fn run(domain: &str) -> Result<()> {
+/// CLI entry: `coldtrail send <domain> [--channel email|linkedin]` — send a reviewed draft
+/// (requires that channel's auto-send on). Without a channel, the newest draft on either.
+pub async fn run(domain: &str, channel: Option<&str>) -> Result<()> {
     crate::db::init()?;
     let domain = domain.trim().to_lowercase();
-    let d = reviewable(&domain)?;
+    let d = reviewable(&domain, channel)?;
     let msg = send(&domain, &d).await?;
     println!("{domain}: {msg}");
     Ok(())
@@ -256,7 +274,8 @@ pub async fn send_pending(channel: &str, max: Option<usize>) -> Result<()> {
     let mut skipped = 0usize;
     let mut stop_reason: Option<String> = None;
     for domain in &domains {
-        let d = match reviewable(domain) {
+        // The domain's LinkedIn note: an email waiting beside it is never sent from here.
+        let d = match reviewable(domain, Some("linkedin")) {
             Ok(d) => d,
             Err(e) => {
                 println!("{domain}: skip (no longer reviewable: {e})");
@@ -374,7 +393,7 @@ mod tests {
                 [],
             )
             .unwrap();
-            let d = reviewable("acme.com").unwrap();
+            let d = reviewable("acme.com", Some("linkedin")).unwrap();
             assert_eq!(d.channel, "linkedin");
             assert_eq!(d.to, "https://www.linkedin.com/in/janedoe");
             assert_eq!(d.body, "Hi Jane");
@@ -405,8 +424,50 @@ mod tests {
                 [],
             )
             .unwrap();
-            let err = reviewable("acme.com").unwrap_err().to_string();
+            let err = reviewable("acme.com", None).unwrap_err().to_string();
             assert!(err.contains("no LinkedIn URL"), "got: {err}");
+        });
+    }
+
+    /// An email and a LinkedIn note waiting for one company: each channel's routes get their own
+    /// draft whichever is newer; a caller that names no channel gets the newest.
+    #[test]
+    fn reviewable_takes_the_named_channel() {
+        crate::testutil::with_home("ct-deliver-reviewable-xchan", |_| {
+            crate::db::init().unwrap();
+            crate::db::open()
+                .unwrap()
+                .execute_batch(
+                    "INSERT INTO companies (domain) VALUES ('x.com'); \
+                     INSERT INTO contacts (id, domain, email, linkedin_url) VALUES \
+                     (1,'x.com','xena@x.com','https://www.linkedin.com/in/xena'); \
+                     INSERT INTO outreach (domain, contact_id, channel, subject, body, status, created_at) VALUES \
+                     ('x.com',1,'linkedin','','Hi Xena','draft_pending','2026-11-04 09:00:00'), \
+                     ('x.com',1,NULL,'Re: idea','Following up.','draft_pending','2026-11-04 10:00:00');",
+                )
+                .unwrap();
+            let li = reviewable("x.com", Some("linkedin")).unwrap();
+            assert_eq!(
+                (li.channel.as_str(), li.body.as_str()),
+                ("linkedin", "Hi Xena")
+            );
+            let em = reviewable("x.com", Some("email")).unwrap();
+            assert_eq!(
+                (em.channel.as_str(), em.to.as_str()),
+                ("email", "xena@x.com")
+            );
+            assert_eq!(reviewable("x.com", None).unwrap().channel, "email");
+            assert!(waiting("x.com", "email").unwrap() && waiting("x.com", "linkedin").unwrap());
+
+            crate::db::open()
+                .unwrap()
+                .execute_batch("DELETE FROM outreach WHERE channel='linkedin';")
+                .unwrap();
+            let err = reviewable("x.com", Some("linkedin"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("no LinkedIn draft waiting"), "{err}");
+            assert!(!waiting("x.com", "linkedin").unwrap());
         });
     }
 

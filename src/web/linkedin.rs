@@ -137,6 +137,16 @@ pub async fn set_auto_send(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+/// The company's newest LinkedIn note waiting for review, for the routes that act on one; None
+/// when only an email waits (a newer email beside the note never hides it). Errors when nothing
+/// waits, or the note's contact has no LinkedIn URL.
+fn linkedin_draft(domain: &str) -> anyhow::Result<Option<crate::deliver::Draft>> {
+    if !crate::deliver::waiting(domain, "linkedin")? && crate::deliver::waiting(domain, "email")? {
+        return Ok(None);
+    }
+    crate::deliver::reviewable(domain, Some("linkedin")).map(Some)
+}
+
 /// `POST /api/drafts/:domain/linkedin/assist` — drive Connect -> Add note -> fill the note in a
 /// real (human-visible) Chrome window, then LEAVE it open with the modal staged for the human to
 /// review and click Send themselves. The channel check runs BEFORE the lock/browser are touched
@@ -153,10 +163,9 @@ pub async fn assist(
     Path(domain): Path<String>,
 ) -> Result<Response, ApiErr> {
     let domain = domain.to_lowercase();
-    let d = crate::deliver::reviewable(&domain)?;
-    if d.channel != "linkedin" {
+    let Some(d) = linkedin_draft(&domain)? else {
         return Ok((StatusCode::BAD_REQUEST, "not a LinkedIn draft").into_response());
-    }
+    };
     let Some(lock) = lock::try_acquire()? else {
         return Ok((
             StatusCode::CONFLICT,
@@ -213,7 +222,7 @@ pub async fn assist(
             let _ = s.save();
             Ok((
                 StatusCode::CONFLICT,
-                "LinkedIn session expired — reconnect from Destination settings",
+                "LinkedIn is signed out — reconnect it in Settings → Connections",
             )
                 .into_response())
         }
@@ -268,12 +277,13 @@ pub async fn confirm(
 /// auto-send is ON, actually drive Connect -> Add note -> Send (and mark the row sent on success)
 /// rather than leaving the Send click to the human. The Drafts "Send" button on a LinkedIn row.
 ///
-/// Like `schedules::run_now`, this SPAWNS A DETACHED `coldtrail send <domain>` subprocess instead
-/// of sending in-process. `coldtrail send` routes a linkedin-channel draft through `deliver::send`
-/// -> the gated `linkedin::send::deliver` auto path (opt-in + weekly/daily caps + daytime window +
-/// inter-invite pacing + the one-Chrome-per-profile lock), which drives a real headful browser and
-/// can sleep for up to two minutes pacing before it even launches Chrome — work that must not block
-/// the axum handler. A subprocess also keeps this off the server's process-global env (the same
+/// Like `schedules::run_now`, this SPAWNS A DETACHED `coldtrail send <domain> --channel linkedin`
+/// subprocess (the note, even when an email waits beside it) instead of sending in-process.
+/// `coldtrail send` routes a linkedin-channel draft through `deliver::send` -> the gated
+/// `linkedin::send::deliver` auto path (opt-in + weekly/daily caps + daytime window + inter-invite
+/// pacing + the one-Chrome-per-profile lock), which drives a real headful browser and can sleep
+/// for up to two minutes pacing before it even launches Chrome — work that must not block the
+/// axum handler. A subprocess also keeps this off the server's process-global env (the same
 /// reason run_now uses one) and is reaped by a background task while the handler returns at once.
 /// The channel + opt-in checks run HERE first so we never spawn a send for an email draft, a domain
 /// with no reviewable draft, or when auto-send is off. This does NOT set `COLDTRAIL_NO_SEND`: it is
@@ -284,8 +294,7 @@ pub async fn send(
     Path(domain): Path<String>,
 ) -> Result<Response, ApiErr> {
     let domain = domain.to_lowercase();
-    let d = crate::deliver::reviewable(&domain)?;
-    if d.channel != "linkedin" {
+    if linkedin_draft(&domain)?.is_none() {
         return Ok((StatusCode::BAD_REQUEST, "not a LinkedIn draft").into_response());
     }
     if !crate::config::load().linkedin_auto_send {
@@ -296,12 +305,12 @@ pub async fn send(
             .into_response());
     }
     // Detached subprocess re-invoking this same binary (exactly the `schedules::run_now` idiom):
-    // find the current exe, spawn `coldtrail send <domain>`, don't wait. A background task awaits
-    // the child only so it's reaped; the HTTP handler returns immediately.
+    // find the current exe, spawn `coldtrail send <domain> --channel linkedin`, don't wait. A
+    // background task awaits the child only so it's reaped; the HTTP handler returns immediately.
     let exe = std::env::current_exe().map_err(|e| ApiErr(anyhow::anyhow!(e)))?;
     tokio::spawn(async move {
         let _ = tokio::process::Command::new(exe)
-            .args(["send", &domain])
+            .args(["send", &domain, "--channel", "linkedin"])
             .status()
             .await;
     });
@@ -551,6 +560,33 @@ mod tests {
             let resp = tokio::runtime::Runtime::new()
                 .unwrap()
                 .block_on(send(State(state()), Path("acme.com".to_string())))
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CONFLICT);
+        });
+    }
+
+    /// A company with a LinkedIn note and a newer email waiting: the LinkedIn routes act on the
+    /// note (here they reach the auto-send gate) instead of refusing it as an email draft.
+    #[test]
+    fn send_takes_the_note_beside_a_newer_email() {
+        crate::testutil::with_home("ct-web-li-send-xchan", |_| {
+            crate::db::init().unwrap();
+            crate::db::open()
+                .unwrap()
+                .execute_batch(
+                    "INSERT INTO companies (domain) VALUES ('x.com'); \
+                     INSERT INTO contacts (id, domain, email, linkedin_url) VALUES \
+                     (1,'x.com','xena@x.com','https://www.linkedin.com/in/xena'); \
+                     INSERT INTO outreach (domain, contact_id, channel, subject, body, status, created_at) VALUES \
+                     ('x.com',1,'linkedin','','Hi Xena','draft_pending','2026-11-04 09:00:00'), \
+                     ('x.com',1,'email','Re: idea','Following up.','draft_pending','2026-11-04 10:00:00');",
+                )
+                .unwrap();
+            let d = linkedin_draft("x.com").unwrap().unwrap();
+            assert_eq!(d.to, "https://www.linkedin.com/in/xena");
+            let resp = tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(send(State(state()), Path("x.com".to_string())))
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::CONFLICT);
         });

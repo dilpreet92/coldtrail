@@ -4,7 +4,7 @@
 //! aggregate queries plus a few small config/secret file reads.
 
 use axum::Json;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use time::{Duration, PrimitiveDateTime, Time};
 
 use super::api::{Attention, LastRun, NextSchedule, RunningChat, SummaryCounts, SummaryDto};
@@ -61,6 +61,8 @@ impl Health {
 }
 
 fn build(c: &Connection, health: &Health, now: PrimitiveDateTime) -> anyhow::Result<SummaryDto> {
+    // Runs first: one that died is recorded as it is found, and can be the last run.
+    let running_runs = running_runs(c)?;
     // The newest run with its schedule's name, exactly as Schedules' run history lists it.
     let last_run = crate::db::list_runs(1)?.into_iter().next();
     Ok(SummaryDto {
@@ -69,7 +71,8 @@ fn build(c: &Connection, health: &Health, now: PrimitiveDateTime) -> anyhow::Res
         attention: attention(health, last_run.as_ref()),
         last_run: last_run.map(LastRun::from),
         next_schedule: next_schedule(now)?,
-        running: running_chat(c)?,
+        running: running_runs.first().cloned(),
+        running_runs,
     })
 }
 
@@ -216,20 +219,17 @@ fn next_schedule(now: PrimitiveDateTime) -> anyhow::Result<Option<NextSchedule>>
         }))
 }
 
-/// The most recently updated conversation a run is still writing to.
-fn running_chat(c: &Connection) -> anyhow::Result<Option<RunningChat>> {
-    Ok(c.query_row(
-        "SELECT id, COALESCE(title,'') FROM chat_sessions WHERE running = 1 \
-         ORDER BY updated_at DESC, created_at DESC, rowid DESC LIMIT 1",
-        [],
-        |r| {
-            Ok(RunningChat {
-                chat_id: r.get(0)?,
-                title: r.get(1)?,
-            })
-        },
-    )
-    .optional()?)
+/// The conversations runs are still writing to, most recently updated first. A run that died
+/// mid-turn never cleared its `running` flag; `running_chats` leaves it out (and records it).
+fn running_runs(c: &Connection) -> anyhow::Result<Vec<RunningChat>> {
+    Ok(crate::scheduled::running_chats(c)?
+        .into_iter()
+        .map(|r| RunningChat {
+            chat_id: r.chat_id,
+            title: r.title,
+            schedule_id: r.schedule_id,
+        })
+        .collect())
 }
 
 /// When a schedule next fires, on the same local wall clock as its OS timer (`now` is local
@@ -557,25 +557,85 @@ mod tests {
         });
     }
 
-    /// `running` is the most recently updated conversation a run is still writing to.
+    /// `running` is the most recently updated conversation a run is still writing to;
+    /// `running_runs` lists every one, each with its schedule (two can run at once, and names
+    /// aren't unique).
     #[test]
     fn summary_running_chat() {
         crate::testutil::with_home("ct-web-summary-running", |_| {
             let c = seed(
-                "INSERT INTO chat_sessions (id, title, updated_at, running) VALUES \
-                 ('idle','Idle chat','2026-10-28 09:59:00',0), \
-                 ('old','Scheduled run — Old','2026-10-27 08:00:00',1), \
-                 ('new','Scheduled run — Lunch Source','2026-10-28 09:00:00',1);",
+                "INSERT INTO chat_sessions (id, title, updated_at, running, schedule_id) VALUES \
+                 ('idle','Idle chat','2026-10-28 09:59:00',0,NULL), \
+                 ('old','Scheduled run — Lunch Source','2026-10-27 08:00:00',1,'s1'), \
+                 ('new','Scheduled run — Lunch Source','2026-10-28 09:00:00',1,'s2'), \
+                 ('cli','Manual run','2026-10-26 08:00:00',1,NULL);",
             );
             let s = build(&c, &healthy(), wed(10, 0)).unwrap();
             let r = s.running.unwrap();
             assert_eq!(
-                (r.chat_id.as_str(), r.title.as_str()),
-                ("new", "Scheduled run — Lunch Source")
+                (
+                    r.chat_id.as_str(),
+                    r.title.as_str(),
+                    r.schedule_id.as_deref()
+                ),
+                ("new", "Scheduled run — Lunch Source", Some("s2"))
+            );
+            let all: Vec<_> = s
+                .running_runs
+                .iter()
+                .map(|r| (r.chat_id.as_str(), r.schedule_id.as_deref()))
+                .collect();
+            assert_eq!(
+                all,
+                [("new", Some("s2")), ("old", Some("s1")), ("cli", None)]
             );
 
             c.execute_batch("UPDATE chat_sessions SET running = 0;")
                 .unwrap();
+            let s = build(&c, &healthy(), wed(10, 0)).unwrap();
+            assert!(s.running.is_none() && s.running_runs.is_empty());
+        });
+    }
+
+    /// A run that died mid-turn (Ctrl+C in the serve terminal, a kill, a shutdown) leaves its
+    /// `running` flag set. Past the start-up grace only a run still holding its lock counts, so
+    /// the chip and Schedules' badge don't stick to a dead run; the dead one is the last run,
+    /// failed, and Home says it stopped.
+    #[test]
+    fn summary_running_ignores_a_run_that_died() {
+        crate::testutil::with_home("ct-web-summary-running-stale", |dir| {
+            let c = seed(
+                "INSERT INTO chat_sessions (id, title, created_at, updated_at, running) VALUES \
+                 ('dead','Scheduled run — Dead',datetime('now','-1 hour'),datetime('now'),1), \
+                 ('live','Scheduled run — Live',datetime('now','-3 hours'),datetime('now','-2 hours'),1);",
+            );
+            // A run still going holds its lock, however long it has been quiet.
+            let lock = crate::scheduled::hold_run_lock("live").unwrap();
+            let s = build(&c, &healthy(), wed(10, 0)).unwrap();
+            assert_eq!(s.running.as_ref().unwrap().chat_id, "live");
+            let lr = s.last_run.as_ref().unwrap();
+            assert_eq!(
+                (lr.status.as_str(), lr.chat_id.as_deref()),
+                ("error", Some("dead"))
+            );
+            assert_eq!(kinds(&s), [("last_run_failed", "#/schedules")]);
+            assert!(s.attention[0]
+                .message
+                .contains("stopped before it finished"));
+            drop(lock);
+            assert!(build(&c, &healthy(), wed(10, 0)).unwrap().running.is_none());
+
+            // Just started by Run now, before the child process has taken its lock: running.
+            c.execute_batch(
+                "INSERT INTO chat_sessions (id, title, running) VALUES ('new','Scheduled run — New',1);",
+            )
+            .unwrap();
+            let r = build(&c, &healthy(), wed(10, 0)).unwrap().running.unwrap();
+            assert_eq!(r.chat_id, "new");
+
+            // Its run started, then died at once: the lock file it left is held by nothing,
+            // so the chip goes on the next poll rather than after the grace.
+            std::fs::write(dir.join(".run-locks").join("new.lock"), "").unwrap();
             assert!(build(&c, &healthy(), wed(10, 0)).unwrap().running.is_none());
         });
     }
@@ -647,6 +707,7 @@ mod tests {
             assert_eq!(v["funnel"].as_array().unwrap().len(), 5);
             assert!(v["last_run"].is_null() && v["next_schedule"].is_null());
             assert!(v["running"].is_null());
+            assert_eq!(v["running_runs"], serde_json::json!([]));
             assert_eq!(
                 v["attention"],
                 serde_json::json!([{

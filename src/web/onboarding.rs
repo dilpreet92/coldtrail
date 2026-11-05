@@ -52,9 +52,19 @@ pub async fn status() -> Result<Json<StatusDto>, ApiErr> {
     // provider (Canonical via `coldtrail source`, Gmail via the Gmail API). Gmail can be
     // keyless via gcloud ADC, so that also counts as connected.
     let discovery_connected = crate::secrets::has_token("canonical");
-    // Connected = a Gmail app password (keyless IMAP) OR a Gmail OAuth token (own client).
-    let destination_connected =
-        crate::secrets::gmail_app_password().is_some() || crate::secrets::has_token("gmail");
+    // Connected = a Gmail app password (keyless IMAP), a Gmail OAuth token (own client) or a
+    // gcloud login, in the order delivery uses them (`deliver::draft`, then `gmail::token`).
+    // One rule for every screen: Drafts' Create Gmail draft works through any of them.
+    let gmail_via = if crate::secrets::gmail_app_password().is_some() {
+        Some("app_password")
+    } else if crate::secrets::has_token("gmail") {
+        Some("google")
+    } else if crate::gcloud::available() {
+        Some("gcloud")
+    } else {
+        None
+    };
+    let destination_connected = gmail_via.is_some();
     let _ = (canonical_wired, gmail_wired, message_customized);
     let onboarded = product_set && provider_ready && discovery_connected;
     let li = crate::linkedin::LinkedinState::load();
@@ -74,6 +84,7 @@ pub async fn status() -> Result<Json<StatusDto>, ApiErr> {
         opencode_model: cfg.opencode_model,
         discovery_connected,
         destination_connected,
+        gmail_via: gmail_via.map(String::from),
         auto_send: cfg.auto_send,
         daily_send_cap: cfg
             .daily_send_cap
@@ -483,6 +494,42 @@ mod tests {
             assert_eq!(s.opencode_model.as_deref(), Some("opencode/grok-code"));
             std::fs::write(dir.join("config.toml"), "agent = \"opencode\"\n").unwrap();
             assert_eq!(rt.block_on(status()).unwrap().0.opencode_model, None);
+        });
+    }
+
+    /// A gcloud user login is a Gmail connection like the others, so every screen agrees on
+    /// it; an app password wins (delivery uses it first). An ADC file with no user login isn't
+    /// one, and isn't offered as the keyless path either.
+    #[test]
+    fn status_counts_a_gcloud_login_as_gmail() {
+        crate::testutil::with_home("ct-web-onboarding-gcloud", |dir| {
+            let _ = std::fs::remove_dir_all(format!("{}.secrets", dir.display()));
+            crate::home::workspace().unwrap();
+            let adc = dir.join("adc.json");
+            std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", &adc);
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let gmail = || {
+                let s = rt.block_on(status()).unwrap().0;
+                (s.destination_connected, s.gmail_via, s.gcloud_available)
+            };
+            let none = gmail();
+            std::fs::write(&adc, r#"{"type":"service_account","client_id":"1"}"#).unwrap();
+            let service_account = gmail();
+            std::fs::write(
+                &adc,
+                r#"{"type":"authorized_user","client_id":"c","client_secret":"s","refresh_token":"r"}"#,
+            )
+            .unwrap();
+            let login = gmail();
+            crate::secrets::set_gmail_app_password("me@gmail.com", "abcd efgh ijkl mnop").unwrap();
+            let both = gmail();
+            std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
+            let _ = std::fs::remove_dir_all(format!("{}.secrets", dir.display()));
+
+            assert_eq!(none, (false, None, false));
+            assert_eq!(service_account, (false, None, false));
+            assert_eq!(login, (true, Some("gcloud".into()), true));
+            assert_eq!(both, (true, Some("app_password".into()), true));
         });
     }
 
