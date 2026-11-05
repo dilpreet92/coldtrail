@@ -397,7 +397,9 @@ a.home-ny-alert:hover .home-ny-cta { text-decoration: underline; }
 
 /* ---- Getting started (no companies yet) ---- */
 
-.home-start { max-width: 880px; }
+/* Any problem (a failed run) sits above the steps, as wide as they are. */
+.home-start,
+.home-start-needs { max-width: 880px; }
 
 .home-start-steps {
   display: flex;

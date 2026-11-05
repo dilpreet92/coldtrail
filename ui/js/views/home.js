@@ -1,5 +1,6 @@
 // Home (spec §5.2): what needs the human now, the stat line, the funnel, recent runs and top
-// searches; a workspace with no companies yet gets a getting-started list instead.
+// searches; a workspace with no companies yet gets a getting-started list instead, under any
+// problem only the human can fix (a failed run, a missing agent).
 //
 // Data: the summary comes from the shared store (/api/summary, polled every 30s and refreshed
 // after mutations elsewhere), so Home and the sidebar counts always agree. /api/runs and
@@ -9,7 +10,8 @@
 // built with href() or checked against the app's own routes. Where their section is too narrow
 // for a table, Recent runs render as cards (a ResizeObserver swaps them). Unmount drops the store
 // subscription and that observer, and aborts any request in flight. Run statuses use the shared
-// wording (runStatus, core/format.js), so Home and Schedules name a run the same way.
+// wording (runStatus, core/format.js), so Home and Schedules name a run the same way. Replies are
+// "new" until the user opens them from their card: the count opened is kept in this browser.
 
 import { api, errorText } from '../core/api.js';
 import { fmtDate, fmtNum, fmtRelative, h, pluralize, runStatus, toDate } from '../core/dom.js';
@@ -48,6 +50,14 @@ const STAGES = {
 
 const TRIGGERS = { scheduled: 'Scheduled', manual: 'Manual', dry: 'Dry run' };
 
+/** Companies at a funnel stage (summary.funnel counts companies; summary.counts.replied and .sent
+ *  count outreach rows, so a company written to twice counts twice there). 0 when it's missing. */
+function stageCount(summary, stage) {
+  const pairs = summary && Array.isArray(summary.funnel) ? summary.funnel : [];
+  const pair = pairs.find((p) => Array.isArray(p) && p[0] === stage);
+  return pair ? Number(pair[1]) || 0 : 0;
+}
+
 // Problems only the human can fix (summary.attention), by kind: a short title, the action, and
 // where to fix it when the server's target isn't an app route.
 const ATTENTION = {
@@ -57,6 +67,47 @@ const ATTENTION = {
   last_run_failed: { title: 'Last run failed', action: 'See run history', target: '#/schedules' },
 };
 const ATTENTION_OTHER = { title: 'Needs attention', action: 'Open Settings', target: '#/settings' };
+// A last run that couldn't sign in is fixed by signing the agent in, where Schedules sends it too
+// (the server's target for every failed run is the run history).
+const SIGN_IN_FAILED = { title: 'Agent sign-in failed', action: 'Sign the agent in again', target: '#/settings?tab=agent' };
+
+// Replies the user has opened: how many companies had replied when they last followed the
+// Replies card, kept in this browser (Needs you counts only replies since). Storage can throw
+// (privacy modes): the count then holds for this page only.
+const SEEN_KEY = 'ct-replies-seen';
+let seenHere = null;
+
+function readSeen() {
+  try {
+    const v = localStorage.getItem(SEEN_KEY);
+    if (v != null && /^\d+$/.test(v)) return Number(v);
+  } catch (_) {
+    /* storage unavailable */
+  }
+  return seenHere;
+}
+
+function writeSeen(n) {
+  seenHere = n;
+  try {
+    localStorage.setItem(SEEN_KEY, String(n));
+  } catch (_) {
+    /* storage unavailable: keep it for this page */
+  }
+}
+
+/** The replied count when the user last opened the replies (null: never, in this browser). Fewer
+ *  replies now than then (a company that replied was deleted) moves the mark down, so the next
+ *  reply to come in counts as new. */
+function repliesSeen(summary) {
+  const seen = readSeen();
+  const replied = stageCount(summary, 'replied');
+  if (seen != null && replied < seen) {
+    writeSeen(replied);
+    return replied;
+  }
+  return seen;
+}
 
 // Only hash routes of this app become hrefs; anything else from the server is ignored.
 const APP_ROUTE = /^#\/[a-z-]+(\/[^\s"'<>]*)?(\?[^\s"'<>]*)?$/;
@@ -167,13 +218,17 @@ function loadingRows(label, rows = 4) {
 // ---- Needs you ----
 
 /** The cards Home shows, most urgent first: connection problems and a failed run, then the
- *  drafts, due follow-ups and replies waiting. */
-export function needsYouItems(summary) {
+ *  drafts, due follow-ups and new replies waiting. Replies are companies (the funnel's Replied
+ *  stage, as the Follow-ups Replied tab the card opens lists them); `seen` is how many had
+ *  replied when the user last opened them (null: never, so every reply is new). */
+export function needsYouItems(summary, seen = null) {
   const c = (summary && summary.counts) || {};
   const items = [];
+  const lastRun = summary && summary.last_run;
   for (const a of (summary && summary.attention) || []) {
-    const known = ATTENTION[a.kind] || ATTENTION_OTHER;
-    const target = typeof a.target === 'string' && APP_ROUTE.test(a.target) ? a.target : known.target;
+    const signIn = a.kind === 'last_run_failed' && lastRun && lastRun.status === 'auth_failed';
+    const known = signIn ? SIGN_IN_FAILED : ATTENTION[a.kind] || ATTENTION_OTHER;
+    const target = !signIn && typeof a.target === 'string' && APP_ROUTE.test(a.target) ? a.target : known.target;
     items.push({ key: `attention:${a.kind}`, warn: true, label: known.title, meta: a.message || '', cta: known.action, href: target });
   }
   const n = (v) => Number(v) || 0;
@@ -196,18 +251,22 @@ export function needsYouItems(summary) {
       num: c.followups_due,
       label: n(c.followups_due) === 1 ? 'follow-up due' : 'follow-ups due',
       meta: 'No reply 4+ days after your last message',
-      cta: 'Open follow-ups',
+      cta: 'Open Follow-ups',
       href: href(['followups'], { tab: 'due' }),
     });
   }
-  if (n(c.replied) > 0) {
+  const replied = stageCount(summary, 'replied');
+  const fresh = seen == null ? replied : replied - Number(seen);
+  if (fresh > 0) {
     items.push({
       key: 'replies',
-      num: c.replied,
-      label: n(c.replied) === 1 ? 'reply' : 'replies',
-      meta: 'Founders who wrote back',
+      num: fresh,
+      label: fresh === 1 ? 'new reply' : 'new replies',
+      meta: seen == null ? 'Founders who wrote back' : 'Founders who wrote back since you last looked',
       cta: 'See replies',
       href: href(['followups'], { tab: 'replied' }),
+      // Following the card opens them all: this many have been seen.
+      opens: replied,
     });
   }
   return items;
@@ -224,7 +283,13 @@ function needsYouCard(it) {
     { class: 'home-ny-item' },
     h(
       'a',
-      { class: 'home-ny-card', href: it.href, 'data-focus': it.key, 'aria-label': nameOf(`${fmtNum(it.num)} ${it.label}`, it.meta, it.cta) },
+      {
+        class: 'home-ny-card',
+        href: it.href,
+        'data-focus': it.key,
+        'aria-label': nameOf(`${fmtNum(it.num)} ${it.label}`, it.meta, it.cta),
+        onClick: it.opens != null ? () => writeSeen(it.opens) : null,
+      },
       h('span', { class: 'home-ny-top' }, h('span', { class: 'home-ny-num' }, fmtNum(it.num)), h('span', { class: 'home-ny-label' }, it.label)),
       it.meta ? h('span', { class: 'home-ny-meta' }, it.meta) : null,
       h('span', { class: 'home-ny-cta' }, it.cta, icon(ICONS.arrow, 14)),
@@ -247,8 +312,9 @@ function needsYouAlert(it) {
   );
 }
 
-function renderNeedsYou(summary) {
-  const items = needsYouItems(summary);
+const alertList = (alerts) => h('ul', { class: 'home-ny-alerts', role: 'list' }, alerts.map(needsYouAlert));
+
+function renderNeedsYou(items) {
   if (!items.length) {
     return h(
       'div',
@@ -260,22 +326,26 @@ function renderNeedsYou(summary) {
   const alerts = items.filter((it) => it.warn);
   const counts = items.filter((it) => !it.warn);
   return [
-    alerts.length ? h('ul', { class: 'home-ny-alerts', role: 'list' }, alerts.map(needsYouAlert)) : null,
+    alerts.length ? alertList(alerts) : null,
     counts.length ? h('ul', { class: 'home-ny-list', role: 'list' }, counts.map(needsYouCard)) : null,
   ];
 }
 
 // ---- Stat line ----
 
+// Sent, replies and the reply rate all count companies (the funnel's Sent and Replied stages): the
+// rate follows from the two numbers beside it and is the funnel's Replied conversion, and the
+// replies match the Replied tab.
 function renderStats(summary) {
   const c = summary.counts || {};
-  const rate = pct(c.replied, c.sent);
+  const sent = stageCount(summary, 'sent');
+  const replied = stageCount(summary, 'replied');
   const stats = [
     { label: 'Companies', value: fmtNum(c.companies), hint: 'in your pipeline' },
     { label: 'Contacts', value: fmtNum(c.contacts), hint: 'people on file' },
-    { label: 'Sent', value: fmtNum(c.sent), hint: 'emails and invites' },
-    { label: 'Replies', value: fmtNum(c.replied), hint: 'marked replied' },
-    { label: 'Reply rate', value: rate, hint: 'replies ÷ sent' },
+    { label: 'Sent', value: fmtNum(sent), hint: 'companies written to' },
+    { label: 'Replies', value: fmtNum(replied), hint: 'companies that wrote back' },
+    { label: 'Reply rate', value: pct(replied, sent), hint: 'of companies written to' },
   ];
   return h(
     'dl',
@@ -637,8 +707,8 @@ function mountHome(root, ctx) {
   // Runs and searches: { status: 'idle'|'loading'|'ok'|'error', rows|queries, total, error }
   let runs = { status: 'idle' };
   let searches = { status: 'idle' };
-  let runsKey; // the summary's last run when runs were fetched
-  let companiesKey; // the company count when searches were fetched
+  let runsKey; // the summary's last run when runs were fetched (unset after a failed refetch)
+  let companiesKey; // the company count when searches were fetched (likewise)
   let runsCtl = null;
   let searchesCtl = null;
   let summaryShown = null;
@@ -695,15 +765,19 @@ function mountHome(root, ctx) {
       const needs = section('needs', 'Needs you', { cls: 'home-needs' });
       const glance = section('glance', 'At a glance', { cls: 'home-glance', hiddenHeading: true });
       const funnel = section('funnel', 'Funnel', { cls: 'home-funnel' });
-      const top = section('searches', 'Top searches', { cls: 'home-searches', link: { label: 'Open pipeline', href: '#/pipeline' } });
+      const top = section('searches', 'Top searches', { cls: 'home-searches', link: { label: 'Open Pipeline', href: '#/pipeline' } });
       const recent = section('runs', 'Recent runs', { cls: 'home-runs', link: { label: 'All runs', href: '#/schedules' } });
       dash = { needs, glance, funnel, top, recent };
       body.replaceChildren(needs.el, glance.el, h('div', { class: 'home-grid' }, funnel.el, top.el), recent.el);
       if (runsRo) runsRo.observe(recent.el);
     } else if (next === 'start') {
+      // Problems (a failed run, a missing agent) still show, above the steps: they are often why
+      // the workspace is still empty. Hidden while there are none.
+      const needs = section('needs', 'Needs you', { cls: 'home-start-needs' });
+      needs.el.hidden = true;
       const start = section('start', 'Get started', { cls: 'home-start' });
-      dash = { start };
-      body.replaceChildren(start.el);
+      dash = { needs, start };
+      body.replaceChildren(needs.el, start.el);
     }
   }
 
@@ -716,20 +790,45 @@ function mountHome(root, ctx) {
   function part(name, sig, container, build) {
     if (sigs[name] === sig) return;
     sigs[name] = sig;
+    const had = container.contains(document.activeElement);
     swap(container, build());
+    if (had) keepFocus(container.closest('section'));
+  }
+
+  // Focus on something a redraw took away (a card or alert that went, with no twin to take it; or
+  // every section, when getting started turns into the dashboard) moves to the heading of its
+  // section, or of the first section still shown, so a keyboard or screen-reader user keeps their
+  // place instead of landing on <body>.
+  function keepFocus(sec) {
+    const a = document.activeElement;
+    if (gone || (a && a !== document.body && document.contains(a))) return;
+    const target = sec && !sec.hidden && body.contains(sec) ? sec : body.querySelector('section:not([hidden])');
+    const h2 = target && target.querySelector('h2');
+    if (h2) h2.focus({ preventScroll: true });
+    else focusTitle();
   }
 
   function renderSummary(summary, status) {
+    const had = body.contains(document.activeElement);
     summaryShown = summary;
     const empty = !(summary.counts && Number(summary.counts.companies) > 0);
     setMode(empty ? 'start' : 'dash');
+    const items = needsYouItems(summary, repliesSeen(summary));
     if (empty) {
+      const alerts = items.filter((it) => it.warn);
+      dash.needs.el.hidden = !alerts.length;
+      part('needs', JSON.stringify(alerts), dash.needs.body, () => (alerts.length ? alertList(alerts) : null));
       const steps = startSteps(summary, status);
       part('start', JSON.stringify(steps), dash.start.body, () => renderStart(summary, status));
-      return;
+    } else {
+      renderDash(summary, items);
     }
-    part('needs', JSON.stringify([summary.counts, summary.attention]), dash.needs.body, () => renderNeedsYou(summary));
-    part('glance', JSON.stringify(summary.counts), dash.glance.body, () => renderStats(summary));
+    if (had) keepFocus();
+  }
+
+  function renderDash(summary, items) {
+    part('needs', JSON.stringify(items), dash.needs.body, () => renderNeedsYou(items));
+    part('glance', JSON.stringify([summary.counts, summary.funnel]), dash.glance.body, () => renderStats(summary));
     part('funnel', JSON.stringify(summary.funnel), dash.funnel.body, () => renderFunnel(summary));
 
     // Runs and searches: first time, or when the summary says they changed.
@@ -810,8 +909,13 @@ function mountHome(root, ctx) {
       runs = { status: 'ok', rows: list.map((r, i) => ({ ...r, key: keys[i] })) };
     } catch (err) {
       if (gone || ctl.signal.aborted || isAbort(err)) return;
-      // A failed background refetch keeps what is on screen.
-      runs = runs.rows && !fromRetry ? { status: 'ok', rows: runs.rows } : { status: 'error', error: err };
+      // A failed background refetch keeps what is on screen, and the next summary asks again.
+      if (runs.rows && !fromRetry) {
+        runs = { status: 'ok', rows: runs.rows };
+        runsKey = undefined;
+      } else {
+        runs = { status: 'error', error: err };
+      }
     } finally {
       release(ctl);
       if (runsCtl === ctl) runsCtl = null;
@@ -840,7 +944,13 @@ function mountHome(root, ctx) {
       };
     } catch (err) {
       if (gone || ctl.signal.aborted || isAbort(err)) return;
-      searches = searches.queries && !fromRetry ? { ...searches, status: 'ok' } : { status: 'error', error: err };
+      // As for runs: keep what is on screen, and the next summary asks again.
+      if (searches.queries && !fromRetry) {
+        searches = { ...searches, status: 'ok' };
+        companiesKey = undefined;
+      } else {
+        searches = { status: 'error', error: err };
+      }
     } finally {
       release(ctl);
       if (searchesCtl === ctl) searchesCtl = null;

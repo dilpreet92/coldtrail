@@ -5,12 +5,15 @@
 //
 // The other screens are stubbed in these tests (stubViews) so Home's links are checked by where
 // they land, independent of how far those screens are built.
+import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+
 import { expectAccessible } from '../harness/a11y.mjs';
 import { test, expect } from '../harness/fixtures.mjs';
 import { SEED } from '../harness/seed.mjs';
 import { SESSION_EXPIRED, SESSION_REOPEN } from '../../../ui/js/core/api.js';
 import { fmtDate, fmtNum, fmtRelative, runStatus } from '../../../ui/js/core/format.js';
-import { FRESH_MS, nextRunWhen, runKeys, runNote, searchesCaption } from '../../../ui/js/views/home.js';
+import { FRESH_MS, needsYouItems, nextRunWhen, runKeys, runNote, searchesCaption } from '../../../ui/js/views/home.js';
 
 const reEscape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const hashIs = (hash) => new RegExp(`${reEscape(hash)}$`);
@@ -24,6 +27,9 @@ const localIso = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.get
 const sqliteUtc = (d) => d.toISOString().slice(0, 19).replace('T', ' ');
 
 const STAGE_LABELS = ['Sourced', 'Contact found', 'Drafted', 'Sent', 'Replied'];
+/** Companies at a funnel stage: in the seed, or in a summary from the server. */
+const stageOf = (funnel, name) => funnel.find(([s]) => s === name)[1];
+const seedStage = (name) => stageOf(SEED.funnel, name);
 // The shared run-status wording (core/format.js), the same on Schedules.
 const statusLabel = (status) => runStatus(status)[0];
 const TRIGGERS = { scheduled: 'Scheduled', manual: 'Manual', dry: 'Dry run' };
@@ -144,6 +150,31 @@ test.describe('helpers', () => {
     // More found than the total (counts read a moment apart) is nothing to explain.
     expect(searchesCaption({ shown: 1, searches: 1, total: 4, found: 5 })).toBe('');
   });
+
+  test('needsYouItems: replies since they were last opened; a sign-in failure goes to agent settings', () => {
+    const replies = (seen) =>
+      needsYouItems({ counts: {}, funnel: [['sent', 15], ['replied', 3]], attention: [] }, seen).find((it) => it.key === 'replies');
+    // Never opened in this browser: every reply is new.
+    expect(replies(null)).toMatchObject({
+      num: 3,
+      label: 'new replies',
+      meta: 'Founders who wrote back',
+      cta: 'See replies',
+      href: '#/followups?tab=replied',
+    });
+    expect(replies(undefined)).toMatchObject({ num: 3 });
+    expect(replies(2)).toMatchObject({ num: 1, label: 'new reply', meta: 'Founders who wrote back since you last looked' });
+    // All of them opened (or fewer now than then): nothing waits.
+    expect(replies(3)).toBeUndefined();
+    expect(replies(5)).toBeUndefined();
+
+    // The server sends every failed last run to the run history; one that couldn't sign in is
+    // fixed in agent settings, as Schedules says on its row.
+    const failed = (status) =>
+      needsYouItems({ counts: {}, funnel: [], last_run: { status }, attention: [{ kind: 'last_run_failed', message: 'm', target: '#/schedules' }] })[0];
+    expect(failed('error')).toMatchObject({ label: 'Last run failed', cta: 'See run history', href: '#/schedules' });
+    expect(failed('auth_failed')).toMatchObject({ label: 'Agent sign-in failed', cta: 'Sign the agent in again', href: '#/settings?tab=agent' });
+  });
 });
 
 test('numbers match the seed', async ({ app, page, server, request }) => {
@@ -152,19 +183,28 @@ test('numbers match the seed', async ({ app, page, server, request }) => {
   await expect(page).toHaveTitle('Home · coldtrail');
   await expect(page.locator('#nav [aria-current="page"] .nav-label')).toHaveText('Home');
 
-  // Stat line: companies, contacts, sent, replies, reply rate (replies ÷ sent).
+  // Stat line: companies and contacts, then companies written to, companies that replied and the
+  // reply rate between them, as the funnel's Sent and Replied rows give them (one unit, so the rate
+  // follows from the two numbers beside it).
   const stats = page.getByRole('region', { name: 'At a glance' });
   await expect(stats.locator('.home-stat-label')).toHaveText(['Companies', 'Contacts', 'Sent', 'Replies', 'Reply rate']);
   await expect(stats.locator('.home-stat-value')).toHaveText([
     fmtNum(SEED.counts.companies),
     fmtNum(SEED.counts.contacts),
-    fmtNum(SEED.counts.sent),
-    fmtNum(SEED.counts.replied),
-    pct(SEED.counts.replied, SEED.counts.sent),
+    fmtNum(seedStage('sent')),
+    fmtNum(seedStage('replied')),
+    pct(seedStage('replied'), seedStage('sent')),
+  ]);
+  await expect(stats.locator('.home-stat-hint')).toHaveText([
+    'in your pipeline',
+    'people on file',
+    'companies written to',
+    'companies that wrote back',
+    'of companies written to',
   ]);
 
   // Needs you: the failed last run first (with why it failed, from its note), then drafts,
-  // follow-ups due and replies.
+  // follow-ups due and replies (all new: none were opened in this browser).
   const runs = await (await request.get(server.apiUrl('/api/runs'))).json();
   const cards = needsYou(page).getByRole('link');
   await expect(cards).toHaveCount(4);
@@ -178,8 +218,8 @@ test('numbers match the seed', async ({ app, page, server, request }) => {
   await expect(cards.nth(1)).toContainText(`${SEED.counts.drafts_email} email · ${SEED.counts.drafts_linkedin} LinkedIn`);
   await expect(cards.nth(2).locator('.home-ny-num')).toHaveText(fmtNum(SEED.counts.followups_due));
   await expect(cards.nth(2)).toContainText('follow-ups due');
-  await expect(cards.nth(3).locator('.home-ny-num')).toHaveText(fmtNum(SEED.counts.replied));
-  await expect(cards.nth(3)).toContainText('replies');
+  await expect(cards.nth(3).locator('.home-ny-num')).toHaveText(fmtNum(seedStage('replied')));
+  await expect(cards.nth(3)).toContainText('new replies');
   expect(await cards.evaluateAll((els) => els.map((a) => a.getAttribute('href')))).toEqual([
     '#/schedules',
     '#/drafts',
@@ -259,6 +299,8 @@ test('needs-you links navigate', async ({ app, page }) => {
 
   await page.goBack();
   await homeReady(page);
+  // Screens are named as the sidebar names them.
+  await expect(card(page, /follow-ups due/).locator('.home-ny-cta')).toHaveText('Open Follow-ups');
   await card(page, /follow-ups due/).click();
   await expect(page).toHaveURL(hashIs('#/followups?tab=due'));
   await expect(page.locator('#view h1')).toHaveText('Stub followups');
@@ -359,7 +401,7 @@ test('top search row opens filtered pipeline', async ({ app, page }) => {
   // The section's own link opens the whole pipeline.
   await page.goBack();
   await homeReady(page);
-  await page.getByRole('region', { name: 'Top searches' }).getByRole('link', { name: 'Open pipeline' }).click();
+  await page.getByRole('region', { name: 'Top searches' }).getByRole('link', { name: 'Open Pipeline', exact: true }).click();
   await expect(page).toHaveURL(hashIs('#/pipeline'));
 });
 
@@ -484,6 +526,7 @@ test('quiet and edge states: nothing needs you, no runs, no sends', async ({ app
     const res = await route.fetch();
     const s = await res.json();
     s.counts = { ...s.counts, drafts: 0, drafts_email: 0, drafts_linkedin: 0, followups_due: 0, replied: 0, sent: 0 };
+    s.funnel = s.funnel.map(([stage, n]) => [stage, stage === 'sent' || stage === 'replied' ? 0 : n]);
     s.attention = [];
     s.last_run = null;
     s.next_schedule = null;
@@ -846,6 +889,72 @@ test('a focused run link keeps focus when a newer run arrives', async ({ app, pa
   await expect(rows.nth(at + 1).getByRole('link', { name: /^View run/ })).toBeFocused();
 });
 
+test('a background refetch that fails is tried again on the next summary', async ({ app, page }) => {
+  // The browser logs each failed request as a console error.
+  app.allowConsole(/status of 500/);
+  const newer = { started_at: sqliteUtc(new Date()), status: 'ok', sourced: 7, enriched: 7, drafted: 0, sent: 0, chat_id: null, trigger: 'manual', schedule_name: null, note: null };
+  const fresh = ['A search since', 1000];
+  let changed = false;
+  const fail = { runs: 0, companies: 0 };
+  const calls = { runs: 0, companies: 0 };
+  await page.route('**/api/summary*', async (route) => {
+    const res = await route.fetch();
+    const s = await res.json();
+    if (changed) {
+      s.last_run = { ...s.last_run, started_at: newer.started_at, status: newer.status };
+      s.counts = { ...s.counts, companies: s.counts.companies + fresh[1] };
+    }
+    await route.fulfill({ response: res, json: s });
+  });
+  const serve = (key, patch) => async (route) => {
+    calls[key]++;
+    if (fail[key] > 0) {
+      fail[key]--;
+      await route.fulfill({ status: 500, contentType: 'text/plain', body: 'internal error' });
+      return;
+    }
+    const res = await route.fetch();
+    const json = await res.json();
+    await route.fulfill({ response: res, json: changed ? patch(json) : json });
+  };
+  await page.route('**/api/runs*', serve('runs', (runs) => [newer, ...runs]));
+  await page.route('**/api/companies?*', serve('companies', (b) => ({ ...b, total: b.total + fresh[1], queries: [fresh, ...b.queries] })));
+  await app.goto('#/home');
+  await homeReady(page);
+  const firstRunName = page.getByRole('table', { name: 'Recent runs' }).locator('tbody tr').first().locator('.home-run-name');
+  const topSearch = page.getByRole('table', { name: 'Top searches' }).locator('tbody tr').first().getByRole('link');
+  await expect(firstRunName).toHaveText(SEED.runs.at(-1).schedule_name);
+  await expect(topSearch).toHaveText(SEED.queries[0][0]);
+
+  // A newer run and more companies: the refetch each starts fails once. The last good rows stay
+  // on screen, with no error (it was a background refetch).
+  changed = true;
+  Object.assign(fail, { runs: 1, companies: 1 });
+  await refreshStore(page);
+  await expect.poll(() => ({ ...fail })).toEqual({ runs: 0, companies: 0 });
+  await expect(firstRunName).toHaveText(SEED.runs.at(-1).schedule_name);
+  await expect(page.locator('#view .home-error')).toHaveCount(0);
+
+  // The next summary asks again: the new run and the new search show up.
+  await expect
+    .poll(async () => {
+      await refreshStore(page);
+      return firstRunName.textContent();
+    })
+    .toBe('Manual run');
+  await expect
+    .poll(async () => {
+      await refreshStore(page);
+      return topSearch.textContent();
+    })
+    .toBe(fresh[0]);
+  // Once they have, a summary that changes nothing fetches neither again.
+  const settled = { ...calls };
+  await refreshStore(page);
+  await refreshStore(page);
+  expect(calls).toEqual(settled);
+});
+
 test('with no runs yet, says when the next schedule runs', async ({ app, page }) => {
   // 5½ hours away: "in 5h" (relative within 48h, as the top bar's chip says it).
   const at = localIso(new Date(Date.now() + 5.5 * HOUR));
@@ -883,6 +992,7 @@ test('top searches say what the list leaves out, and few cards share the row', a
     const res = await route.fetch();
     const s = await res.json();
     s.counts = { ...s.counts, followups_due: 0, replied: 0 };
+    s.funnel = s.funnel.map(([stage, n]) => [stage, stage === 'replied' ? 0 : n]);
     s.attention = [];
     await route.fulfill({ response: res, json: s });
   });
@@ -903,8 +1013,101 @@ test('top searches say what the list leaves out, and few cards share the row', a
   expect(Math.abs(cardBox.width - listBox.width)).toBeLessThanOrEqual(1);
 });
 
+test('replies need you until you open them; after that only new ones do', async ({ app, page }) => {
+  await stubViews(page);
+  // Nothing else waits on the human, so the replies are all of Needs you. `more` replies arrive
+  // (or, below 0, companies that replied are deleted).
+  let more = 0;
+  await page.route('**/api/summary*', async (route) => {
+    const res = await route.fetch();
+    const s = await res.json();
+    s.counts = { ...s.counts, drafts: 0, drafts_email: 0, drafts_linkedin: 0, followups_due: 0 };
+    s.funnel = s.funnel.map(([stage, n]) => [stage, stage === 'replied' ? n + more : n]);
+    s.attention = [];
+    await route.fulfill({ response: res, json: s });
+  });
+  const replied = seedStage('replied');
+  const statReplies = () => page.getByRole('region', { name: 'At a glance' }).locator('.home-stat-value').nth(3);
+  await app.goto('#/home');
+  await homeReady(page);
+
+  // Never opened in this browser: every reply is new.
+  await expect(needsYou(page).getByRole('link')).toHaveCount(1);
+  await expect(card(page, /new replies/).locator('.home-ny-num')).toHaveText(fmtNum(replied));
+  await card(page, /new replies/).click();
+  await expect.poll(() => stubbed(page)).toMatchObject({ name: 'followups', query: { tab: 'replied' } });
+
+  // Opened: they no longer need you, so nothing does. The stat line still counts them all.
+  await page.goBack();
+  await homeReady(page);
+  await expect(needsYou(page)).toContainText('Nothing needs you right now');
+  await expect(needsYou(page).getByRole('link')).toHaveCount(0);
+  await expect(statReplies()).toHaveText(fmtNum(replied));
+
+  // A founder writes back: that one is new, and stays new after a reload until it is opened.
+  more = 1;
+  await refreshStore(page);
+  await expect(card(page, /new reply\b/).locator('.home-ny-num')).toHaveText('1');
+  await expect(card(page, /new reply\b/)).toContainText('Founders who wrote back since you last looked');
+  await page.reload();
+  await homeReady(page);
+  await expect(card(page, /new reply\b/).locator('.home-ny-num')).toHaveText('1');
+
+  // Fewer replies than when they were opened (a company that replied was deleted): none are new,
+  // and the next one to come in is.
+  more = -1;
+  await refreshStore(page);
+  await expect(needsYou(page)).toContainText('Nothing needs you right now');
+  more = 0;
+  await refreshStore(page);
+  await expect(card(page, /new reply\b/).locator('.home-ny-num')).toHaveText('1');
+});
+
+// Changes the workspace, so it runs after the other tests on the full seed.
+test('replies count companies, as the funnel and the Replied tab do', async ({ app, page, server, request }) => {
+  // A company that replies after two messages has two outreach rows marked replied, but it is one
+  // founder who wrote back: one row on Follow-ups' Replied tab and one in the funnel.
+  const followups = async () => (await request.get(server.apiUrl('/api/followups'))).json();
+  const twice = (await followups()).find((f) => f.touches === 2 && f.state !== 'replied');
+  expect(twice, 'a company written to twice').toBeTruthy();
+  const res = await request.post(server.apiUrl(`/api/followups/${encodeURIComponent(twice.domain)}/mark`), { data: { value: 'replied' } });
+  expect(res.ok()).toBe(true);
+  const replied = (await followups()).filter((f) => f.state === 'replied').length;
+  const summary = await (await request.get(server.apiUrl('/api/summary'))).json();
+  const sent = stageOf(summary.funnel, 'sent');
+  expect(stageOf(summary.funnel, 'replied')).toBe(replied);
+  // The summary's own count is of messages, more than the companies.
+  expect(summary.counts.replied).toBeGreaterThan(replied);
+
+  await app.goto('#/home');
+  await homeReady(page);
+  // None opened in this browser: the card says as many as the Replied tab it opens lists.
+  await expect(card(page, /replies/).locator('.home-ny-num')).toHaveText(fmtNum(replied));
+  // One reply rate on the screen: the stat line's is the funnel's Replied conversion.
+  const values = page.getByRole('region', { name: 'At a glance' }).locator('.home-stat-value');
+  await expect(values.nth(3)).toHaveText(fmtNum(replied));
+  await expect(values.nth(4)).toHaveText(pct(replied, sent));
+  const funnelReplied = page.getByRole('table', { name: 'Funnel' }).locator('tbody tr').last();
+  await expect(funnelReplied.locator('.home-funnel-count')).toHaveText(fmtNum(replied));
+  await expect(funnelReplied.locator('.home-funnel-rate')).toHaveText(pct(replied, sent));
+});
+
 // Last: a different seed restarts the server.
 test.describe('new workspace', () => {
+  /** Record a finished manual run in the workspace, as `coldtrail run` does. */
+  const addRun = (server, status, note = null) => {
+    const db = new DatabaseSync(join(server.home, 'outreach.db'));
+    try {
+      db.exec('PRAGMA busy_timeout = 5000');
+      db.prepare(
+        `INSERT INTO scheduled_runs (finished_at, status, sourced, enriched, drafted, sent, note, trigger)
+         VALUES (datetime('now'), ?, 0, 0, 0, 0, ?, 'manual')`,
+      ).run(status, note);
+    } finally {
+      db.close();
+    }
+  };
+
   test.use({ seed: 'onboarded' });
 
   test('empty workspace shows getting started', async ({ app, page }) => {
@@ -920,7 +1123,8 @@ test.describe('new workspace', () => {
       'Create a schedule',
       'Connect where outreach goes',
     ]);
-    // No dashboard for an empty workspace.
+    // No dashboard for an empty workspace, and nothing is wrong to show above the steps.
+    await expect(needsYou(page)).toHaveCount(0);
     await expect(page.getByRole('region', { name: 'At a glance' })).toHaveCount(0);
     await expect(page.getByRole('table')).toHaveCount(0);
 
@@ -976,5 +1180,74 @@ test.describe('new workspace', () => {
     nextAt = localIso(new Date(Date.now() + 4 * 24 * HOUR));
     await refreshStore(page);
     await expect(schedule.locator('p')).toHaveText(`Morning <b>Source</b> runs next on ${fmtDate(nextAt, { time: true })}.`);
+  });
+
+  test('focus on something a redraw takes away moves to a heading, not the page', async ({ app, page }) => {
+    let patch = null;
+    await page.route('**/api/summary*', async (route) => {
+      const res = await route.fetch();
+      const s = await res.json();
+      if (patch) s.counts = { ...s.counts, ...patch };
+      await route.fulfill({ response: res, json: s });
+    });
+    await app.goto('#/home');
+    const start = page.getByRole('region', { name: 'Get started' });
+    const ask = start.getByRole('link', { name: 'Ask the agent' });
+    await ask.focus();
+
+    // The first companies land while the user waits on a step (a run started elsewhere): Home
+    // turns into the dashboard, and focus goes to its first section.
+    patch = { companies: 1 };
+    await refreshStore(page);
+    await expect(page.getByRole('region', { name: 'At a glance' })).toBeVisible();
+    await expect(needsYou(page).getByRole('heading', { name: 'Needs you' })).toBeFocused();
+
+    // A card that goes while focused (its drafts were sent from another tab): focus stays in its
+    // section, on the heading.
+    patch = { companies: 1, drafts: 2, drafts_email: 2 };
+    await refreshStore(page);
+    await card(page, /drafts waiting/).focus();
+    patch = { companies: 1, drafts: 0, drafts_email: 0 };
+    await refreshStore(page);
+    await expect(needsYou(page)).toContainText('Nothing needs you right now');
+    await expect(needsYou(page).getByRole('heading', { name: 'Needs you' })).toBeFocused();
+  });
+
+  // Changes the workspace, so it runs last.
+  test('a failed run shows above the steps until a run works', async ({ app, page, server }) => {
+    // The first run fails (say the model was retired), so the agent sources nothing and the
+    // workspace stays empty: Home says why above the steps, not only on Schedules.
+    const why = 'opencode: model fake/model-a has been retired';
+    addRun(server, 'error', why);
+    await app.goto('#/home');
+    const start = page.getByRole('region', { name: 'Get started' });
+    await expect(start.getByRole('listitem')).toHaveCount(4);
+    const alert = card(page, /Last run failed/);
+    await expect(alert).toContainText(`ended with an error: ${why}`);
+    await expect(alert).toHaveAttribute('href', '#/schedules');
+    const [above, steps] = [await needsYou(page).boundingBox(), await start.boundingBox()];
+    expect(above.y + above.height).toBeLessThanOrEqual(steps.y);
+    // Only the problem: no counts, no dashboard.
+    await expect(needsYou(page).getByRole('link')).toHaveCount(1);
+    await expect(page.getByRole('region', { name: 'At a glance' })).toHaveCount(0);
+    await expectAccessible(page);
+
+    // A run that couldn't sign in: the fix is signing the agent in (Settings → Agent, where
+    // Schedules sends it too), not the run history.
+    addRun(server, 'auth_failed', 'opencode: not signed in');
+    await refreshStore(page);
+    const signIn = card(page, /Agent sign-in failed/);
+    await expect(signIn).toContainText("The last run didn't start because the agent couldn't sign in");
+    await expect(signIn.locator('.home-ny-cta')).toHaveText('Sign the agent in again');
+    await expect(signIn).toHaveAttribute('href', '#/settings?tab=agent');
+    await expect(card(page, /Last run failed/)).toHaveCount(0);
+
+    // A run that works clears it, without leaving Home; focus that was on it moves to the steps.
+    await signIn.focus();
+    addRun(server, 'ok');
+    await refreshStore(page);
+    await expect(needsYou(page)).toHaveCount(0);
+    await expect(start.getByRole('listitem')).toHaveCount(4);
+    await expect(start.getByRole('heading', { name: 'Get started' })).toBeFocused();
   });
 });
