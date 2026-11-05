@@ -12,16 +12,22 @@
 // first step to do (remembered in the history entry, so back/forward return to it).
 //
 // Everything dynamic reaches the DOM through h() (text nodes); nothing here parses HTML.
-// Leaving the screen aborts in-flight reads and stops the LinkedIn poll; saves already sent
-// still land. A pending profile edit is saved first: the router waits for it (beforeLeave), and
-// moving between steps hands it to the editor's exit save.
+// Moving between steps keeps everything running: saves, connect requests (a step shown again
+// waits on a connect still running) and the LinkedIn sign-in poll (a sign-in that finishes after
+// Skip for now still counts). Leaving the screen aborts in-flight reads, stops that poll and
+// drops a sign-in still waiting on a browser approval, saying so in a toast (Settings can't see
+// it, and it would hold the callback port every other sign-in needs); saves and the other
+// connect requests already sent still land. One sign-in waits at a time (they share that port).
+// A pending profile edit is saved first: the router waits for it (beforeLeave), and moving
+// between steps hands it to the editor's exit save. Opened again once onboarded (Settings → Run
+// guided setup), the header links back to Settings.
 //
 // agentPanel(root, ctx) is exported for Settings → Agent; see its JSDoc below.
 
 import { api, errorText, isStaleSession } from '../core/api.js';
 import { fmtNum, h } from '../core/dom.js';
 import { ensureViewCss, href } from '../core/router.js';
-import { copyText, isBusy, setBusy } from '../core/ui.js';
+import { copyText, isBusy, setBusy, toast } from '../core/ui.js';
 import { badge } from '../components/badge.js';
 import { searchSelect } from '../components/searchSelect.js';
 import { wordmark } from '../shell.js';
@@ -119,14 +125,15 @@ const aborted = (err) => !!err && err.name === 'AbortError';
 // only the fix, since the app's session banner already says the rest.
 /** An OAuth wait the user stopped. The server may still hold the callback port meanwhile. */
 const STOPPED = 'Stopped waiting. If connecting again fails, restart coldtrail and try once more.';
-
-/** An AbortController that also aborts when `parent` does (Cancel inside a step's lifetime). */
-function childController(parent) {
-  const ctl = new AbortController();
-  if (parent.aborted) ctl.abort();
-  else parent.addEventListener('abort', () => ctl.abort(), { once: true });
-  return ctl;
-}
+/** The server couldn't listen for an approval: a wait setup doesn't know about holds the port. */
+const PORT_HELD =
+  'Another sign-in may still be waiting, maybe in Settings → Connections or another coldtrail tab: finish or cancel it there, or restart coldtrail, then try again.';
+/** The OAuth waits (jobs under these keys): what each is called, and the step it's shown on. */
+const WAITS = {
+  canonical: { name: 'Canonical approval', step: 'canonical' },
+  'gmail-google': { name: 'Google sign-in', step: 'destination' },
+  'gmail-client': { name: 'Google sign-in', step: 'destination' },
+};
 
 function extLink(url, text) {
   return h('a', { href: url, target: '_blank', rel: 'noopener noreferrer' }, text);
@@ -180,10 +187,13 @@ let apUid = 0;
  *     ('' = opencode's default).
  *   - Your own model: the base URL / model / API key form; Save posts {provider:'openai',
  *     base_url, model, api_key|null} (a blank key keeps the stored one). Choosing the card only
- *     opens the form; the provider switches on Save.
+ *     opens the form; the provider switches on Save. Until then the panel is pending().
  *   - Test connection: POST /api/provider/probe on the saved provider, result shown inline; a
  *     CLI that fails it also gets its sign-in command (its "signed in" state is only a file check).
+ *     A result, or a test still running, is about the agent and model it ran on: saving another
+ *     one clears it and frees the button.
  *   Saves go out one at a time, in the order they were made, so the last choice is the one kept.
+ *   Status reads are numbered: one that answers after a later one was applied is dropped.
  *
  * ctx (all optional):
  *   status     the StatusDto (GET /api/status) to render first. Without it the panel shows a
@@ -193,13 +203,17 @@ let apUid = 0;
  *              store can pass `() => store.refresh().then((s) => s.status)`.
  *   onChange(status, change) runs after each save lands, with the fresh status; change is
  *              { what: 'provider' | 'model' | 'byok', provider }.
+ *   onPending(pending) runs when pending() changes.
  *   signal     an AbortSignal; aborting it is destroy().
  *
- * Returns { el, update(status), settled(), destroy() }. update(status) re-renders from a status
- * the host already has (typing in the form and the last test result are kept). settled() →
- * Promise<boolean> waits for the saves already made (a model typed just before the host moves
- * on is saved when the field loses focus) and says whether they all landed. destroy() aborts
- * reads and the probe and empties `root`; a save already made still lands. The panel loads
+ * Returns { el, update(status), settled(), pending(), destroy() }. update(status) re-renders
+ * from a status the host already has (typing in the form and the last test result are kept).
+ * settled() → Promise<boolean> waits for the saves already made (a model typed just before the
+ * host moves on is saved when the field loses focus) and says whether they all landed.
+ * pending() → true while "Your own model" is the chosen card but its form isn't what's in use
+ * (nothing saved since it was chosen, or a field changed since): a host that moves on would leave
+ * it behind. A save on its way doesn't count (settled() waits for it). destroy() aborts reads and
+ * the probe and empties `root`; a save already made still lands. The panel loads
  * css/views/setup.css itself (ensureViewCss) and stays invisible until it has.
  */
 export function agentPanel(root, ctx = {}) {
@@ -214,7 +228,9 @@ export function agentPanel(root, ctx = {}) {
   let saving = null; // the CLI kind being saved
   let models = null; // null | { state: 'loading' | 'ready' | 'empty' | 'error', list, message }
   let byokDirty = false;
-  let probeFor = null; // the provider the shown test result is about
+  let probeFor = null; // the configuration (probeKey) the shown result, or the running test, is about
+  let probeRun = 0; // numbers each test, so one answering after a reset is dropped
+  let pendingShown = false; // pending() as onPending last heard it
   let destroyed = false;
   const cards = new Map(); // kind → { el, pick, badgeSlot, cmd }
   // Saves, each → Promise<boolean> (true = it landed). They run one after another in the order
@@ -242,6 +258,35 @@ export function agentPanel(root, ctx = {}) {
       console.error(err);
     }
   };
+
+  // Status reads, numbered: one that answers after a later one was applied is older news (a
+  // "Check again" landing after a card's save) and comes back as null.
+  let reads = 0;
+  let readApplied = 0;
+  async function read() {
+    const n = ++reads;
+    const fresh = await refresh();
+    if (n < readApplied) return null;
+    readApplied = n;
+    return fresh;
+  }
+
+  // What a test result is about: the agent and, for opencode or your own model, its model.
+  const probeKey = (s) =>
+    s.provider === 'opencode' ? `opencode|${s.opencode_model || ''}` : s.provider === OWN ? `${OWN}|${s.base_url || ''}|${s.model || ''}` : s.provider;
+
+  const pending = () => !!status && view === OWN && !isBusy(byokSave) && (byokDirty || status.provider !== OWN);
+  function notePending() {
+    const now = pending();
+    if (now === pendingShown || destroyed) return;
+    pendingShown = now;
+    if (typeof ctx.onPending !== 'function') return;
+    try {
+      ctx.onPending(now);
+    } catch (err) {
+      console.error(err);
+    }
+  }
 
   // ---- Shell of the panel ----
 
@@ -286,6 +331,7 @@ export function agentPanel(root, ctx = {}) {
     onInput: () => {
       byokDirty = true;
       setBaseError('');
+      notePending();
     },
   });
   const baseError = h('p', { class: 'field-error', id: `${uid}-base-error`, hidden: true });
@@ -298,6 +344,7 @@ export function agentPanel(root, ctx = {}) {
     spellcheck: 'false',
     onInput: () => {
       byokDirty = true;
+      notePending();
     },
   });
   const keyInput = h('input', {
@@ -308,6 +355,7 @@ export function agentPanel(root, ctx = {}) {
     spellcheck: 'false',
     onInput: () => {
       byokDirty = true;
+      notePending();
     },
   });
   const byokNote = h('p', { class: 'ap-byok-note' });
@@ -506,12 +554,10 @@ export function agentPanel(root, ctx = {}) {
     if (showTest) {
       const label = saved === OWN ? 'your model' : (cards.get(saved) || {}).name || saved;
       testNote.textContent = `Sends one tiny request to check that ${label} answers.`;
-      if (probeFor !== saved) {
-        say(testResult, '');
-        hideTestCmd();
-        probeFor = null;
-      }
     }
+    // A result, or a test still running, says nothing about another agent or model once that's
+    // the one saved.
+    if (probeFor !== null && probeFor !== probeKey(status)) resetProbe();
   }
 
   function render() {
@@ -521,6 +567,7 @@ export function agentPanel(root, ctx = {}) {
     grid.hidden = false;
     renderCards();
     renderDetails();
+    notePending();
   }
 
   // ---- Actions ----
@@ -530,10 +577,12 @@ export function agentPanel(root, ctx = {}) {
     loadError.hidden = true;
     grid.hidden = true;
     try {
-      const fresh = await refresh();
+      const fresh = await read();
       if (destroyed) return;
-      status = fresh;
-      view = status.provider;
+      if (fresh) {
+        status = fresh;
+        view = status.provider;
+      }
       render();
     } catch (err) {
       if (destroyed || aborted(err)) return;
@@ -551,8 +600,9 @@ export function agentPanel(root, ctx = {}) {
     if (isBusy(recheckBtn)) return;
     setBusy(recheckBtn, true, { label: 'Checking…' });
     try {
-      const fresh = await refresh();
-      if (destroyed) return;
+      // Older than a save's re-read that landed first (a card chosen meanwhile): nothing new.
+      const fresh = await read();
+      if (destroyed || !fresh) return;
       status = fresh;
       if (view !== OWN && saving == null) view = status.provider;
       render();
@@ -591,9 +641,9 @@ export function agentPanel(root, ctx = {}) {
     try {
       await api.post('/api/onboarding/provider', { provider: kind });
       saved = true;
-      const fresh = await refresh();
+      const fresh = await read();
       if (destroyed) return true;
-      status = fresh;
+      if (fresh) status = fresh;
       saving = null;
       view = status.provider;
       render();
@@ -648,9 +698,9 @@ export function agentPanel(root, ctx = {}) {
     try {
       await api.post('/api/onboarding/provider', { provider: 'opencode', opencode_model: value });
       saved = true;
-      const fresh = await refresh();
+      const fresh = await read();
       if (destroyed) return true;
-      status = fresh;
+      if (fresh) status = fresh;
       render();
       say(modelStatus, value ? 'Model saved' : "Using opencode's default model", 'ok');
       emit('model', 'opencode');
@@ -683,6 +733,7 @@ export function agentPanel(root, ctx = {}) {
     if (!modelInput.value.trim()) modelInput.value = OLLAMA.model;
     byokDirty = true;
     setBaseError('');
+    notePending();
   }
 
   function saveByok(e) {
@@ -702,6 +753,7 @@ export function agentPanel(root, ctx = {}) {
     setBaseError('');
     say(byokStatus, '');
     setBusy(byokSave, true, { label: 'Saving…' });
+    notePending();
     const key = keyInput.value.trim();
     track(() => sendByok({ provider: OWN, base_url: base, model: modelInput.value.trim(), api_key: key || null }));
   }
@@ -713,9 +765,11 @@ export function agentPanel(root, ctx = {}) {
       saved = true;
       keyInput.value = '';
       byokDirty = false;
-      const fresh = await refresh();
+      // The key may have changed with nothing else: a result from before is about the old one.
+      resetProbe();
+      const fresh = await read();
       if (destroyed) return true;
-      status = fresh;
+      if (fresh) status = fresh;
       view = OWN;
       setBusy(byokSave, false);
       render();
@@ -724,21 +778,32 @@ export function agentPanel(root, ctx = {}) {
     } catch (err) {
       if (destroyed || aborted(err)) return saved;
       setBusy(byokSave, false);
+      notePending();
       say(byokStatus, saved ? 'Saved. coldtrail now uses your own model.' : `Couldn't save: ${errorText(err)}`, saved ? 'ok' : 'err');
     }
     return saved;
   }
 
+  /** Forget the shown result and free the button; a test still running is dropped when it answers. */
+  function resetProbe() {
+    probeRun++;
+    probeFor = null;
+    say(testResult, '');
+    hideTestCmd();
+    setBusy(testBtn, false);
+  }
+
   async function runProbe() {
     if (isBusy(testBtn) || !status) return;
     const provider = status.provider;
-    probeFor = provider;
+    const run = ++probeRun;
+    probeFor = probeKey(status);
     hideTestCmd();
     setBusy(testBtn, true, { label: 'Testing…' });
     say(testResult, 'Running a quick check. This can take up to a minute.');
     try {
       const r = await api.post('/api/provider/probe', {}, { signal });
-      if (destroyed || probeFor !== provider) return;
+      if (destroyed || run !== probeRun) return;
       say(testResult, r.message || (r.ok ? 'It answered.' : "It didn't answer."), r.ok ? 'ok' : 'err');
       // "Ready" only means an auth file exists: a CLI whose login lapsed fails here, so offer
       // the way back in.
@@ -748,10 +813,10 @@ export function agentPanel(root, ctx = {}) {
         testCmd.hidden = false;
       }
     } catch (err) {
-      if (destroyed || aborted(err)) return;
+      if (destroyed || aborted(err) || run !== probeRun) return;
       say(testResult, errorText(err), 'err');
     } finally {
-      if (!destroyed) setBusy(testBtn, false);
+      if (!destroyed && run === probeRun) setBusy(testBtn, false);
     }
   }
 
@@ -785,6 +850,7 @@ export function agentPanel(root, ctx = {}) {
     settled() {
       return Promise.all([...inflight]).then((all) => all.every(Boolean));
     },
+    pending,
     destroy,
   };
 }
@@ -806,13 +872,29 @@ function mountSetup(root, ctx) {
 
   const progress = h('nav', { class: 'setup-progress', 'aria-label': 'Setup progress' });
   const main = h('div', { class: 'setup-main' });
+  const exit = h('a', { class: 'btn btn-ghost btn-sm setup-exit', href: '#/settings', hidden: true }, 'Back to Settings');
   const page = h(
     'div',
     { class: 'setup' },
-    h('header', { class: 'setup-top' }, wordmark(), h('span', { class: 'setup-top-sep', 'aria-hidden': 'true' }), h('h1', { class: 'setup-h1' }, 'Setup')),
+    h(
+      'header',
+      { class: 'setup-top' },
+      wordmark(),
+      h('span', { class: 'setup-top-sep', 'aria-hidden': 'true' }),
+      h('h1', { class: 'setup-h1' }, 'Setup'),
+      exit,
+    ),
     h('div', { class: 'setup-body' }, progress, main),
   );
   root.replaceChildren(page);
+  // Opened again once onboarded (Settings → Run guided setup), the screen has no sidebar: link
+  // back. Decided by the first status it has, so a first run doesn't grow one on the way through.
+  let exitDecided = false;
+  function renderExit() {
+    if (exitDecided || !status) return;
+    exitDecided = true;
+    exit.hidden = !status.onboarded;
+  }
 
   // ---- Status ----
 
@@ -876,8 +958,18 @@ function mountSetup(root, ctx) {
     nav.navigate(to, { replace: true, silent: true });
   }
 
+  // Status reads, numbered: one that answers after a later one was applied is older news (a
+  // "Check again" landing after a save's re-read) and leaves `status` as it is.
+  let statusReads = 0;
+  let statusApplied = 0;
+  /** → the newest status read so far (this one, unless a later one answered first). */
   async function fetchStatus() {
-    status = await api.get('/api/status', { signal: viewCtl.signal });
+    const n = ++statusReads;
+    const fresh = await api.get('/api/status', { signal: viewCtl.signal });
+    if (n > statusApplied) {
+      statusApplied = n;
+      status = fresh;
+    }
     return status;
   }
 
@@ -891,6 +983,171 @@ function mountSetup(root, ctx) {
     }
     renderProgress();
     if (scope && scope.api && scope.api.onStatus) scope.api.onStatus();
+  }
+
+  // ---- Connect requests ----
+
+  // Connect requests outlive the step that sent them, as in Settings: the server holds an OAuth
+  // connect open for the whole browser approval, and dropping it would stop the callback listener
+  // the approval comes back to. So they go out without the step's signal (only Cancel stops a
+  // wait), one that connects counts whatever is shown when it lands, and a step shown again
+  // waits on the one still running instead of starting another. They don't outlive the screen,
+  // though: unlike Settings' waits, which its module keeps, nothing could show or cancel one
+  // left behind (Settings doesn't know about these), and it would keep the server listening on
+  // the one callback port (8765) every sign-in needs. So unmounting drops the OAuth waits (see
+  // the end of mountSetup); the app-password check, which holds no port, still lands.
+  const jobs = new Map(); // key → { ctl: AbortController | null, done: Promise<{ r } | { err }> }
+
+  /**
+   * Send `send(signal)` under `key`; the signal is Cancel's (with `cancellable`, an OAuth wait),
+   * else none. An ok answer marks `confirms` connected (confirmed) before anything waiting on
+   * `done` runs. The shown step hears when the job starts and ends (jobsChanged).
+   */
+  function startJob(key, send, { cancellable = false, confirms = null } = {}) {
+    const ctl = cancellable ? new AbortController() : null;
+    const job = { ctl, done: null };
+    job.done = Promise.resolve()
+      .then(() => send(ctl ? ctl.signal : undefined))
+      .then(
+        (r) => {
+          if (confirms && !(r && r.ok === false)) confirmed(confirms);
+          return { r };
+        },
+        (err) => ({ err }),
+      )
+      .finally(() => {
+        if (jobs.get(key) === job) jobs.delete(key);
+        jobsChanged();
+      });
+    jobs.set(key, job);
+    jobsChanged();
+    return job;
+  }
+
+  /** A job started or ended: the shown step updates what depends on it (holdFor). */
+  function jobsChanged() {
+    if (viewCtl.signal.aborted) return;
+    if (scope && scope.api && scope.api.onJobs) scope.api.onJobs();
+  }
+
+  /** The OAuth wait other than `key`'s that is open now, if any: one at a time, as they share the port. */
+  const otherWait = (key) => {
+    for (const [k, job] of jobs) if (k !== key && job.ctl) return k;
+    return null;
+  };
+
+  /**
+   * An OAuth button while another sign-in waits: it stays focusable, dimmed (aria-disabled), and
+   * a press says why (held()). A busy button is left alone (setBusy owns it meanwhile).
+   */
+  function holdFor(btn, key) {
+    if (isBusy(btn)) return;
+    if (otherWait(key)) btn.setAttribute('aria-disabled', 'true');
+    else btn.removeAttribute('aria-disabled');
+  }
+
+  /** True, saying so in `msg`, when another sign-in's wait keeps `key` from starting now. */
+  function held(key, msg) {
+    const other = otherWait(key);
+    if (!other) return false;
+    const w = WAITS[other];
+    const where = w.step === step ? '' : ` on step ${STEPS.findIndex((s) => s.id === w.step) + 1}`;
+    say(msg, `Finish or cancel the ${w.name}${where} first: only one sign-in can wait at a time.`, 'err');
+    return true;
+  }
+
+  /** A connection an ok answer confirmed: it counts at once (status can lag), on any step. */
+  function confirmed(kind) {
+    local[kind] = true;
+    if (viewCtl.signal.aborted) return;
+    renderProgress();
+    if (scope && scope.api && scope.api.onStatus) scope.api.onStatus();
+    refreshStatus().catch(() => {});
+  }
+
+  /**
+   * Show `job` on a card until it lands: `btn` busy with `label`, `text` under it and, for a job
+   * that can be cancelled, `cancel` (waitCancel). Then `then(outcome)`, if the card is still shown.
+   */
+  function follow(sc, job, { btn, out, cancel = null, label, text }, then) {
+    if (cancel && job.ctl) cancel.start(job.ctl);
+    setBusy(btn, true, { label });
+    say(out, text);
+    job.done.then((o) => {
+      if (scope !== sc) return;
+      if (cancel) cancel.end();
+      setBusy(btn, false);
+      then(o);
+    });
+  }
+
+  /** What a landed job that didn't connect says, as say()'s [text, tone]; null when it did. */
+  function failure(o, fallback) {
+    if (o.err) return aborted(o.err) ? [STOPPED] : [errorText(o.err), 'err'];
+    if (o.r && o.r.ok === false) {
+      const msg = o.r.message || fallback;
+      // The server couldn't listen for the approval: a wait setup doesn't know about holds the
+      // port (setup's own are one at a time and end with the screen).
+      return [/callback port/i.test(msg) ? `${msg.replace(/\.\s*$/, '')}. ${PORT_HELD}` : msg, 'err'];
+    }
+    return null;
+  }
+
+  // ---- LinkedIn sign-in ----
+
+  // LinkedIn signs in through a Chrome window the server opens and watches, so no request is held
+  // open here: the screen polls the server's view of the sign-in instead. The poll is the
+  // screen's, not the step's: a sign-in that finishes after the step was left (Skip for now, a
+  // progress link) still counts, on the progress and the finish screen. It stops on unmount.
+  const li = { waiting: false, seq: 0, timer: null, card: null }; // card: the shown card's { started(), ended(outcome) }
+
+  /** The server's view of the sign-in, read with `signal` (null when it can't be read). */
+  function liState(signal) {
+    return api.get('/api/destination/linkedin/status', { signal }).catch(() => null);
+  }
+
+  function liStop() {
+    li.waiting = false;
+    li.seq++;
+    clearTimeout(li.timer);
+    li.timer = null;
+  }
+
+  /** A sign-in window is open (just now, or since before this screen): poll until it ends. */
+  function liWatch() {
+    liStop();
+    li.waiting = true;
+    liNext(li.seq);
+    if (li.card) li.card.started();
+  }
+
+  function liNext(seq) {
+    li.timer = setTimeout(() => liTick(seq), LINKEDIN_POLL_MS);
+  }
+
+  async function liTick(seq) {
+    let s;
+    try {
+      s = await api.get('/api/destination/linkedin/status', { signal: viewCtl.signal });
+    } catch (err) {
+      if (aborted(err) || seq !== li.seq) return;
+      // Every later poll would get the same 401: stop, and point at the fix.
+      if (isStaleSession(err)) liEnd({ err });
+      else liNext(seq); // a hiccup: try again next tick
+      return;
+    }
+    if (seq !== li.seq) return;
+    if (s.connected && !s.reconnect_needed) liEnd({ connected: true });
+    else if (!s.waiting) liEnd({ connected: false });
+    else liNext(seq);
+  }
+
+  /** The sign-in ended: the card, if one is shown, says how; a connection counts on any step. */
+  function liEnd(outcome) {
+    liStop();
+    if (outcome.connected) local.linkedin = true;
+    if (li.card) li.card.ended(outcome);
+    if (outcome.connected) confirmed('linkedin');
   }
 
   // ---- Progress ----
@@ -940,6 +1197,7 @@ function mountSetup(root, ctx) {
   }
 
   function show(want, { focus = false } = {}) {
+    renderExit();
     const target = resolveStep(want);
     // A bare #/setup stays bare; a step that needs an earlier one first names the one shown.
     if (!want) rememberBare(target);
@@ -977,12 +1235,17 @@ function mountSetup(root, ctx) {
     );
   }
 
-  function renderLoadError(err) {
+  /** Focus has nowhere to be: what had it was replaced (Try again's card) and nothing took it since. */
+  const focusLost = () => !document.activeElement || document.activeElement === document.body;
+
+  /** `focus`: put focus on this card's Try again (the last one had it, and this load failed too). */
+  function renderLoadError(err, { focus = false } = {}) {
     progress.hidden = true;
     // A stale session: the app's banner above says what happened (once, as the alert), and
     // retrying can't work until the tab is reopened, so the card only points at the fix.
     const stale = isStaleSession(err);
-    const retry = stale ? null : h('div', { class: 'setup-error-actions' }, h('button', { type: 'button', class: 'btn btn-secondary', onClick: load }, 'Try again'));
+    const again = stale ? null : h('button', { type: 'button', class: 'btn btn-secondary', onClick: (e) => load(e.currentTarget === document.activeElement) }, 'Try again');
+    const retry = again ? h('div', { class: 'setup-error-actions' }, again) : null;
     main.replaceChildren(
       h(
         'section',
@@ -996,19 +1259,25 @@ function mountSetup(root, ctx) {
         retry,
       ),
     );
+    if (focus && again) again.focus();
   }
 
-  async function load() {
+  /**
+   * Read status and show the asked-for step. `refocus`: Try again had focus when pressed; the
+   * card it sat on is gone, so focus moves on to what the load shows (the step's title, or the
+   * next Try again if this load failed too) unless something else took it meanwhile.
+   */
+  async function load(refocus = false) {
     renderLoading();
     try {
       await fetchStatus();
     } catch (err) {
       if (aborted(err)) return;
-      renderLoadError(err);
+      renderLoadError(err, { focus: refocus && focusLost() });
       return;
     }
     step = null;
-    show(requested);
+    show(requested, { focus: refocus && focusLost() });
   }
 
   // ---- A step card: eyebrow, title, description, content, footer ----
@@ -1112,15 +1381,23 @@ function mountSetup(root, ctx) {
         return s;
       },
       onChange: () => step_.gate(),
+      // "Your own model" chosen but not saved: Continue would leave it behind, typed key and all.
+      onPending: () => step_.gate(),
     });
     const reason = 'Choose an installed agent, or save your own model, to continue.';
+    const unsaved = 'Save your own model, or choose another agent, to continue.';
     return {
-      gate: () => (providerReady(status) ? { ok: true } : { ok: false, reason }),
-      // A model typed just before Continue was sent when the field lost focus: let it land
-      // (and stop here if it didn't, while its error is still on screen).
+      gate: () => (panel.pending() ? { ok: false, reason: unsaved } : providerReady(status) ? { ok: true } : { ok: false, reason }),
+      // A model typed just before Continue was sent when the field lost focus, and a Save pressed
+      // just before is on its way: let them land (and stop here if one didn't, while its error is
+      // still on screen).
       async beforeContinue() {
         if (!(await panel.settled())) {
           step_.showError("Your agent change didn't save. See the message above.");
+          return false;
+        }
+        if (panel.pending()) {
+          step_.showError(unsaved);
           return false;
         }
         if (!providerReady(status)) {
@@ -1139,7 +1416,7 @@ function mountSetup(root, ctx) {
 
   // ---- Step 2: Canonical ----
 
-  /** A Cancel for an OAuth wait: hidden until `start`, and putting focus back on `btn`. */
+  /** A Cancel for an OAuth wait: hidden until `start(ctl)`, aborts ctl, and puts focus back on `btn`. */
   function waitCancel(btn) {
     let ctl = null;
     const cancelBtn = h(
@@ -1158,10 +1435,9 @@ function mountSetup(root, ctx) {
     );
     return {
       el: cancelBtn,
-      start(parent) {
-        ctl = childController(parent);
+      start(waitCtl) {
+        ctl = waitCtl;
         cancelBtn.hidden = false;
-        return ctl.signal;
       },
       end() {
         ctl = null;
@@ -1195,46 +1471,37 @@ function mountSetup(root, ctx) {
         btn.className = on ? 'btn btn-secondary' : 'btn btn-primary';
         btn.textContent = on ? 'Reconnect' : 'Connect Canonical';
       }
+      holdFor(btn, 'canonical');
     }
 
-    async function connect() {
-      if (isBusy(btn)) return;
-      const wait = cancel.start(sc.ctl.signal);
-      setBusy(btn, true, { label: 'Waiting for approval…' });
-      say(msg, "Approve coldtrail in the browser tab that opened. This page updates when you're done.");
-      const settle = () => {
-        cancel.end();
-        setBusy(btn, false);
-      };
-      try {
-        const r = await api.post('/api/discovery/canonical/connect', {}, { signal: wait });
-        settle();
-        if (r && r.ok === false) {
-          say(msg, r.message || "Couldn't connect to Canonical.", 'err');
-        } else {
-          local.canonical = true;
-          say(msg, 'Canonical is connected.', 'ok');
-          await refreshStatus().catch(() => {});
-        }
-      } catch (err) {
-        if (sc.ctl.signal.aborted) return;
-        settle();
-        if (aborted(err)) say(msg, STOPPED);
-        else say(msg, errorText(err), 'err');
-      }
-      if (scope !== sc) return;
-      render();
-      renderProgress();
-      step_.gate();
+    function wait(job) {
+      const text = "Approve coldtrail in the browser tab that opened. This page updates when you're done.";
+      follow(sc, job, { btn, out: msg, cancel, label: 'Waiting for approval…', text }, (o) => {
+        const failed = failure(o, "Couldn't connect to Canonical.");
+        if (failed) say(msg, ...failed);
+        else say(msg, 'Canonical is connected.', 'ok');
+        render();
+        step_.gate();
+      });
+    }
+
+    function connect() {
+      if (isBusy(btn) || jobs.has('canonical') || held('canonical', msg)) return;
+      const send = (signal) => api.post('/api/discovery/canonical/connect', {}, { signal });
+      wait(startJob('canonical', send, { cancellable: true, confirms: 'canonical' }));
     }
 
     render();
+    // Left while the consent tab was open, and back: still waiting on that approval.
+    const running = jobs.get('canonical');
+    if (running) wait(running);
     return {
       gate: () => (canonicalOn() ? { ok: true } : { ok: false, reason: 'Connect Canonical to continue.' }),
       onStatus: () => {
         render();
         step_.gate();
       },
+      onJobs: render,
     };
   }
 
@@ -1408,6 +1675,8 @@ function mountSetup(root, ctx) {
       const on = gmailOn();
       badgeSlot.replaceChildren(on ? badge('Connected', 'ok') : badge('Not connected'));
       googleBlock.hidden = !status.gmail_client_configured;
+      holdFor(googleBtn, 'gmail-google');
+      holdFor(byoBtn, 'gmail-client');
       if (on) {
         note.textContent = status.auto_send
           ? `Auto-send is on: Send on the Drafts screen emails people right away, up to ${fmtNum(status.daily_send_cap)} a day. Change it in Settings → Sending.`
@@ -1436,20 +1705,33 @@ function mountSetup(root, ctx) {
       }
     }
 
-    async function connected(text) {
-      local.gmail = true;
+    // After a connect (startJob already counted it): the outcome on the card.
+    function connected(text) {
       clearMessages();
       say(msg, text, 'ok');
-      await refreshStatus().catch(() => {});
-      if (sc.ctl.signal.aborted) return;
       render();
       onChange();
       // The form that had focus folded away under "Use different credentials": land on the card.
+      // Focus the user moved on meanwhile (LinkedIn, Back) stays where they put it.
       const at = document.activeElement;
-      if (!el.contains(at) || at.closest('details:not([open])')) el.querySelector('.setup-conn-title').focus({ preventScroll: true });
+      if (!at || at === document.body || (el.contains(at) && at.closest('details:not([open])'))) {
+        el.querySelector('.setup-conn-title').focus({ preventScroll: true });
+      }
     }
 
-    async function connectAppPassword(e) {
+    function waitAppPassword(job) {
+      follow(sc, job, { btn: apBtn, out: ap.msg, label: 'Checking…', text: 'Checking the app password with Gmail…' }, (o) => {
+        const failed = failure(o, "Couldn't connect Gmail.");
+        if (failed) {
+          say(ap.msg, ...failed);
+          return;
+        }
+        pw.input.value = '';
+        connected('Gmail is connected.');
+      });
+    }
+
+    function connectAppPassword(e) {
       e.preventDefault();
       if (isBusy(apBtn)) return;
       const addr = email.input.value.trim();
@@ -1462,60 +1744,43 @@ function mountSetup(root, ctx) {
         (addr ? pw.input : email.input).focus();
         return;
       }
-      setBusy(apBtn, true, { label: 'Checking…' });
-      say(ap.msg, 'Checking the app password with Gmail…');
-      try {
-        const r = await api.post('/api/destination/gmail/app-password', { email: addr, app_password: pass }, { signal: sc.ctl.signal });
-        setBusy(apBtn, false);
-        if (r && r.ok === false) {
-          say(ap.msg, r.message || "Couldn't connect Gmail.", 'err');
-          return;
-        }
-        pw.input.value = '';
-        await connected('Gmail is connected.');
-      } catch (err) {
-        if (aborted(err)) return;
-        setBusy(apBtn, false);
-        say(ap.msg, errorText(err), 'err');
-      }
+      const send = () => api.post('/api/destination/gmail/app-password', { email: addr, app_password: pass });
+      waitAppPassword(startJob('gmail-ap', send, { confirms: 'gmail' }));
     }
 
-    async function oauth(btn, out, cancel) {
-      const wait = cancel.start(sc.ctl.signal);
-      setBusy(btn, true, { label: 'Waiting for Google…' });
-      say(out, "Approve coldtrail in the Google tab that opened. This page updates when you're done.");
-      const settle = () => {
-        cancel.end();
-        setBusy(btn, false);
-      };
-      try {
-        const r = await api.post('/api/destination/gmail/connect', { callback_port: 8765 }, { signal: wait });
-        settle();
-        if (r && r.ok === false) {
-          say(out, r.message || "Couldn't connect Gmail.", 'err');
-          return;
-        }
-        await connected('Gmail is connected.');
-      } catch (err) {
-        if (sc.ctl.signal.aborted) return;
-        settle();
-        if (aborted(err)) say(out, STOPPED);
-        else say(out, errorText(err), 'err');
-      }
+    // The Google wait, started from "Sign in with Google" or after saving your own client.
+    const googleWays = {
+      google: { btn: googleBtn, out: google.msg, cancel: googleCancel },
+      client: { btn: byoBtn, out: byo.msg, cancel: byoCancel },
+    };
+    function waitGoogle(way, job) {
+      const { out } = googleWays[way];
+      const text = "Approve coldtrail in the Google tab that opened. This page updates when you're done.";
+      follow(sc, job, { ...googleWays[way], label: 'Waiting for Google…', text }, (o) => {
+        const failed = failure(o, "Couldn't connect Gmail.");
+        if (failed) say(out, ...failed);
+        else connected('Gmail is connected.');
+      });
+    }
+
+    function oauth(way) {
+      const send = (signal) => api.post('/api/destination/gmail/connect', { callback_port: 8765 }, { signal });
+      waitGoogle(way, startJob(`gmail-${way}`, send, { cancellable: true, confirms: 'gmail' }));
     }
 
     function connectGoogle() {
       if (isBusy(googleBtn)) return;
       clearMessages();
-      oauth(googleBtn, google.msg, googleCancel);
+      if (!held('gmail-google', google.msg)) oauth('google');
     }
 
     async function connectOwnClient(e) {
       e.preventDefault();
       if (isBusy(byoBtn)) return;
+      clearMessages();
+      if (held('gmail-client', byo.msg)) return;
       const id = clientId.input.value.trim();
       invalid(clientId.input, !id, byo.msg);
-      clearMessages();
       if (!id) {
         say(byo.msg, 'Paste your client ID first.', 'err');
         clientId.input.focus();
@@ -1523,15 +1788,42 @@ function mountSetup(root, ctx) {
       }
       setBusy(byoBtn, true, { label: 'Saving…' });
       try {
-        await api.post('/api/destination/gmail/client', { client_id: id, client_secret: clientSecret.input.value.trim() }, { signal: sc.ctl.signal });
+        // No signal: a save that went out lands even if the step goes.
+        await api.post('/api/destination/gmail/client', { client_id: id, client_secret: clientSecret.input.value.trim() });
       } catch (err) {
-        if (aborted(err)) return;
+        if (scope !== sc) return;
         setBusy(byoBtn, false);
         say(byo.msg, errorText(err), 'err');
         return;
       }
+      // Left meanwhile: the client is saved, and Google's tab waits for a press here.
+      if (scope !== sc) return;
       setBusy(byoBtn, false);
-      await oauth(byoBtn, byo.msg, byoCancel);
+      if (held('gmail-client', byo.msg)) {
+        // Another sign-in started while this saved: the client is saved; this waits its turn.
+        holdFor(byoBtn, 'gmail-client');
+        return;
+      }
+      oauth('client'); // stays busy straight on, now waiting for Google
+    }
+
+    /** Open the folds around `node` (More options, Use different credentials). */
+    function unfold(node) {
+      for (let d = node.closest('details'); d; d = d.parentElement && d.parentElement.closest('details')) d.open = true;
+    }
+
+    render();
+    // Left while a check or a Google wait was running, and back: wait on it here too, in view.
+    const checking = jobs.get('gmail-ap');
+    if (checking) {
+      unfold(apBtn);
+      waitAppPassword(checking);
+    }
+    for (const way of Object.keys(googleWays)) {
+      const job = jobs.get(`gmail-${way}`);
+      if (!job) continue;
+      unfold(googleWays[way].btn);
+      waitGoogle(way, job);
     }
 
     return { el, render };
@@ -1549,14 +1841,12 @@ function mountSetup(root, ctx) {
       connHead('person', 'setup-linkedin-title', 'LinkedIn', note, badgeSlot),
       h('div', { class: 'setup-conn-body' }, row, msg),
     );
-    let phase = 'idle'; // idle | starting | waiting
-    let timer = null;
-    let pollSeq = 0;
+    let starting = false; // Connect pressed, the server's answer not back yet
 
     function render() {
       const on = linkedinOn();
       const reconnect = !on && status.linkedin_reconnect_needed;
-      if (phase === 'waiting') badgeSlot.replaceChildren(badge('Waiting for sign-in', 'accent'));
+      if (li.waiting) badgeSlot.replaceChildren(badge('Waiting for sign-in', 'accent'));
       else if (on) badgeSlot.replaceChildren(badge('Connected', 'ok'));
       else if (reconnect) badgeSlot.replaceChildren(badge('Reconnect needed', 'warn'));
       else badgeSlot.replaceChildren(badge('Not connected'));
@@ -1569,107 +1859,75 @@ function mountSetup(root, ctx) {
         : reconnect
           ? 'Your LinkedIn session expired. Reconnect to keep sending invites.'
           : `${how} Connecting opens Chrome at LinkedIn's sign-in page.`;
-      row.hidden = (on && phase === 'idle') || phase === 'waiting';
-      if (phase === 'idle' && !isBusy(btn)) btn.textContent = reconnect ? 'Reconnect LinkedIn' : 'Connect LinkedIn';
+      row.hidden = (on && !starting) || li.waiting;
+      if (!starting && !li.waiting && !isBusy(btn)) btn.textContent = reconnect ? 'Reconnect LinkedIn' : 'Connect LinkedIn';
     }
 
-    function stop() {
-      pollSeq++;
-      clearTimeout(timer);
-      timer = null;
-    }
-
-    function finish() {
-      stop();
-      phase = 'idle';
-      setBusy(btn, false);
-    }
-
-    function schedule(seq) {
-      timer = setTimeout(() => tick(seq), LINKEDIN_POLL_MS);
-    }
-
-    /** The server's view of the sign-in (null when it can't be read). */
-    function signInState() {
-      return api.get('/api/destination/linkedin/status', { signal: sc.ctl.signal }).catch(() => null);
-    }
-
-    async function tick(seq) {
-      let s;
-      try {
-        s = await api.get('/api/destination/linkedin/status', { signal: sc.ctl.signal });
-      } catch (err) {
-        if (aborted(err) || seq !== pollSeq) return;
-        schedule(seq); // a hiccup: try again next tick
-        return;
-      }
-      if (seq !== pollSeq) return;
-      if (s.connected && !s.reconnect_needed) {
-        finish();
-        local.linkedin = true;
-        say(msg, 'LinkedIn is connected.', 'ok');
-        render();
-        onChange();
-        refreshStatus().catch(() => {});
-      } else if (!s.waiting) {
-        finish();
-        say(msg, "LinkedIn sign-in didn't finish: the window was closed or it timed out. Try again.", 'err');
-        render();
-      } else {
-        schedule(seq);
-      }
-    }
-
-    /** A sign-in window is open (just now, or since before this card): wait for it to finish. */
-    function startWaiting() {
-      setBusy(btn, false);
-      phase = 'waiting';
+    /** The screen follows an open sign-in (started just now, or before this card was shown). */
+    function showWaiting() {
       say(msg, "Sign in to LinkedIn in the Chrome window that opened. This page updates when you're done.", 'busy');
       // The button hides while waiting: keep keyboard focus on the card.
       const hadFocus = document.activeElement === btn;
       render();
       if (hadFocus) el.querySelector('.setup-conn-title').focus({ preventScroll: true });
-      stop();
-      schedule(pollSeq);
+    }
+
+    /** How the sign-in ended (the screen's poll says); a connection already counts (liEnd). */
+    function ended(o) {
+      if (o.err) say(msg, errorText(o.err), 'err');
+      else if (o.connected) say(msg, 'LinkedIn is connected.', 'ok');
+      else say(msg, "LinkedIn sign-in didn't finish: the window was closed or it timed out. Try again.", 'err');
+      render();
+      onChange();
     }
 
     async function connect() {
-      if (phase !== 'idle' || isBusy(btn)) return;
-      phase = 'starting';
+      if (starting || li.waiting || isBusy(btn)) return;
+      starting = true;
       setBusy(btn, true, { label: 'Opening Chrome…' });
       say(msg, '');
+      let open = false;
+      let error = null;
       try {
-        const r = await api.post('/api/destination/linkedin/connect', {}, { signal: sc.ctl.signal });
-        if (r && r.status === 'busy') {
-          // Chrome may be busy with this user's own sign-in, started before this page was
-          // left and opened again: then keep waiting for it instead.
-          const s = await signInState();
-          if (sc.ctl.signal.aborted) return;
-          if (s && s.waiting) {
-            startWaiting();
-            return;
-          }
-          finish();
-          say(msg, 'Chrome is busy with another LinkedIn task. Try again in a moment.', 'err');
-          render();
-          return;
-        }
-        startWaiting();
+        // No signal: this starts the sign-in task on the server, which should start either way,
+        // and the screen follows it even if this step is gone by the time it answers.
+        const r = await api.post('/api/destination/linkedin/connect', {});
+        // Chrome may be busy with this user's own sign-in, opened before this screen (another
+        // tab, a reload): then wait for that one instead.
+        open = !(r && r.status === 'busy') || !!((await liState(viewCtl.signal)) || {}).waiting;
       } catch (err) {
-        if (aborted(err)) return;
-        finish();
-        say(msg, errorText(err), 'err');
-        render();
+        error = err;
       }
+      if (viewCtl.signal.aborted) return;
+      if (scope === sc) {
+        starting = false;
+        setBusy(btn, false);
+      }
+      if (open) {
+        if (!li.waiting) liWatch(); // shows it here, through li.card, if this card is still up
+        return;
+      }
+      if (scope !== sc) return;
+      say(msg, error ? errorText(error) : 'Chrome is busy with another LinkedIn task. Try again in a moment.', 'err');
+      render();
     }
 
-    // A sign-in started before (this step was left while it was open) is picked up again.
-    signInState().then((s) => {
-      if (!s || !s.waiting || phase !== 'idle' || sc.ctl.signal.aborted) return;
-      startWaiting();
+    const me = { started: showWaiting, ended };
+    li.card = me;
+    sc.cleanups.push(() => {
+      if (li.card === me) li.card = null;
     });
-
-    sc.cleanups.push(stop);
+    // A sign-in the screen follows already is shown at once. Else the server knows of one opened
+    // before this screen (another tab, a reload), and of one that finished where nothing here
+    // watched it, while the status this screen has still says otherwise: count that one.
+    if (li.waiting) showWaiting();
+    else {
+      liState(sc.ctl.signal).then((s) => {
+        if (!s || scope !== sc || starting || li.waiting) return;
+        if (s.waiting) liWatch();
+        else if (s.connected && !s.reconnect_needed && !linkedinOn()) confirmed('linkedin');
+      });
+    }
     return { el, render };
   }
 
@@ -1691,6 +1949,7 @@ function mountSetup(root, ctx) {
         linkedin.render();
         step_.gate();
       },
+      onJobs: () => gmail.render(),
     };
   }
 
@@ -1699,7 +1958,6 @@ function mountSetup(root, ctx) {
   function doneScreen(sc) {
     const homeBtn = h('button', { type: 'button', class: 'btn btn-primary', onClick: goHome }, 'Go to Home', icon('arrow', 16));
     const back = h('button', { type: 'button', class: 'btn btn-secondary', onClick: () => go('destination') }, 'Back');
-    const destOn = gmailOn() || linkedinOn();
     const nextItem = (to, iconName, title, text) =>
       h(
         'li',
@@ -1719,7 +1977,26 @@ function mountSetup(root, ctx) {
       if (scope !== sc) return;
       nav.navigate('#/home');
     }
-    return h(
+    const next = h(
+      'ul',
+      { class: 'setup-next' },
+      nextItem(
+        href(['agent'], { prompt: STARTER_PROMPT }),
+        'chat',
+        'Find your first companies',
+        'Open the agent with a starter request filled in. Nothing runs until you send it.',
+      ),
+      // ?new=1: Schedules opens its New schedule dialog straight away.
+      nextItem(href(['schedules'], { new: '1' }), 'clock', 'Create a schedule', 'Run the agent every day or week so new companies and drafts are waiting for you.'),
+    );
+    const note = h(
+      'p',
+      { class: 'setup-note' },
+      "Gmail and LinkedIn aren't connected yet. Connect them any time in ",
+      h('a', { href: '#/settings?tab=connections' }, 'Settings → Connections'),
+      '.',
+    );
+    const card = h(
       'section',
       { class: 'setup-card setup-done', 'aria-labelledby': 'setup-title' },
       h(
@@ -1728,29 +2005,19 @@ function mountSetup(root, ctx) {
         h('span', { class: 'setup-done-mark', 'aria-hidden': 'true' }, icon('check', 22)),
         h('h2', { class: 'setup-title', id: 'setup-title', tabindex: '-1' }, "You're set"),
         h('p', { class: 'setup-desc' }, 'coldtrail is ready to find companies and write drafts. Two good first steps:'),
-        h(
-          'ul',
-          { class: 'setup-next' },
-          nextItem(
-            href(['agent'], { prompt: STARTER_PROMPT }),
-            'chat',
-            'Find your first companies',
-            'Open the agent with a starter request filled in. Nothing runs until you send it.',
-          ),
-          nextItem('#/schedules', 'clock', 'Create a schedule', 'Run the agent every day or week so new companies and drafts are waiting for you.'),
-        ),
-        destOn
-          ? null
-          : h(
-              'p',
-              { class: 'setup-note' },
-              "Gmail and LinkedIn aren't connected yet. Connect them any time in ",
-              h('a', { href: '#/settings?tab=connections' }, 'Settings → Connections'),
-              '.',
-            ),
+        next,
       ),
       h('div', { class: 'setup-foot' }, h('div', { class: 'setup-foot-start' }, back), h('div', { class: 'setup-foot-end' }, homeBtn)),
     );
+    // A connect sent before skipping here can still land (startJob, the LinkedIn poll): the note
+    // follows it.
+    function renderNote() {
+      if (gmailOn() || linkedinOn()) note.remove();
+      else if (!note.parentNode) next.after(note);
+    }
+    renderNote();
+    sc.api = { onStatus: renderNote };
+    return card;
   }
 
   // ---- Start ----
@@ -1789,7 +2056,17 @@ function mountSetup(root, ctx) {
 
   return () => {
     teardownStep();
+    liStop();
     viewCtl.abort();
+    // An OAuth wait still open: drop it, so the server stops listening on the callback port (see
+    // "Connect requests"), and say so where the user went. One at a time (held), so one toast.
+    const waiting = [...jobs].find(([, job]) => job.ctl);
+    for (const [, job] of jobs) if (job.ctl) job.ctl.abort();
+    if (waiting) {
+      toast(
+        `Stopped waiting for the ${WAITS[waiting[0]].name} because you left setup. Close its browser tab and connect again in Settings → Connections.`,
+      );
+    }
     if (current === instance) current = null;
   };
 }

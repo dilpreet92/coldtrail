@@ -1,15 +1,18 @@
 // First-run setup (spec §5.1) on an empty workspace: the four steps (agent with the opencode model
 // picker and Test connection, Canonical, the company profile in Company profile's editor, where
-// outreach goes) and the "You're set" screen; Continue gating; the address (a bare #/setup stays
-// bare, a step that isn't open yet names the one shown); copy buttons; keyboard-only completion;
-// loading, error and stale-session states; saves that outlive the step (and keep their order);
+// outreach goes) and the "You're set" screen; Continue gating (an own model chosen but not saved
+// holds it); the address (a bare #/setup stays bare, a step that isn't open yet names the one
+// shown); copy buttons; keyboard-only completion; loading, error and stale-session states; saves
+// that outlive the step (and keep their order) and connect requests that do too (a step shown
+// again waits on them); a late status read or test result not overruling a later choice;
 // cancelling an OAuth wait; the outreach copy following auto-send; the LinkedIn poll stopping on
-// unmount and picking up a sign-in already open; hostile text staying text; and the exported
-// agentPanel working outside the wizard (Settings reuses it).
+// unmount and on a stale session, and picking up a sign-in already open; the way back to Settings
+// when setup is run again; hostile text staying text; and the exported agentPanel working outside
+// the wizard (Settings reuses it).
 //
 // Tests share one server and run in order: the early ones leave the workspace as they found it,
 // "walks all four steps to Home" onboards it, and the later ones build on that.
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { expectAccessible } from '../harness/a11y.mjs';
@@ -168,6 +171,8 @@ test('first load shows a loading state, then step 1 of 4', async ({ app, page })
   // The configured opencode is present, so step 1 can continue; there's nowhere to go back to.
   await expect(continueBtn(page)).not.toHaveAttribute('aria-disabled', 'true');
   await expect(foot(page).getByRole('button', { name: 'Back' })).toHaveCount(0);
+  // A first run has nowhere else to go (the app sends an unfinished workspace back here).
+  await expect(view(page).getByRole('link', { name: 'Back to Settings' })).toHaveCount(0);
 });
 
 test('status that fails to load shows the error and a retry', async ({ app, page }) => {
@@ -180,10 +185,19 @@ test('status that fails to load shows the error and a retry', async ({ app, page
   const alert = view(page).getByRole('alert').filter({ hasText: 'workspace is not readable' });
   await expect(alert).toBeVisible({ timeout: 15_000 });
   await expect(alert).toContainText("Setup couldn't load");
+  // Try again replaces the card it sits on: pressed from the keyboard, focus moves on to what
+  // the load shows (this card's Try again again when it fails again, else the step's title)
+  // instead of dropping to <body>.
+  const retry = view(page).getByRole('button', { name: 'Try again' });
+  await retry.focus();
+  await page.keyboard.press('Enter');
+  await expect(alert).toBeVisible();
+  await expect(retry).toBeFocused();
   fail = false;
-  await view(page).getByRole('button', { name: 'Try again' }).click();
+  await page.keyboard.press('Enter');
   await expect(stepTitle(page, 'agent')).toBeVisible();
   await expect(alert).toHaveCount(0);
+  await expect(stepTitle(page, 'agent')).toBeFocused();
 });
 
 test('stale session shows the session message once', async ({ app, page, context }) => {
@@ -268,7 +282,7 @@ test('model list loading, empty and error states fall back to free text', async 
   // Free text still saves.
   await model.fill('custom/model-x');
   await model.press('Enter');
-  await expect(view(page).locator('.ap-model [role="status"]')).toHaveText('Model saved');
+  await expect(view(page).locator('.ap-model .ap-msg[role="status"]')).toHaveText('Model saved');
   expect((await getJSON(request, server, '/api/status')).opencode_model).toBe('custom/model-x');
 
   // A failed listing says so, and typing still works.
@@ -282,11 +296,11 @@ test('model list loading, empty and error states fall back to free text', async 
 
   // Clearing it goes back to opencode's default; then restore the seeded model.
   await view(page).getByRole('button', { name: 'Clear Model' }).click();
-  await expect(view(page).locator('.ap-model [role="status"]')).toHaveText("Using opencode's default model");
+  await expect(view(page).locator('.ap-model .ap-msg[role="status"]')).toHaveText("Using opencode's default model");
   expect((await getJSON(request, server, '/api/status')).opencode_model).toBeNull();
   await model.fill('fake/model-a');
   await model.press('Enter');
-  await expect(view(page).locator('.ap-model [role="status"]')).toHaveText('Model saved');
+  await expect(view(page).locator('.ap-model .ap-msg[role="status"]')).toHaveText('Model saved');
   expect((await getJSON(request, server, '/api/status')).opencode_model).toBe('fake/model-a');
 });
 
@@ -363,6 +377,45 @@ test('agent changes save one at a time, in the order made', async ({ app, page, 
   expect(res.status()).toBe(200);
 });
 
+test('a Check again that answers late does not undo a card chosen after it', async ({ app, page, request, server }) => {
+  await app.goto('#/setup/agent');
+  await expect(pick(page, 'opencode')).toHaveAttribute('aria-pressed', 'true');
+  // The next status read is taken now (opencode) and answered only when released: a slow read.
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  let holdNext = true;
+  await page.route(statusPath, async (route) => {
+    if (!holdNext) return route.fallback();
+    holdNext = false;
+    const res = await route.fetch();
+    await held;
+    await route.fulfill({ response: res });
+  });
+  await view(page).getByRole('button', { name: 'Check again' }).click();
+  await expect(view(page).getByRole('button', { name: 'Checking…' })).toBeVisible();
+  await pick(page, 'codex').click();
+  await expect(card(page, 'codex')).not.toHaveClass(/is-saving/);
+  expect((await getJSON(request, server, '/api/status')).provider).toBe('codex');
+
+  const landed = page.waitForEvent('requestfinished', (req) => statusPath(new URL(req.url())));
+  release();
+  await landed;
+  await expect(view(page).getByRole('button', { name: 'Check again' })).toBeVisible();
+  // The older answer is dropped: Codex CLI stays the chosen card, with its own test note.
+  await expect(pick(page, 'codex')).toHaveAttribute('aria-pressed', 'true');
+  await expect(pick(page, 'opencode')).toHaveAttribute('aria-pressed', 'false');
+  await expect(view(page).getByRole('combobox', { name: 'Model' })).toBeHidden();
+  await expect(view(page).locator('.ap-test-note')).toHaveText('Sends one tiny request to check that Codex CLI answers.');
+  expect((await getJSON(request, server, '/api/status')).provider).toBe('codex');
+
+  const res = await request.post(server.apiUrl('/api/onboarding/provider'), {
+    data: { provider: 'opencode', opencode_model: 'fake/model-a' },
+  });
+  expect(res.status()).toBe(200);
+});
+
 test('a failed connection test offers the sign-in command again', async ({ app, page, context, server }) => {
   await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: server.base });
   // "Ready" only means an auth file exists; a login that lapsed fails the test.
@@ -399,6 +452,53 @@ test('a failed connection test offers the sign-in command again', async ({ app, 
   await testBox.getByRole('button', { name: 'Test connection' }).click();
   await expect(testBox.locator('.ap-test-result')).toHaveText(answer.message);
   await expect(testBox.locator('code')).toHaveCount(0);
+});
+
+test('a connection test result is about the agent and model it ran on', async ({ app, page, request, server }) => {
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  await page.route('**/api/provider/probe', async (route) => {
+    await held;
+    await route.fulfill({ json: { ok: true, message: 'opencode is signed in and responding.' } });
+  });
+  await app.goto('#/setup/agent');
+  const testBox = view(page).locator('.ap-test');
+  const result = testBox.locator('.ap-test-result');
+  const testBtn = testBox.getByRole('button', { name: 'Test connection' });
+  await testBtn.click();
+  await expect(testBox.getByRole('button', { name: 'Testing…' })).toHaveAttribute('aria-busy', 'true');
+
+  // Another agent while it runs: that test is about opencode, so Codex CLI's button is free at
+  // once and the late answer isn't shown under it.
+  await pick(page, 'codex').click();
+  await expect(card(page, 'codex')).not.toHaveClass(/is-saving/);
+  await expect(testBox.locator('.ap-test-note')).toHaveText('Sends one tiny request to check that Codex CLI answers.');
+  await expect(testBtn).toBeVisible();
+  await expect(testBtn).not.toHaveAttribute('aria-busy', 'true');
+  await expect(result).toHaveText('');
+  const landed = page.waitForEvent('requestfinished', (req) => new URL(req.url()).pathname === '/api/provider/probe');
+  release();
+  await landed;
+  await expect(result).toHaveText('');
+  await expect(testBtn).not.toHaveAttribute('aria-busy', 'true');
+
+  // A pass, then another model: the pass was about the old model, so it goes.
+  await pick(page, 'opencode').click();
+  await expect(card(page, 'opencode')).not.toHaveClass(/is-saving/);
+  await testBtn.click();
+  await expect(result).toHaveText('opencode is signed in and responding.');
+  const model = view(page).getByRole('combobox', { name: 'Model' });
+  await model.fill('custom/untested-model');
+  await model.press('Enter');
+  await expect(view(page).locator('.ap-model .ap-msg[role="status"]')).toHaveText('Model saved');
+  await expect(result).toHaveText('');
+
+  const res = await request.post(server.apiUrl('/api/onboarding/provider'), {
+    data: { provider: 'opencode', opencode_model: 'fake/model-a' },
+  });
+  expect(res.status()).toBe(200);
 });
 
 test('your own model: the form checks the URL, saves, tests and switches back', async ({ app, page, request, server }) => {
@@ -460,6 +560,78 @@ test('your own model: the form checks the URL, saves, tests and switches back', 
   await expect(form.getByLabel('Base URL')).toHaveValue('http://localhost:11434/v1');
 });
 
+test('Continue holds an own model that is chosen but not saved', async ({ app, page, request, server }) => {
+  const saves = recordProviderSaves(page);
+  await app.goto('#/setup/agent');
+  await expect(pick(page, 'opencode')).toHaveAttribute('aria-pressed', 'true');
+  const hint = foot(page).locator('.setup-hint');
+  await expect(continueBtn(page)).not.toHaveAttribute('aria-disabled', 'true');
+
+  // Choosing the card only opens the form and opencode stays in use: Continue would leave the
+  // chosen model behind (typed key and all), so it waits for a save or another card.
+  const reason = 'Save your own model, or choose another agent, to continue.';
+  await pick(page, 'openai').click();
+  const form = view(page).getByRole('form', { name: 'Your own model' });
+  await expect(form).toBeVisible();
+  await expect(continueBtn(page)).toHaveAttribute('aria-disabled', 'true');
+  await expect(hint).toHaveText(reason);
+  await form.getByLabel('Base URL').fill('https://api.example.com/v1');
+  await form.getByLabel('Model').fill('my-model');
+  await form.getByLabel('API key').fill('sk-typed-secret');
+  await continueBtn(page).click({ force: true });
+  await expect(hint).toHaveClass(/is-error/);
+  await expect(page).toHaveURL(hashIs('#/setup/agent'));
+  await expect(pick(page, 'openai')).toHaveAttribute('aria-pressed', 'true');
+  await expect(form.getByLabel('API key')).toHaveValue('sk-typed-secret');
+  expect(saves).toEqual([]);
+
+  // Another card lets it through (the form keeps what was typed for when it's chosen again).
+  await pick(page, 'opencode').click();
+  await expect(continueBtn(page)).not.toHaveAttribute('aria-disabled', 'true');
+  await expect(hint).toHaveText('');
+  await pick(page, 'openai').click();
+  await expect(form.getByLabel('Model')).toHaveValue('my-model');
+  await expect(continueBtn(page)).toHaveAttribute('aria-disabled', 'true');
+
+  // So does a save; an edit after it holds Continue again.
+  await form.getByRole('button', { name: 'Save' }).click();
+  await expect(form.getByRole('status')).toHaveText('Saved. coldtrail now uses your own model.');
+  await expect(continueBtn(page)).not.toHaveAttribute('aria-disabled', 'true');
+  await expect(hint).toHaveText('');
+  let status = await getJSON(request, server, '/api/status');
+  expect(status.provider).toBe('openai');
+  expect(status.base_url).toBe('https://api.example.com/v1');
+  expect(status.key_set).toBe(true);
+  await form.getByLabel('Model').fill('my-other-model');
+  await expect(continueBtn(page)).toHaveAttribute('aria-disabled', 'true');
+  await expect(hint).toHaveText(reason);
+
+  // Save, then Continue while that save is on its way: Continue waits for it, then goes on.
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  await page.route('**/api/onboarding/provider', async (route) => {
+    await held;
+    await route.fallback();
+  });
+  await form.getByRole('button', { name: 'Save' }).click();
+  await expect(continueBtn(page)).not.toHaveAttribute('aria-disabled', 'true');
+  await continueBtn(page).click();
+  await expect(continueBtn(page)).toHaveAttribute('aria-busy', 'true');
+  await expect(stepTitle(page, 'agent')).toBeVisible();
+  release();
+  await expect(stepTitle(page, 'canonical')).toBeVisible();
+  status = await getJSON(request, server, '/api/status');
+  expect(status.provider).toBe('openai');
+  expect(status.model).toBe('my-other-model');
+  expect(saves.map((s) => s.model)).toEqual(['my-model', 'my-other-model']);
+
+  const res = await request.post(server.apiUrl('/api/onboarding/provider'), { data: { provider: 'opencode' } });
+  expect(res.status()).toBe(200);
+  expect((await getJSON(request, server, '/api/status')).opencode_model).toBe('fake/model-a');
+});
+
 test('walks all four steps to Home', async ({ app, page, request, server }) => {
   const canonicalCalls = [];
   await connectCanonicalLikeOAuth(page, server, canonicalCalls);
@@ -485,7 +657,7 @@ test('walks all four steps to Home', async ({ app, page, request, server }) => {
   await expect(view(page).getByRole('option')).toHaveText(['fake/model-a', 'fake/model-b', 'opencode/free-c']);
   await view(page).getByRole('option', { name: 'fake/model-b' }).click();
   await expect(model).toHaveValue('fake/model-b');
-  await expect(view(page).locator('.ap-model [role="status"]')).toHaveText('Model saved');
+  await expect(view(page).locator('.ap-model .ap-msg[role="status"]')).toHaveText('Model saved');
   expect((await getJSON(request, server, '/api/status')).opencode_model).toBe('fake/model-b');
 
   const test_ = view(page).getByRole('button', { name: 'Test connection' });
@@ -544,10 +716,13 @@ test('walks all four steps to Home', async ({ app, page, request, server }) => {
   await expect(stepTitle(page, 'done')).toBeFocused();
   const agentLink = view(page).getByRole('link', { name: /Find your first companies/ });
   await expect(agentLink).toHaveAttribute('href', /^#\/agent\?prompt=.+/);
-  await expect(view(page).getByRole('link', { name: /Create a schedule/ })).toHaveAttribute('href', '#/schedules');
+  // Create a schedule opens Schedules' New schedule dialog straight away (?new=1).
+  await expect(view(page).getByRole('link', { name: /Create a schedule/ })).toHaveAttribute('href', '#/schedules?new=1');
   await expect(view(page)).toContainText("Gmail and LinkedIn aren't connected yet");
   const status = await getJSON(request, server, '/api/status');
   expect(status.onboarded).toBe(true);
+  // Onboarded on the way through, but a first run never came from Settings: no way back there.
+  await expect(view(page).getByRole('link', { name: 'Back to Settings' })).toHaveCount(0);
   await view(page).getByRole('button', { name: 'Go to Home' }).click();
   await expect(page).toHaveURL(hashIs('#/home'));
   await expect(page.locator('.setup')).toHaveCount(0);
@@ -712,9 +887,23 @@ test('a profile that fails to load says so and can be retried', async ({ app, pa
 test('a profile that meets a stale session points at the fix, once', async ({ app, page, request, server }) => {
   app.allowConsole(/status of 401/);
   await onboard(request, server);
-  await page.route('**/api/company', (route) =>
-    route.request().method() === 'GET' ? route.fulfill({ status: 401, contentType: 'text/plain', body: 'unauthorized' }) : route.fallback(),
-  );
+  // The session goes stale (coldtrail restarted) just as the profile loads: from that read on,
+  // every answer is a refusal, as it would be (one that isn't a 401 means the tab works again),
+  // including a request already on its way then.
+  let stale = false;
+  const refuse = (route) => route.fulfill({ status: 401, contentType: 'text/plain', body: 'unauthorized' });
+  await page.route('**/api/**', async (route) => {
+    const req = route.request();
+    if (req.method() === 'GET' && new URL(req.url()).pathname === '/api/company') stale = true;
+    if (stale) return refuse(route);
+    try {
+      const res = await route.fetch();
+      await (stale ? refuse(route) : route.fulfill({ response: res }));
+    } catch (err) {
+      // A read the end of the test cut off: nothing waits for it.
+      if (!/disposed|closed|ended/i.test(String(err))) throw err;
+    }
+  });
   await app.goto('#/setup/company');
   await expect(stepTitle(page, 'company')).toBeVisible();
   const loadError = view(page).locator('.pe-load-error');
@@ -839,6 +1028,245 @@ test('an OAuth wait can be cancelled', async ({ app, page, request, server }) =>
   await expect(continueBtn(page)).not.toHaveAttribute('aria-disabled', 'true');
 });
 
+test('connect requests outlive their step, and the step shown again waits on them', async ({ app, page, request, server }) => {
+  await onboard(request, server);
+  // Canonical still to connect, so the approval that comes back after the step was left counts.
+  removeCanonicalToken(server);
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  const canonicalCalls = [];
+  await page.route('**/api/discovery/canonical/connect', async (route) => {
+    canonicalCalls.push(route.request().postDataJSON());
+    await held;
+    storeCanonicalToken(server);
+    await route.fulfill({ json: { ok: true, message: null } });
+  });
+  const failed = [];
+  page.on('requestfailed', (req) => {
+    const path = new URL(req.url()).pathname;
+    if (req.method() === 'POST' && path.startsWith('/api/d')) failed.push(`${path} ${req.failure().errorText}`);
+  });
+  const finished = (path) => page.waitForEvent('requestfinished', (req) => new URL(req.url()).pathname === path);
+  const progress = view(page).getByRole('navigation', { name: 'Setup progress' });
+  const progressItem = (n) => progress.getByRole('listitem').nth(n);
+
+  await app.goto('#/setup/canonical');
+  const canonical = view(page).getByRole('region', { name: 'Canonical' });
+  const waiting = canonical.getByRole('button', { name: 'Waiting for approval…' });
+  await canonical.getByRole('button', { name: 'Connect Canonical' }).click();
+  await expect(waiting).toHaveAttribute('aria-busy', 'true');
+
+  // Back while the consent tab is open: the server's callback listener lives only as long as
+  // that request, so it stays open; shown again, the step waits on it instead of starting another.
+  await foot(page).getByRole('button', { name: 'Back' }).click();
+  await expect(stepTitle(page, 'agent')).toBeVisible();
+  await continueBtn(page).click();
+  await expect(stepTitle(page, 'canonical')).toBeVisible();
+  await expect(waiting).toHaveAttribute('aria-busy', 'true');
+  await expect(canonical.locator('.setup-msg')).toHaveText("Approve coldtrail in the browser tab that opened. This page updates when you're done.");
+  await expect(canonical.getByRole('button', { name: 'Cancel' })).toBeVisible();
+  expect(canonicalCalls).toEqual([{}]);
+
+  // A progress link leaves it too; the approval then lands with the step gone, and still counts.
+  await progress.getByRole('link', { name: /Agent/ }).click();
+  await expect(stepTitle(page, 'agent')).toBeVisible();
+  await expect(progressItem(1)).not.toHaveClass(/is-done/);
+  const canonicalDone = finished('/api/discovery/canonical/connect');
+  release();
+  await canonicalDone;
+  await expect(progressItem(1)).toHaveClass(/is-done/);
+  await progress.getByRole('link', { name: /Canonical/ }).click();
+  await expect(canonical.locator('.badge')).toHaveText('Connected');
+  await expect(canonical.getByRole('button', { name: 'Reconnect' })).toBeVisible();
+  await expect(continueBtn(page)).not.toHaveAttribute('aria-disabled', 'true');
+  expect(canonicalCalls).toEqual([{}]);
+
+  // Gmail's app-password check, then Skip for now: it still connects, and the finish screen
+  // stops saying nothing is connected.
+  let releaseGmail;
+  const gmailHeld = new Promise((resolve) => {
+    releaseGmail = resolve;
+  });
+  await page.route('**/api/destination/gmail/app-password', async (route) => {
+    await gmailHeld;
+    await route.fallback(); // the harness's intercept answers {ok:true}
+  });
+  await page.evaluate(() => {
+    location.hash = '#/setup/destination';
+  });
+  const gmail = view(page).getByRole('region', { name: 'Gmail' });
+  await gmail.getByLabel('Gmail address', { exact: true }).fill('dee@example.com');
+  await gmail.getByLabel('App password', { exact: true }).fill('abcd efgh ijkl mnop');
+  await gmail.getByRole('button', { name: 'Connect Gmail' }).click();
+  await expect(gmail.getByRole('button', { name: 'Checking…' })).toHaveAttribute('aria-busy', 'true');
+  await foot(page).getByRole('button', { name: 'Skip for now' }).click();
+  await expect(stepTitle(page, 'done')).toBeVisible();
+  await expect(view(page)).toContainText("Gmail and LinkedIn aren't connected yet");
+  await expect(progressItem(3)).not.toHaveClass(/is-done/);
+  const gmailDone = finished('/api/destination/gmail/app-password');
+  releaseGmail();
+  await gmailDone;
+  await expect(progressItem(3)).toHaveClass(/is-done/);
+  await expect(view(page)).not.toContainText("aren't connected yet");
+  expect(app.calls.map((c) => c.path)).toEqual(['/api/destination/gmail/app-password']);
+  expect(failed).toEqual([]);
+});
+
+test('leaving setup stops its sign-in wait, and says so', async ({ app, page, request, server }) => {
+  await onboard(request, server);
+  // The approval never comes (its consent tab is left open): the request hangs until dropped.
+  const connects = [];
+  await page.route('**/api/discovery/canonical/connect', (route) => {
+    connects.push(route.request().postDataJSON());
+  });
+  const dropped = [];
+  page.on('requestfailed', (req) => {
+    if (new URL(req.url()).pathname === '/api/discovery/canonical/connect') dropped.push(req.failure().errorText);
+  });
+  await app.goto('#/settings');
+  await view(page).getByRole('link', { name: 'Run guided setup' }).click();
+  await expect(stepTitle(page, 'agent')).toBeVisible();
+  await page.evaluate(() => {
+    location.hash = '#/setup/canonical';
+  });
+  const canonical = view(page).getByRole('region', { name: 'Canonical' });
+  await canonical.getByRole('button', { name: 'Reconnect' }).click();
+  await expect(canonical.getByRole('button', { name: 'Waiting for approval…' })).toHaveAttribute('aria-busy', 'true');
+
+  // Moving between steps keeps the wait (above); leaving the screen drops it, so the server
+  // stops listening on the callback port every other sign-in needs (Settings' included), and a
+  // toast says what happened.
+  await view(page).getByRole('link', { name: 'Back to Settings' }).click();
+  await expect(page.locator('.setup')).toHaveCount(0);
+  await expect.poll(() => dropped).toEqual(['net::ERR_ABORTED']);
+  await expect(page.locator('#toasts .toast')).toHaveText(
+    'Stopped waiting for the Canonical approval because you left setup. Close its browser tab and connect again in Settings → Connections.',
+  );
+
+  // Setup opened again has nothing to wait on: a plain Reconnect that starts afresh.
+  await page.evaluate(() => {
+    location.hash = '#/setup/canonical';
+  });
+  await expect(stepTitle(page, 'canonical')).toBeVisible();
+  await expect(canonical.getByRole('button', { name: 'Reconnect' })).not.toHaveAttribute('aria-busy', 'true');
+  await expect(canonical.getByRole('button', { name: 'Cancel' })).toHaveCount(0);
+  await expect(canonical.locator('.setup-msg')).toHaveText('');
+  expect(connects).toEqual([{}]);
+});
+
+test('one sign-in waits at a time, and a port another one holds is explained', async ({ app, page, request, server }) => {
+  await onboard(request, server);
+  // A Google client is saved, so "Sign in with Google" shows under More options.
+  await page.route(statusPath, async (route) => {
+    try {
+      const res = await route.fetch();
+      await route.fulfill({ response: res, json: { ...(await res.json()), gmail_client_configured: true } });
+    } catch (err) {
+      if (!/disposed|closed|ended/i.test(String(err))) throw err;
+    }
+  });
+  // Approvals that never come: each request hangs until cancelled.
+  const connects = [];
+  await page.route('**/api/discovery/canonical/connect', () => connects.push('canonical'));
+  await page.route('**/api/destination/gmail/connect', () => connects.push('google'));
+  const clientSaves = [];
+  page.on('request', (req) => {
+    if (new URL(req.url()).pathname === '/api/destination/gmail/client') clientSaves.push(req.postDataJSON());
+  });
+  const progress = view(page).getByRole('navigation', { name: 'Setup progress' });
+
+  await app.goto('#/setup/canonical');
+  const canonical = view(page).getByRole('region', { name: 'Canonical' });
+  await canonical.getByRole('button', { name: 'Reconnect' }).click();
+  await expect(canonical.getByRole('button', { name: 'Waiting for approval…' })).toHaveAttribute('aria-busy', 'true');
+
+  // On to step 4 while it waits: Google's sign-in comes back to the same callback port, so it
+  // holds (focusable, dimmed) and a press says why instead of opening a second consent tab.
+  await continueBtn(page).click();
+  await expect(stepTitle(page, 'company')).toBeVisible();
+  await continueBtn(page).click();
+  await expect(stepTitle(page, 'destination')).toBeVisible();
+  const gmail = view(page).getByRole('region', { name: 'Gmail' });
+  const google = gmail.getByRole('button', { name: 'Sign in with Google' });
+  const byo = gmail.getByRole('button', { name: 'Save and connect' });
+  await gmail.getByText('More options').click();
+  await expect(google).toHaveAttribute('aria-disabled', 'true');
+  await expect(byo).toHaveAttribute('aria-disabled', 'true');
+  await google.click({ force: true });
+  await expect(gmail.locator('#setup-gmail-google-msg')).toHaveText(
+    'Finish or cancel the Canonical approval on step 2 first: only one sign-in can wait at a time.',
+  );
+  await gmail.getByLabel('Client ID', { exact: true }).fill('999-e2e.apps.googleusercontent.com');
+  await byo.click({ force: true });
+  await expect(gmail.locator('#setup-gmail-client-msg')).toHaveText(
+    'Finish or cancel the Canonical approval on step 2 first: only one sign-in can wait at a time.',
+  );
+  expect(connects).toEqual(['canonical']);
+  expect(clientSaves).toEqual([]);
+
+  // Cancelled there, Google can go; then it holds the own-client way in turn.
+  await progress.getByRole('link', { name: /Canonical/ }).click();
+  await canonical.getByRole('button', { name: 'Cancel' }).click();
+  await expect(canonical.locator('.setup-msg')).toHaveText(STOPPED);
+  await page.evaluate(() => {
+    location.hash = '#/setup/destination';
+  });
+  await gmail.getByText('More options').click();
+  await expect(google).not.toHaveAttribute('aria-disabled', /.*/);
+  await google.click();
+  await expect(gmail.getByRole('button', { name: 'Waiting for Google…' })).toHaveAttribute('aria-busy', 'true');
+  await expect(byo).toHaveAttribute('aria-disabled', 'true');
+  await gmail.getByLabel('Client ID', { exact: true }).fill('999-e2e.apps.googleusercontent.com');
+  await byo.click({ force: true });
+  await expect(gmail.locator('#setup-gmail-client-msg')).toHaveText('Finish or cancel the Google sign-in first: only one sign-in can wait at a time.');
+  expect(connects).toEqual(['canonical', 'google']);
+  expect(clientSaves).toEqual([]);
+  await gmail.getByRole('button', { name: 'Cancel' }).click();
+  await expect(gmail.locator('#setup-gmail-google-msg')).toHaveText(STOPPED);
+  await expect(byo).not.toHaveAttribute('aria-disabled', /.*/);
+
+  // A port the server can't listen on (a wait left open in Settings, or in another tab, holds
+  // it) says what to do, not just the server's words.
+  await page.unroute('**/api/discovery/canonical/connect');
+  await page.route('**/api/discovery/canonical/connect', (route) =>
+    route.fulfill({ json: { ok: false, message: 'could not bind callback port 8765' } }),
+  );
+  await progress.getByRole('link', { name: /Canonical/ }).click();
+  await canonical.getByRole('button', { name: 'Reconnect' }).click();
+  await expect(canonical.locator('.setup-msg')).toHaveText(
+    'could not bind callback port 8765. Another sign-in may still be waiting, maybe in Settings → Connections or another coldtrail tab: finish or cancel it there, or restart coldtrail, then try again.',
+  );
+});
+
+test('a Gmail connect that lands leaves focus where the user moved it', async ({ app, page, request, server }) => {
+  await onboard(request, server);
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  await page.route('**/api/destination/gmail/app-password', async (route) => {
+    await held;
+    await route.fallback(); // the harness's intercept answers {ok:true}
+  });
+  await app.goto('#/setup/destination');
+  const gmail = view(page).getByRole('region', { name: 'Gmail' });
+  const linkedin = view(page).getByRole('region', { name: 'LinkedIn' });
+  await gmail.getByLabel('Gmail address', { exact: true }).fill('dee@example.com');
+  await gmail.getByLabel('App password', { exact: true }).fill('abcd efgh ijkl mnop');
+  await gmail.getByRole('button', { name: 'Connect Gmail' }).click();
+  await expect(gmail.getByRole('button', { name: 'Checking…' })).toHaveAttribute('aria-busy', 'true');
+  // The check takes a few seconds; the user tabs on to LinkedIn meanwhile.
+  const connectLinkedin = linkedin.getByRole('button', { name: 'Connect LinkedIn' });
+  await tabTo(page, connectLinkedin);
+  const landed = page.waitForEvent('requestfinished', (req) => new URL(req.url()).pathname === '/api/destination/gmail/app-password');
+  release();
+  await landed;
+  await expect(gmail.locator('.badge').first()).toHaveText('Connected');
+  await expect(connectLinkedin).toBeFocused();
+});
+
 test('a stale first status opens the asked-for step once fresh status arrives', async ({ app, page, request, server }) => {
   await onboard(request, server);
   // The app's first status says Canonical and the profile aren't done (the store's copy can be
@@ -907,8 +1335,10 @@ test('outreach step connects Gmail with an app password and LinkedIn', async ({ 
   await gmail.getByLabel('App password', { exact: true }).press('Enter');
   await expect(gmail.locator('.badge').first()).toHaveText('Connected');
   await expect(gmail.locator('.setup-conn-msg')).toHaveText('Gmail is connected.');
-  // The form folded away under "Use different credentials"; its message was cleared.
+  // The form folded away under "Use different credentials"; its message was cleared, and focus
+  // (on the password field it folded away with) lands on the card's heading.
   await expect(gmail.locator('#setup-gmail-ap-msg')).toHaveText('');
+  await expect(gmail.getByRole('heading', { level: 3, name: 'Gmail' })).toBeFocused();
   await expect(gmail).toContainText('coldtrail saves each email as a draft in your Gmail');
   expect(app.calls).toEqual([
     { method: 'POST', path: '/api/destination/gmail/app-password', body: { email: 'dee@example.com', app_password: 'abcd efgh ijkl mnop' } },
@@ -1058,6 +1488,123 @@ test('a LinkedIn sign-in already open is picked up again', async ({ app, page, r
   await expect(badge).toHaveText('Waiting for sign-in');
   await expect(linkedin.locator('.setup-msg')).toContainText('Sign in to LinkedIn in the Chrome window');
   await expect(linkedin).not.toContainText('Chrome is busy');
+});
+
+test('a LinkedIn sign-in that finishes after Skip for now still counts', async ({ app, page, request, server }) => {
+  await onboard(request, server);
+  // What the server's sign-in task leaves behind once the user has signed in, and /api/status reads.
+  const stateFile = join(server.secretsDir, 'linkedin-state.json');
+  let li = { connected: false, reconnect_needed: false, waiting: false };
+  await page.route('**/api/destination/linkedin/status', (route) => route.fulfill({ json: li }));
+  await page.route('**/api/destination/linkedin/connect', (route) => {
+    li = { ...li, waiting: true };
+    return route.fulfill({ json: { status: 'waiting' } });
+  });
+  const progress = view(page).getByRole('navigation', { name: 'Setup progress' });
+  const outreachDone = progress.getByRole('listitem').nth(3);
+  try {
+    await app.goto('#/setup/destination');
+    const linkedin = view(page).getByRole('region', { name: 'LinkedIn' });
+    const badge = linkedin.locator('.badge').first();
+    await linkedin.getByRole('button', { name: 'Connect LinkedIn' }).click();
+    await expect(badge).toHaveText('Waiting for sign-in');
+    // Skip is the way on while the Chrome window is open; the sign-in goes on without the step.
+    await foot(page).getByRole('button', { name: 'Skip for now' }).click();
+    await expect(stepTitle(page, 'done')).toBeVisible();
+    await expect(view(page)).toContainText("Gmail and LinkedIn aren't connected yet");
+    await expect(outreachDone).not.toHaveClass(/is-done/);
+
+    writeFileSync(stateFile, JSON.stringify({ connected: true, reconnect_needed: false }));
+    li = { connected: true, reconnect_needed: false, waiting: false };
+    // The finish screen follows it: the note goes and Outreach is done.
+    await expect(outreachDone).toHaveClass(/is-done/, { timeout: 15_000 });
+    await expect(view(page)).not.toContainText("aren't connected yet");
+    await foot(page).getByRole('button', { name: 'Back' }).click();
+    await expect(stepTitle(page, 'destination')).toBeVisible();
+    await expect(badge).toHaveText('Connected');
+    await expect(linkedin.getByRole('button', { name: /LinkedIn/ })).toHaveCount(0);
+    await expect(continueBtn(page)).toBeVisible();
+
+    // Signed in where this screen wasn't watching (say, Settings in another tab) while the status
+    // it has still says otherwise: the card asks the server, and counts what it says.
+    await page.route(statusPath, async (route) => {
+      try {
+        const res = await route.fetch();
+        await route.fulfill({ response: res, json: { ...(await res.json()), linkedin_connected: false } });
+      } catch (err) {
+        if (!/disposed|closed|ended/i.test(String(err))) throw err;
+      }
+    });
+    await page.reload();
+    await expect(stepTitle(page, 'destination')).toBeVisible();
+    await expect(badge).toHaveText('Connected');
+    await expect(linkedin.getByRole('button', { name: 'Connect LinkedIn' })).toHaveCount(0);
+    await expect(outreachDone).toHaveClass(/is-done/);
+    await expect(continueBtn(page)).toBeVisible();
+  } finally {
+    rmSync(stateFile, { force: true });
+  }
+});
+
+test('a stale session stops the LinkedIn sign-in poll', async ({ app, page, request, server }) => {
+  app.allowConsole(/status of 401/);
+  await onboard(request, server);
+  await page.clock.install();
+  // Counted in the page itself: a poll the clock fires is counted before runFor returns.
+  await page.addInitScript(() => {
+    const orig = window.fetch;
+    window.__liPolls = 0;
+    window.fetch = function (input, init) {
+      const url = String((input && input.url) || input);
+      if (url.includes('/api/destination/linkedin/status')) window.__liPolls++;
+      return orig.call(this, input, init);
+    };
+  });
+  await page.route('**/api/destination/linkedin/status', (route) =>
+    route.fulfill({ status: 401, contentType: 'text/plain', body: 'unauthorized' }),
+  );
+  const polls = () => page.evaluate(() => window.__liPolls);
+  await app.goto('#/setup/destination');
+  const linkedin = view(page).getByRole('region', { name: 'LinkedIn' });
+  // The card's own first read (is a sign-in already open?) is refused too: nothing to wait for.
+  await expect.poll(polls).toBe(1);
+  await linkedin.getByRole('button', { name: 'Connect LinkedIn' }).click();
+  await expect(linkedin.locator('.badge').first()).toHaveText('Waiting for sign-in');
+  await page.clock.runFor(2_100);
+  // One refused poll is enough: it says how to fix it and offers Connect again.
+  await expect(linkedin.locator('.setup-msg')).toHaveText('Reopen coldtrail from your terminal.');
+  await expect(linkedin.locator('.badge').first()).toHaveText('Not connected');
+  await expect(linkedin.getByRole('button', { name: 'Connect LinkedIn' })).toBeVisible();
+  expect(await polls()).toBe(2);
+  await page.clock.runFor(20_000);
+  expect(await polls()).toBe(2);
+});
+
+test('setup opened again from Settings has a way back', async ({ app, page, request, server }) => {
+  await onboard(request, server);
+  await app.goto('#/settings');
+  await view(page).getByRole('link', { name: 'Run guided setup' }).click();
+  await expect(stepTitle(page, 'agent')).toBeVisible();
+  const exit = view(page).getByRole('link', { name: 'Back to Settings' });
+  await expect(exit).toHaveAttribute('href', '#/settings');
+  // On every step, the finish screen included.
+  await page.evaluate(() => {
+    location.hash = '#/setup/done';
+  });
+  await expect(stepTitle(page, 'done')).toBeVisible();
+  await expect(exit).toBeVisible();
+  await exit.click();
+  await expect(page).toHaveURL(hashIs('#/settings'));
+  await expect(page.locator('.setup')).toHaveCount(0);
+});
+
+test("the finish screen's Create a schedule opens the New schedule dialog", async ({ app, page, request, server }) => {
+  await onboard(request, server);
+  await app.goto('#/setup/done');
+  await expect(stepTitle(page, 'done')).toBeVisible();
+  await view(page).getByRole('link', { name: /Create a schedule/ }).click();
+  await expect(page).toHaveURL(/#\/schedules/);
+  await expect(page.getByRole('dialog', { name: 'New schedule' })).toBeVisible();
 });
 
 test('agentPanel works outside the wizard', async ({ app, page, request, server }) => {

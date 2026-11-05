@@ -35,6 +35,8 @@
 .setup-top .wordmark { margin-left: calc(-1 * var(--space-2)); }
 .setup-top-sep { width: 1px; height: 20px; background: var(--border-strong); }
 .setup-h1 { font-size: 15px; line-height: 1.4; font-weight: 500; letter-spacing: 0; color: var(--text-2); }
+/* Back to Settings, when setup is opened again once onboarded: at the far end of the bar. */
+.setup-exit { margin-left: auto; margin-right: calc(-1 * var(--space-2)); white-space: nowrap; }
 
 /* Wide enough for the company step's editor with its checklist beside it (company.css puts them
    side by side from an 860px container: 960 less the card's 2 × 32px padding is 896). */
