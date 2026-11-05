@@ -59,7 +59,7 @@
 
 /* The wrapper is a size container: the tools row stacks by its own width, not the window's
    (the sidebar takes a share of the window above 900px). */
-.fu-toolbar { margin-top: var(--space-6); container-type: inline-size; }
+.fu-toolbar { margin-top: var(--space-4); container-type: inline-size; }
 
 .fu-tools {
   display: flex;
@@ -121,6 +121,14 @@
 }
 .fu-domain:hover { color: var(--accent); text-decoration: underline; }
 .fu-email { font-size: 12.5px; color: var(--text-2); }
+/* The other columns of the Due tab (Draft follow-up and both marks, one of them busy, beside the
+   widest next step, "Follow up on LinkedIn") take about 775px. Just above the card breakpoint
+   that leaves less than 40ch for the company and contact: they are cut to what is left (the full
+   text is in the tooltip), so the table never scrolls sideways. */
+@container (min-width: 960px) {
+  .fu-domain,
+  .fu-email { max-width: min(40ch, 100cqi - 792px); }
+}
 .fu-none { color: var(--text-3); }
 .fu-since { color: var(--text-2); }
 

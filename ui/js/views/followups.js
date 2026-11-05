@@ -1,9 +1,10 @@
 // Follow-ups (spec §5.5): everyone already contacted, by state — Due / Awaiting / Replied /
 // Bounced — from GET /api/followups, filterable, at most 100 rows at a time. Row actions: Draft
 // follow-up (POST /api/followups/:domain/draft, one agent turn), Mark replied / Mark bounced
-// (POST /api/followups/:domain/mark). Header action: Check for replies (POST
-// /api/followups/check, one agent turn that reads Gmail). GET /api/drafts tells which due rows
-// already have an email draft waiting, so a second follow-up isn't drafted by accident.
+// (POST /api/followups/:domain/mark, after a confirm: there is no undo). Header action: Check for
+// replies (POST /api/followups/check, one agent turn that reads Gmail). GET /api/drafts tells
+// which due rows already have an email draft waiting, so a second follow-up isn't drafted by
+// accident, and, as a mark's confirm opens, which drafts the mark deletes.
 //
 // Agent turns take minutes and the server keeps running them whatever the page does, so they
 // belong to the page, not the screen: leaving Follow-ups never cancels one, coming back shows its
@@ -11,11 +12,11 @@
 // itself starts (fetches, the elapsed-time ticker, its store subscription) stops on unmount.
 
 import { api, errorText } from '../core/api.js';
-import { debounce, fmtNum, h, pluralize, truncate } from '../core/dom.js';
+import { debounce, fmtDate, fmtNum, fmtRelative, h, pluralize, truncate } from '../core/dom.js';
 import { renderMarkdown } from '../core/markdown.js';
 import { href } from '../core/router.js';
 import { store } from '../core/store.js';
-import { setBusy, toast } from '../core/ui.js';
+import { confirmDialog, setBusy, toast } from '../core/ui.js';
 import { badge } from '../components/badge.js';
 import { emptyState } from '../components/emptyState.js';
 import { table } from '../components/table.js';
@@ -55,8 +56,13 @@ const STATES = [
     empty: ['No bounces', 'Addresses that bounced show up here, so you can look for a better contact.'],
   },
 ];
-const STATE = Object.fromEntries(STATES.map((st) => [st.id, st]));
+// No prototype: a `tab` from the address or a `state` from the server named "constructor" or
+// "toString" is not a state.
+const STATE = Object.assign(Object.create(null), Object.fromEntries(STATES.map((st) => [st.id, st])));
 const tabFrom = (query) => (query && STATE[query.tab] ? query.tab : 'due');
+/** An address with a filter and no tab (Pipeline links a sent company that way: it can't tell
+ *  Due from Awaiting). The tab is then the first one the filter matches under. */
+const tabByMatch = (query) => !!(query && String(query.q ?? '').trim() && !STATE[query.tab]);
 /** The tab a row is listed under. A state this UI doesn't know (the server only sends the four
  *  above today) still shows, under Awaiting, with its raw label. */
 const tabOf = (r) => (STATE[r.state] ? r.state : 'awaiting');
@@ -76,7 +82,8 @@ const jobs = {
 };
 let screen = null; // hooks of the mounted screen, or null
 
-/** Contacts a reply check covers: due or awaiting, with an email (the server's own rule). */
+/** Contacts a reply check covers: due or awaiting, and emailed (`to` is the address an email
+ *  went to: a company reached only on LinkedIn has none). */
 const checkable = (rows) => rows.filter((r) => isOpen(r) && r.to).length;
 
 /** Start a reply check. `rows` (the list on screen, or null) gives the progress line its count
@@ -144,26 +151,30 @@ async function changesSince(job) {
   const changes = { replied: [], bounced: [] };
   for (const row of rows) {
     const was = job.before.get(row.domain);
-    if (was && was !== row.state && changes[row.state] && !job.manual.has(row.domain)) changes[row.state].push(row.domain);
+    if (was && was !== row.state && Object.hasOwn(changes, row.state) && !job.manual.has(row.domain)) changes[row.state].push(row.domain);
   }
   return changes;
 }
 
-/** "No new replies or bounces." / "1 new reply (a.example) and 2 bounces (b.example, c.example)." */
+// The summary says what coldtrail saw change in the list, not what is in the inbox: the agent may
+// not have read it, or may have found a reply and not marked it.
+
+/** "Nothing was marked replied or bounced." / "Marked 1 replied (a.example) and 2 bounced
+ *  (b.example, c.example)." */
 function changesText({ replied, bounced }) {
   const list = (ds) => (ds.length > 4 ? `${ds.slice(0, 3).join(', ')} and ${fmtNum(ds.length - 3)} more` : ds.join(', '));
   const parts = [];
-  if (replied.length) parts.push(`${pluralize(replied.length, 'new reply', 'new replies')} (${list(replied)})`);
-  if (bounced.length) parts.push(`${pluralize(bounced.length, 'bounce')} (${list(bounced)})`);
-  return parts.length ? `${parts.join(' and ')}.` : 'No new replies or bounces.';
+  if (replied.length) parts.push(`${fmtNum(replied.length)} replied (${list(replied)})`);
+  if (bounced.length) parts.push(`${fmtNum(bounced.length)} bounced (${list(bounced)})`);
+  return parts.length ? `Marked ${parts.join(' and ')}.` : 'Nothing was marked replied or bounced.';
 }
 
-/** "no new replies or bounces" / "1 new reply and 2 bounces" (a toast's short form). */
+/** "nothing was marked replied or bounced" / "marked 1 replied and 2 bounced" (a toast's short form). */
 function changesShort({ replied, bounced }) {
   const parts = [];
-  if (replied.length) parts.push(pluralize(replied.length, 'new reply', 'new replies'));
-  if (bounced.length) parts.push(pluralize(bounced.length, 'bounce'));
-  return parts.length ? parts.join(' and ') : 'no new replies or bounces';
+  if (replied.length) parts.push(`${fmtNum(replied.length)} replied`);
+  if (bounced.length) parts.push(`${fmtNum(bounced.length)} bounced`);
+  return parts.length ? `marked ${parts.join(' and ')}` : 'nothing was marked replied or bounced';
 }
 
 /** How many email drafts for `domain` are waiting in Drafts; null when that can't be told. */
@@ -174,6 +185,52 @@ async function emailDraftCount(domain) {
   } catch (_) {
     return null;
   }
+}
+
+const NO_DRAFTS = Object.freeze({ email: 0, linkedin: 0, gmail: 0 });
+
+/** GET /api/drafts by company (lowercased domain): { email, linkedin, gmail (email drafts
+ *  already pushed to Gmail) }. */
+function draftsByDomain(list) {
+  const out = new Map();
+  for (const d of list) {
+    if (!d) continue;
+    const w = out.get(lower(d.domain)) || { ...NO_DRAFTS };
+    if (!isEmailDraft(d)) w.linkedin += 1;
+    else {
+      w.email += 1;
+      if (d.status === 'drafted') w.gmail += 1;
+    }
+    out.set(lower(d.domain), w);
+  }
+  return out;
+}
+
+/** Drafts waiting for `domain` now, as draftsByDomain counts them; null when Drafts can't be read. */
+async function waitingDrafts(domain, signal) {
+  try {
+    const list = await api.get('/api/drafts', { signal });
+    return Array.isArray(list) ? draftsByDomain(list).get(lower(domain)) || NO_DRAFTS : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/** The mark confirm's word on a company's waiting drafts (draftsByDomain's counts, or null when
+ *  unknown): " Its follow-up draft and LinkedIn note are deleted." ("" when none waits). A mark
+ *  deletes coldtrail's copy only, so one already in Gmail stays in the user's Gmail Drafts, where
+ *  it can still be sent: said too. `emailed`: the row has a `to` (else an email draft waiting is
+ *  a first email, not a follow-up). */
+function deletedText(w, emailed) {
+  if (!w) return ' Any draft waiting for it is deleted too.';
+  const name = (n, one) => (n === 1 ? one : `${fmtNum(n)} ${one}s`);
+  const parts = [];
+  if (w.email) parts.push(name(w.email, emailed ? 'follow-up draft' : 'email draft'));
+  if (w.linkedin) parts.push(name(w.linkedin, 'LinkedIn note'));
+  if (!parts.length) return '';
+  let text = ` Its ${parts.join(' and ')} ${w.email + w.linkedin > 1 ? 'are' : 'is'} deleted.`;
+  if (w.gmail) text += w.gmail === 1 ? ' The copy in your Gmail Drafts stays there.' : ' The copies in your Gmail Drafts stay there.';
+  return text;
 }
 
 function runDraft(domain) {
@@ -236,11 +293,12 @@ function sinceLabel(days) {
 }
 
 /** What comes next for a row still open: which follow-up is due, or when the next one is. A
- *  row without an email can't get a drafted follow-up, so it promises none. */
+ *  row never emailed (reached only on LinkedIn) can't get a drafted follow-up: due, it says where
+ *  to follow up instead; awaiting, it promises nothing. */
 function nextStep(r) {
   const touches = Number(r.touches) || 0;
   if (r.state === 'awaiting' && touches >= MAX_TOUCHES) return 'No more follow-ups';
-  if (!r.to) return null;
+  if (!r.to) return r.state === 'due' ? 'Follow up on LinkedIn' : null;
   if (r.state === 'due') return `Follow-up ${fmtNum(touches)} of ${fmtNum(MAX_TOUCHES - 1)}`;
   if (r.state === 'awaiting') return `Due in ${pluralize(Math.max(1, DUE_AFTER_DAYS - (Number(r.days) || 0)), 'day')}`;
   return null;
@@ -252,7 +310,8 @@ function fmtElapsed(ms) {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 }
 
-const clock = (d) => `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+/** "Finished just now" / "Finished 5m ago" / "Finished Oct 9, 13:00". */
+const finishedText = (at) => `Finished ${fmtRelative(at)}`;
 
 /** Agent text as rendered markdown (the safe subset only). */
 function mdBlock(text) {
@@ -286,7 +345,7 @@ function mount(root, ctx) {
     q: (ctx.query && ctx.query.q) || '',
     limit: PAGE,
     rows: null, // FollowupDto[] once loaded
-    pending: new Set(), // lowercased domains with an email draft waiting in Drafts
+    drafts: null, // draftsByDomain() of the last drafts list, once one has loaded
     error: null,
     loading: false,
     marking: new Map(), // domain → the value being marked
@@ -294,12 +353,13 @@ function mount(root, ctx) {
   };
   const ac = new AbortController();
   let loadSeq = 0;
-  let loaded = null; // what the last render showed (rows + pending), to skip identical reloads
+  let loaded = null; // what the last render showed (rows + draft hints), to skip identical reloads
   let draftsSeen = null; // the summary's email-draft count when the drafts on hand were asked for
   let ticker = null;
   let elapsedEl = null;
   let selfRefresh = false;
   let revealFrom = null; // first row index shown by the last "Show more"
+  let autoTab = tabByMatch(ctx.query); // the tab waits for the rows: see chooseTab
 
   // ---- Header ----
 
@@ -347,6 +407,7 @@ function mount(root, ctx) {
     s.q = filterInput.value;
     s.limit = PAGE;
     renderContent();
+    announceFilter();
     nav.setQuery({ q: s.q || null }, { silent: true });
   }, FILTER_MS);
   filterInput.addEventListener('input', onFilter);
@@ -440,11 +501,14 @@ function mount(root, ctx) {
         // coldtrail's own summary (from the list), then whatever the agent reported.
         body = [
           r.changes ? h('p', { class: 'fu-notice-text fu-changes' }, changesText(r.changes)) : null,
-          r.message ? mdBlock(r.message) : null,
-          !r.changes && !r.message ? h('p', { class: 'fu-notice-text' }, 'The agent did not report anything.') : null,
+          r.message ? mdBlock(r.message) : h('p', { class: 'fu-notice-text' }, 'The agent did not report anything.'),
         ];
       }
-      noticeSlot.replaceChildren(noticeBox(r.tone, r.title, body, r.at ? `Finished at ${clock(r.at)}` : null, true));
+      // Relative, so it is kept current: see the store subscription.
+      const at = r.at
+        ? h('time', { class: 'fu-finished', datetime: r.at.toISOString(), title: fmtDate(r.at, { time: true }) }, finishedText(r.at))
+        : null;
+      noticeSlot.replaceChildren(noticeBox(r.tone, r.title, body, at, true));
     } else {
       noticeSlot.replaceChildren();
     }
@@ -505,9 +569,12 @@ function mount(root, ctx) {
     const marking = s.marking.has(domain);
     const box = h('div', { class: 'fu-actions' });
     if (r.state === 'due' && r.to) {
-      if (!drafting && s.pending.has(lower(domain))) {
+      if (!drafting && emailDrafts(domain) > 0) {
+        // The email draft by name: the company's LinkedIn note (or the last Drafts tab) must not
+        // be what opens.
+        const to = href(['drafts', domain], { channel: 'email' });
         box.append(
-          h('a', { class: 'btn btn-secondary btn-sm', href: href(['drafts', domain]), 'data-action': 'review', 'data-domain': domain, 'aria-label': `Review draft, ${domain}` }, 'Review draft'),
+          h('a', { class: 'btn btn-secondary btn-sm', href: to, 'data-action': 'review', 'data-domain': domain, 'aria-label': `Review draft, ${domain}` }, 'Review draft'),
         );
       } else {
         box.append(
@@ -534,7 +601,7 @@ function mount(root, ctx) {
             aria: `Mark ${value}, ${domain}`,
             busy: marking && s.marking.get(domain) === value,
             disabled: drafting || marking,
-            onClick: () => mark(domain, value),
+            onClick: (e) => mark(domain, value, e.currentTarget),
           }),
         );
       }
@@ -559,7 +626,9 @@ function mount(root, ctx) {
             'div',
             { class: 'fu-who' },
             h('a', { class: 'fu-domain', href: href(['pipeline', r.domain]), title: r.domain, 'data-action': 'open', 'data-domain': r.domain }, r.domain),
-            r.to ? h('span', { class: 'fu-email', title: r.to }, r.to) : h('span', { class: 'fu-email fu-none' }, 'No email on file'),
+            // `to` is the address an email went to: none means the company was reached only on
+            // LinkedIn (its contact may still have an email on file).
+            r.to ? h('span', { class: 'fu-email', title: r.to }, r.to) : h('span', { class: 'fu-email fu-none' }, 'Reached on LinkedIn'),
           ),
       },
       {
@@ -592,19 +661,27 @@ function mount(root, ctx) {
     return { action: a.dataset.action || null, domain: tr ? tr.dataset.key : null, index: tr ? rowEls().indexOf(tr) : -1 };
   }
 
+  /** A row's company link. */
+  const lead = (tr) => tr && tr.querySelector('a[href], button');
+
   function restoreFocus(f) {
     if (!f) return;
     const trs = rowEls();
-    const inRow = (tr) => tr && ((f.action && tr.querySelector(`[data-action="${f.action}"]`)) || tr.querySelector('a[href], button'));
+    // The same row: the same control, else its first action (a saved draft turns Draft follow-up
+    // into Review draft), else its company link.
+    const inRow = (tr) => (f.action && tr.querySelector(`[data-action="${f.action}"]`)) || tr.querySelector('.fu-actions a[href], .fu-actions button') || lead(tr);
     let target = null;
     if (f.action === 'more') {
-      target = content.querySelector('[data-action="more"]') || (revealFrom != null ? inRow(trs[revealFrom]) : null);
+      target = content.querySelector('[data-action="more"]') || (revealFrom != null ? lead(trs[revealFrom]) : null);
     } else if (f.action === 'clear' || f.action === 'retry') {
       target = filterBox.hidden ? null : filterInput;
     } else {
       const same = f.domain != null ? trs.find((tr) => tr.dataset.key === f.domain) : null;
       if (same) target = inRow(same);
-      else if (f.index >= 0 && trs.length) target = inRow(trs[Math.min(f.index, trs.length - 1)]);
+      // The row left this tab (marked, or changed elsewhere): the company link of the row now in
+      // its place, never an action, so pressing Enter again can't mark or draft a company the
+      // user didn't pick.
+      else if (f.index >= 0 && trs.length) target = lead(trs[Math.min(f.index, trs.length - 1)]);
     }
     if (!target) target = tabsEl.querySelector('[aria-selected="true"]');
     if (target) target.focus();
@@ -695,12 +772,29 @@ function mount(root, ctx) {
     restoreFocus(focus);
   }
 
+  /** What a filter change left on screen, for screen readers (the list, the counts and the
+   *  empty state change silently). */
+  function announceFilter() {
+    if (!s.rows) return;
+    const st = STATE[s.tab];
+    const q = s.q.trim();
+    const n = filtered().filter((r) => tabOf(r) === s.tab).length;
+    let text;
+    if (!s.rows.length) text = 'No one to follow up with yet.';
+    else if (!s.rows.some((r) => tabOf(r) === s.tab)) text = `${st.empty[0]}.`;
+    else if (!q) text = `${pluralize(n, 'follow-up')} under ${st.label}.`;
+    else if (!n) text = `No follow-ups match “${q}”. ${elsewhere()}`;
+    else text = `${pluralize(n, 'follow-up')} under ${st.label} match “${q}”.`;
+    announce(text);
+  }
+
   /** Where the filter does match, when it isn't the open tab. */
   function elsewhere() {
     const hits = STATES.filter((x) => x.id !== s.tab)
       .map((x) => [x, filtered().filter((r) => tabOf(r) === x.id).length])
       .filter(([, n]) => n > 0);
-    if (!hits.length) return 'No domain or email under any tab contains that text.';
+    // The filter sees the address an email went to, not every contact's email.
+    if (!hits.length) return 'No domain or emailed address under any tab contains that text.';
     return `Nothing under ${STATE[s.tab].label}, but ${hits.map(([x, n]) => `${fmtNum(n)} under ${x.label}`).join(' and ')}.`;
   }
 
@@ -714,7 +808,7 @@ function mount(root, ctx) {
     const next = actionsCell(r);
     cell.replaceWith(next);
     if (focused) {
-      const el = next.querySelector(`[data-action="${focused}"]`);
+      const el = next.querySelector(`[data-action="${focused}"]`) || next.querySelector('a[href], button') || lead(tr);
       if (el) el.focus();
     }
   }
@@ -741,22 +835,32 @@ function mount(root, ctx) {
     if (fu.status === 'fulfilled') {
       s.rows = Array.isArray(fu.value) ? fu.value : [];
       s.error = null;
+      if (autoTab) chooseTab();
     } else if (!quiet) {
       if (s.rows) toast(`Couldn't refresh follow-ups: ${errorText(fu.reason)}`, 'err');
       else s.error = fu.reason || new Error('Unknown error');
     }
-    // The drafts list only adds the "Review draft" hint; without it the rows still work.
+    // The drafts list only adds the "Review draft" hint (and a mark confirm's first word on what
+    // it deletes); without it the rows still work.
     if (withDrafts && dr.status === 'fulfilled' && Array.isArray(dr.value)) {
-      s.pending = new Set(dr.value.filter(isEmailDraft).map((d) => lower(d.domain)));
+      s.drafts = draftsByDomain(dr.value);
       draftsSeen = drafts;
     }
-    const now = s.rows ? JSON.stringify([s.rows, [...s.pending].sort()]) : null;
+    // What the list shows of the drafts: which rows have an email draft waiting.
+    const hints = s.drafts ? [...s.drafts].filter(([, w]) => w.email).map(([d]) => d).sort() : [];
+    const now = s.rows ? JSON.stringify([s.rows, hints]) : null;
     if (quiet && now === loaded) {
       content.setAttribute('aria-busy', 'false');
       return;
     }
     loaded = now;
     renderContent();
+  }
+
+  /** Email drafts waiting for `domain`, as of the last drafts list. */
+  function emailDrafts(domain) {
+    const w = s.drafts && s.drafts.get(lower(domain));
+    return w ? w.email : 0;
   }
 
   /** The summary's count of email drafts waiting, or null if there is no summary yet. */
@@ -781,14 +885,33 @@ function mount(root, ctx) {
   // each time: one cheap GET, and nothing is redrawn unless it changed. The drafts list is
   // heavier, and a draft made or discarded does move the email-draft count, so load() asks for
   // it only when that count has changed.
+  // The store's refresh (every 30s while the tab is visible) also keeps the result's
+  // "Finished 5m ago" current.
   const unsubscribe = store.subscribe(() => {
+    const finished = noticeSlot.querySelector('.fu-finished');
+    if (finished && jobs.result && jobs.result.at) finished.textContent = finishedText(jobs.result.at);
     if (selfRefresh || s.gone || !s.rows) return;
     load({ quiet: true });
   });
 
+  /** Open the first tab the filter matches under, once the rows are in (Due, the default, when
+   *  none does), and name it in the address. True when the tab changed. */
+  function chooseTab() {
+    autoTab = false;
+    const hit = STATES.find((x) => filtered().some((r) => tabOf(r) === x.id));
+    if (!hit || hit.id === s.tab) return false;
+    s.tab = hit.id;
+    s.limit = PAGE;
+    revealFrom = null;
+    tabsEl.setActive(hit.id);
+    nav.setQuery({ tab: hit.id === 'due' ? null : hit.id }, { silent: true });
+    return true;
+  }
+
   // ---- Actions ----
 
   function onTab(id) {
+    autoTab = false; // picked by hand before the rows landed
     s.tab = id;
     s.limit = PAGE;
     revealFrom = null;
@@ -808,6 +931,7 @@ function mount(root, ctx) {
     s.q = '';
     s.limit = PAGE;
     renderContent();
+    announceFilter();
     filterInput.focus();
     nav.setQuery({ q: null }, { silent: true });
   }
@@ -832,8 +956,51 @@ function mount(root, ctx) {
     announce(`Drafting a follow-up for ${domain}.`);
   }
 
-  async function mark(domain, value) {
+  /** Ask before a mark: coldtrail has no way to take one back (spec §4). */
+  async function confirmMark(domain, value, opener) {
+    const label = value === 'replied' ? 'Replied' : 'Bounced';
+    const row = s.rows && s.rows.find((x) => x.domain === domain);
+    const emailed = !!(row && row.to);
+    // The mark deletes every draft waiting for the company, on both channels: name each one.
+    const say = (w) => `${domain} moves to ${label} and gets no more follow-ups.${deletedText(w, emailed)} coldtrail can’t undo this.`;
+    // The confirm opens at once (keys typed ahead reach it) with the drafts the list last loaded,
+    // and Drafts is read again meanwhile: that list can be a refresh old (a LinkedIn note written,
+    // or a follow-up pushed to Gmail, since then doesn't move the count it reloads by).
+    const text = h('p', {}, say(s.drafts ? s.drafts.get(lower(domain)) || NO_DRAFTS : null));
+    waitingDrafts(domain, ac.signal).then((w) => {
+      if (w) text.textContent = say(w);
+    });
+    const ok = await confirmDialog({
+      title: `Mark ${domain} as ${value}?`,
+      body: text,
+      confirmText: `Mark ${value}`,
+      // A bounce writes the address off: a red confirm, which opens on Cancel, so Enter pressed
+      // twice or held can't confirm it.
+      danger: value === 'bounced',
+      opener,
+      signal: ac.signal,
+    });
+    // The opener can be redrawn while the dialog is open (a background refresh): focus goes back
+    // to the row's control, not to the top of the screen.
+    if (!s.gone && !content.contains(document.activeElement)) {
+      const tr = rowEls().find((el) => el.dataset.key === domain);
+      const el = tr && (tr.querySelector(`[data-action="${value}"]`) || lead(tr));
+      if (el) el.focus();
+    }
+    return ok && !s.gone;
+  }
+
+  async function mark(domain, value, opener) {
     if (s.marking.has(domain) || jobs.drafting.has(domain)) return;
+    if (!(await confirmMark(domain, value, opener))) return;
+    if (s.marking.has(domain) || jobs.drafting.has(domain)) return;
+    // A refresh while the confirm was open can show the row already replied or bounced (a reply
+    // check, or another tab): a second mark would overwrite that.
+    const current = s.rows && s.rows.find((x) => x.domain === domain);
+    if (!current || !isOpen(current)) {
+      if (current) toast(`${domain} is already marked ${current.state}.`, 'info');
+      return;
+    }
     // A reply check running now must not report this mark as something it found.
     const job = jobs.check;
     if (job) job.manual.add(domain);
@@ -848,21 +1015,24 @@ function mount(root, ctx) {
       if (job) job.manual.delete(domain);
       // Toasts are page-level: say so even if the user has moved on.
       toast(`Couldn't mark ${domain} as ${value}.\n${errorText(err)}`, 'err');
-    } finally {
-      s.marking.delete(domain);
     }
     if (s.gone) {
+      s.marking.delete(domain);
       store.refresh();
       return;
     }
+    // The row stays busy until the list has reloaded without it, so its button can't start the
+    // same mark again meanwhile.
     if (ok) await load();
-    else refreshRow(domain);
+    s.marking.delete(domain);
+    refreshRow(domain);
     refreshStore();
   }
 
   function applyQuery(query) {
     const tab = tabFrom(query);
     const q = (query && query.q) || '';
+    autoTab = tabByMatch(query);
     let changed = false;
     if (tab !== s.tab) {
       s.tab = tab;
@@ -875,6 +1045,8 @@ function mount(root, ctx) {
       if (filterInput.value !== q) filterInput.value = q;
       changed = true;
     }
+    // Rows not in yet: load() chooses once they are.
+    if (autoTab && s.rows && chooseTab()) changed = true;
     if (changed) {
       s.limit = PAGE;
       revealFrom = null;
