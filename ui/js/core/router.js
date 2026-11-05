@@ -137,6 +137,18 @@ function showError(r, err) {
   );
 }
 
+// The screen's module never arrived (coldtrail was down or restarting): say what to do, not the
+// browser's "Failed to fetch dynamically imported module" (that goes to the console).
+function showLoadError(r) {
+  r.failed = true;
+  document.title = "This screen didn't load · coldtrail";
+  r.root.replaceChildren(
+    h('h1', {}, "This screen didn't load"),
+    h('p', { class: 'text-2' }, "Its code couldn't be downloaded. Check that coldtrail is still running, then reload."),
+    h('p', {}, h('button', { type: 'button', class: 'btn btn-primary', onClick: () => location.reload() }, 'Reload')),
+  );
+}
+
 /** Settles when `value` (a Promise or not) settles or after `ms`, whichever comes first; never
  *  rejects (onError sees a rejection). */
 function within(value, ms, onError) {
@@ -294,15 +306,30 @@ async function handle(r, redirects = 0, from = typeof document === 'undefined' ?
 
   // Leaving: let the current view flush while the next one loads.
   const leaving = leave(cur, { name, path, query });
+  if (r.loadFailed && !r.loaded.has(name)) {
+    // The browser keeps a failed import() failed for the page's life: for its URL, and for every
+    // module that imports it (Settings imports Setup, which imports Company profile). A screen
+    // that hasn't loaded on this page yet can't be trusted to load in place, so load the page
+    // again at its address, as the Reload button does.
+    await leaving;
+    if (seq !== r.seq || active !== r) return;
+    r.failed = true;
+    location.reload();
+    return;
+  }
   let view;
   try {
     view = (await r.routes[name]()).default;
+    r.loaded.add(name);
   } catch (err) {
+    r.loadFailed = true;
     await leaving;
     if (seq !== r.seq || active !== r) return;
     console.error(err);
     unmountCurrent(r);
-    showError(r, err);
+    showLoadError(r);
+    if (focusUnmoved(from, r.root)) focusHeading(r.root);
+    else window.scrollTo(0, 0);
     return;
   }
   await Promise.all([leaving, view.css ? ensureViewCss(name) : null]);
@@ -343,7 +370,11 @@ async function handle(r, redirects = 0, from = typeof document === 'undefined' ?
 }
 
 /**
- * Start routing. routes[name] = () => import('../views/<name>.js'); unknown routes show `home`.
+ * Start routing. routes[name]() → import('../views/<name>.js'); unknown routes show `home`.
+ * A screen that failed to mount is mounted again when the current address is navigated to again
+ * (its nav link). Once a screen's code failed to download, any screen that hasn't loaded on this
+ * page yet (the failed one included) is opened by reloading the page at its address: the browser
+ * keeps a failed import() failed, for every module that imports it too.
  * redirect({ name, path, query }) → a route (anything navigate takes) | null, or a Promise of
  * one, runs first on every route change: a route replaces the address and is routed instead, and
  * the screen on show stays until the answer comes, so the original target never flashes.
@@ -353,7 +384,7 @@ async function handle(r, redirects = 0, from = typeof document === 'undefined' ?
  */
 export function startRouter({ routes, root, onRoute, redirect, store = sharedStore }) {
   if (active) active.stop();
-  const r = { routes, root, onRoute, redirect, store, hash: null, seq: 0, failed: false, current: null, pending: Promise.resolve() };
+  const r = { routes, root, onRoute, redirect, store, hash: null, seq: 0, failed: false, current: null, loaded: new Set(), loadFailed: false, pending: Promise.resolve() };
   const onChange = () => {
     route();
   };

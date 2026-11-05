@@ -1,11 +1,12 @@
 // App shell (spec §4): the sidebar (sections with live counts, connection dots), the top bar
 // (global search, schedule chip, and below 900px the menu button that opens the sidebar as an
-// off-canvas panel) and the stale-session banner. Everything it shows comes from the shared store
-// (/api/summary + /api/status), so it stays current without polling of its own.
+// off-canvas panel) and the banner for a stale session or a coldtrail that stopped answering.
+// Everything it shows comes from the shared store (/api/summary + /api/status), so it stays
+// current without polling of its own.
 
-import { api, SESSION_EXPIRED } from './core/api.js';
+import { api, errorText } from './core/api.js';
 import { debounce, fmtDate, fmtNum, fmtRelative, h, pluralize } from './core/dom.js';
-import { bindKeys, clearOverlay } from './core/keys.js';
+import { bindKeys, clearOverlay, holdPageKeys } from './core/keys.js';
 import { href } from './core/router.js';
 
 const SECTIONS = [
@@ -123,11 +124,47 @@ export function groupCompanyHits(rows, q) {
   return { companies, people };
 }
 
-/** Drafts whose domain, recipient or subject contains q (any case), at most `limit`. */
+const channelOf = (d) => (d.channel === 'linkedin' ? 'linkedin' : 'email');
+
+/** Drafts whose contact, company, domain, recipient or subject contains q (any case), at most
+ *  `limit`. One per domain and channel, the first (the newest): Drafts shows one row for them. */
 export function matchDrafts(drafts, q, limit = SEARCH_LIMIT) {
   const needle = q.trim().toLowerCase();
   const has = (s) => s != null && String(s).toLowerCase().includes(needle);
-  return drafts.filter((d) => has(d.domain) || has(d.to) || has(d.subject)).slice(0, limit);
+  const seen = new Set();
+  return drafts
+    .filter((d) => has(d.contact_name) || has(d.company_name) || has(d.domain) || has(d.to) || has(d.subject))
+    .filter((d) => {
+      const key = `${channelOf(d)}:${d.domain}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, limit);
+}
+
+/** Where a draft search result goes: its row in Drafts, with the channel when the company has
+ *  drafts on both (`all`: the whole queue), as Drafts' own address does. */
+export function draftHref(d, all = []) {
+  const channel = channelOf(d);
+  const shared = all.some((x) => x.domain === d.domain && channelOf(x) !== channel);
+  return href(['drafts', d.domain], { channel: shared ? channel : null });
+}
+
+/**
+ * A draft as a search result names it, the way the Drafts list does: { name: "Sami Roe ·
+ * Northwind Health" (the contact and company, either alone when the other is missing; with
+ * neither an email's recipient, else the domain), meta: "LinkedIn note · <domain>" / "Email ·
+ * <domain> · <subject>" (the domain left out when the name is just the domain) }.
+ */
+export function draftOption(d) {
+  const named = (v) => (v == null || !String(v).trim() ? null : String(v).trim());
+  const linkedin = d.channel === 'linkedin';
+  const domain = String(d.domain || '');
+  const who = [named(d.contact_name), named(d.company_name)].filter(Boolean).join(' · ');
+  const name = who || (!linkedin && named(d.to)) || domain;
+  const meta = [linkedin ? 'LinkedIn note' : 'Email', name === domain ? null : domain, linkedin ? null : named(d.subject)];
+  return { name, meta: meta.filter(Boolean).join(' · ') };
 }
 
 /**
@@ -163,7 +200,7 @@ export function mountShell({ store, navigate }) {
               : null;
             const a = h(
               'a',
-              { class: 'nav-item', href: `#/${item.route}`, 'data-route': item.route, onClick: (e) => onNavClick(e, a) },
+              { class: 'nav-item', href: `#/${item.route}`, 'data-route': item.route },
               h('span', { class: 'nav-label' }, item.label),
               count,
             );
@@ -174,14 +211,6 @@ export function mountShell({ store, navigate }) {
       );
     }),
   );
-  // A plain click on the link to the screen on show reloads a screen that failed to load (the
-  // router only retries then; the browser fires no hashchange for the same address).
-  function onNavClick(e, a) {
-    closeNav({ restore: false });
-    if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
-    if (a.getAttribute('href') === location.hash) navigate(location.hash);
-  }
-
   const conns = h('ul', { class: 'nav-conns', 'aria-label': 'Connections' });
   const closeBtn = h('button', { type: 'button', class: 'icon-btn nav-close', 'aria-label': 'Close menu', onClick: () => closeNav() }, icon(ICONS.close));
   aside.replaceChildren(h('div', { class: 'nav-head' }, wordmark(), closeBtn), navEl, conns);
@@ -200,23 +229,30 @@ export function mountShell({ store, navigate }) {
     }
   }
 
+  // The rows are built once and then updated in place, as the counts are: rebuilding them on
+  // every store refresh (each 30s) would drop the focus of anyone resting on one.
+  const connRows = []; // [{ li, a, label, state }] in connections() order
   function renderConnections(status, summary) {
-    conns.replaceChildren(
-      ...connections(status, summary).map((c) => {
-        const name = `${c.label}: ${c.spoken}`;
-        return h(
-          'li',
-          {},
-          h(
-            'a',
-            { class: 'conn', href: `#/settings?${c.tab}`, 'data-state': c.state, 'aria-label': name, title: name, onClick: () => closeNav({ restore: false }) },
-            h('span', { class: 'conn-dot', 'aria-hidden': 'true' }),
-            h('span', { class: 'conn-label' }, c.label),
-            h('span', { class: 'conn-state', 'aria-hidden': 'true' }, c.word || ''),
-          ),
-        );
-      }),
-    );
+    const list = connections(status, summary);
+    while (connRows.length > list.length) connRows.pop().li.remove();
+    list.forEach((c, i) => {
+      if (!connRows[i]) {
+        const label = h('span', { class: 'conn-label' });
+        const state = h('span', { class: 'conn-state', 'aria-hidden': 'true' });
+        const dot = h('span', { class: 'conn-dot', 'aria-hidden': 'true' });
+        const a = h('a', { class: 'conn' }, dot, label, state);
+        connRows[i] = { li: h('li', {}, a), a, label, state };
+        conns.append(connRows[i].li);
+      }
+      const row = connRows[i];
+      const name = `${c.label}: ${c.spoken}`;
+      row.a.setAttribute('href', `#/settings?${c.tab}`);
+      row.a.setAttribute('data-state', c.state);
+      row.a.setAttribute('aria-label', name);
+      row.a.title = name;
+      row.label.textContent = c.label;
+      row.state.textContent = c.word || '';
+    });
   }
 
   // ---- Phone: the sidebar as an off-canvas menu ----
@@ -237,6 +273,7 @@ export function mountShell({ store, navigate }) {
     toggle.setAttribute('aria-expanded', 'true');
     scrim.hidden = false;
     mainCol.inert = true;
+    holdPageKeys(true); // J/K and the rest must not act on the page the menu covers
     const first = aside.querySelector('[aria-current="page"]') || aside.querySelector(FOCUSABLE);
     if (first) first.focus();
   }
@@ -247,6 +284,7 @@ export function mountShell({ store, navigate }) {
     toggle.setAttribute('aria-expanded', 'false');
     scrim.hidden = true;
     mainCol.inert = false;
+    holdPageKeys(false);
     if (restore) toggle.focus();
   }
 
@@ -274,6 +312,28 @@ export function mountShell({ store, navigate }) {
     if (!phone.matches) closeNav({ restore: false });
   });
 
+  // The screen's heading, where the router puts focus on a new screen.
+  function focusScreen() {
+    const h1 = view.querySelector('h1');
+    if (h1 && !h1.hasAttribute('tabindex')) h1.setAttribute('tabindex', '-1');
+    (h1 || view).focus({ preventScroll: true });
+  }
+
+  // Any link in the sidebar: a screen, a connection dot, the wordmark. In the phone menu it closes
+  // the menu and puts focus on the screen's heading, not on a link the closed menu hides (a new
+  // screen's heading takes it over; a screen that stays keeps it), also when the link is to the
+  // address on show and nothing else happens. A plain click on that address retries a screen that
+  // failed (the browser fires no hashchange for it).
+  aside.addEventListener('click', (e) => {
+    const a = e.target.closest('a[href]');
+    if (!a) return;
+    const wasOpen = isOpen();
+    closeNav({ restore: false });
+    if (wasOpen) focusScreen();
+    if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    if (a.getAttribute('href') === location.hash) navigate(location.hash);
+  });
+
   // ---- Top bar: search ----
 
   const mac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent || '');
@@ -290,7 +350,6 @@ export function mountShell({ store, navigate }) {
     autocomplete: 'off',
     spellcheck: 'false',
     enterkeyhint: 'search',
-    placeholder: 'Search companies, people, drafts',
   });
   const status = h('div', { class: 'search-status', role: 'status' });
   const listbox = h('div', { class: 'search-list', role: 'listbox', id: listId, 'aria-label': 'Search results' });
@@ -371,7 +430,7 @@ export function mountShell({ store, navigate }) {
     return h('div', { role: 'group', 'aria-labelledby': id, class: 'search-group' }, h('div', { class: 'search-group-label eyebrow', id, role: 'presentation' }, label), items);
   }
 
-  function renderResults(q, rows, drafts) {
+  function renderResults(q, rows, drafts, allDrafts) {
     results = [];
     shownQuery = q;
     const { companies, people } = groupCompanyHits(rows, q);
@@ -380,10 +439,8 @@ export function mountShell({ store, navigate }) {
       option(r.founder || r.email, [r.name || r.domain, r.domain].filter((v, i, a) => a.indexOf(v) === i).join(' · '), href(['pipeline', r.domain])),
     );
     const draftOpts = drafts.map((d) => {
-      const channel = d.channel === 'linkedin' ? 'LinkedIn note' : 'Email';
-      const name = d.channel === 'linkedin' ? d.domain : d.to || d.domain;
-      const meta = d.channel === 'linkedin' ? channel : `${channel} · ${d.subject || d.domain}`;
-      return option(name, meta, href(['drafts', d.domain]));
+      const { name, meta } = draftOption(d);
+      return option(name, meta, draftHref(d, allDrafts));
     });
     listbox.replaceChildren(...[group('Companies', companyOpts), group('People', peopleOpts), group('Drafts', draftOpts)].filter(Boolean));
     if (results.length) setStatus(`${pluralize(results.length, 'result')}`, { quiet: true });
@@ -416,14 +473,16 @@ export function mountShell({ store, navigate }) {
       const qs = new URLSearchParams({ q, per: String(SEARCH_LIMIT) });
       const [page, drafts] = await Promise.all([api.get(`/api/companies?${qs}`, { signal: ctl.signal }), loadDrafts()]);
       if (seq !== searchSeq) return;
-      renderResults(q, page.rows || [], matchDrafts(Array.isArray(drafts) ? drafts : [], q));
+      const all = Array.isArray(drafts) ? drafts : [];
+      renderResults(q, page.rows || [], matchDrafts(all, q), all);
     } catch (err) {
       if (seq !== searchSeq || (err && err.name === 'AbortError')) return;
       results = [];
       listbox.replaceChildren();
       setActive(-1);
       openFirst = false;
-      setStatus((err && err.message) || String(err));
+      // On a stale session only the short pointer: the banner above says it in full, once.
+      setStatus(errorText(err));
     }
   }
   const runSearch = debounce(search, SEARCH_DEBOUNCE_MS);
@@ -499,42 +558,74 @@ export function mountShell({ store, navigate }) {
   const chipText = h('span', { class: 'chip-text' });
   const chip = h('a', { class: 'chip', href: '#/schedules', hidden: true }, chipDot, chipText);
 
+  // On a phone the chip has room for when, not what: "Next in 21h" / "Running", the full text
+  // staying its name (which starts with the words on show, WCAG 2.5.3).
+  let chipSummary = null;
   function renderChip(summary) {
+    chipSummary = summary;
     if (!summary) {
       chip.hidden = true;
       return;
     }
     chip.hidden = false;
     chipDot.className = 'chip-dot';
+    let text;
+    let short = null; // [the phone's text, the name it goes with]
     if (summary.running) {
-      const text = `Running · ${summary.running.title || 'a run'}`;
+      text = `Running · ${summary.running.title || 'a run'}`;
+      short = ['Running', text];
       chip.setAttribute('href', href(['agent', summary.running.chat_id]));
       chip.title = `${text}: open its conversation`;
-      chipText.textContent = text;
       chipDot.classList.add('is-live');
     } else if (summary.next_schedule) {
       const next = summary.next_schedule;
+      const when = fmtRelative(next.next_at);
+      text = `${next.name} · next ${when}`;
+      short = [`Next ${when}`, `Next ${when} · ${next.name}`];
       chip.setAttribute('href', '#/schedules');
       chip.title = `Next run ${fmtDate(next.next_at, { time: true })}`;
-      chipText.textContent = `${next.name} · next ${fmtRelative(next.next_at)}`;
       chipDot.classList.add('is-next');
     } else {
+      text = 'No schedule';
       chip.setAttribute('href', '#/schedules');
       chip.title = 'Create a schedule';
-      chipText.textContent = 'No schedule';
+    }
+    if (short && phone.matches) {
+      chipText.textContent = short[0];
+      chip.setAttribute('aria-label', short[1]);
+    } else {
+      chipText.textContent = text;
+      chip.removeAttribute('aria-label');
     }
   }
 
+  // The search's hint, cut to fit a phone's top bar.
+  function fitTopbar() {
+    input.placeholder = phone.matches ? 'Search' : 'Search companies, people, drafts';
+    renderChip(chipSummary);
+  }
+  phone.addEventListener('change', fitTopbar);
+
   topbar.replaceChildren(toggle, searchBox, chip);
+  fitTopbar();
 
-  // ---- Stale session ----
+  // ---- Stale session, or coldtrail not answering ----
 
+  // One banner while api.js says the tab can't reach coldtrail (a stale session, or no answer at
+  // all), gone with the first answer after. A new problem replaces it, so it is announced.
   let banner = null;
-  window.addEventListener('coldtrail:session-expired', (e) => {
-    if (banner) return;
-    const message = (e.detail && e.detail.message) || SESSION_EXPIRED;
-    banner = h('div', { class: 'session-banner', role: 'alert' }, icon(ICONS.alert), h('span', {}, message));
+  function showBanner(e) {
+    const message = (e.detail && e.detail.message) || '';
+    if (banner && banner.dataset.message === message) return;
+    if (banner) banner.remove();
+    banner = h('div', { class: 'session-banner', role: 'alert', 'data-message': message }, icon(ICONS.alert), h('span', {}, message));
     mainCol.insertBefore(banner, view);
+  }
+  window.addEventListener('coldtrail:session-expired', showBanner);
+  window.addEventListener('coldtrail:offline', showBanner);
+  window.addEventListener('coldtrail:reconnected', () => {
+    if (banner) banner.remove();
+    banner = null;
   });
 
   // ---- Store ----

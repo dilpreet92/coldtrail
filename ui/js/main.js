@@ -43,6 +43,7 @@ const firstLoad = new Promise((resolve) => {
     resolve();
   });
   window.addEventListener('coldtrail:session-expired', resolve, { once: true });
+  window.addEventListener('coldtrail:offline', resolve, { once: true });
   setTimeout(resolve, FIRST_LOAD_MS);
 });
 store.start();

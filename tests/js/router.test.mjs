@@ -566,9 +566,8 @@ test('a screen that mounts late leaves focus the user moved meanwhile, and other
   }
 });
 
-test('navigating to the current address after a failed load or mount retries', async () => {
+test('navigating to the current address after a failed mount mounts it again', async () => {
   const env = fakeBrowser('#/flaky');
-  const log = [];
   const origError = console.error;
   console.error = () => {};
   let imports = 0;
@@ -577,9 +576,9 @@ test('navigating to the current address after a failed load or mount retries', a
   try {
     router = startRouter({
       routes: {
-        home: async () => view('home', log),
+        home: async () => view('home', []),
         flaky: async () => {
-          if (++imports === 1) throw new Error('import failed');
+          imports++;
           return { default: { title: 'Flaky', mount(root) { if (++mounts === 1) throw new Error('mount failed'); root.append('ok'); } } };
         },
       },
@@ -587,15 +586,83 @@ test('navigating to the current address after a failed load or mount retries', a
       store: {},
     });
     await router.ready;
-    assert.match(env.root.textContent, /import failed/);
-    await navigate('#/flaky');
-    assert.equal(imports, 2, 'the import is retried');
     assert.match(env.root.textContent, /mount failed/);
     await navigate('#/flaky');
     assert.equal(mounts, 2, 'the mount is retried');
     assert.equal(env.root.textContent, 'ok');
     await navigate('#/flaky');
     assert.equal(mounts, 2, 'a screen that loaded is not reloaded');
+    assert.equal(imports, 2);
+  } finally {
+    console.error = origError;
+    router?.stop();
+    env.restore();
+  }
+});
+
+test('a screen whose module failed to load says to reload, takes focus, and reloads the page on a retry', async () => {
+  const env = fakeBrowser('#/home');
+  env.reloads = [];
+  env.location.reload = () => { env.reloads.push(env.location.hash); };
+  const navLink = new FakeEl('a', env);
+  Object.defineProperty(env.document, 'activeElement', { get: () => env.focused, configurable: true });
+  const origError = console.error;
+  const errors = [];
+  console.error = (e) => errors.push(e);
+  const log = [];
+  const asked = [];
+  let router;
+  try {
+    router = startRouter({
+      routes: {
+        home: async () => view('home', log),
+        drafts: async () => view('drafts', log),
+        flaky: async () => {
+          asked.push('flaky');
+          throw new TypeError('Failed to fetch dynamically imported module: http://127.0.0.1/assets/js/views/flaky.js');
+        },
+        settings: async () => {
+          asked.push('settings');
+          return view('settings', log);
+        },
+      },
+      root: env.root,
+      store: {},
+    });
+    await router.ready;
+    await navigate('#/drafts');
+    await navigate('#/home');
+    navLink.focus();
+    env.document.title = 'Home · coldtrail';
+    await navigate('#/flaky');
+    assert.deepEqual(asked, ['flaky']);
+    const text = env.root.textContent;
+    assert.match(text, /^This screen didn't load/);
+    assert.match(text, /Check that coldtrail is still running/);
+    assert.doesNotMatch(text, /dynamically imported module/, 'the raw error stays in the console');
+    assert.equal(env.document.title, "This screen didn't load · coldtrail", 'the tab title says so too');
+    assert.equal(errors.length, 1);
+    assert.equal(env.focused?.tag, 'h1', 'its heading takes focus, as after a failed mount');
+    const reload = env.root.querySelector('button');
+    assert.equal(reload?.textContent, 'Reload');
+    reload.listeners.click[0]({ type: 'click' });
+    assert.deepEqual(env.reloads, ['#/flaky']);
+
+    // A failed import() stays failed, for every module that imports it too, so the nav link (the
+    // same address) loads the page again rather than asking for the module in place.
+    await navigate('#/flaky');
+    assert.deepEqual(asked, ['flaky'], 'not imported in place again');
+    assert.deepEqual(env.reloads, ['#/flaky', '#/flaky']);
+    // So does any screen that hasn't loaded on this page (Settings imports Setup, which imports
+    // Company profile: a failed Company profile breaks it too)…
+    await navigate('#/settings');
+    assert.deepEqual(asked, ['flaky']);
+    assert.deepEqual(env.reloads, ['#/flaky', '#/flaky', '#/settings']);
+    // …while screens that loaded before still open in place.
+    await navigate('#/drafts');
+    assert.equal(env.root.textContent, 'drafts');
+    assert.equal(env.reloads.length, 3);
+    assert.equal(env.document.title, 'Drafts · coldtrail');
   } finally {
     console.error = origError;
     router?.stop();

@@ -5,7 +5,7 @@
 import { expectAccessible } from '../harness/a11y.mjs';
 import { test, expect } from '../harness/fixtures.mjs';
 import { COMPANIES, SEED } from '../harness/seed.mjs';
-import { SESSION_EXPIRED } from '../../../ui/js/core/api.js';
+import { OFFLINE, OFFLINE_SHORT, SESSION_EXPIRED, SESSION_REOPEN } from '../../../ui/js/core/api.js';
 import { fmtDate, fmtNum, fmtRelative } from '../../../ui/js/core/format.js';
 
 const reEscape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -110,6 +110,54 @@ test('connection link names start with their visible words', async ({ app, page 
   await expect(agent.locator('.conn-state')).toHaveText('Sign in');
   await expect(agent).toHaveAccessibleName('Agent · opencode: Sign in');
   await expect(agent).toHaveAttribute('title', 'Agent · opencode: Sign in');
+});
+
+test('connection links keep focus while the store refreshes them', async ({ app, page }) => {
+  let gmail = false;
+  await page.route('**/api/status*', async (route) => {
+    const res = await route.fetch();
+    await route.fulfill({ response: res, json: { ...(await res.json()), destination_connected: gmail } });
+  });
+  await app.goto('#/home');
+  await shellReady(page);
+  const refresh = () =>
+    page.evaluate(async () => {
+      const { store } = await import('/assets/js/core/store.js');
+      await store.refresh();
+    });
+  const conns = page.locator('#nav .conn');
+  const link = conns.nth(2);
+  await expect(link).toHaveAccessibleName('Gmail: Connect');
+  await link.focus();
+  await page.evaluate(() => { window.__focused = document.activeElement; });
+
+  // The state changes in place: the same link, still focused, says the new state.
+  gmail = true;
+  await refresh();
+  await expect(link).toHaveAccessibleName('Gmail: connected');
+  await expect(link).toHaveAttribute('data-state', 'ok');
+  await expect(link).toHaveAttribute('title', 'Gmail: connected');
+  await expect(link.locator('.conn-state')).toHaveText('');
+  await expect(link).toBeFocused();
+  expect(await page.evaluate(() => window.__focused === document.activeElement)).toBe(true);
+  // Tab goes on from there, not from the first link.
+  await page.keyboard.press('Tab');
+  await expect(conns.nth(3)).toBeFocused();
+
+  // Phone: focus stays inside the open menu, so Esc still closes it.
+  await page.setViewportSize({ width: 390, height: 844 });
+  const menu = page.getByRole('button', { name: 'Menu', exact: true });
+  await menu.click();
+  await expect(page.getByRole('navigation', { name: 'Main' })).toBeVisible();
+  await link.focus();
+  gmail = false;
+  await refresh();
+  await expect(link).toHaveAccessibleName('Gmail: Connect');
+  await expect(link.locator('.conn-state')).toHaveText('Connect');
+  await expect(link).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('navigation', { name: 'Main' })).toBeHidden();
+  await expect(menu).toBeFocused();
 });
 
 test('deep link #/pipeline loads Pipeline and back/forward works', async ({ app, page }) => {
@@ -240,13 +288,76 @@ test('⌘K focuses search and results navigate to a company', async ({ app, page
   expect(await page.evaluate(() => window.__xss)).toBeUndefined();
 });
 
+test('search finds a draft by the contact and company the Drafts list names it by', async ({ app, page, server, request }) => {
+  const drafts = await (await request.get(server.apiUrl('/api/drafts'))).json();
+  const named = (d) => d.contact_name && d.company_name && !/[<>]/.test(d.contact_name + d.company_name);
+  const once = (d) => drafts.filter((x) => x.contact_name === d.contact_name).length === 1;
+  const li = drafts.find((d) => d.channel === 'linkedin' && named(d) && once(d));
+  const email = drafts.find((d) => d.channel === 'email' && named(d) && once(d));
+  expect(li && email).toBeTruthy();
+  await app.goto('#/home');
+  await shellReady(page);
+  const search = page.getByRole('combobox', { name: 'Search' });
+  const found = page.getByRole('group', { name: 'Drafts' }).getByRole('option');
+
+  // A LinkedIn note: by the person's full name, labelled as the list labels it.
+  await search.fill(li.contact_name);
+  await expect(found).toHaveCount(1);
+  await expect(found.locator('.search-opt-name')).toHaveText(`${li.contact_name} · ${li.company_name}`);
+  await expect(found.locator('.search-opt-meta')).toHaveText(`LinkedIn note · ${li.domain}`);
+
+  // An email: by the company name too, with its subject.
+  await search.fill(email.contact_name);
+  await expect(found).toHaveCount(1);
+  await expect(found.locator('.search-opt-name')).toHaveText(`${email.contact_name} · ${email.company_name}`);
+  await expect(found.locator('.search-opt-meta')).toHaveText(`Email · ${email.domain} · ${email.subject}`);
+  await search.fill(email.company_name);
+  await expect(found.filter({ hasText: email.contact_name })).toHaveCount(1);
+  await found.filter({ hasText: email.contact_name }).click();
+  await expect(page).toHaveURL(hashIs(`#/drafts/${email.domain}`));
+});
+
+test('a draft result opens that draft when the company has an email and a LinkedIn note', async ({ app, page, server, request }) => {
+  const drafts = await (await request.get(server.apiUrl('/api/drafts'))).json();
+  const named = (d) => d.contact_name && d.company_name && !/[<>]/.test(d.contact_name + d.company_name);
+  const email = drafts.find(
+    (d) => d.channel === 'email' && d.status === 'draft_pending' && named(d) && !drafts.some((x) => x.domain === d.domain && x !== d),
+  );
+  expect(email).toBeTruthy();
+  // The same company has a LinkedIn note waiting too, newer than the email.
+  const note = { ...email, channel: 'linkedin', to: 'https://www.linkedin.com/in/lina-note', contact_name: 'Lina Note', subject: null, body: 'Hi Lina, a quick hello.' };
+  await page.route('**/api/drafts', async (route) => {
+    if (route.request().method() !== 'GET') return route.fallback();
+    const res = await route.fetch();
+    await route.fulfill({ response: res, json: [note, ...(await res.json())] });
+  });
+  await app.goto('#/home');
+  await shellReady(page);
+  const search = page.getByRole('combobox', { name: 'Search' });
+  const found = page.getByRole('group', { name: 'Drafts' }).getByRole('option');
+  const detail = page.locator('.draft');
+  const open = async (meta, channel, who, editor, other) => {
+    await page.keyboard.press('ControlOrMeta+k');
+    await search.fill(email.company_name);
+    await expect(found).toHaveCount(2);
+    await found.filter({ has: page.locator('.search-opt-meta', { hasText: meta }) }).click();
+    await expect(page).toHaveURL(hashIs(`#/drafts/${email.domain}?channel=${channel}`));
+    await expect(detail).toContainText(who);
+    await expect(detail.getByRole('textbox', { name: editor })).toBeVisible();
+    await expect(detail.getByRole('textbox', { name: other })).toHaveCount(0);
+  };
+  await open(/^Email · /, 'email', email.contact_name, 'Body', 'Connection note');
+  await open(/^LinkedIn note/, 'linkedin', 'Lina Note', 'Connection note', 'Body');
+});
+
 test('schedule chip shows next Lunch Source run', async ({ app, page, server, request }) => {
   const summary = await (await request.get(server.apiUrl('/api/summary'))).json();
   expect(summary.next_schedule.name).toBe(SEED.schedules.lunch.name);
   await app.goto('#/home');
   const chip = page.locator('#topbar .chip');
-  // "<name> · next <relative>": a daily run is always within 48h, so it counts down ("in 3h").
-  await expect(chip).toHaveText(/^Lunch Source · next in \d+[mh]$/);
+  // "<name> · next <relative>": a daily run is always within 48h, so it counts down ("in 3h",
+  // "in under a minute" in its last minute).
+  await expect(chip).toHaveText(/^Lunch Source · next in (\d+[mh]|under a minute)$/);
   const text = await chip.textContent();
   const now = Date.now();
   const nextAt = summary.next_schedule.next_at;
@@ -275,6 +386,59 @@ test('schedule chip shows a running run, or that nothing is scheduled', async ({
   await page.reload();
   await expect(chip).toHaveText('No schedule');
   await expect(chip).toHaveAttribute('href', '#/schedules');
+});
+
+test('on a phone the schedule chip says when, and the search hint fits', async ({ app, page, server, request }) => {
+  const summary = await (await request.get(server.apiUrl('/api/summary'))).json();
+  const name = summary.next_schedule.name;
+  await page.setViewportSize({ width: 390, height: 844 });
+  await app.goto('#/home');
+  const chip = page.locator('#topbar .chip');
+  const search = page.getByRole('combobox', { name: 'Search' });
+  await expect(chip).toHaveText(/^Next in (\d+[mh]|under a minute)$/);
+  const shown = await chip.textContent();
+  await expect(chip).toHaveAttribute('aria-label', `${shown} · ${name}`);
+  // Nothing cut off: the time is what the chip is for.
+  const cut = (loc) => loc.evaluate((el) => el.scrollWidth > el.clientWidth + 1);
+  expect(await cut(chip.locator('.chip-text'))).toBe(false);
+  await expect(search).toHaveAttribute('placeholder', 'Search');
+  const hintFits = await search.evaluate((el) => {
+    const ctx = document.createElement('canvas').getContext('2d');
+    const cs = getComputedStyle(el);
+    ctx.font = `${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
+    return ctx.measureText(el.placeholder).width <= el.clientWidth;
+  });
+  expect(hintFits).toBe(true);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+
+  // Wider, it names the schedule again.
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await expect(chip).toHaveText(new RegExp(`^${reEscape(name)} · next `));
+  expect(await chip.getAttribute('aria-label')).toBeNull();
+  await expect(search).toHaveAttribute('placeholder', 'Search companies, people, drafts');
+});
+
+test('a pinned theme is on the page before the app code runs', async ({ app, page }) => {
+  await page.emulateMedia({ colorScheme: 'light' });
+  await app.goto('#/home');
+  await shellReady(page);
+  await page.evaluate(() => localStorage.setItem('ct-theme', 'dark'));
+  // Hold main.js: what is on screen meanwhile is the first paint.
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  await page.route('**/assets/js/main.js', async (route) => {
+    await held;
+    await route.continue();
+  });
+  await page.reload({ waitUntil: 'commit' });
+  await expect.poll(() => page.evaluate(() => document.readyState !== 'loading' && !!document.body)).toBe(true);
+  expect(await page.evaluate(() => document.getElementById('nav').childElementCount)).toBe(0); // the app hasn't run
+  expect(await page.evaluate(() => document.documentElement.getAttribute('data-theme'))).toBe('dark');
+  await expect.poll(() => page.evaluate(() => getComputedStyle(document.body).backgroundColor)).toBe('rgb(15, 16, 18)');
+  release();
+  await shellReady(page);
+  expect(await page.evaluate(() => document.documentElement.getAttribute('data-theme'))).toBe('dark');
+  await page.evaluate(() => localStorage.removeItem('ct-theme'));
 });
 
 test('theme follows system then persists Light/Dark', async ({ app, page }) => {
@@ -374,6 +538,130 @@ test('stale token shows session banner', async ({ app, page }) => {
   });
   await expect(banner).toHaveCount(1);
   await expect(banner).toHaveText(SESSION_EXPIRED);
+  // The search, like every screen, only points the way: the banner says it in full, once.
+  await page.keyboard.press('ControlOrMeta+k');
+  await page.getByRole('combobox', { name: 'Search' }).fill('acme');
+  await expect(page.locator('.search-status')).toHaveText(SESSION_REOPEN);
+  await expect(page.getByText(SESSION_EXPIRED)).toHaveCount(1);
+});
+
+test('the stale-session banner goes once the tab works again', async ({ app, page, server }) => {
+  app.allowConsole(/401|Unauthorized/i);
+  await app.goto('#/home');
+  await shellReady(page);
+  await page.context().clearCookies();
+  await page.reload();
+  const banner = page.locator('.session-banner');
+  await expect(banner).toHaveText(SESSION_EXPIRED);
+  // coldtrail reopened from the terminal in another tab: the shared cookie is good again.
+  const url = new URL(server.base);
+  await page.context().addCookies([{ name: 'ct_token', value: server.token, domain: url.hostname, path: '/' }]);
+  await page.evaluate(async () => {
+    const { store } = await import('/assets/js/core/store.js');
+    await store.refresh();
+  });
+  await expect(banner).toHaveCount(0);
+  await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: /^Drafts\b/ }).click();
+  await expect(page.locator('#view h1')).toHaveText('Drafts');
+  // And a later stale session is told again.
+  await page.context().clearCookies();
+  await page.evaluate(async () => {
+    const { store } = await import('/assets/js/core/store.js');
+    await store.refresh();
+  });
+  await expect(banner).toHaveText(SESSION_EXPIRED);
+  await expect(banner).toHaveCount(1);
+});
+
+test('with coldtrail not answering, one banner says so and screens say it plainly', async ({ app, page }) => {
+  // The browser logs each refused request.
+  app.allowConsole(/ERR_CONNECTION_REFUSED|Failed to load resource/);
+  await app.goto('#/home');
+  await shellReady(page);
+  const nav = page.getByRole('navigation', { name: 'Main' });
+  // Load Follow-ups once, so only its data is missing later.
+  await nav.getByRole('link', { name: /^Follow-ups\b/ }).click();
+  await expect(page.locator('#view h1')).toHaveText('Follow-ups');
+  await nav.getByRole('link', { name: /^Home\b/ }).click();
+  await expect(page.locator('#view h1')).toHaveText('Home');
+
+  // As when its terminal was closed: every API request is refused.
+  await page.route('**/api/**', (route) => route.abort('connectionrefused'));
+  const banner = page.locator('.session-banner');
+  await page.keyboard.press('ControlOrMeta+k');
+  await page.getByRole('combobox', { name: 'Search' }).fill('acme');
+  await expect(page.locator('.search-status')).toHaveText(OFFLINE_SHORT);
+  await expect(banner).toHaveText(OFFLINE);
+  await expect(banner).toHaveAttribute('role', 'alert');
+  await page.keyboard.press('Escape');
+  await nav.getByRole('link', { name: /^Follow-ups\b/ }).click();
+  await expect(page.locator('#view')).toContainText("Couldn't load follow-ups");
+  await expect(page.locator('#view')).toContainText(OFFLINE_SHORT);
+  await expect(page.locator('body')).not.toContainText(/Failed to fetch|NetworkError|Load failed/);
+  await expect(banner).toHaveCount(1);
+
+  // Back: the next answer takes the banner away.
+  await page.unroute('**/api/**');
+  await page.evaluate(async () => {
+    const { store } = await import('/assets/js/core/store.js');
+    await store.refresh();
+  });
+  await expect(banner).toHaveCount(0);
+});
+
+test('page shortcuts stay off while the phone menu covers the page', async ({ app, page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await app.goto('#/drafts');
+  await expect(page.getByRole('listbox', { name: 'Drafts' }).getByRole('option').first()).toBeVisible();
+  await expect(page).toHaveURL(hashIs('#/drafts'));
+  const menu = page.getByRole('button', { name: 'Menu', exact: true });
+  await menu.click();
+  await expect(page.getByRole('navigation', { name: 'Main' })).toBeVisible();
+  await page.keyboard.press('j');
+  await page.keyboard.press('k');
+  await expect(page).toHaveURL(hashIs('#/drafts'));
+  await expect(menu).toHaveAttribute('aria-expanded', 'true');
+  // ⌘K still works: it closes the menu and focuses the search.
+  await page.keyboard.press('ControlOrMeta+k');
+  await expect(menu).toHaveAttribute('aria-expanded', 'false');
+  await expect(page.getByRole('combobox', { name: 'Search' })).toBeFocused();
+  // With the menu closed, J moves through the drafts again.
+  await page.getByRole('combobox', { name: 'Search' }).blur();
+  await page.keyboard.press('j');
+  await expect(page).not.toHaveURL(hashIs('#/drafts'));
+});
+
+test('phone menu: a link to the screen on show closes the menu and keeps focus in view', async ({ app, page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await app.goto('#/home');
+  await expect(page.locator('#view h1')).toHaveText('Home');
+  const nav = page.getByRole('navigation', { name: 'Main' });
+  const menu = page.getByRole('button', { name: 'Menu', exact: true });
+  const h1 = page.locator('#view h1');
+
+  // The wordmark, on Home.
+  await menu.click();
+  await page.locator('#nav .wordmark').click();
+  await expect(nav).toBeHidden();
+  await expect(menu).toHaveAttribute('aria-expanded', 'false');
+  await expect(h1).toBeFocused();
+  // Home's own link.
+  await menu.click();
+  await nav.getByRole('link', { name: /^Home\b/ }).click();
+  await expect(nav).toBeHidden();
+  await expect(h1).toBeFocused();
+  // A connection dot to the Settings tab on show.
+  await page.evaluate(() => { location.hash = '#/settings?tab=connections'; });
+  await expect(h1).toHaveText('Settings');
+  await menu.click();
+  await page.locator('#nav .conn').filter({ hasText: 'Gmail' }).click();
+  await expect(nav).toBeHidden();
+  await expect(h1).toBeFocused();
+  // A new screen still takes focus on its heading.
+  await menu.click();
+  await nav.getByRole('link', { name: /^Drafts\b/ }).click();
+  await expect(h1).toHaveText('Drafts');
+  await expect(h1).toBeFocused();
 });
 
 test('shell is accessible', async ({ app, page }) => {
@@ -448,6 +736,80 @@ test('a screen that failed to load is tried again from its nav link', async ({ a
   await link.click();
   await expect(page.locator('#view h1')).toHaveText('Follow-ups');
   await expect(page).toHaveURL(hashIs('#/followups'));
+});
+
+test('a screen whose code failed to download is fetched again, from its nav link or Reload', async ({ app, page }) => {
+  // The browser logs the refused request; the router logs the failed import.
+  app.allowConsole(/ERR_CONNECTION_REFUSED|Failed to load resource|dynamically imported module/);
+  // The first download of each held screen is refused, as while coldtrail restarts.
+  const asked = { followups: [], schedules: [] };
+  for (const name of Object.keys(asked)) {
+    await page.route(`**/assets/js/views/${name}.js*`, async (route) => {
+      asked[name].push(new URL(route.request().url()).search);
+      if (asked[name].length === 1) await route.abort('connectionrefused');
+      else await route.continue();
+    });
+  }
+  await app.goto('#/home');
+  await shellReady(page);
+  const nav = page.getByRole('navigation', { name: 'Main' });
+  const h1 = page.locator('#view h1');
+
+  // The error says what to do, in words, and takes focus like any new screen.
+  const link = nav.getByRole('link', { name: /^Follow-ups\b/ });
+  await link.click();
+  await expect(h1).toHaveText("This screen didn't load");
+  await expect(h1).toBeFocused();
+  await expect(page.locator('#view')).toContainText('Check that coldtrail is still running');
+  await expect(page.locator('#view')).not.toContainText('dynamically imported module');
+  // The nav link asks for it again (loading the page afresh: the failure sticks to its URL), and
+  // it comes.
+  await link.click();
+  await expect(h1).toHaveText('Follow-ups');
+  expect(asked.followups.length).toBe(2);
+  // Leaving and coming back uses the copy that loaded.
+  await nav.getByRole('link', { name: /^Drafts\b/ }).click();
+  await expect(h1).toHaveText('Drafts');
+  await link.click();
+  await expect(h1).toHaveText('Follow-ups');
+  expect(asked.followups.length).toBe(2);
+
+  // Reload works too.
+  await nav.getByRole('link', { name: /^Schedules\b/ }).click();
+  await expect(h1).toHaveText("This screen didn't load");
+  await page.locator('#view').getByRole('button', { name: 'Reload' }).click();
+  await expect(h1).toHaveText('Schedules');
+  await expect(page).toHaveURL(hashIs('#/schedules'));
+  expect(asked.schedules).toEqual(['', '']);
+});
+
+test('a screen whose code failed to download breaks no screen that imports it', async ({ app, page }) => {
+  app.allowConsole(/ERR_CONNECTION_REFUSED|Failed to load resource|dynamically imported module/);
+  // Company profile's first download is refused. Settings imports Setup, which imports it.
+  let asked = 0;
+  await page.route('**/assets/js/views/company.js*', async (route) => {
+    if (++asked === 1) await route.abort('connectionrefused');
+    else await route.continue();
+  });
+  await app.goto('#/home');
+  await shellReady(page);
+  const nav = page.getByRole('navigation', { name: 'Main' });
+  const h1 = page.locator('#view h1');
+  await nav.getByRole('link', { name: /^Company profile\b/ }).click();
+  await expect(h1).toHaveText("This screen didn't load");
+  await expect(page).toHaveTitle("This screen didn't load · coldtrail");
+
+  // Settings hadn't loaded yet: it comes, and Company profile with it.
+  await nav.getByRole('link', { name: /^Settings\b/ }).click();
+  await expect(h1).toHaveText('Settings');
+  await expect(page).toHaveTitle('Settings · coldtrail');
+  await nav.getByRole('link', { name: /^Company profile\b/ }).click();
+  await expect(h1).toHaveText('Company profile');
+  // A connection dot goes to Settings in place now.
+  await page.locator('#nav .conn').filter({ hasText: 'Gmail' }).click();
+  await expect(h1).toHaveText('Settings');
+  await expect(page).toHaveURL(hashIs('#/settings?tab=connections'));
+  expect(asked).toBe(2);
 });
 
 /** Hold a view module's download until the returned release() is called, so its screen mounts
@@ -621,35 +983,52 @@ test.describe('components', () => {
         checked: false,
         label: 'Auto-send email',
         description: 'Sends up to 20 emails a day without asking.',
+        // Pending until the test lets it go, so the wait is there to see however slow the machine.
         onChange: async (on) => {
           window.__calls.push(on);
-          await new Promise((r) => setTimeout(r, 150));
+          await new Promise((r) => { window.__release = r; });
           if (window.__mode === 'fail') throw new Error('Could not save the setting');
           if (window.__mode === 'cancel') return false;
         },
       }));
     });
+    const release = () => page.evaluate(() => window.__release());
     const sw = page.getByRole('switch', { name: 'Auto-send email' });
     await expect(sw).toHaveAttribute('aria-checked', 'false');
     await expect(sw).toHaveAccessibleDescription('Sends up to 20 emails a day without asking.');
+    // It flips at once and is busy until onChange settles.
     await sw.click();
     await expect(sw).toHaveAttribute('aria-checked', 'true');
     await expect(sw).toHaveAttribute('aria-busy', 'true');
+    await release();
     await expect(sw).not.toHaveAttribute('aria-busy', 'true');
-
-    await page.evaluate(() => { window.__mode = 'fail'; });
-    await sw.click();
-    await expect(page.locator('.toast-err')).toContainText('Could not save the setting');
     await expect(sw).toHaveAttribute('aria-checked', 'true');
 
+    // A failure puts it back and says why.
+    await page.evaluate(() => { window.__mode = 'fail'; });
+    await sw.click();
+    await expect(sw).toHaveAttribute('aria-busy', 'true');
+    await expect(sw).toHaveAttribute('aria-checked', 'false');
+    await release();
+    await expect(page.locator('.toast-err')).toContainText('Could not save the setting');
+    await expect(sw).toHaveAttribute('aria-checked', 'true');
+    await expect(sw).not.toHaveAttribute('aria-busy', 'true');
+
+    // Resolving to false puts it back quietly.
     await page.evaluate(() => { window.__mode = 'cancel'; });
     await page.getByText('Auto-send email').click(); // the label toggles it too
+    await expect(sw).toHaveAttribute('aria-busy', 'true');
+    await expect(sw).toHaveAttribute('aria-checked', 'false');
+    await release();
     await expect(sw).not.toHaveAttribute('aria-busy', 'true');
     await expect(sw).toHaveAttribute('aria-checked', 'true');
 
     await page.evaluate(() => { window.__mode = ''; });
     await sw.focus();
     await page.keyboard.press('Space');
+    await expect(sw).toHaveAttribute('aria-busy', 'true');
+    await release();
+    await expect(sw).not.toHaveAttribute('aria-busy', 'true');
     await expect(sw).toHaveAttribute('aria-checked', 'false');
     expect(await calls(page)).toEqual([true, false, false, false]);
   });
@@ -745,6 +1124,129 @@ test.describe('components', () => {
     await page.keyboard.press('Enter');
     await expect(model).toHaveValue('custom/model-z');
     expect(await calls(page)).toEqual(['Q2', 'Q1', '', 'custom/model-z']);
+  });
+
+  test('search select keeps the highlighted option when its options are refreshed', async ({ app, page }) => {
+    await app.goto('#/home');
+    await sandbox(page, async (box) => {
+      const { searchSelect } = await import('/assets/js/components/searchSelect.js');
+      const opts = (extra) => [
+        { value: '', label: 'All sources', pinned: true },
+        ...['Q1', 'Q2', 'Q3', 'Q4', ...extra].map((v, i) => ({ value: v, label: v, count: 100 - i })),
+      ];
+      window.__opts = opts;
+      const el = searchSelect({ label: 'Sourced by', placeholder: 'All sources', value: '', options: opts([]), onChange: (v) => window.__calls.push(v) });
+      window.__ss = el;
+      box.append(el);
+    });
+    const box = page.getByRole('combobox', { name: 'Sourced by' });
+    const active = () => box.evaluate((el) => document.getElementById(el.getAttribute('aria-activedescendant') || '')?.textContent ?? null);
+
+    // Typed, then moved to Q3; a background refresh adds a source and changes the counts.
+    await box.click();
+    await box.fill('Q');
+    for (let i = 0; i < 3; i++) await page.keyboard.press('ArrowDown');
+    expect(await active()).toMatch(/^Q3/);
+    await page.evaluate(() => window.__ss.setOptions(window.__opts(['Q5'])));
+    expect(await active()).toMatch(/^Q3/);
+    await expect(box).toHaveAttribute('aria-expanded', 'true');
+    await page.keyboard.press('Enter');
+    expect(await calls(page)).toEqual(['Q3']);
+
+    // Opened with the arrow keys, nothing typed.
+    await box.press('ArrowDown');
+    await page.keyboard.press('ArrowDown');
+    expect(await active()).toMatch(/^Q4/);
+    await page.evaluate(() => window.__ss.setOptions(window.__opts(['Q5', 'Q6'])));
+    expect(await active()).toMatch(/^Q4/);
+    await page.keyboard.press('Enter');
+    expect(await calls(page)).toEqual(['Q3', 'Q4']);
+
+    // A highlighted option that went away leaves nothing highlighted (Enter then goes by what was typed).
+    await box.fill('Q6');
+    await page.keyboard.press('ArrowDown');
+    expect(await active()).toMatch(/^Q6/);
+    await page.evaluate(() => window.__ss.setOptions(window.__opts(['Q5'])));
+    expect(await active()).toBeNull();
+  });
+
+  test('search select reads out "No matches" and the free-text hint', async ({ app, page }) => {
+    await app.goto('#/home');
+    await sandbox(page, async (box) => {
+      const { searchSelect } = await import('/assets/js/components/searchSelect.js');
+      box.append(searchSelect({ label: 'Sourced by', value: '', options: [{ value: 'Q1', label: 'fintech' }], onChange() {} }));
+      box.append(searchSelect({ label: 'Model', value: '', freeText: true, options: [{ value: 'fake/a' }], onChange() {} }));
+    });
+    const status = (name) => page.locator('#sandbox .search-select').filter({ has: page.getByRole('combobox', { name }) }).locator('[aria-live="polite"]');
+    const source = page.getByRole('combobox', { name: 'Sourced by' });
+    // The live region is there before anything is said, so the first message is heard.
+    await expect(status('Sourced by')).toHaveText('');
+    await source.fill('zzzz-nothing');
+    await expect(status('Sourced by')).toHaveText('No matches');
+    const described = await source.getAttribute('aria-describedby');
+    expect(described).toBeTruthy();
+    await expect(page.locator(`[id="${described}"]`)).toHaveText('No matches');
+    await expect(page.locator(`[id="${described}"]`)).toBeVisible();
+    await source.fill('fin');
+    await expect(status('Sourced by')).toHaveText('');
+    expect(await source.getAttribute('aria-describedby')).toBeNull();
+
+    // A description the view gave the field stays, with the message beside it while it shows.
+    const model = page.getByRole('combobox', { name: 'Model' });
+    await model.evaluate((el) => el.setAttribute('aria-describedby', 'model-hint'));
+    await model.fill('custom/x');
+    await expect(status('Model')).toHaveText('Press Enter to use “custom/x”');
+    await expect(model).toHaveAttribute('aria-describedby', /^\S+-empty model-hint$/);
+    await page.keyboard.press('Escape');
+    await expect(status('Model')).toHaveText('');
+    await expect(model).toHaveAttribute('aria-describedby', 'model-hint');
+    await expectAccessible(page);
+  });
+
+  test('the focus ring of a tab goes around its label and count, not through them', async ({ app, page }) => {
+    for (const width of [1440, 390]) {
+      await page.setViewportSize({ width, height: 800 });
+      await app.goto('#/home');
+      await sandbox(page, async (box) => {
+        const { tabs } = await import('/assets/js/components/tabs.js');
+        box.append(tabs({ label: 'Stage', items: ['All', 'Bounced', 'Skipped'].map((label, i) => ({ id: label, label, count: [1200, 2, 60][i] })), active: 'All', onChange() {} }));
+      });
+      const list = page.getByRole('tablist', { name: 'Stage' });
+      const sandboxLeft = await page.locator('#sandbox').evaluate((el) => el.getBoundingClientRect().left);
+      await list.getByRole('tab', { name: /^All/ }).focus();
+      await page.keyboard.press('ArrowRight'); // keyboard focus: :focus-visible
+      for (const name of ['Bounced', 'All']) {
+        if (name === 'All') await page.keyboard.press('ArrowLeft');
+        const tab = list.getByRole('tab', { name: new RegExp(`^${name}`) });
+        await expect(tab).toBeFocused();
+        const g = await tab.evaluate((b) => {
+          const ring = getComputedStyle(b, '::after');
+          const box = b.getBoundingClientRect();
+          const l = b.parentElement.getBoundingClientRect();
+          const text = [b.querySelector('.tab-label').getBoundingClientRect(), b.querySelector('.tab-count').getBoundingClientRect()];
+          const inset = (v) => parseFloat(v);
+          return {
+            width: ring.borderTopWidth,
+            color: ring.borderTopColor,
+            // The ring's inner edges, and the text's extent.
+            innerLeft: box.left + inset(ring.left) + parseFloat(ring.borderLeftWidth),
+            innerRight: box.right - inset(ring.right) - parseFloat(ring.borderRightWidth),
+            outerLeft: box.left + inset(ring.left),
+            outerRight: box.right - inset(ring.right),
+            textLeft: text[0].left,
+            textRight: text[1].right,
+            listLeft: l.left,
+            labelLeft: text[0].left,
+          };
+        });
+        expect(g.width).toBe('2px');
+        expect(g.color).toBe('rgb(29, 78, 216)');
+        expect(g.innerLeft, `${name} at ${width}: ring clear of the label`).toBeLessThanOrEqual(g.textLeft - 1);
+        expect(g.innerRight, `${name} at ${width}: ring clear of the count`).toBeGreaterThanOrEqual(g.textRight + 1);
+        expect(g.outerLeft, 'not clipped by the tablist').toBeGreaterThanOrEqual(g.listLeft - 0.5);
+        if (name === 'All') expect(Math.abs(g.labelLeft - sandboxLeft), 'the first label stays in line with the content').toBeLessThanOrEqual(0.5);
+      }
+    }
   });
 
   test('list/detail, badge and empty state', async ({ app, page }) => {
@@ -937,6 +1439,144 @@ test.describe('components', () => {
     expect(await calls(page)).toEqual([1]);
     await expect(list).toHaveAttribute('data-more', 'end');
     expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+  });
+
+  test('a deep-linked tab stays in view when counts arrive later and widen the tabs', async ({ app, page }) => {
+    // As Pipeline at #/pipeline?stage=skip: the tabs mount, then the stage counts land.
+    for (const width of [390, 1024]) {
+      await page.setViewportSize({ width, height: 800 });
+      await app.goto('#/home');
+      await sandbox(page, async (box) => {
+        const { tabs } = await import('/assets/js/components/tabs.js');
+        const labels = ['All', 'New', 'Contact found', 'In Gmail', 'Sent', 'Replied', 'Follow-up due', 'Bounced', 'Skipped'];
+        box.style.maxWidth = '728px';
+        const t = tabs({ label: 'Stage', items: labels.map((label, i) => ({ id: 's' + i, label })), active: 's8', onChange() {} });
+        window.__tabs = t;
+        box.append(t);
+      });
+      const list = page.getByRole('tablist', { name: 'Stage' });
+      const skipped = list.getByRole('tab', { name: /^Skipped/ });
+      const inView = () =>
+        skipped.evaluate((b) => {
+          const l = b.parentElement.getBoundingClientRect();
+          const r = b.getBoundingClientRect();
+          return r.left >= l.left - 1 && r.right <= l.right + 1;
+        });
+      await expect.poll(inView, { message: `placed at ${width}` }).toBe(true);
+      await page.evaluate(() => window.__tabs.setCounts({ s0: 1200, s1: 590, s2: 320, s3: 120, s4: 99, s5: 12, s6: 4, s7: 3, s8: 60 }));
+      await expect(skipped.locator('.tab-count')).toHaveText('60');
+      await expect.poll(inView, { message: `after the counts at ${width}` }).toBe(true);
+      await expect(list).toHaveAttribute('data-more', /start/);
+      // Counts that change nothing leave a strip the user scrolled alone.
+      await list.evaluate((l) => { l.scrollLeft = 0; });
+      await page.evaluate(() => window.__tabs.setCounts({ s0: 1200, s8: 60 }));
+      expect(await list.evaluate((l) => l.scrollLeft)).toBe(0);
+    }
+  });
+
+  test('toasts on screen step aside while a dialog is open and come back when it closes', async ({ app, page }) => {
+    for (const size of [{ width: 390, height: 844 }, { width: 1024, height: 768 }]) {
+      await page.setViewportSize(size);
+      await app.goto('#/home');
+      await expect(page.locator('#view h1')).toBeVisible();
+      await page.evaluate(async () => {
+        const ui = await import('/assets/js/core/ui.js');
+        window.__ui = ui;
+        ui.toast(`Gmail draft not created — ${'Gmail isn’t connected, so coldtrail can’t create drafts there. '.repeat(6)}`, 'err');
+      });
+      const sticky = page.locator('.toast', { hasText: 'Gmail draft not created' });
+      await expect(sticky).toBeVisible();
+      await page.evaluate(() => {
+        const p = (t) => Object.assign(document.createElement('p'), { textContent: t });
+        window.__ui.openDialog({
+          title: 'Send all drafts',
+          content: [p('Creates 10 Gmail drafts, one per email in the queue.'), p('LinkedIn notes stay here.'), p('Nothing is sent.'), p('You can still edit each draft in Gmail.')],
+          actions: [{ label: 'Cancel' }, { label: 'Create 10 Gmail drafts', kind: 'primary', onClick: () => { window.__created = true; } }],
+        });
+      });
+      const dialog = page.getByRole('dialog', { name: 'Send all drafts' });
+      await expect(dialog).toBeVisible();
+      await expect(sticky).toBeHidden();
+      // Nothing covers the dialog's buttons: a real click reaches the confirm button.
+      await dialog.getByRole('button', { name: 'Create 10 Gmail drafts' }).click({ timeout: 2000 });
+      await expect(dialog).toHaveCount(0);
+      expect(await page.evaluate(() => window.__created)).toBe(true);
+      await expect(sticky).toBeVisible();
+
+      // A toast raised while a dialog is open (its action failed) shows over it.
+      await page.evaluate(() => {
+        window.__ui.openDialog({ title: 'Rename', content: 'x', actions: [{ label: 'Cancel' }] });
+        window.__ui.toast('Could not rename it', 'err');
+      });
+      await expect(sticky).toBeHidden();
+      await expect(page.locator('.toast', { hasText: 'Could not rename it' })).toBeVisible();
+      await page.keyboard.press('Escape');
+      await expect(page.getByRole('dialog')).toHaveCount(0);
+      await expect(sticky).toBeVisible();
+      await expect(page.locator('.toast', { hasText: 'Could not rename it' })).toBeVisible();
+      await page.evaluate(() => document.querySelectorAll('#toasts .toast').forEach((t) => t.remove()));
+    }
+  });
+
+  test('a confirm dialog starts on Cancel, so Enter never confirms by accident', async ({ app, page }) => {
+    await app.goto('#/home');
+    await shellReady(page);
+    const ask = (opts) =>
+      page.evaluate(async (o) => {
+        const { confirmDialog } = await import('/assets/js/core/ui.js');
+        window.__answer = confirmDialog(o);
+      }, opts);
+    for (const opts of [
+      { title: 'Send this email now?', body: 'It goes out right away.', confirmText: 'Send now' },
+      { title: 'Delete Lunch Source?', body: 'Its timer is removed.', confirmText: 'Delete schedule', danger: true },
+    ]) {
+      await ask(opts);
+      const dlg = page.getByRole('alertdialog', { name: opts.title });
+      await expect(dlg.getByRole('button', { name: 'Cancel' })).toBeFocused();
+      await page.keyboard.press('Enter');
+      await expect(dlg).toHaveCount(0);
+      expect(await page.evaluate(() => window.__answer)).toBe(false);
+    }
+    // Confirming takes a deliberate move to the confirm button.
+    await ask({ title: 'Turn on email auto-send?', body: 'Sends without asking.', confirmText: 'Turn on' });
+    await page.keyboard.press('Tab');
+    await expect(page.getByRole('button', { name: 'Turn on' })).toBeFocused();
+    await page.keyboard.press('Enter');
+    expect(await page.evaluate(() => window.__answer)).toBe(true);
+  });
+
+  test('hovered rows keep their small grey text at 4.5:1', async ({ app, page }) => {
+    await page.emulateMedia({ colorScheme: 'light' });
+    await app.goto('#/pipeline');
+    await shellReady(page);
+    const text2 = 'rgb(87, 83, 78)';
+    const nav = page.getByRole('navigation', { name: 'Main' });
+    const hovered = async (el, part, color) => {
+      await el.hover();
+      await expect(el.locator(part)).toHaveCSS('color', color);
+    };
+    await hovered(nav.getByRole('link', { name: /^Follow-ups\b/ }), '.nav-count', text2);
+    // The Drafts badge and the current item keep their own colours.
+    await hovered(nav.getByRole('link', { name: /^Drafts\b/ }), '.nav-count', 'rgb(255, 255, 255)');
+    await hovered(nav.getByRole('link', { name: /^Pipeline\b/ }), '.nav-count', 'rgb(30, 58, 138)');
+    await hovered(page.locator('#nav .conn').nth(2), '.conn-state', text2);
+
+    const search = page.getByRole('combobox', { name: 'Search' });
+    await search.fill(SEED.emailDrafts[1].domain);
+    const second = page.getByRole('option').nth(1);
+    await expect(second).not.toHaveClass(/is-active/);
+    await hovered(second, '.search-opt-meta', text2);
+    await search.fill('');
+
+    await sandbox(page, async (box) => {
+      const { searchSelect } = await import('/assets/js/components/searchSelect.js');
+      box.append(searchSelect({ label: 'Source list', value: '', options: [{ value: 'Q1', label: 'Q1', count: 3 }, { value: 'Q2', label: 'Q2', count: 4 }], onChange() {} }));
+    });
+    const box = page.locator('#sandbox');
+    await box.getByRole('combobox', { name: 'Source list' }).click();
+    const opt = box.locator('.ss-option').nth(1);
+    await expect(opt).not.toHaveClass(/is-active/);
+    await hovered(opt, '.ss-option-count', text2);
   });
 
   test('search select can be disabled later and opens under its input, inside the viewport', async ({ app, page }) => {

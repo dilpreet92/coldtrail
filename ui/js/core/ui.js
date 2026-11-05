@@ -7,7 +7,9 @@
 // AbortSignal (`signal`) that closes them, so a view can tie them to its own lifetime. Dialogs and
 // drawers take beforeClose(reason) to keep themselves open (unsaved typing). Every open overlay
 // carries [data-overlay], which keys.js checks so page shortcuts stay off while one is open (⌘K
-// closes the top one with closeTopOverlay() instead).
+// closes the top one with closeTopOverlay() instead). Toasts on screen when a modal opens step
+// aside (hidden) until it closes, so a sticky error never covers its buttons; toasts raised while
+// it is open (its own action failing) show over it.
 //
 // Class hooks for components.css: .overlay (.overlay-dialog | .overlay-drawer: the backdrop),
 // .dialog > .dialog-head (.dialog-title, .overlay-close) + .dialog-body + .dialog-actions
@@ -104,6 +106,20 @@ function syncInert() {
     o.el.inert = i < top;
   });
   document.documentElement.classList.toggle('has-overlay', top >= 0);
+}
+
+// Hide the toasts on screen and return them, for releaseToasts() once the modal holding them
+// closes.
+function holdToasts() {
+  const host = document.getElementById('toasts');
+  if (!host) return [];
+  const shown = [...host.children].filter((t) => !t.hidden);
+  for (const t of shown) t.hidden = true;
+  return shown;
+}
+
+function releaseToasts(toasts) {
+  for (const t of toasts) if (t.isConnected) t.hidden = false;
 }
 
 function restoreFocus(opener) {
@@ -228,7 +244,7 @@ function askBeforeClose(beforeClose, reason) {
  */
 function pushOverlay({ el, panel, modal, kind, anchor = null, opener = null, onKey = null, onClose = null, beforeClose = null, initialFocus }) {
   const active = document.activeElement;
-  const entry = { el, panel, modal, kind, anchor, onKey, closed: false, asking: false };
+  const entry = { el, panel, modal, kind, anchor, onKey, closed: false, asking: false, toasts: [] };
   entry.opener = opener || (active && active !== document.body ? active : null);
   entry.close = (reason = 'api', { restore = true, force = false } = {}) => {
     if (entry.closed) return;
@@ -251,6 +267,11 @@ function pushOverlay({ el, panel, modal, kind, anchor = null, opener = null, onK
     stack.splice(i, 1);
     // An overlay opened from this one now returns focus to this one's opener instead.
     if (!wasTop && stack[i] && stack[i].opener && el.contains(stack[i].opener)) stack[i].opener = entry.opener;
+    // The toasts it held come back, unless a modal opened over it is still open: that one holds
+    // them now.
+    const above = stack.slice(i).filter((o) => o.modal).pop();
+    if (above) above.toasts.push(...entry.toasts);
+    else releaseToasts(entry.toasts);
     el.remove();
     syncInert();
     if (!stack.length) listen(false);
@@ -263,6 +284,7 @@ function pushOverlay({ el, panel, modal, kind, anchor = null, opener = null, onK
       }
     }
   };
+  if (modal) entry.toasts = holdToasts();
   overlayRoot().append(el);
   stack.push(entry);
   listen(true);
@@ -452,9 +474,11 @@ export function openDialog({ title, content, actions = [], onClose, beforeClose 
 
 /**
  * confirmDialog({ title, body, confirmText = 'Confirm', cancelText = 'Cancel', danger = false,
- * opener?, signal? }) → Promise<boolean>: true only when the confirm button is pressed. Danger
- * dialogs focus Cancel. Aborting `signal` (e.g. the view's, on unmount) closes it with false;
- * an already aborted one never opens.
+ * opener?, signal? }) → Promise<boolean>: true only when the confirm button is pressed. Every
+ * confirm opens on Cancel, danger or not: what it guards (a send, auto-send, a higher cap) can't
+ * be taken back, so an Enter pressed twice or held never confirms; Tab reaches the confirm
+ * button. `danger` makes that button red. Aborting `signal` (e.g. the view's, on unmount) closes
+ * it with false; an already aborted one never opens.
  */
 export function confirmDialog({ title, body, confirmText = 'Confirm', cancelText = 'Cancel', danger = false, opener = null, signal = null }) {
   return new Promise((resolve) => {
@@ -470,8 +494,8 @@ export function confirmDialog({ title, body, confirmText = 'Confirm', cancelText
       opener,
       signal,
       actions: [
-        { label: cancelText, kind: 'secondary', autofocus: danger },
-        { label: confirmText, kind: danger ? 'danger' : 'primary', autofocus: !danger, onClick: () => { confirmed = true; } },
+        { label: cancelText, kind: 'secondary', autofocus: true },
+        { label: confirmText, kind: danger ? 'danger' : 'primary', onClick: () => { confirmed = true; } },
       ],
       onClose: () => resolve(confirmed),
     });

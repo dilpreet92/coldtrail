@@ -2,8 +2,9 @@
 // End move between tabs and select as they go (automatic activation); only the selected tab is a
 // tab stop. The component keeps its own selection, so a view does not rebuild it on change (that
 // would drop focus): call setActive / setCounts on the returned element instead. When the tabs
-// don't fit (phones) the list scrolls sideways: the selected tab is kept in view, and the edge
-// with more tabs fades out (data-more="start" / "end" / "start end" on the list).
+// don't fit (phones) the list scrolls sideways: the selected tab is kept in view (also when counts
+// that land later widen the tabs), and the edge with more tabs fades out (data-more="start" /
+// "end" / "start end" on the list).
 
 import { fmtNum, h } from '../core/dom.js';
 
@@ -70,6 +71,15 @@ export function tabs({ items, active, onChange, label, panelId }) {
     else list.removeAttribute('data-more');
   }
 
+  // Whether the tab is wholly inside the list's box (scrolled into sight).
+  function inSight(k) {
+    const b = buttons.get(k);
+    if (!b) return false;
+    const l = list.getBoundingClientRect();
+    const r = b.getBoundingClientRect();
+    return r.left >= l.left - 1 && r.right <= l.right + 1;
+  }
+
   // Scroll the list (only the list, never the page) so the tab clears the faded edges.
   function reveal(k) {
     const b = buttons.get(k);
@@ -122,12 +132,23 @@ export function tabs({ items, active, onChange, label, panelId }) {
     reveal(k);
   };
   list.setCounts = (map) => {
+    // New counts widen or narrow the tabs and can push the selected one out of sight (a deep link
+    // is revealed before its counts land): keep it in sight if it was. Counts that change nothing,
+    // or a selected tab the user scrolled away from, leave the strip where it is.
+    const wasInSight = inSight(current);
+    let changed = false;
     for (const [id, n] of Object.entries(map || {})) {
       const el = counts.get(key(id));
       if (!el) continue;
-      el.textContent = n == null ? '' : fmtNum(n);
+      const text = n == null ? '' : fmtNum(n);
+      if (el.textContent === text && el.hidden === (n == null)) continue;
+      el.textContent = text;
       el.hidden = n == null;
+      changed = true;
     }
+    if (!changed) return;
+    if (wasInSight) reveal(current);
+    syncMore();
   };
   sync();
   return list;

@@ -6,10 +6,12 @@ import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { h, debounce, esc as domEsc } from '../../ui/js/core/dom.js';
 import { esc } from '../../ui/js/core/format.js';
-import { api, SESSION_EXPIRED, SESSION_REOPEN, errorText, isStaleSession, initToken, token, openStream } from '../../ui/js/core/api.js';
+import { api, SESSION_EXPIRED, SESSION_REOPEN, OFFLINE, OFFLINE_SHORT, errorText, isStaleSession, isOffline, initToken, token, openStream } from '../../ui/js/core/api.js';
 import { store } from '../../ui/js/core/store.js';
 import { bindKeys, comboOf } from '../../ui/js/core/keys.js';
 import { getThemePref, setThemePref, applyTheme } from '../../ui/js/core/theme.js';
+import { readFileSync } from 'node:fs';
+import vm from 'node:vm';
 
 /** Install globals for the duration of `fn`, then restore whatever was there. */
 async function withGlobals(globals, fn) {
@@ -205,6 +207,85 @@ test('401 throws SESSION_EXPIRED and fires coldtrail:session-expired once', asyn
     assert.equal(events.length, 1);
     assert.equal(events[0].detail.message, SESSION_EXPIRED);
   });
+});
+
+test('a request that gets no answer throws OFFLINE in plain words; an abort stays an abort', async () => {
+  assert.equal(OFFLINE, "coldtrail isn't responding. Check that it's still running in your terminal.");
+  assert.equal(OFFLINE_SHORT, "coldtrail isn't responding.");
+  let down = true;
+  // What every browser does when nothing listens on the port: a TypeError in its own words.
+  const fetch = fakeFetch((path, init) => {
+    if (init.signal && init.signal.aborted) throw new DOMException('The operation was aborted.', 'AbortError');
+    if (down) throw new TypeError('Failed to fetch');
+    return Response.json({ ok: true });
+  });
+  const win = new EventTarget();
+  const events = [];
+  for (const type of ['coldtrail:offline', 'coldtrail:reconnected', 'coldtrail:session-expired']) {
+    win.addEventListener(type, (e) => events.push([type, e.detail.message]));
+  }
+  await withGlobals({ fetch, window: win }, async () => {
+    for (const call of [() => api.get('/api/summary'), () => api.post('/api/x', {}), () => api.patch('/api/x', {}), () => api.del('/api/x')]) {
+      const err = await call().catch((e) => e);
+      assert.equal(err.message, OFFLINE);
+      assert.equal(isOffline(err), true);
+      assert.equal(err.status, undefined, 'no status: nothing answered');
+      assert.equal(err.cause?.message, 'Failed to fetch', 'the browser\'s error is kept as the cause');
+      assert.equal(errorText(err), OFFLINE_SHORT, 'screens point the way; the banner says it in full');
+      assert.equal(isStaleSession(err), false);
+    }
+    assert.deepEqual(events, [['coldtrail:offline', OFFLINE]], 'announced once');
+
+    // An aborted request is not "coldtrail stopped".
+    const ctl = new AbortController();
+    ctl.abort();
+    const aborted = await api.get('/api/companies', { signal: ctl.signal }).catch((e) => e);
+    assert.equal(aborted.name, 'AbortError');
+    assert.equal(isOffline(aborted), false);
+
+    // The first answer says it's back, once.
+    down = false;
+    assert.deepEqual(await api.get('/api/summary'), { ok: true });
+    await api.get('/api/status');
+    assert.deepEqual(events, [['coldtrail:offline', OFFLINE], ['coldtrail:reconnected', null]]);
+  });
+  assert.equal(isOffline(new Error(OFFLINE)), false, 'only api.js marks it');
+  assert.equal(isOffline(null), false);
+});
+
+test('a stale session lasts until another token gets an answer, then is announced afresh', async () => {
+  // Reopening coldtrail from the terminal rewrites the shared cookie, so an old tab can work again.
+  const doc = { cookie: 'ct_token=old' };
+  const refused = new Set(['old']);
+  const tokenOf = () => (doc.cookie.match(/ct_token=([^;]+)/) || [])[1];
+  let answer = () => Response.json({ ok: true });
+  const fetch = fakeFetch((path) => {
+    if (refused.has(tokenOf()) && path !== '/api/open') return new Response('unauthorized', { status: 401 });
+    return answer();
+  });
+  const win = new EventTarget();
+  const events = [];
+  for (const type of ['coldtrail:reconnected', 'coldtrail:session-expired']) win.addEventListener(type, () => events.push(type));
+  await withGlobals({ fetch, window: win, document: doc }, async () => {
+    await assert.rejects(api.get('/api/summary'), { message: SESSION_EXPIRED });
+    await assert.rejects(api.get('/api/status'), { message: SESSION_EXPIRED });
+    // Another request getting through on the same token doesn't end it.
+    await api.get('/api/open');
+    assert.deepEqual(events, ['coldtrail:session-expired']);
+    // Reopened from the terminal: a new cookie, and the tab works again.
+    doc.cookie = 'ct_token=new';
+    await api.get('/api/summary');
+    await api.post('/api/x', {});
+    assert.deepEqual(events, ['coldtrail:session-expired', 'coldtrail:reconnected']);
+    // A later restart is told again.
+    refused.add('new');
+    await assert.rejects(api.get('/api/summary'), { message: SESSION_EXPIRED });
+    // A 500 is still an answer: the session is fine, the request failed.
+    doc.cookie = 'ct_token=newer';
+    answer = () => new Response('database is locked', { status: 500 });
+    await assert.rejects(api.get('/api/summary'), { message: 'database is locked' });
+  });
+  assert.deepEqual(events, ['coldtrail:session-expired', 'coldtrail:reconnected', 'coldtrail:session-expired', 'coldtrail:reconnected']);
 });
 
 test('api helpers pass keepalive through for saves sent as the page goes away', async () => {
@@ -630,4 +711,32 @@ test('theme: system by default, persists light/dark, survives a broken localStor
     assert.equal(attrs['data-theme'], 'dark', 'still applies for this session');
     assert.equal(getThemePref(), 'dark');
   });
+});
+
+test('theme-boot.js pins the stored Light / Dark choice before the app loads, as theme.js stores it', async () => {
+  const boot = readFileSync(new URL('../../ui/js/core/theme-boot.js', import.meta.url), 'utf8');
+  assert.doesNotMatch(boot, /^\s*(import|export)\b/m, 'a classic script: no module syntax');
+  const mem = new Map();
+  const storage = {
+    getItem: (k) => (mem.has(k) ? mem.get(k) : null),
+    setItem: (k, v) => mem.set(k, String(v)),
+    removeItem: (k) => mem.delete(k),
+  };
+  const run = (localStorage) => {
+    const attrs = {};
+    const documentElement = { setAttribute: (k, v) => { attrs[k] = v; } };
+    vm.runInNewContext(boot, { localStorage, document: { documentElement } });
+    return attrs['data-theme'] ?? null;
+  };
+  const sink = { setAttribute() {}, removeAttribute() {} };
+  await withGlobals({ localStorage: storage, document: { documentElement: sink } }, () => {
+    for (const pref of ['dark', 'light', 'system']) {
+      setThemePref(pref); // what Settings → Appearance writes
+      assert.equal(run(storage), pref === 'system' ? null : pref, pref);
+    }
+  });
+  mem.set('ct-theme', 'bogus');
+  assert.equal(run(storage), null, 'anything else is System');
+  const broken = { getItem: () => { throw new Error('SecurityError'); } };
+  assert.equal(run(broken), null, 'storage that throws is System');
 });

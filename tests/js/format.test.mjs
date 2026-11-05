@@ -56,13 +56,18 @@ test('fmtDate reads SQLite datetime() strings as UTC and zone-less ISO as local'
   assert.equal(fmtDate('2026-10-09', { time: true, now }), 'Oct 9, 00:00');
 });
 
-test('fmtRelative: just now, minutes, hours both ways, then a dated fallback', () => {
+test('fmtRelative: just now / in under a minute, minutes, hours both ways, then a dated fallback', () => {
   const now = new Date('2026-10-27T12:00:00Z');
   const at = (ms) => new Date(now.getTime() + ms).toISOString();
   const MIN = 60_000;
   const HOUR = 60 * MIN;
   assert.equal(fmtRelative(at(-30_000), now), 'just now');
-  assert.equal(fmtRelative(at(20_000), now), 'just now');
+  assert.equal(fmtRelative(at(0), now), 'just now');
+  // The last minute before a time still looks ahead (the chip's "next in under a minute", not
+  // "next just now"), in the words Schedules uses.
+  assert.equal(fmtRelative(at(20_000), now), 'in under a minute');
+  assert.equal(fmtRelative(at(59_999), now), 'in under a minute');
+  assert.equal(fmtRelative(at(MIN), now), 'in 1m');
   assert.equal(fmtRelative(at(-5 * MIN), now), '5m ago');
   assert.equal(fmtRelative(at(-2 * HOUR), now), '2h ago');
   assert.equal(fmtRelative(at(3 * HOUR), now), 'in 3h');

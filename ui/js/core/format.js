@@ -57,14 +57,15 @@ export function fmtDate(iso, { time = false, now = new Date() } = {}) {
   return out;
 }
 
-/** "just now" (<60s), "5m ago" / "in 5m", "2h ago" / "in 3h" within 48h, else a dated
+/** "just now" (the last 60s), "in under a minute" (the next 60s: "next in under a minute", never
+ *  "next just now"), "5m ago" / "in 5m", "2h ago" / "in 3h" within 48h, else a dated
  *  fmtDate(iso, { time: true }). */
 export function fmtRelative(iso, now = new Date()) {
   const d = toDate(iso);
   if (!d) return DASH;
   const diff = d.getTime() - now.getTime();
   const abs = Math.abs(diff);
-  if (abs < MIN) return 'just now';
+  if (abs < MIN) return diff > 0 ? 'in under a minute' : 'just now';
   let span;
   if (abs < HOUR) span = `${Math.floor(abs / MIN)}m`;
   else if (abs < 48 * HOUR) span = `${Math.floor(abs / HOUR)}h`;

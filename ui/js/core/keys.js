@@ -1,6 +1,7 @@
 // Keyboard shortcuts (spec §4, §5.4): ⌘K / Ctrl+K, J/K, Enter, Esc, ⌘/Ctrl+Enter. Plain keys are
 // ignored while the user is typing, and every key is ignored while an overlay (dialog, drawer,
-// menu) is open: the overlay owns the keyboard then. The exception is ⌘K / Ctrl+K (global
+// menu) is open, or while the shell holds the page's keys (holdPageKeys: the phone menu covers
+// the page): the overlay or menu owns the keyboard then. The exception is ⌘K / Ctrl+K (global
 // search): its handler still runs and decides. If it can act it calls clearOverlay() first, which
 // closes the overlay on top as Esc would; if it can't (Setup hides the search) it returns false
 // and the overlay and the browser's own shortcut are left alone. Only one bindKeys map (the
@@ -17,6 +18,18 @@ const CONTROL_TAGS = new Set(['BUTTON', 'A', 'SUMMARY']);
 const CONTROL_ROLES = new Set(['button', 'link', 'switch', 'tab', 'menuitem', 'option', 'checkbox', 'radio', 'combobox']);
 
 const normalize = (combo) => combo.toLowerCase().replace(/\besc\b/, 'escape');
+
+let held = false;
+
+/**
+ * holdPageKeys(true) turns every shortcut but mod+k off, as an open overlay does, until
+ * holdPageKeys(false). For the shell's phone menu: it covers the page (made inert) without being
+ * an overlay, so J must not move the selection behind it. (Not [data-overlay]: clearOverlay()
+ * would then never see the overlays cleared.)
+ */
+export function holdPageKeys(on) {
+  held = !!on;
+}
 
 /** "mod+k", "shift+j", "escape" … from a KeyboardEvent (mod = ⌘ or Ctrl). */
 export function comboOf(e) {
@@ -57,7 +70,8 @@ export function clearOverlay() {
 /**
  * bindKeys({ 'mod+k': fn, j: fn, k: fn, escape: fn, enter: fn, 'mod+enter': fn }) → unbind.
  * fn(event) runs and the event is consumed (preventDefault) unless fn returns false. While an
- * overlay is open only mod+k runs, and its fn deals with the overlay (see clearOverlay).
+ * overlay is open (or holdPageKeys holds the keys) only mod+k runs, and its fn deals with the
+ * overlay (see clearOverlay).
  */
 export function bindKeys(map) {
   const handlers = new Map(Object.entries(map).map(([k, fn]) => [normalize(k), fn]));
@@ -68,7 +82,7 @@ export function bindKeys(map) {
     if (!fn) return;
     if (isTyping(e.target) && !WHILE_TYPING.has(combo)) return;
     if (combo === 'enter' && isControl(e.target)) return;
-    if (!OVER_OVERLAYS.has(combo) && document.querySelector('[data-overlay]')) return;
+    if (!OVER_OVERLAYS.has(combo) && (held || document.querySelector('[data-overlay]'))) return;
     if (fn(e) !== false) e.preventDefault();
   };
   document.addEventListener('keydown', onKeydown);

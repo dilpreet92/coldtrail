@@ -82,6 +82,9 @@
   font-variant-numeric: tabular-nums;
   color: var(--text-3);
 }
+/* On a hovered row's --surface-2, --text-3 is 4.4:1 (light): small grey text darkens to --text-2.
+   The same goes for the connection words, search result meta and search-select counts below. */
+.nav-item:not([aria-current="page"]):hover .nav-count:not(.nav-count-strong) { color: var(--text-2); }
 .nav-item[aria-current="page"] .nav-count { color: var(--accent-ink); }
 .nav-count.nav-count-strong,
 .nav-item[aria-current="page"] .nav-count-strong {
@@ -112,6 +115,7 @@
 .conn:hover { background: var(--surface-2); color: var(--text); }
 .conn-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .conn-state { color: var(--text-3); white-space: nowrap; }
+.conn:hover .conn-state { color: var(--text-2); }
 .conn[data-state="warn"] .conn-state { color: var(--warn); font-weight: 500; }
 
 /* ok: filled green; warn: filled amber; none (not set up): a grey ring. */
@@ -241,6 +245,7 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.search-opt:hover .search-opt-meta { color: var(--text-2); }
 .search-opt.is-active .search-opt-meta { color: var(--accent-ink); }
 
 .chip {
@@ -278,7 +283,9 @@
     width: auto;
     max-width: none;
   }
-  .chip { max-width: 45%; padding: 4px 10px; }
+  /* Here the chip says only when ("Next in 3h", see shell.js): it keeps that whole, and the
+     search takes the rest. */
+  .chip { flex: none; max-width: 45%; padding: 4px 10px; }
 }
 
 /* ---- Session-expired banner ---- */
@@ -454,12 +461,17 @@ textarea.input { min-height: 80px; line-height: 1.5; }
 .tabs {
   display: flex;
   gap: 20px;
+  /* Room inside the scroll box for the first and last tab's focus ring; the labels stay in line
+     with the content. */
+  margin-inline: -4px;
+  padding-inline: 4px;
   overflow-x: auto;
   border-bottom: 1px solid var(--border);
   scrollbar-width: none;
 }
 
 .tab {
+  position: relative;
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -473,7 +485,17 @@ textarea.input { min-height: 80px; line-height: 1.5; }
 }
 .tab:hover { color: var(--text); }
 .tab[aria-selected="true"] { color: var(--text); box-shadow: inset 0 -2px 0 var(--accent); }
-.tab:focus-visible { outline-offset: -2px; }
+/* The ring goes around the label and count, not through them: inside the tab's height (the
+   tablist clips above and below), 4px out to either side (tabs have no side padding). */
+.tab:focus-visible { outline: none; }
+.tab:focus-visible::after {
+  content: "";
+  position: absolute;
+  inset: 4px -4px;
+  border: 2px solid var(--accent);
+  border-radius: var(--radius-control);
+  pointer-events: none;
+}
 
 /* Tabs that scroll sideways fade out at the edge with more of them (tabs.js sets data-more). The
    mask only uses the gradient's alpha. */
@@ -608,6 +630,7 @@ textarea.input { min-height: 80px; line-height: 1.5; }
 .ss-option.is-chosen .ss-option-label { font-weight: 600; }
 .ss-option-label { min-width: 0; overflow-wrap: anywhere; }
 .ss-option-count { flex: none; font-family: var(--font-mono); font-size: 12px; color: var(--text-3); }
+.ss-option:hover .ss-option-count { color: var(--text-2); }
 .ss-option.is-active .ss-option-count { color: var(--accent-ink); }
 
 /* ---- List + detail ---- */

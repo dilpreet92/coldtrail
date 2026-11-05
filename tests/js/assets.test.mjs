@@ -152,6 +152,17 @@ test('index.html has no inline script and boots /assets/js/main.js as a module',
   assert.doesNotMatch(html, /app\.js|app\.css/, 'legacy UI is no longer referenced');
 });
 
+test('index.html pins the stored theme before the stylesheets, with a classic script', () => {
+  const doc = htmlTree(read('index.html'));
+  const head = all(doc, (e) => e.tag === 'head')[0];
+  const order = head.children.filter((e) => e.tag === 'script' || (e.tag === 'link' && e.attrs.rel === 'stylesheet'));
+  const boot = order.findIndex((e) => e.attrs.src === '/assets/js/core/theme-boot.js');
+  assert.ok(boot >= 0, 'theme-boot.js is loaded');
+  assert.equal(order.findIndex((e) => e.tag === 'link'), boot + 1, 'right before the first stylesheet');
+  // Parser-blocking, so it runs before the first paint: not a module, not deferred, not async.
+  for (const a of ['type', 'defer', 'async']) assert.ok(!(a in order[boot].attrs), `no ${a}`);
+});
+
 test('index.html loads tokens, base, components stylesheets in order', () => {
   const doc = htmlTree(read('index.html'));
   const sheets = all(doc, (e) => e.tag === 'link' && e.attrs.rel === 'stylesheet').map((l) => l.attrs.href);

@@ -13,18 +13,35 @@ export const SESSION_REOPEN = 'Reopen coldtrail from your terminal.';
  *  carrying the SESSION_EXPIRED message. */
 export const isStaleSession = (err) => !!err && (err.status === 401 || err.message === SESSION_EXPIRED);
 
+// The request never got an answer: coldtrail stopped (its terminal was closed) or is restarting.
+// The browser's own words for that ("Failed to fetch", "Load failed", "NetworkError when…") say
+// nothing to the user, so api.js throws this instead.
+export const OFFLINE = "coldtrail isn't responding. Check that it's still running in your terminal.";
+
+/** The short pointer a screen shows where a request got no answer. The shell's banner says OFFLINE
+ *  in full while it lasts, so screens don't repeat the sentence. */
+export const OFFLINE_SHORT = "coldtrail isn't responding.";
+
+/** True when `err` is api.js's error for a request that got no answer (see OFFLINE). */
+export const isOffline = (err) => !!err && err.offline === true;
+
 /**
  * The text to show for a failed request: SESSION_REOPEN ('Reopen coldtrail from your terminal.')
- * for a stale session (see isStaleSession), else err.message, else String(err) ('' for null or
- * undefined).
+ * for a stale session (see isStaleSession), OFFLINE_SHORT for a request that got no answer (see
+ * isOffline), else err.message, else String(err) ('' for null or undefined).
  */
 export function errorText(err) {
   if (isStaleSession(err)) return SESSION_REOPEN;
+  if (isOffline(err)) return OFFLINE_SHORT;
   return (err && err.message) || (err == null ? '' : String(err));
 }
 
 let bootToken = '';
-let expiredAnnounced = false;
+// What the latest answer (or its absence) said is wrong with this tab: 'expired' (a 401),
+// 'offline' (no answer) or null. Each change is announced once on window, so the shell's banner
+// comes and goes with it.
+let trouble = null;
+let staleToken = null; // the token the 401 behind 'expired' refused
 
 /**
  * Move a first-load `?t=<token>` into the `ct_token` cookie (exactly as before: raw value,
@@ -47,14 +64,22 @@ export function initToken() {
  * captured at boot, else "".
  */
 export function token() {
-  const m = String(document.cookie || '').match(/(?:^|;\s*)ct_token=([^;]+)/);
+  const cookie = typeof document === 'undefined' ? '' : document.cookie;
+  const m = String(cookie || '').match(/(?:^|;\s*)ct_token=([^;]+)/);
   return m ? m[1] : bootToken;
 }
 
-function sessionExpired() {
-  if (expiredAnnounced) return;
-  expiredAnnounced = true;
-  window.dispatchEvent(new CustomEvent('coldtrail:session-expired', { detail: { message: SESSION_EXPIRED } }));
+const TROUBLE_EVENTS = {
+  expired: ['coldtrail:session-expired', SESSION_EXPIRED],
+  offline: ['coldtrail:offline', OFFLINE],
+};
+
+// `kind`: 'expired' | 'offline' | null (an answer that wasn't a 401: the tab works again).
+function setTrouble(kind) {
+  if (kind === trouble) return;
+  trouble = kind;
+  const [type, message] = kind ? TROUBLE_EVENTS[kind] : ['coldtrail:reconnected', null];
+  window.dispatchEvent(new CustomEvent(type, { detail: { message } }));
 }
 
 function fail(message, status) {
@@ -63,14 +88,37 @@ function fail(message, status) {
   return err;
 }
 
+// fetch(), with a request that got no answer turned into OFFLINE. An abort is passed on as is.
+async function request(path, init) {
+  const sent = token(); // what the cookie carries with this request
+  let r;
+  try {
+    r = await fetch(path, init);
+  } catch (err) {
+    if ((init.signal && init.signal.aborted) || !(err instanceof TypeError)) throw err;
+    setTrouble('offline');
+    const e = new Error(OFFLINE, { cause: err });
+    e.offline = true;
+    throw e;
+  }
+  if (r.status === 401) {
+    // A 401 to a token the tab has since replaced (coldtrail reopened meanwhile) says nothing now.
+    if (sent === token()) {
+      staleToken = sent;
+      setTrouble('expired');
+    }
+    throw fail(SESSION_EXPIRED, 401);
+  }
+  // An answer: coldtrail is up. A stale session is over only once another token gets one (coldtrail
+  // reopened from the terminal rewrote the shared cookie), not because some other request passed.
+  if (trouble === 'offline' || (trouble === 'expired' && sent !== staleToken)) setTrouble(null);
+  return r;
+}
+
 async function getJSON(path, { signal, keepalive } = {}) {
   const init = { credentials: 'same-origin', signal };
   if (keepalive) init.keepalive = true;
-  const r = await fetch(path, init);
-  if (r.status === 401) {
-    sessionExpired();
-    throw fail(SESSION_EXPIRED, 401);
-  }
+  const r = await request(path, init);
   if (!r.ok) throw fail((await r.text()) || r.statusText, r.status);
   return r.json();
 }
@@ -85,11 +133,7 @@ async function send(method, path, body, { signal, keepalive } = {}) {
     init.headers = { 'content-type': 'application/json' };
     init.body = JSON.stringify(body || {});
   }
-  const r = await fetch(path, init);
-  if (r.status === 401) {
-    sessionExpired();
-    throw fail(SESSION_EXPIRED, 401);
-  }
+  const r = await request(path, init);
   const raw = await r.text();
   let data = {};
   try {
@@ -105,8 +149,14 @@ async function send(method, path, body, { signal, keepalive } = {}) {
  * get(path, opts) → parsed JSON. post(path, body, opts), patch(path, body, opts) send JSON (an
  * empty object when body is missing); del(path, opts) sends no body. opts: { signal, keepalive }
  * (keepalive: the request outlives the page, for a save sent as the tab closes; browsers cap
- * keepalive bodies at 64 KiB in total). All throw Error(message) with `.status` on failure, and
- * SESSION_EXPIRED on 401 (after firing the window event `coldtrail:session-expired` once per page).
+ * keepalive bodies at 64 KiB in total). All throw Error(message) with `.status` on failure,
+ * SESSION_EXPIRED on 401, and OFFLINE (with `.offline` true, no `.status`) when no answer came; an
+ * aborted request rejects with the abort as before. Window events say when that changes, once
+ * each time: `coldtrail:session-expired` at the first 401, `coldtrail:offline` at the first request
+ * without an answer (both with detail.message), and `coldtrail:reconnected` when that is over:
+ * at the first answer after no answer (coldtrail is back), or at the first answer that isn't a 401
+ * to a token other than the one refused (coldtrail was reopened from the terminal, which rewrites
+ * the shared cookie).
  */
 export const api = {
   get: getJSON,

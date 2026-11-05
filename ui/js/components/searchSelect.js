@@ -92,10 +92,14 @@ export function searchSelect({
   );
   const chevron = h('span', { class: 'ss-chevron' }, svg('M6 9l6 6 6-6'));
   const listbox = h('ul', { class: 'ss-list', role: 'listbox', id: `${id}-list`, 'aria-labelledby': `${id}-label`, hidden: true });
-  const empty = h('div', { class: 'ss-empty', hidden: true });
+  const empty = h('div', { class: 'ss-empty', id: `${id}-empty`, hidden: true });
+  // The empty message is read out as it appears or changes ("No matches", "Press Enter to use
+  // “x”"): a live region has to be in the page before its text changes, so this one always is.
+  // aria-live without role="status", so it doesn't count as a status message of the form around.
+  const said = h('div', { class: 'sr-only', 'aria-live': 'polite' });
   // The popup lives in the control, so it lines up with the input whatever the label does.
   const control = h('div', { class: 'ss-control' }, input, clearBtn, chevron, listbox, empty);
-  const el = h('div', { class: 'search-select' }, labelEl, control);
+  const el = h('div', { class: 'search-select' }, labelEl, control, said);
 
   const optionFor = (v) => opts.find((o) => String(o.value) === v);
   const displayOf = (v) => {
@@ -168,6 +172,13 @@ export function searchSelect({
     listbox.hidden = !visible;
     empty.hidden = !open || shown.length > 0;
     if (!shown.length) empty.textContent = freeText && typed ? `Press Enter to use “${typed}”` : 'No matches';
+    const message = empty.hidden ? '' : empty.textContent;
+    if (said.textContent !== message) said.textContent = message;
+    // The message describes the field while it shows, beside any description a view gave it.
+    const ids = (input.getAttribute('aria-describedby') || '').split(/\s+/).filter((x) => x && x !== empty.id);
+    if (message) ids.unshift(empty.id);
+    if (ids.length) input.setAttribute('aria-describedby', ids.join(' '));
+    else input.removeAttribute('aria-describedby');
     input.setAttribute('aria-expanded', visible ? 'true' : 'false');
     listen(open);
     place();
@@ -180,11 +191,13 @@ export function searchSelect({
     }
   }
 
-  // Open with every option (click, ArrowDown) or with the ones matching what was typed.
-  function openWith(filterText, activeIndex = -1) {
+  // Open with every option (click, ArrowDown) or with the ones matching what was typed. `keep`:
+  // the value to stay highlighted, when it is still shown.
+  function openWith(filterText, activeIndex = -1, keep = null) {
     open = true;
     shown = filterOptions(opts, filterText).slice(0, MAX_SHOWN);
-    active = Math.min(activeIndex, shown.length - 1);
+    const kept = keep == null ? -1 : shown.findIndex((o) => String(o.value) === keep);
+    active = kept >= 0 ? kept : Math.min(activeIndex, shown.length - 1);
     render();
   }
 
@@ -262,12 +275,14 @@ export function searchSelect({
   });
 
   el.setOptions = (list) => {
-    // Options that arrive while the user is typing must not replace what they typed.
+    // Options that arrive while the user is typing must not replace what they typed, nor move the
+    // highlight off the option they went to (Enter would pick another one).
     const typing = document.activeElement === input && input.value !== displayOf(current);
+    const highlighted = open && active >= 0 && shown[active] ? String(shown[active].value) : null;
     opts = (list || []).slice();
     if (typing) syncClear();
     else showValue();
-    if (open) openWith(typing ? input.value : '');
+    if (open) openWith(typing ? input.value : '', -1, highlighted);
   };
   el.setValue = (v) => {
     current = v == null ? '' : String(v);

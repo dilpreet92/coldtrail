@@ -3,10 +3,10 @@
 // sees document.activeElement === <body>; these tests open overlays from that state and check
 // where Esc sends focus.
 
-import { test } from 'node:test';
+import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
-import { openMenu, openDialog, openDrawer, confirmDialog, closeTopOverlay, copyText, setBusy, isBusy } from '../../ui/js/core/ui.js';
-import { bindKeys, clearOverlay } from '../../ui/js/core/keys.js';
+import { openMenu, openDialog, openDrawer, confirmDialog, closeTopOverlay, copyText, setBusy, isBusy, toast } from '../../ui/js/core/ui.js';
+import { bindKeys, clearOverlay, holdPageKeys } from '../../ui/js/core/keys.js';
 
 /** Install globals for the duration of `fn`, then restore whatever was there. */
 async function withGlobals(globals, fn) {
@@ -558,5 +558,143 @@ test('setBusy marks a button busy without disabling it, and puts it back', async
     setBusy(plain, false);
     assert.ok(!('aria-disabled' in plain.attrs));
     assert.equal(plain.textContent, 'Test');
+  });
+});
+
+/** The first element under `root` (depth first) that `pred` accepts. */
+function findEl(root, pred) {
+  if (pred(root)) return root;
+  for (const c of root.children) {
+    const hit = c instanceof El && findEl(c, pred);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+function pressKey(doc, key, mods = {}) {
+  const e = new Event('keydown', { cancelable: true });
+  Object.assign(e, { key, metaKey: false, ctrlKey: false, shiftKey: false, altKey: false }, mods);
+  Object.defineProperty(e, 'target', { value: doc.activeElement });
+  doc.dispatchEvent(e);
+  return e;
+}
+
+test('toast: info and ok leave after 4s, held while hovered or focused; errors stay until closed', async () => {
+  const { doc, win } = fakeDom();
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    await withGlobals({ document: doc, window: win }, () => {
+      const shown = (t) => t.el.parent !== null;
+      const ok = toast('Saved', 'ok');
+      const err = toast('Not saved: disk full', 'err');
+      assert.equal(err.el.attrs.role, 'alert', 'an error is announced at once');
+      assert.equal(ok.el.attrs.role, undefined);
+      mock.timers.tick(3999);
+      assert.ok(shown(ok), 'still there just before 4s');
+      mock.timers.tick(1);
+      assert.ok(!shown(ok), 'gone at 4s');
+
+      // The pointer over it holds it; leaving starts the full 4s again.
+      const hovered = toast('Copied');
+      mock.timers.tick(3000);
+      hovered.el.dispatchEvent(new Event('mouseenter'));
+      mock.timers.tick(60_000);
+      assert.ok(shown(hovered), 'held while hovered');
+      hovered.el.dispatchEvent(new Event('mouseleave'));
+      mock.timers.tick(3999);
+      assert.ok(shown(hovered), 're-armed in full on leave');
+      mock.timers.tick(1);
+      assert.ok(!shown(hovered));
+
+      // Focus inside holds it too, even after the pointer leaves; focus leaving re-arms it.
+      const focused = toast('Copied');
+      const close = findEl(focused.el, (el) => el.tagName === 'BUTTON');
+      close.focus();
+      focused.el.dispatchEvent(new Event('focusin'));
+      focused.el.dispatchEvent(new Event('mouseenter'));
+      focused.el.dispatchEvent(new Event('mouseleave'));
+      mock.timers.tick(60_000);
+      assert.ok(shown(focused), 'held while focus is inside');
+      doc.body.focus();
+      const out = new Event('focusout');
+      out.relatedTarget = doc.body;
+      focused.el.dispatchEvent(out);
+      mock.timers.tick(4000);
+      assert.ok(!shown(focused));
+
+      mock.timers.tick(10 * 60_000);
+      assert.ok(shown(err), 'an error never leaves on its own');
+      err.close();
+      assert.ok(!shown(err));
+    });
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test('toasts on screen step aside while a modal is open; ones raised meanwhile show over it', async () => {
+  const { doc, win, trigger } = fakeDom();
+  await withGlobals({ document: doc, window: win }, () => {
+    const before = toast('Gmail draft not created', 'err');
+    const drawer = openDrawer({ title: 'D', content: 'x', opener: trigger });
+    assert.equal(before.el.hidden, true, 'never covers the drawer');
+    const during = toast('Could not save', 'err');
+    assert.notEqual(during.el.hidden, true, 'raised while it is open: shown');
+    const dialog = openDialog({ title: 'T', content: 'x', actions: [{ label: 'OK' }] });
+    assert.equal(during.el.hidden, true, 'a modal over it holds it in turn');
+    const closedMeanwhile = toast('Copied');
+    const inner = openDialog({ title: 'T2', content: 'x', actions: [{ label: 'OK' }] });
+    closedMeanwhile.close();
+    inner.close();
+    assert.equal(closedMeanwhile.el.parent, null, 'a toast closed while held stays closed');
+    dialog.close();
+    assert.equal(during.el.hidden, false, 'back when the modal that held it closes');
+    assert.equal(before.el.hidden, true, 'still under the drawer');
+    // A menu covers nothing: it holds no toasts.
+    const menu = openMenu(trigger, [{ label: 'Edit' }]);
+    assert.equal(during.el.hidden, false);
+    menu.close();
+    drawer.close();
+    assert.equal(before.el.hidden, false);
+    before.close();
+    during.close();
+  });
+});
+
+test('confirm dialogs start on Cancel, danger or not, so Enter never confirms by accident', async () => {
+  const { doc, win, trigger } = fakeDom();
+  await withGlobals({ document: doc, window: win }, async () => {
+    for (const danger of [false, true]) {
+      const answer = confirmDialog({ title: 'Send this email now?', body: 'It goes out now.', confirmText: 'Send now', danger, opener: trigger });
+      const button = (label) => findEl(doc.documentElement, (el) => el.tagName === 'BUTTON' && el.textContent === label);
+      assert.ok('data-autofocus' in button('Cancel').attrs, `Cancel takes focus (danger: ${danger})`);
+      assert.ok(!('data-autofocus' in button('Send now').attrs));
+      assert.equal(doc.activeElement, button('Cancel'));
+      pressEscape(doc);
+      assert.equal(await answer, false);
+    }
+  });
+});
+
+test('page keys stay off while held (the phone menu is open); mod+k still runs', async () => {
+  const { doc, win } = fakeDom();
+  await withGlobals({ document: doc, window: win }, () => {
+    const hits = [];
+    const unbind = bindKeys({ j: () => hits.push('j'), escape: () => hits.push('escape'), 'mod+k': () => hits.push('mod+k') });
+    try {
+      holdPageKeys(true);
+      const j = pressKey(doc, 'j');
+      pressKey(doc, 'Escape');
+      assert.deepEqual(hits, [], 'J and Esc are left to the menu');
+      assert.equal(j.defaultPrevented, false);
+      pressKey(doc, 'k', { metaKey: true });
+      assert.deepEqual(hits, ['mod+k']);
+      holdPageKeys(false);
+      pressKey(doc, 'j');
+      assert.deepEqual(hits, ['mod+k', 'j']);
+    } finally {
+      holdPageKeys(false);
+      unbind();
+    }
   });
 });
