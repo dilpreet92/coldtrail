@@ -188,7 +188,8 @@
   border-radius: var(--radius-input);
   white-space: pre-wrap;
 }
-/* A message Stop kept from being sent, while something new is typed in the composer. */
+/* A message Stop kept from being sent, or a failed first turn's (not saved), while something new
+   is typed in the composer. */
 .agent-msg-user.is-unsent .agent-bubble { background: var(--surface); border-style: dashed; color: var(--text-2); }
 .agent-unsent { font-size: 12px; color: var(--text-3); }
 
@@ -288,6 +289,8 @@
 .agent-step[data-state="ok"] .agent-step-icon { color: var(--ok); }
 .agent-step[data-state="fail"] .agent-step-icon { color: var(--danger); }
 .agent-step[data-state="fail"] .agent-step-name { color: var(--danger); }
+/* A step that never got its result (Stop, a lost connection): settled, not pulsing, muted. */
+.agent-step[data-state="none"] .agent-step-name { color: var(--text-3); }
 .agent-step[data-state="pending"] .agent-step-icon::before {
   content: '';
   width: 6px;
@@ -523,6 +526,25 @@
 }
 .agent-warn svg { color: var(--warn); }
 .agent-warn a { margin-left: auto; font-weight: 500; }
+
+/* A ?prompt= the screen didn't take on load (agent.js offer()): link · quote · actions; the
+   actions go under the text when the pane is narrow. */
+.agent-foot > .agent-offer { margin-bottom: var(--space-2); }
+.agent-offer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-input);
+  background: var(--surface);
+  font-size: 13px;
+}
+.agent-offer > svg { flex: none; color: var(--text-3); }
+.agent-offer-text { flex: 1 1 24ch; min-width: 0; color: var(--text-2); overflow-wrap: anywhere; }
+.agent-offer-quote { color: var(--text); }
+.agent-offer-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-left: auto; }
 
 /* Lock · why · action on one line; on a narrow pane the action goes under the text. */
 .agent-readonly {

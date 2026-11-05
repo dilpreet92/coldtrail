@@ -4,9 +4,12 @@
 // the stream, which makes the server cancel the turn at its next event).
 //
 // Routes: #/agent is a new conversation, #/agent/<chat_id> an existing one, and
-// #/agent?prompt=<text> fills the composer without sending (the Pipeline hand-off).
+// #/agent?prompt=<text> fills the composer without sending (the Pipeline and Home hand-offs),
+// only when the app was already running: one in the address the page loads with (a hand-off
+// opened in a new tab, a link from elsewhere) waits in a notice above the composer for a click.
 // Scheduled-run conversations are a read-only log, polled every 2s while the run is writing to
-// them. Leaving the screen closes the stream, stops the poll and aborts every pending request;
+// them (a failed poll is tried again, less often, and the header says updates aren't arriving).
+// Leaving the screen closes the stream, stops the poll and aborts every pending request;
 // text typed but not sent waits in the composer for the screen to come back.
 // While a turn streams, links inside this screen (other conversations, New chat, Settings) ask
 // before they stop it; the sidebar can't be intercepted, so the composer says so instead.
@@ -19,7 +22,7 @@
 // (holding the server's one-turn lock) until a 45s reaper, so a turn this view gives up on is
 // still claimed once and closed as soon as it connects, which cancels it.
 
-import { api, errorText, openStream } from '../core/api.js';
+import { api, errorText, isStaleSession, openStream } from '../core/api.js';
 import { fmtNum, fmtRelative, h, runStatus } from '../core/dom.js';
 import { renderMarkdown } from '../core/markdown.js';
 import { href } from '../core/router.js';
@@ -31,6 +34,10 @@ import { listDetail } from '../components/listDetail.js';
 const title = 'Agent';
 
 const POLL_MS = 2000;
+// After failed polls, the most ticks the next try waits (16s).
+const POLL_BACKOFF_TICKS = 8;
+// How often relative times ("just now", "2h ago") are brought up to date while the screen is open.
+const TICK_MS = 30_000;
 // After `done` the server still saves the reply (or deletes a failed first turn) before it
 // closes the stream; wait for that close, but never longer than this.
 const SETTLE_MS = 2000;
@@ -45,12 +52,21 @@ const ADOPT_WAIT_MS = 120000;
 const STOPPED_WAITING = "Stopped. The agent is busy with another turn; this conversation is saved once it's free.";
 const STOPPED_DETACHED =
   "Stopped. The agent is still busy with another turn, so your message is saved as a conversation of its own once it's free.";
+// A failed first turn: the server keeps nothing of it (keepFailed()).
+const FAILED_BACK = "This conversation wasn't saved. Your message is back in the composer.";
 // A scheduled run whose log is empty.
 const EMPTY_RUN = 'It ended before the agent started.';
 const LIST_PAGE = 50;
+// How long the search waits for typing to pause before it says what it found.
+const SAY_FOUND_MS = 300;
 const MAX_INPUT_PX = 200;
 const TITLE_CHARS = 60;
-const RUN_TITLE = /^(Scheduled run|Manual run)\b/;
+// The most of a dropped hand-off's first line its notice quotes (excerpt()).
+const OFFER_CHARS = 120;
+// Only the titles the server gives a run's log: "Scheduled run — <schedule>", "Manual run", and
+// a bare "Scheduled run" from older versions. A chat whose first message starts with those words
+// ("Manual run from yesterday found nothing…") is still the user's own.
+const RUN_TITLE = /^(?:Scheduled run(?: — |$)|Manual run$)/;
 const RUN_PREFIX = /^Scheduled run\s+—\s+/;
 // What keeps keyboard focus in the transcript (a poll redraw puts it back by position).
 const FOCUSABLE = 'a[href], button, summary';
@@ -58,7 +74,8 @@ const FOCUSABLE = 'a[href], button, summary';
 const STARTERS = [
   {
     title: 'Source companies',
-    text: 'Find 20 seed-stage B2B SaaS companies that fit my company profile and add them to the pipeline.',
+    // Pipeline's "Find companies" words: the company profile says which market, not the starter.
+    text: 'Find 20 companies that match my company profile and add them to the pipeline.',
   },
   {
     title: 'Find founders',
@@ -82,10 +99,16 @@ const ICONS = {
   caret: ['M9 6l6 6-6 6'],
   check: ['M5 12.5l4.5 4.5L19 7.5'],
   cross: ['M7 7l10 10', 'M17 7L7 17'],
+  dash: ['M8 12h8'],
   alert: ['M12 3l9.5 17h-19L12 3z', 'M12 10v4', 'M12 17.5v.01'],
   lock: ['M7 11V8a5 5 0 0 1 10 0v3', 'M5.5 11h13v9.5h-13z'],
+  link: ['M10 14a4 4 0 0 0 5.66 0l3-3a4 4 0 0 0-5.66-5.66l-1 1', 'M14 10a4 4 0 0 0-5.66 0l-3 3a4 4 0 0 0 5.66 5.66l1-1'],
   search: ['M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14z', 'M20 20l-3.5-3.5'],
 };
+
+// A tool step's glyph and the words a screen reader hears after its name, by state (toolGroup).
+const STEP_GLYPHS = { ok: 'check', done: 'check', fail: 'cross', none: 'dash' };
+const STEP_WORDS = { fail: ' (failed)', pending: ' (running)', none: ' (no result)' };
 
 function icon(name, size = 16) {
   return h(
@@ -130,10 +153,52 @@ function lastAt(d) {
   return (msgs.length && msgs[msgs.length - 1].created_at) || null;
 }
 
-/** A ?prompt= hand-off (Pipeline, Home), or ''. */
+/** A ?prompt= in the address, or ''. */
 function promptOf(query) {
   const p = query && typeof query.prompt === 'string' ? query.prompt : '';
   return p.trim() ? p : '';
+}
+
+// A ?prompt= is only taken from inside the running app. One Enter would send text the user may
+// not have read (and may not see: it can sit below the composer's fold), so two others are
+// dropped. One in the address the page loaded with came from a link on another site or a
+// bookmark: the navigation entry keeps that hash (changing only the hash later doesn't). One set
+// by another window holding this one (a site that opened coldtrail can later change just the
+// hash, which loads nothing) comes with no click or key press here. The in-app hand-offs
+// (Pipeline, Home, Setup) follow one in this window, as every link or button does. A dropped one
+// isn't lost without a word, though: those hand-offs are links, and one opened in a new tab
+// arrives in the address it loads with. A notice above the composer shows it, and its button is
+// the click that puts it there (offer()).
+const loadHash = (() => {
+  try {
+    const entry = performance.getEntriesByType('navigation')[0];
+    return entry ? new URL(entry.name).hash : location.hash;
+  } catch (_) {
+    return location.hash;
+  }
+})();
+let firstRoute = true;
+
+/**
+ * The ?prompt= hand-off: { prompt } to put in the composer, or { dropped } when it came from
+ * outside the app (each '' when there is none).
+ */
+function handOff(query) {
+  const fromLoad = firstRoute && location.hash === loadHash;
+  firstRoute = false;
+  const ua = navigator.userActivation; // where a browser lacks it, the load check stands alone
+  const p = promptOf(query);
+  return fromLoad || (ua && !ua.isActive) ? { prompt: '', dropped: p } : { prompt: p, dropped: '' };
+}
+
+/** What a dropped hand-off's notice quotes: its first line with text, cut short, and "…" when
+ *  there is more (a run of blank lines can hide the rest below the composer's fold). */
+function excerpt(text) {
+  const lines = String(text).trim().split(/\r?\n/);
+  const first = lines[0].trim();
+  const chars = [...first];
+  if (chars.length > OFFER_CHARS) return `${chars.slice(0, OFFER_CHARS).join('').trimEnd()}…`;
+  return lines.length > 1 ? `${first} …` : first;
 }
 
 /** What the composer footer says the turn runs on: [agent, model]. */
@@ -197,6 +262,8 @@ export default {
     let waiting = false; // a send() is waiting for one of those two
     let poll = null;
     let runInfo = null; // the /api/runs row of the open run conversation
+    let warnFor = null; // the problem the warning above the composer shows, if any
+    let listRefocus = false; // the list's Try again had focus: give it to what replaces it
 
     // ---- Skeleton ----
 
@@ -229,14 +296,21 @@ export default {
       onInput: () => {
         filter = search.value.trim().toLowerCase();
         renderList();
+        cancel(sayFoundTimer);
+        sayFoundTimer = later(sayFound, SAY_FOUND_MS);
       },
     });
     const navEl = h('nav', { class: 'agent-nav', 'aria-label': 'Conversations' });
+    // The search's outcome, for screen readers. The list's own: on a phone the conversation pane
+    // (and its announcer) is hidden while the list is open.
+    const listStatus = h('div', { class: 'sr-only', role: 'status' });
+    let sayFoundTimer = null;
     const listPane = h(
       'div',
       { class: 'agent-list', id: 'agent-list' },
       h('div', { class: 'agent-search' }, icon('search', 15), search),
       navEl,
+      listStatus,
     );
 
     const headTitle = h('h2', { class: 'agent-chat-title' });
@@ -318,6 +392,27 @@ export default {
       ),
     );
     inputBar.append(modelLink, hint, busyHint, sendButton, stopButton);
+    // A ?prompt= hand-off this screen didn't take (handOff()), quoted above the footer with the
+    // click that puts it in the composer. It stays, whatever conversation shows, until used or
+    // dismissed.
+    let offered = '';
+    const offerText = h('p', { class: 'agent-offer-text' });
+    const offerEl = h(
+      'div',
+      { class: 'agent-offer', role: 'group', 'aria-label': 'Message from a link' },
+      icon('link'),
+      offerText,
+      h(
+        'div',
+        { class: 'agent-offer-actions' },
+        h(
+          'button',
+          { type: 'button', class: 'btn btn-secondary btn-sm', onClick: (e) => takeOffer(e.currentTarget) },
+          'Put it in the composer',
+        ),
+        h('button', { type: 'button', class: 'btn btn-ghost btn-sm', onClick: () => dismissOffer() }, 'Dismiss'),
+      ),
+    );
     const foot = h('div', { class: 'agent-foot' }, form);
     const announcer = h('div', { class: 'sr-only', role: 'status' });
 
@@ -436,6 +531,15 @@ export default {
       h1.focus({ preventScroll: true });
     }
 
+    /**
+     * After a control that had focus was replaced (a Try again that reloads, for one): focus `el`,
+     * unless the user has put focus somewhere else meanwhile.
+     */
+    function regainFocus(el) {
+      const now = document.activeElement;
+      if (el && (!now || now === document.body || !now.isConnected)) el.focus({ preventScroll: true });
+    }
+
     function announce(text) {
       announcer.textContent = text;
     }
@@ -445,11 +549,30 @@ export default {
       input.style.height = `${Math.min(input.scrollHeight, MAX_INPUT_PX)}px`;
     }
 
-    function fill(text) {
-      input.value = text;
-      grow();
+    /**
+     * Put `text` in the composer and focus it: the caret at the end (a starter, to add to it),
+     * or for a hand-off at the start, scrolled to the top, so a long one is read from its start.
+     * It goes in as an edit the browser can undo, so Cmd/Ctrl+Z brings back a draft it replaced
+     * (a value set from code can't be undone); setting the value is only the fallback.
+     */
+    function fill(text, { atStart = false } = {}) {
       input.focus();
-      input.setSelectionRange(input.value.length, input.value.length);
+      let edited = false;
+      // Only into the composer: one that can't take focus (hidden behind the list on a phone)
+      // would send the edit to whatever has it.
+      if (document.activeElement === input) {
+        input.select();
+        try {
+          edited = document.execCommand('insertText', false, text);
+        } catch (_) {
+          edited = false;
+        }
+      }
+      if (!edited || input.value !== text) input.value = text;
+      grow();
+      const at = atStart ? 0 : input.value.length;
+      input.setSelectionRange(at, at);
+      if (atStart) input.scrollTop = 0;
     }
 
     const phone = window.matchMedia('(max-width: 899px)');
@@ -521,7 +644,9 @@ export default {
      * A "Worked · N steps" group, closed by default. add(name, state) appends a step: 'pending'
      * (live, not finished), 'ok' / 'fail' (a live result), or 'done' (from history, where the
      * outcome isn't stored). end(ok) settles the oldest pending step, so parallel calls pair
-     * with their results in order. setRunning(on) switches the "Working…" label.
+     * with their results in order. setRunning(on) switches the "Working…" label. close() ends a
+     * live group: a step still pending then never gets its result (Stop, a lost connection, the
+     * agent moving on) and becomes 'none'.
      */
     function toolGroup({ running = false } = {}) {
       const steps = [];
@@ -549,9 +674,8 @@ export default {
       function setState(step, state) {
         step.state = state;
         step.row.dataset.state = state;
-        const glyph = state === 'ok' || state === 'done' ? icon('check', 14) : state === 'fail' ? icon('cross', 14) : '';
-        step.glyph.replaceChildren(glyph);
-        step.word.textContent = state === 'fail' ? ' (failed)' : state === 'pending' ? ' (running)' : '';
+        step.glyph.replaceChildren(STEP_GLYPHS[state] ? icon(STEP_GLYPHS[state], 14) : '');
+        step.word.textContent = STEP_WORDS[state] || '';
       }
 
       function sync() {
@@ -593,6 +717,7 @@ export default {
           sync();
         },
         close() {
+          for (const s of steps) if (s.state === 'pending') setState(s, 'none');
           g.setRunning(false);
         },
       };
@@ -626,6 +751,10 @@ export default {
         headTitle.textContent = 'Conversation not found';
         return;
       }
+      if (current.failed) {
+        headTitle.textContent = 'Conversation'; // it didn't load: the transcript says why
+        return;
+      }
       headTitle.textContent = current.title || 'Untitled conversation';
       if (current.title) headTitle.title = current.title;
       const listed = chats.find((c) => c.id === currentId);
@@ -635,7 +764,8 @@ export default {
           // shows whether it is still going (a run that died can leave `running` set).
           headMeta.textContent = runningMeta();
           const live = badge('Running', 'accent');
-          live.prepend(h('span', { class: 'agent-live-dot', 'aria-hidden': 'true' }));
+          // Pulsing only while updates arrive (runningMeta() says why they don't).
+          if (!current.stalled) live.prepend(h('span', { class: 'agent-live-dot', 'aria-hidden': 'true' }));
           headBadges.append(live);
         } else if (runInfo) {
           // /api/runs `started_at` is written when the run ends: it is the finish time. Each
@@ -662,8 +792,9 @@ export default {
       }
     }
 
-    /** A running run's meta line: live, and when it last wrote to its log. */
+    /** A running run's meta line: live, and when it last wrote to its log; or why it isn't live. */
     function runningMeta() {
+      if (current && current.stalled) return current.stalled;
       const listed = chats.find((c) => c.id === currentId);
       const at = (current && current.lastAt) || (listed && listed.updated_at) || null;
       return at ? `Updates as the run works · last update ${fmtRelative(at)}` : 'Updates as the run works';
@@ -682,6 +813,10 @@ export default {
         modelLink.hidden = true;
       }
       const problem = agentProblem(status);
+      // Rebuilt only when it says something else: the store refreshes every 30s and after each
+      // turn, and a rebuild would take keyboard focus off its link.
+      if (problem === warnFor) return;
+      warnFor = problem;
       warn.hidden = !problem;
       warn.replaceChildren();
       if (problem) {
@@ -696,6 +831,7 @@ export default {
     function setMode(next, message) {
       mode = next;
       foot.replaceChildren();
+      if (offered) foot.append(offerEl); // a dropped hand-off's notice stays above whatever comes
       if (next === 'compose') {
         foot.append(form);
         grow(); // its height was measured while it was out of the page, if it was
@@ -736,6 +872,47 @@ export default {
       log.setAttribute('aria-busy', busy ? 'true' : 'false');
       if (busy && focused === sendButton) stopButton.focus();
       if (!busy && focused === stopButton) input.focus();
+    }
+
+    /** Quote a dropped hand-off above the composer, in place of one quoted before. */
+    function offer(text) {
+      offered = text;
+      offerText.replaceChildren(
+        'A link opened this screen with a message for the agent: ',
+        h('span', { class: 'agent-offer-quote' }, `“${excerpt(text)}”`),
+      );
+      if (!offerEl.isConnected) foot.prepend(offerEl);
+    }
+
+    function clearOffer() {
+      offered = '';
+      offerEl.remove();
+    }
+
+    function dismissOffer() {
+      clearOffer();
+      // Its buttons are gone: focus goes to the composer it was about, or the heading.
+      if (mode === 'compose') input.focus();
+      else focusHeading();
+    }
+
+    /**
+     * The click a dropped hand-off was waiting for: it goes where one from inside the app goes, a
+     * new conversation's composer, read from its start, not sent.
+     */
+    async function takeOffer(btn) {
+      const text = offered;
+      // Leaving the conversation on screen stops a turn streaming there: ask first.
+      if (turn && currentId !== null && !(await confirmLeave(btn))) return;
+      if (gone || offered !== text) return;
+      clearOffer();
+      if (currentId === null) {
+        fill(text, { atStart: true });
+        return;
+      }
+      nav.navigate('#/agent').then(() => {
+        if (!gone) fill(text, { atStart: true });
+      });
     }
 
     // ---- Conversation list ----
@@ -810,6 +987,17 @@ export default {
         navEl.replaceChildren(listSkeleton());
         return;
       }
+      drawList(focused);
+      if (listRefocus) {
+        // Try again had focus, and the placeholders took its place: the first conversation (or
+        // the next Try again, or the search box) gets it once the list is back.
+        listRefocus = false;
+        regainFocus(navEl.querySelector('.agent-item, .btn') || search);
+      }
+    }
+
+    /** The loaded list, or why there is none; `focused`: the data-id of the item that had focus. */
+    function drawList(focused) {
       if (listState === 'error') {
         navEl.replaceChildren(
           h(
@@ -822,7 +1010,8 @@ export default {
               {
                 type: 'button',
                 class: 'btn btn-secondary btn-sm',
-                onClick: () => {
+                onClick: (e) => {
+                  listRefocus = e.currentTarget === document.activeElement;
                   listState = 'loading';
                   renderList();
                   loadList();
@@ -845,9 +1034,8 @@ export default {
         );
         return;
       }
-      const match = (c) => !filter || (c.title || '').toLowerCase().includes(filter);
-      const mine = chats.filter((c) => !isRun(c.title) && match(c));
-      const runs = chats.filter((c) => isRun(c.title) && match(c));
+      const mine = chats.filter((c) => !isRun(c.title) && matches(c));
+      const runs = chats.filter((c) => isRun(c.title) && matches(c));
       if (filter && !mine.length && !runs.length) {
         navEl.replaceChildren(
           h('div', { class: 'agent-list-msg' }, h('p', { class: 'agent-list-msg-body' }, `No conversations match “${search.value.trim()}”`)),
@@ -870,6 +1058,21 @@ export default {
       }
     }
 
+    /** Whether conversation `c` is one the search keeps. */
+    function matches(c) {
+      return !filter || (c.title || '').toLowerCase().includes(filter);
+    }
+
+    /** Once typing pauses: what the search left in the list (which only redraws), said aloud. */
+    function sayFound() {
+      sayFoundTimer = null;
+      if (listState !== 'ready') return;
+      const n = chats.filter(matches).length;
+      if (!chats.length) listStatus.textContent = 'No conversations yet';
+      else if (!n) listStatus.textContent = `No conversations match “${search.value.trim()}”`;
+      else listStatus.textContent = `${fmtNum(n)} ${n === 1 ? 'conversation' : 'conversations'}`;
+    }
+
     function emptySection(label, body) {
       return h(
         'section',
@@ -877,6 +1080,16 @@ export default {
         h('h2', { class: 'agent-section-title eyebrow' }, label),
         h('p', { class: 'agent-section-empty' }, body),
       );
+    }
+
+    /** Bring the relative times ("just now", "2h ago") in the list and the header up to date. */
+    function refreshTimes() {
+      for (const a of navEl.querySelectorAll('.agent-item')) {
+        const c = chats.find((x) => x.id === a.getAttribute('data-id'));
+        const meta = a.querySelector('.agent-item-meta');
+        if (c && meta) meta.textContent = fmtRelative(c.updated_at);
+      }
+      renderHead();
     }
 
     function markCurrent() {
@@ -1136,7 +1349,11 @@ export default {
       if (!keepList) setListOpen(false);
     }
 
-    async function openChat(id) {
+    /**
+     * Put conversation `id` on screen. `retry`: its Try again had focus, and the placeholders took
+     * its place: once it has loaded, the transcript gets focus (or the action of what it shows).
+     */
+    async function openChat(id, { retry = false } = {}) {
       const seq = ++openSeq;
       wakeNaps();
       dropTurn();
@@ -1158,8 +1375,8 @@ export default {
         d = await api.get(`/api/chats/${enc(id)}`, { signal });
       } catch (err) {
         if (gone || isAbort(err) || seq !== openSeq) return;
-        current = { id, title: null, missing: false, run: false, running: false };
-        headTitle.textContent = 'Conversation';
+        current = { id, title: null, missing: false, failed: true, run: false, running: false };
+        renderHead();
         logState(
           h(
             'div',
@@ -1167,11 +1384,15 @@ export default {
             emptyState({
               title: "Couldn't open this conversation",
               body: errorText(err),
-              action: { label: 'Try again', onClick: () => openChat(id) },
+              action: {
+                label: 'Try again',
+                onClick: (e) => openChat(id, { retry: e.currentTarget === document.activeElement }),
+              },
               level: 3,
             }),
           ),
         );
+        if (retry) regainFocus(logInner.querySelector('.empty-action .btn'));
         return;
       }
       if (gone || seq !== openSeq) return;
@@ -1183,20 +1404,25 @@ export default {
           emptyState({
             title: 'This conversation doesn’t exist',
             body: 'It may have been a link from another workspace. Start a new chat instead.',
-            action: { label: 'Start a new chat', href: '#/agent' },
+            // A button, not a link: startNewChat() puts focus in the composer it opens.
+            action: { label: 'Start a new chat', onClick: (e) => startNewChat(e.currentTarget) },
             level: 3,
           }),
         );
+        if (retry) regainFocus(logInner.querySelector('.empty-action .btn'));
         return;
       }
       const run = isRun(d.title);
       current = { id, title: d.title, run, running: !!d.running, missing: false, lastAt: lastAt(d) };
       renderHead();
       renderStored(d);
+      // The footer (a run's note, or the composer) goes in before the transcript scrolls to its
+      // end: it takes its height from the transcript, which would otherwise open short of the end.
+      setMode(run ? 'readonly' : 'compose');
       toBottom();
+      if (retry) regainFocus(log);
       if (d.running) startPoll(id, seq, d);
       if (run) {
-        setMode('readonly');
         loadRunInfo(id, seq);
         return;
       }
@@ -1208,11 +1434,10 @@ export default {
         (err) => err,
       );
       activating = p;
-      setMode('compose');
       const err = await p;
       if (activating === p) activating = null;
       if (!err || gone || isAbort(err) || seq !== openSeq) return;
-      setMode('blocked', errorText(err));
+      follow(() => setMode('blocked', errorText(err)));
     }
 
     async function loadRunInfo(id, seq) {
@@ -1255,16 +1480,25 @@ export default {
       stopPoll();
       let last = signature(first);
       let busy = false;
+      let failures = 0;
+      let skip = 0; // ticks to wait before the next try after a failed one
       poll = setInterval(async () => {
         if (gone || seq !== openSeq) {
           stopPoll();
           return;
         }
         if (busy || document.hidden) return;
+        if (skip > 0) {
+          skip--;
+          return;
+        }
         busy = true;
         try {
           const d = await api.get(`/api/chats/${enc(id)}`, { signal });
           if (gone || seq !== openSeq) return;
+          failures = 0;
+          const stalled = !!current.stalled;
+          current.stalled = null;
           const sig = signature(d);
           current.lastAt = lastAt(d);
           if (sig !== last) {
@@ -1272,6 +1506,8 @@ export default {
             current.running = !!d.running;
             follow(() => renderStored(d, { keep: true }));
             renderHead();
+          } else if (stalled) {
+            renderHead(); // live again: the meta line and the pulsing badge come back
           } else if (current.running) {
             headMeta.textContent = runningMeta(); // "last update 1m ago" moves on with the clock
           }
@@ -1282,8 +1518,19 @@ export default {
             store.refresh();
           }
         } catch (err) {
-          // As before, a failed poll stops quietly; reopening the conversation resumes it.
-          if (!isAbort(err)) stopPoll();
+          if (gone || isAbort(err) || seq !== openSeq) return;
+          // The run goes on regardless, so the header stops saying it updates live. A stale
+          // session won't come back by itself; anything else (coldtrail restarting, a busy
+          // database) is tried again, less often each time: after 1, 2, 4, then every 8 ticks.
+          if (isStaleSession(err)) {
+            stopPoll();
+            current.stalled = `Stopped updating. ${errorText(err)}`;
+          } else {
+            failures++;
+            skip = Math.min(2 ** (failures - 1), POLL_BACKOFF_TICKS) - 1;
+            current.stalled = "Couldn't get the latest update. Trying again…";
+          }
+          renderHead();
         } finally {
           busy = false;
         }
@@ -1360,7 +1607,15 @@ export default {
         });
       }
 
-      clearWelcome();
+      if (fresh) {
+        // The server starts a conversation of its own for this message, so nothing still on
+        // screen is part of it: a failed first turn (deleted, its message back in the composer),
+        // a message Stop kept back, the welcome. The transcript shows what a reload would.
+        logInner.classList.remove('is-empty');
+        logInner.replaceChildren();
+      } else {
+        clearWelcome();
+      }
       t.bubble = userMsg(text);
       t.working = workingRow();
       logInner.append(t.bubble, t.working);
@@ -1459,6 +1714,23 @@ export default {
       settle(t);
     }
 
+    /**
+     * A first turn that failed leaves nothing on the server. Its text goes back into the composer
+     * to send again (and so also waits there if the screen goes away), unless something new is
+     * being typed there, in which case its bubble says it wasn't saved. → whether it went back.
+     */
+    function keepFailed(t) {
+      if (!input.value.trim()) {
+        input.value = t.text;
+        grow();
+        logInner.append(noteRow(FAILED_BACK));
+        return true;
+      }
+      t.bubble.classList.add('is-unsent');
+      t.bubble.append(h('span', { class: 'agent-unsent' }, 'Not saved'));
+      return false;
+    }
+
     function hideWorking(t) {
       if (t.working) t.working.remove();
       t.working = null;
@@ -1510,15 +1782,18 @@ export default {
             hideWorking(t);
             logInner.append(errorRow(String(ev.message || 'The agent reported an error.')));
             break;
-          case 'done':
+          case 'done': {
             t.done = true;
             t.ok = !!ev.ok;
             if (!t.ok && !t.sawError) logInner.append(errorRow('The agent stopped without finishing this turn.'));
             endTurn(t);
-            announce(t.ok ? 'The agent finished.' : 'The turn ended with an error.');
+            // A failed first turn: the server discards its conversation, message and all.
+            const back = !t.ok && t.fresh && keepFailed(t);
+            announce(t.ok ? 'The agent finished.' : `The turn ended with an error.${back ? ` ${FAILED_BACK}` : ''}`);
             // The server closes the stream once it has saved the turn; settle then.
             t.settleTimer = later(() => settle(t), SETTLE_MS);
             break;
+          }
           default:
             break;
         }
@@ -1661,22 +1936,32 @@ export default {
 
     /**
      * The conversation a route shows: a ?prompt= hand-off always gets a new one (it fills the
-     * composer and never sends). The prompt leaves the address bar, so a refresh won't refill it,
-     * and #/agent takes the place of the address it came on, so Back skips that.
+     * composer and never sends). One that came with the page load is dropped (handOff()): the
+     * route shows what it would without it, and `dropped` is offered above the composer. Either
+     * way the prompt leaves the address bar, so a refresh won't refill it, and the address without
+     * it takes the place of the one it came on, so Back skips that.
      */
     function target(c) {
-      const prompt = promptOf(c.query);
-      if (prompt) nav.navigate(href(['agent']), { replace: true, silent: true });
-      return { id: prompt ? null : c.path[1] || null, prompt };
+      const { prompt, dropped } = handOff(c.query);
+      const id = prompt ? null : c.path[1] || null;
+      if (prompt || dropped) nav.navigate(href(id ? ['agent', id] : ['agent']), { replace: true, silent: true });
+      return { id, prompt, dropped };
     }
 
     function route(c) {
-      const { id, prompt } = target(c);
+      const { id, prompt, dropped } = target(c);
       if (id !== currentId) {
         if (id) openChat(id);
         else newConversation();
       }
-      if (prompt) fill(prompt); // overwrites whatever was typed, as the old hand-off did
+      if (prompt) {
+        // In place of whatever was typed, as the old hand-off did (Cmd/Ctrl+Z brings that back),
+        // and of a notice offering an earlier one.
+        clearOffer();
+        fill(prompt, { atStart: true });
+      } else if (dropped) {
+        offer(dropped);
+      }
     }
 
     // ---- Start ----
@@ -1694,6 +1979,8 @@ export default {
       if (!phone.matches) setListOpen(false);
     };
     phone.addEventListener('change', onPhoneChange);
+    // Relative times move on while the screen is open, as on Schedules.
+    const ticker = setInterval(refreshTimes, TICK_MS);
 
     renderList();
     renderHead();
@@ -1704,8 +1991,9 @@ export default {
       showWelcome();
       loadList();
     }
+    if (start.dropped) offer(start.dropped);
     if (start.prompt) {
-      fill(start.prompt); // the hand-off: focus goes to the composer
+      fill(start.prompt, { atStart: true }); // the hand-off: focus goes to the composer
     } else {
       if (unsent) {
         input.value = unsent;
@@ -1734,6 +2022,7 @@ export default {
       for (const s of [...streams]) s.release();
       streams.clear();
       stopPoll();
+      clearInterval(ticker);
       for (const id of timers) clearTimeout(id);
       timers.clear();
       ctl.abort();
