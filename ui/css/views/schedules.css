@@ -182,6 +182,14 @@
   .sch-menu-btn { width: 40px; height: 40px; }
   /* Stacked (phones, touch): the whole note, as no tooltip can be opened here. */
   .sch-note { display: block; max-width: none; overflow: visible; -webkit-line-clamp: none; line-clamp: none; }
+
+  /* Loading: the placeholder stacks as a row does (switch and name, then next and last run). */
+  .sch-skel-row {
+    grid-template-columns: 40px minmax(0, 1fr);
+    column-gap: var(--space-3);
+    row-gap: var(--space-3);
+  }
+  .sch-skel-schedule > .sch-skel-lines:nth-child(n + 3) { grid-column: 2; }
 }
 
 /* ---- Placeholders: loading skeleton, error, empty ---- */
@@ -196,6 +204,16 @@
 .sch-skel-switch { width: 40px; height: 24px; border-radius: 999px; }
 .sch-skel-main { width: 60%; height: 14px; }
 .sch-skel-cell { width: 70%; height: 12px; }
+.sch-skel-sub { width: 45%; height: 10px; }
+
+/* A schedule's placeholder: a row's lines at about a row's height (79px with no runs yet, 101px
+   with a last run; stacked at 390px, 189px and 230px), so Run history below doesn't jump when
+   the list lands. */
+.sch-skel-schedule { align-items: start; min-height: 90px; }
+.sch-skel-lines { display: flex; flex-direction: column; gap: var(--space-2); min-width: 0; padding-top: 4px; }
+@container sch-list (max-width: 719px) {
+  .sch-skel-schedule { min-height: 210px; }
+}
 .sch-skel-row .skeleton:nth-child(n + 5) { display: none; }
 
 .sch-error {

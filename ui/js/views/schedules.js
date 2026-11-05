@@ -5,12 +5,16 @@
 //
 // Data: GET /api/schedules, /api/runs and /api/status, each loaded (and failing) on its own.
 // No polling of its own: the shared store's 30s summary tells it when a run finished (last_run
-// changes) or is running, and a 30s ticker keeps the relative times fresh. Unmount aborts
-// requests and, through the same signal, closes any dialog, confirm or row menu this screen
-// opened; it also stops the ticker and unsubscribes.
+// changes) or is running, and a 30s ticker keeps the relative times fresh. Unmount aborts the
+// screen's loads and, through the same signal, closes any dialog, confirm or row menu this
+// screen opened; it also stops the ticker and unsubscribes.
 // The server writes a schedule's row before it installs or removes the OS timer, so a 500 from
 // a save or a toggle may come after the change was stored: the screen then reloads the list and
-// says what was saved and what wasn't.
+// says what was saved and what wasn't. A list reload that read the list before a change was
+// stored never undoes it on screen. A write (save, toggle, delete, run) is never aborted, and
+// how it went is told even once the screen is left: a toast shows on the screen open then.
+// A run is named as Home names it (runName) and its status in the shared wording (runStatus), so
+// a run Home's "All runs" leads to reads the same here.
 // Every dynamic string goes through h() (text nodes); nothing here builds HTML.
 
 import { api, errorText, isStaleSession } from '../core/api.js';
@@ -21,6 +25,7 @@ import { badge } from '../components/badge.js';
 import { emptyState } from '../components/emptyState.js';
 import { switchEl } from '../components/switch.js';
 import { table } from '../components/table.js';
+import { runName } from './home.js';
 
 const title = 'Schedules';
 
@@ -29,6 +34,7 @@ const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Frid
 const WEEK_ORDER = [1, 2, 3, 4, 5, 6, 0]; // the day picker starts on Monday
 const TICK_MS = 30_000;
 const RUN_TITLE_PREFIX = 'Scheduled run — ';
+const SENDING_SETTINGS = '#/settings?tab=sending';
 const DEFAULT_EMAIL_CAP = 20;
 const DEFAULT_LINKEDIN_CAP = 15;
 
@@ -38,6 +44,10 @@ const COUNTS = ['sourced', 'enriched', 'drafted', 'sent'];
 const LINKEDIN_CAVEAT =
   'LinkedIn invites only go out if this computer is awake and unlocked and LinkedIn is connected ' +
   'when it runs; otherwise they stay in Drafts.';
+
+// Deleting or pausing a schedule removes its timer. A run of it going on now is a process of its
+// own (`coldtrail run`), which neither stops.
+const LIVE_RUN_GOES_ON = "The run going on now isn't stopped: it finishes, and can still send what auto-send allows.";
 
 // ---- Pure helpers (time rules match the OS timer and summary::next_run_at) ----
 
@@ -88,11 +98,16 @@ const localIso = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.get
 /** "Fri, Oct 30, 16:30". */
 export const runLabel = (d) => `${DAYS[d.getDay()]}, ${fmtDate(d, { time: true })}`;
 
-/** "in 3h" within 48h, else the dated label. */
-function nextText(d) {
+/** How soon a run that is ahead comes: "in 3h" within 48h, else null. fmtRelative's "just now"
+ *  is for the past: a run less than a minute away is "in under a minute". */
+function untilText(d) {
   const rel = fmtRelative(d);
-  return /^in |^just now$/.test(rel) ? rel : runLabel(d);
+  if (rel === 'just now') return 'in under a minute';
+  return /^in /.test(rel) ? rel : null;
 }
+
+/** "in 3h" within 48h, else the dated label. */
+const nextText = (d) => untilText(d) || runLabel(d);
 
 /** "Daily at 13:00" / "Weekly · Mon 09:00" (spec §5.7). */
 export function cadenceLabel(s) {
@@ -203,11 +218,14 @@ function mountSchedules(root, ctx) {
   let menu = null; // the row menu open now, or null
   const rowRefs = new Map(); // id → { s, nextCell, lastCell, row, menuBtn }
   const busyRows = new Set(); // ids whose Run now / Dry run is starting
+  const toggling = new Map(); // id → the state its switch is saving
   let lastRunKey = runKey(store.get().summary);
   let running = runningOf(store.get().summary);
 
   // ---- Layout ----
 
+  // Hidden while there are no schedules: the empty list's Create a schedule is then the one
+  // primary action (startBtn() is whichever is shown).
   const newBtn = h(
     'button',
     { type: 'button', class: 'btn btn-primary', onClick: () => openEditor(null, newBtn) },
@@ -341,8 +359,14 @@ function mountSchedules(root, ctx) {
     return [...root.querySelectorAll('[data-focus-key]')].find((el) => el.dataset.focusKey === key) || null;
   }
 
+  /** The button shown now that starts a new schedule: New schedule, or the empty list's own. */
+  function startBtn() {
+    return (newBtn.hidden && listBox.querySelector('.empty-state .btn')) || newBtn;
+  }
+
   // Re-rendering replaces rows; put focus back on the same control (by data-focus-key), or on
-  // New schedule when that control is gone (a deleted row, the empty state's button).
+  // startBtn() when that control is gone (a deleted row, the empty state's button) or hidden
+  // (New schedule, once the list turns out empty).
   function keepFocus(fn) {
     const at = document.activeElement;
     const key = at && root.contains(at) && at.dataset ? at.dataset.focusKey : null;
@@ -354,17 +378,19 @@ function mountSchedules(root, ctx) {
       again.focus({ preventScroll: true });
       return;
     }
-    if (inList && !listBox.contains(document.activeElement)) newBtn.focus({ preventScroll: true });
+    const lost = inList ? !listBox.contains(document.activeElement) : at === newBtn && newBtn.hidden;
+    if (lost) startBtn().focus({ preventScroll: true });
   }
 
   // An overlay gives focus back to the control that opened it. When the list was rebuilt while
-  // it was open (a run finished, a reload), that control is gone and focus fell back to the
-  // page: put it on the control's replacement (same data-focus-key), else on New schedule.
+  // it was open (a run finished, a reload), that control is gone (or, New schedule, hidden) and
+  // focus fell back to the page: put it on the control's replacement (same data-focus-key), else
+  // on startBtn().
   function refocus(opener) {
-    if (!alive || !opener || opener.isConnected) return;
+    if (!alive || !opener || (opener.isConnected && !opener.hidden)) return;
     const at = document.activeElement;
     if (at && at !== document.body && at.id !== 'view') return;
-    (byKey(opener.dataset && opener.dataset.focusKey) || newBtn).focus({ preventScroll: true });
+    (byKey(opener.dataset && opener.dataset.focusKey) || startBtn()).focus({ preventScroll: true });
   }
 
   function errorBlock(what, err, retry) {
@@ -397,8 +423,25 @@ function mountSchedules(root, ctx) {
     );
   }
 
+  // A schedule's placeholder has a row's shape (name over cadence; next run; last run over its
+  // counts) and about its height (schedules.css), so Run history doesn't jump when the list lands.
+  function skeletonSchedules(n) {
+    const lines = (...cls) => h('span', { class: 'sch-skel-lines' }, cls.map((c) => h('span', { class: `skeleton ${c}` })));
+    return Array.from({ length: n }, () =>
+      h(
+        'div',
+        { class: 'sch-skel-row sch-skel-schedule', 'aria-hidden': 'true' },
+        h('span', { class: 'skeleton sch-skel-switch' }),
+        lines('sch-skel-main', 'sch-skel-sub'),
+        lines('sch-skel-cell', 'sch-skel-sub'),
+        lines('sch-skel-cell', 'sch-skel-sub', 'sch-skel-sub'),
+      ),
+    );
+  }
+
   function renderList() {
     rowRefs.clear();
+    newBtn.hidden = !!schedules && !schedules.length;
     listBox.setAttribute('aria-busy', schedules == null && !errSchedules ? 'true' : 'false');
     if (schedules == null) {
       listBox.className = 'sch-list is-placeholder';
@@ -409,7 +452,7 @@ function mountSchedules(root, ctx) {
             renderList();
             loadSchedules();
           })]
-          : [h('span', { class: 'sr-only' }, 'Loading schedules…'), ...skeletonRows(2)]),
+          : [h('span', { class: 'sr-only' }, 'Loading schedules…'), listHead(), ...skeletonSchedules(2)]),
       );
       return;
     }
@@ -431,16 +474,21 @@ function mountSchedules(root, ctx) {
       return;
     }
     listBox.className = 'sch-list';
-    const header = h(
+    listBox.replaceChildren(
+      listHead(),
+      h('ul', { class: 'sch-rows', 'aria-label': 'Schedules' }, schedules.map(scheduleRow)),
+    );
+  }
+
+  // The column header (wide screens; for the eye only, each cell has its own label). The loading
+  // placeholder has it too, so the rows that replace it start at the same place.
+  function listHead() {
+    return h(
       'div',
       { class: 'sch-list-head', 'aria-hidden': 'true' },
       h('span', { class: 'sch-h-main' }, 'Schedule'),
       h('span', { class: 'sch-h-next' }, 'Next run'),
       h('span', { class: 'sch-h-last' }, 'Last run'),
-    );
-    listBox.replaceChildren(
-      header,
-      h('ul', { class: 'sch-rows', 'aria-label': 'Schedules' }, schedules.map(scheduleRow)),
     );
   }
 
@@ -528,11 +576,16 @@ function mountSchedules(root, ctx) {
   }
 
   function scheduleRow(s) {
-    const sw = switchEl({ checked: !!s.enabled, label: nameOf(s), onChange: (on) => toggle(s, on) });
+    // A toggle of it is still saving (the list was rebuilt meanwhile, from a read made before
+    // it): show the state it is saving and ignore presses until it is done, as before.
+    const held = toggling.has(s.id);
+    const sw = switchEl({ checked: held ? toggling.get(s.id) : !!s.enabled, label: nameOf(s), onChange: (on) => toggle(s, on) });
     sw.classList.add('sch-switch');
     const text = sw.querySelector('.switch-text');
     if (text) text.classList.add('sr-only');
     sw.button.dataset.focusKey = `switch:${s.id}`;
+    sw.addEventListener('click', (e) => toggling.has(s.id) && e.stopPropagation(), true);
+    if (held) sw.button.setAttribute('aria-busy', 'true');
 
     const menuBtn = h(
       'button',
@@ -566,7 +619,7 @@ function mountSchedules(root, ctx) {
       lastCell,
       h('div', { class: 'sch-actions' }, menuBtn),
     );
-    rowRefs.set(s.id, { s, row, nextCell, lastCell, sw, menuBtn });
+    rowRefs.set(s.id, { s, row, nextCell, lastCell, sw, menuBtn, held });
     return row;
   }
 
@@ -575,7 +628,11 @@ function mountSchedules(root, ctx) {
     if (!ref) return;
     const { s } = ref;
     ref.row.classList.toggle('is-paused', !s.enabled);
-    ref.sw.setChecked(!!s.enabled);
+    ref.sw.setChecked(toggling.has(id) ? toggling.get(id) : !!s.enabled);
+    if (ref.held && !toggling.has(id)) {
+      ref.held = false;
+      ref.sw.button.removeAttribute('aria-busy');
+    }
     fill(ref.nextCell.lastChild, nextContent(s));
     fill(ref.lastCell.lastChild, lastContent(s));
   }
@@ -592,9 +649,10 @@ function mountSchedules(root, ctx) {
 
   // ---- Actions ----
 
-  /** GET /api/schedules outside the screen's own loader → the list, or null when it failed. */
+  /** GET /api/schedules outside the screen's own loader → the list, or null when it failed. It
+   *  tells what a write stored, which is said even once the screen is left: never aborted. */
   function fetchList() {
-    return api.get('/api/schedules', { signal: life.signal }).then((v) => listOf(v, 'schedules'), () => null);
+    return api.get('/api/schedules').then((v) => listOf(v, 'schedules'), () => null);
   }
 
   /** Show `fresh` (a list just read) as the screen's list. A reload already on its way (e.g. the
@@ -610,18 +668,26 @@ function mountSchedules(root, ctx) {
     keepFocus(renderList);
   }
 
+  /** After a change is stored: a reload already on its way may have read the list before it, and
+   *  its answer would undo the change on screen. Ask again instead. */
+  function rereadAfterChange() {
+    if (ctls.schedules) loadSchedules();
+  }
+
   async function toggle(s, on) {
+    toggling.set(s.id, on);
     try {
       await api.patch(`/api/schedules/${enc(s.id)}`, { enabled: on });
     } catch (err) {
+      toggling.delete(s.id);
       // The row may already say `on` (the timer step failed after it was written): show what
-      // is stored rather than leave the switch saying the opposite. (A stale session stored
-      // nothing, and can't read the list either.)
-      if (alive && !isStaleSession(err)) {
+      // is stored rather than leave the switch saying the opposite, and say so even if the
+      // screen was left meanwhile. (A stale session stored nothing, and can't read the list.)
+      if (!isStaleSession(err)) {
         const fresh = await fetchList();
         adopt(fresh);
         const stored = fresh && fresh.find((x) => x.id === s.id);
-        if (alive && stored && !!stored.enabled === on) {
+        if (stored && !!stored.enabled === on) {
           store.refresh();
           toast(
             on
@@ -632,14 +698,23 @@ function mountSchedules(root, ctx) {
           return true;
         }
       }
-      // Nothing changed: the switch goes back and shows this.
+      // Nothing changed: the switch goes back and shows this (and so does one the list was
+      // rebuilt with meanwhile).
+      if (alive) refreshRow(s.id);
       throw new Error(`Couldn't ${on ? 'turn on' : 'pause'} ${quoted(s)}: ${errorText(err)}`);
     }
-    if (!alive) return true;
-    // The response's last_run is always null: keep the one on screen.
+    toggling.delete(s.id);
+    // The response's last_run is always null: keep the one on screen. The list may have been
+    // reloaded while this saved, from a read made before it: change the copy shown now too.
     s.enabled = on;
-    refreshRow(s.id);
+    if (alive) {
+      const shown = (schedules || []).find((x) => x.id === s.id);
+      if (shown) shown.enabled = on;
+      rereadAfterChange();
+      refreshRow(s.id);
+    }
     if (on) toast(`${quoted(s)} is on. Next run ${runLabel(nextRuns(s, 1)[0])}.`, 'ok');
+    else if (isRunning(s)) toast(`${quoted(s)} is paused. The run going on now isn't stopped: it finishes, and then it won't run until you turn it back on.`, 'ok');
     else toast(`${quoted(s)} is paused. It won't run until you turn it back on.`, 'ok');
     store.refresh();
     return true;
@@ -711,12 +786,12 @@ function mountSchedules(root, ctx) {
         }
       }
       const res = await api.post(`/api/schedules/${enc(s.id)}/run`, { draft_only: dry });
-      if (!alive) return;
       store.refresh();
       toast(dry ? `Dry run of ${quoted(s)} started. It only writes drafts.` : `${quoted(s)} is running.`, 'info');
-      nav.navigate(href(['agent', res.chat_id]));
+      // Left meanwhile: the screen open now stays (the toast and the shell say it runs).
+      if (alive) nav.navigate(href(['agent', res.chat_id]));
     } catch (err) {
-      if (alive && !(err && err.name === 'AbortError')) {
+      if (!(err && err.name === 'AbortError')) {
         toast(`Couldn't start ${dry ? 'a dry run of ' : ''}${quoted(s)}: ${errorText(err)}`, 'err');
       }
     } finally {
@@ -731,7 +806,10 @@ function mountSchedules(root, ctx) {
   async function remove(s, btn) {
     const ok = await ask({
       title: `Delete ${quoted(s)}?`,
-      body: 'Its timer is removed and it stops running. Past runs stay in the run history.',
+      body: [
+        "Its timer is removed, so it won't run again. Past runs stay in the run history.",
+        isRunning(s) ? LIVE_RUN_GOES_ON : null,
+      ],
       confirmText: 'Delete schedule',
       danger: true,
       opener: btn,
@@ -740,14 +818,17 @@ function mountSchedules(root, ctx) {
     try {
       await api.del(`/api/schedules/${enc(s.id)}`);
     } catch (err) {
-      if (alive) toast(`Couldn't delete ${quoted(s)}: ${errorText(err)}`, 'err');
+      // Said even if the screen was left meanwhile: the schedule is still there, and still runs.
+      toast(`Couldn't delete ${quoted(s)}: ${errorText(err)}`, 'err');
       return;
     }
-    if (!alive) return;
     toast(`${quoted(s)} deleted.`, 'ok');
-    if (schedules) schedules = schedules.filter((x) => x.id !== s.id);
-    keepFocus(renderList);
-    loadRuns(); // its past runs lose their schedule name
+    if (alive) {
+      if (schedules) schedules = schedules.filter((x) => x.id !== s.id);
+      rereadAfterChange();
+      keepFocus(renderList);
+      loadRuns(); // its past runs lose their schedule name
+    }
     store.refresh();
   }
 
@@ -856,6 +937,7 @@ function mountSchedules(root, ctx) {
 
     // This screen's own status read, else the shell's (still loading or failed here).
     const policy = sendingPolicy(status || store.get().status || null);
+    const settingsLink = h('a', { href: SENDING_SETTINGS, class: 'sch-link', onClick: (e) => toSettings(e) }, 'Change in Settings');
     const consequence = h(
       'div',
       { class: ['sch-consequence', policy.risky && 'is-risky'] },
@@ -863,7 +945,7 @@ function mountSchedules(root, ctx) {
       h(
         'div',
         { class: 'sch-consequence-text' },
-        h('p', {}, policy.text, ' ', h('a', { href: '#/settings?tab=sending', class: 'sch-link' }, 'Change in Settings')),
+        h('p', {}, policy.text, ' ', settingsLink),
         policy.caveat ? h('p', { class: 'sch-caveat' }, policy.caveat) : null,
       ),
     );
@@ -893,12 +975,12 @@ function mountSchedules(root, ctx) {
       const times = time ? nextRuns(spec, 3) : [];
       previewList.replaceChildren(
         ...times.map((d, i) => {
-          const rel = fmtRelative(d);
+          const rel = i === 0 ? untilText(d) : null;
           return h(
             'li',
             {},
             h('span', { class: 'sch-run-at' }, runLabel(d)),
-            i === 0 && /^in |^just now$/.test(rel) ? h('span', { class: 'sch-run-rel' }, rel) : null,
+            rel ? h('span', { class: 'sch-run-rel' }, rel) : null,
           );
         }),
       );
@@ -971,7 +1053,7 @@ function mountSchedules(root, ctx) {
             // A timer error comes after the row was written: show what is stored now. Only a
             // change that is now stored says "Saved": a save of what was stored already can't
             // tell a failed write (e.g. "database is locked") from a failed timer step.
-            if (err && err.status >= 500 && alive) {
+            if (err && err.status >= 500) {
               const fresh = await fetchList();
               adopt(fresh);
               store.refresh();
@@ -985,19 +1067,19 @@ function mountSchedules(root, ctx) {
         } else {
           // The ids that exist just before this save, read fresh (the screen's list may be
           // missing or out of date), so a row the failed save left behind can be told apart.
+          // Leaving the screen meanwhile doesn't drop the save: Create was pressed.
           const listed = await fetchList();
           const before = listed || schedules ? new Set((listed || schedules).map((x) => x.id)) : null;
-          if (!alive) return false;
           try {
             const res = await api.post('/api/schedules', { ...body, enabled: true });
             saved = { schedule: res, created: true };
           } catch (err) {
             // The server writes the row before installing its timer: if that row exists now,
             // keep editing it so saving again can't create a duplicate.
-            if (err && err.status >= 500 && before && alive) {
+            if (err && err.status >= 500 && before) {
               const fresh = await fetchList();
               const added = (fresh || []).filter((x) => !before.has(x.id) && matchesSave(x, body)).pop();
-              if (added && alive) {
+              if (added) {
                 editId = added.id;
                 base = added;
                 adopt(fresh);
@@ -1011,7 +1093,8 @@ function mountSchedules(root, ctx) {
           }
         }
       } catch (err) {
-        if (!alive) return false;
+        // Closed while it saved (Esc, Close, or the screen was left, which closes it too): a
+        // toast says how it went, on whichever screen is open now.
         if (!open) {
           toast(err && err.shown ? err.closed : `Couldn't save ${quoted(body)}: ${errorText(err)}`, 'err');
           return false;
@@ -1021,7 +1104,7 @@ function mountSchedules(root, ctx) {
         return false;
       }
       // Closed while it saved: onClose has been and gone, so show the result now.
-      if (!open && alive) afterSave(saved);
+      if (!open) settleSave(saved);
       return true;
     }
 
@@ -1040,6 +1123,25 @@ function mountSchedules(root, ctx) {
     // What the form holds, to tell whether anything was typed or changed since it opened.
     const snapshot = () => JSON.stringify([nameIn.value, freq(), daySel.value, timeIn.value, task(), promptIn.value]);
     const pristine = snapshot();
+
+    // "Change in Settings" leaves this screen, which closes the dialog: once the form has changed,
+    // ask before dropping it. (A click that opens another tab loses nothing.)
+    async function toSettings(e) {
+      if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+      if (snapshot() === pristine) return;
+      e.preventDefault();
+      const ok = await ask({
+        title: editId ? 'Discard your changes and open Settings?' : 'Discard this schedule and open Settings?',
+        body: editId
+          ? `Your changes to ${quoted(base)} aren’t saved yet. To keep them, save first, then change sending in Settings.`
+          : 'It isn’t saved yet. To keep it, create it first, then change sending in Settings.',
+        confirmText: 'Discard and open Settings',
+        cancelText: 'Keep editing',
+        danger: true,
+        opener: settingsLink,
+      });
+      if (ok && open) nav.navigate(SENDING_SETTINGS);
+    }
     const dlg = openDialog({
       title: s ? 'Edit schedule' : 'New schedule',
       content: form,
@@ -1055,17 +1157,34 @@ function mountSchedules(root, ctx) {
       onClose: () => {
         open = false;
         refocus(opener);
-        if (saved && alive) afterSave(saved);
+        if (saved) settleSave(saved);
       },
     });
     dlg.el.classList.add('sch-dialog');
     const saveBtn = dlg.el.querySelector('.dialog-actions .btn-primary');
   }
 
+  /** "“Lunch” created. First run Fri, Oct 30, 16:30." */
+  function savedText({ schedule: s, created }) {
+    const when = s.enabled ? ` ${created ? 'First' : 'Next'} run ${runLabel(nextRuns(s, 1)[0])}.` : ' It’s paused.';
+    return `${quoted(s)} ${created ? 'created' : 'saved'}.${when}`;
+  }
+
+  // A save that worked, once its dialog has closed: shown on the list, or by a toast alone when
+  // the screen was left meanwhile.
+  function settleSave(result) {
+    if (alive) {
+      afterSave(result);
+      return;
+    }
+    toast(savedText(result), 'ok');
+    store.refresh();
+  }
+
   // Runs once the dialog has closed and focus is back on its opener, so re-rendering the list
   // can put focus back on the same row control.
-  function afterSave({ schedule, created }) {
-    const s = schedule;
+  function afterSave(result) {
+    const s = result.schedule;
     const at = (schedules || []).findIndex((x) => x.id === s.id);
     if (at >= 0) {
       s.last_run = schedules[at].last_run; // the response's last_run is always null
@@ -1076,8 +1195,7 @@ function mountSchedules(root, ctx) {
       schedules = [s];
     }
     keepFocus(renderList);
-    const when = s.enabled ? ` ${created ? 'First' : 'Next'} run ${runLabel(nextRuns(s, 1)[0])}.` : ' It’s paused.';
-    toast(`${quoted(s)} ${created ? 'created' : 'saved'}.${when}`, 'ok');
+    toast(savedText(result), 'ok');
     loadSchedules({ announce: true });
     store.refresh();
   }
@@ -1127,10 +1245,11 @@ function mountSchedules(root, ctx) {
             key: 'schedule_name',
             label: 'Schedule',
             nowrap: true,
-            render: (r) =>
-              r.schedule_name
-                ? h('span', { class: 'sch-run-name', title: r.schedule_name }, r.schedule_name)
-                : h('span', { class: 'text-3' }, 'No schedule'),
+            render: (r) => {
+              // No name: a manual run, or one whose schedule was deleted since (Home's wording).
+              const { text, muted } = runName(r);
+              return muted ? h('span', { class: 'text-3' }, text) : h('span', { class: 'sch-run-name', title: text }, text);
+            },
           },
           { key: 'trigger', label: 'Trigger', nowrap: true, render: (r) => TRIGGERS[r.trigger] || (r.trigger ? r.trigger : '—') },
           {
@@ -1158,7 +1277,7 @@ function mountSchedules(root, ctx) {
                   'a',
                   { class: 'sch-link', href: href(['agent', r.chat_id]), 'data-focus-key': `run:${r.chat_id}` },
                   'View run',
-                  h('span', { class: 'sr-only' }, ` (${r.schedule_name || 'no schedule'}, ${fmtDate(r.started_at, { time: true })})`),
+                  h('span', { class: 'sr-only' }, ` (${runName(r).text}, ${fmtDate(r.started_at, { time: true })})`),
                 )
                 : null,
           },
@@ -1201,7 +1320,7 @@ function mountSchedules(root, ctx) {
       // Never stack it on a dialog that is already open (this one, a confirm, a drawer).
       if (document.querySelector('#overlays [data-overlay="dialog"], #overlays [data-overlay="drawer"]')) return;
       if (menu) menu.close();
-      openEditor(null, newBtn);
+      openEditor(null, startBtn());
     },
     unmount() {
       alive = false;
