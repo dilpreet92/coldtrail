@@ -1,15 +1,16 @@
 // Feedback and overlays (spec §4): toasts, confirm/dialog, drawer, menu, plus busy buttons and
-// copy-to-clipboard. Overlays live in #overlays, stack (Esc closes the top one), trap Tab inside,
-// make the app behind a modal inert, and give focus back to whatever opened them: the `opener`
-// option when given (a menu's anchor), else the element focused at open, else #view. Pass
-// `opener` when the triggering control is known: WebKit does not focus a clicked button, so a
-// mouse-opened overlay sees <body> focused. Dialogs, confirms, drawers and menus take an
-// AbortSignal (`signal`) that closes them, so a view can tie them to its own lifetime. Dialogs and
-// drawers take beforeClose(reason) to keep themselves open (unsaved typing). Every open overlay
-// carries [data-overlay], which keys.js checks so page shortcuts stay off while one is open (⌘K
-// closes the top one with closeTopOverlay() instead). Toasts on screen when a modal opens step
-// aside (hidden) until it closes, so a sticky error never covers its buttons; toasts raised while
-// it is open (its own action failing) show over it.
+// copy-to-clipboard. Overlays live in #overlays, stack (Esc closes the top one, unless an IME is
+// composing), trap Tab inside, make the app behind a modal inert, ignore the second half of the
+// double-click or double-tap that opened a modal one, and give focus back to whatever opened
+// them: the `opener` option when given (a menu's anchor), else the element focused at open, else
+// #view. Pass `opener` when the triggering control is known: WebKit does not focus a clicked
+// button, so a mouse-opened overlay sees <body> focused. Dialogs, confirms, drawers and menus
+// take an AbortSignal (`signal`) that closes them, so a view can tie them to its own lifetime.
+// Dialogs and drawers take beforeClose(reason) to keep themselves open (unsaved typing). Every
+// open overlay carries [data-overlay], which keys.js checks so page shortcuts stay off while one
+// is open (⌘K closes the top one with closeTopOverlay() instead). Toasts on screen when a modal
+// opens step aside (hidden) until it closes, so a sticky error never covers its buttons; toasts
+// raised while it is open (its own action failing) show over it.
 //
 // Class hooks for components.css: .overlay (.overlay-dialog | .overlay-drawer: the backdrop),
 // .dialog > .dialog-head (.dialog-title, .overlay-close) + .dialog-body + .dialog-actions
@@ -122,6 +123,52 @@ function releaseToasts(toasts) {
   for (const t of toasts) if (t.isConnected) t.hidden = false;
 }
 
+// A double-click or double-tap on a control that opens a dialog or drawer lands its second press
+// on it: on the backdrop (it opens and closes at once), or on a phone on its own button, where the
+// row's was (Mark bounced confirmed unread). So a pointer click anywhere in a modal overlay that
+// comes within ECHO_MS and ECHO_PX of the press that opened it is that press's echo and is
+// swallowed. Keyboard clicks (detail 0) never are.
+const ECHO_MS = 500;
+const ECHO_PX = 32;
+let lastPress = null; // the last pointerdown anywhere: { x, y, t }
+const pressDocs = new WeakSet();
+
+function trackPresses() {
+  if (typeof document === 'undefined' || pressDocs.has(document)) return;
+  pressDocs.add(document);
+  document.addEventListener(
+    'pointerdown',
+    (e) => {
+      lastPress = { x: e.clientX, y: e.clientY, t: e.timeStamp };
+    },
+    true,
+  );
+}
+trackPresses();
+
+/** Swallow the clicks on `el` (a modal overlay opening now) that echo the press that opened it;
+ *  their mousedown doesn't move focus either (off Cancel, onto a confirm button). */
+function ignoreEchoes(el) {
+  trackPresses();
+  const press = lastPress;
+  if (!press) return;
+  const isEcho = (e) =>
+    e.detail > 0 &&
+    e.timeStamp - press.t < ECHO_MS &&
+    Math.abs(e.clientX - press.x) <= ECHO_PX &&
+    Math.abs(e.clientY - press.y) <= ECHO_PX;
+  el.addEventListener('mousedown', (e) => isEcho(e) && e.preventDefault(), true);
+  el.addEventListener(
+    'click',
+    (e) => {
+      if (!isEcho(e)) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+    },
+    true,
+  );
+}
+
 function restoreFocus(opener) {
   const target = opener && opener.isConnected ? opener : document.getElementById('view');
   if (target) {
@@ -143,7 +190,9 @@ function trapTab(e, panel) {
   const first = items[0];
   const last = items[items.length - 1];
   const at = document.activeElement;
-  if (e.shiftKey && (at === first || !panel.contains(at))) {
+  // Focus on the panel itself (a drawer opened on it, a dialog while an action runs) comes before
+  // the first control: left to the browser, Shift+Tab would leave the page.
+  if (e.shiftKey && (at === first || at === panel || !panel.contains(at))) {
     e.preventDefault();
     last.focus();
   } else if (!e.shiftKey && (at === last || !panel.contains(at))) {
@@ -154,7 +203,9 @@ function trapTab(e, panel) {
 
 function onKeydown(e) {
   const top = stack[stack.length - 1];
-  if (!top || e.defaultPrevented) return;
+  // A key pressed while an IME is composing is the IME's: Esc there cancels a candidate, and must
+  // not close the dialog and lose the form. (Safari sends that Esc with keyCode 229 only.)
+  if (!top || e.defaultPrevented || e.isComposing || e.keyCode === 229) return;
   if (e.key === 'Escape' || e.key === 'Esc') {
     e.preventDefault();
     e.stopPropagation();
@@ -284,7 +335,10 @@ function pushOverlay({ el, panel, modal, kind, anchor = null, opener = null, onK
       }
     }
   };
-  if (modal) entry.toasts = holdToasts();
+  if (modal) {
+    entry.toasts = holdToasts();
+    ignoreEchoes(el);
+  }
   overlayRoot().append(el);
   stack.push(entry);
   listen(true);

@@ -202,7 +202,8 @@ test('closeTopOverlay closes the overlay on top as Esc would', async () => {
 
 test('mod+k reaches its handler over an overlay; clearOverlay() closes the top one, then it runs', async () => {
   const { doc, win, trigger } = fakeDom();
-  await withGlobals({ document: doc, window: win }, () => {
+  // Not a Mac, where Ctrl+K is not mod+k (core.test.mjs).
+  await withGlobals({ document: doc, window: win, navigator: { platform: 'Win32', userAgent: '' } }, () => {
     const hits = [];
     let canAct = true;
     // Like the shell's handler: decline when it can't act, else clear the overlays first.
@@ -695,6 +696,105 @@ test('page keys stay off while held (the phone menu is open); mod+k still runs',
     } finally {
       holdPageKeys(false);
       unbind();
+    }
+  });
+});
+
+test('Esc that cancels an IME composition stays with the field: the overlay stays open', async () => {
+  const { doc, win, trigger } = fakeDom();
+  await withGlobals({ document: doc, window: win }, async () => {
+    for (const open of [openDialog, openDrawer]) {
+      const closed = [];
+      open({ title: 'New schedule', content: 'x', actions: [{ label: 'Cancel' }], opener: trigger, onClose: (r) => closed.push(r) });
+      // Chrome reports the composing Esc as isComposing with keyCode 229 (Safari: 229 alone).
+      for (const mods of [{ isComposing: true, keyCode: 229 }, { isComposing: false, keyCode: 229 }, { isComposing: true, keyCode: 27 }]) {
+        const e = pressKey(doc, 'Escape', mods);
+        assert.equal(e.defaultPrevented, false, `left to the IME (${open.name}, ${JSON.stringify(mods)})`);
+      }
+      assert.deepEqual(closed, [], `${open.name} still open`);
+      assert.ok(doc.querySelector('[data-overlay]'));
+      pressKey(doc, 'Escape', { isComposing: false, keyCode: 27 });
+      assert.deepEqual(closed, ['escape'], 'a plain Esc still closes it');
+      assert.equal(doc.querySelector('[data-overlay]'), null);
+    }
+  });
+});
+
+test('Shift+Tab from the panel itself (a drawer opened on it) wraps to the last control', async () => {
+  const { doc, win, trigger } = fakeDom();
+  await withGlobals({ document: doc, window: win }, async () => {
+    const tabbable = (label) => {
+      const b = doc.createElement('button');
+      b.append(label);
+      Object.assign(b, { tabIndex: 0, closest: () => null, getClientRects: () => [{}] });
+      return b;
+    };
+    const first = tabbable('Website');
+    const last = tabbable('Skip');
+    const drawer = openDrawer({ title: 'Lumen Labs', content: [first, last], opener: trigger });
+    drawer.el.querySelectorAll = () => [first, last];
+    assert.equal(doc.activeElement, drawer.el, 'nothing asks for focus: the panel holds it');
+
+    const back = pressKey(doc, 'Tab', { shiftKey: true });
+    assert.ok(back.defaultPrevented, 'not left to the browser (it would leave the page)');
+    assert.equal(doc.activeElement, last);
+    const fwd = pressKey(doc, 'Tab');
+    assert.ok(fwd.defaultPrevented);
+    assert.equal(doc.activeElement, first, 'and Tab from the last wraps to the first');
+
+    drawer.el.focus(); // a dialog parks focus on its panel while an action runs
+    pressKey(doc, 'Tab');
+    assert.equal(doc.activeElement, drawer.el, 'Tab from the panel is left to the browser: the next control');
+    drawer.close();
+  });
+});
+
+test('the double-click or double-tap that opened a dialog or drawer does not also close it', async () => {
+  // The guard listens on the overlay's root, so its own clicks are what this fake DOM (which has
+  // no propagation) can show; shell.spec.js covers the dialog's buttons in a browser.
+  const { doc, win, trigger } = fakeDom();
+  await withGlobals({ document: doc, window: win }, async () => {
+    const at = (type, x, y, t, extra = {}) => {
+      const e = new Event(type, { cancelable: true });
+      Object.defineProperty(e, 'timeStamp', { value: t });
+      Object.assign(e, { clientX: x, clientY: y, detail: 1 }, extra);
+      return e;
+    };
+    const press = (x, y, t) => doc.dispatchEvent(at('pointerdown', x, y, t));
+    const clickOn = (el, x, y, t, extra) => {
+      const down = at('mousedown', x, y, t, extra);
+      el.dispatchEvent(down);
+      el.dispatchEvent(at('click', x, y, t, extra));
+      return down;
+    };
+    openDialog({ title: 'warm-up', content: 'x' }).close(); // presses are tracked from here
+
+    for (const open of [openDialog, openDrawer]) {
+      const closed = [];
+      press(300, 394, 1000); // the press that opens it
+      open({ title: 'T', content: 'x', actions: [{ label: 'OK' }], opener: trigger, onClose: (r) => closed.push(r) });
+      const backdrop = doc.querySelector('[data-overlay]');
+      // The second tap, 120ms on, on the same spot.
+      press(302, 395, 1120);
+      assert.ok(clickOn(backdrop, 302, 395, 1120).defaultPrevented, 'its mousedown moves no focus');
+      // A double-click's second click (detail 2), a little later.
+      clickOn(backdrop, 300, 394, 1300, { detail: 2 });
+      assert.deepEqual(closed, [], `${open.name}: the opening press's echoes are ignored`);
+      // A press elsewhere, even at once, is the user's.
+      assert.equal(clickOn(backdrop, 20, 20, 1150).defaultPrevented, false);
+      assert.deepEqual(closed, ['backdrop'], open.name);
+
+      // On the same spot, but later: the user's too.
+      press(300, 394, 2000);
+      open({ title: 'T', content: 'x', opener: trigger, onClose: (r) => closed.push(r) });
+      clickOn(doc.querySelector('[data-overlay]'), 300, 394, 2600);
+      assert.deepEqual(closed, ['backdrop', 'backdrop'], open.name);
+
+      // A keyboard click (detail 0) never is an echo, however soon it comes.
+      press(300, 394, 3000);
+      open({ title: 'T', content: 'x', opener: trigger, onClose: (r) => closed.push(r) });
+      clickOn(doc.querySelector('[data-overlay]'), 300, 394, 3010, { detail: 0 });
+      assert.deepEqual(closed, ['backdrop', 'backdrop', 'backdrop'], open.name);
     }
   });
 });

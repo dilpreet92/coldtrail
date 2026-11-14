@@ -1,4 +1,5 @@
-// Keyboard shortcuts (spec §4, §5.4): ⌘K / Ctrl+K, J/K, Enter, Esc, ⌘/Ctrl+Enter. Plain keys are
+// Keyboard shortcuts (spec §4, §5.4): ⌘K / Ctrl+K, J/K, Enter, Esc, ⌘/Ctrl+Enter (⌘ on Apple
+// keyboards, Ctrl elsewhere: on a Mac Ctrl+K deletes to the end of the line). Plain keys are
 // ignored while the user is typing, and every key is ignored while an overlay (dialog, drawer,
 // menu) is open, or while the shell holds the page's keys (holdPageKeys: the phone menu covers
 // the page): the overlay or menu owns the keyboard then. The exception is ⌘K / Ctrl+K (global
@@ -31,13 +32,26 @@ export function holdPageKeys(on) {
   held = !!on;
 }
 
-/** "mod+k", "shift+j", "escape" … from a KeyboardEvent (mod = ⌘ or Ctrl). */
+/** True on a Mac, iPhone or iPad, where ⌘ is the shortcut key and the shortcut hints say ⌘K. */
+export function isApple() {
+  const nav = typeof navigator === 'undefined' ? null : navigator;
+  return !!nav && /Mac|iPhone|iPad|iPod/.test(nav.platform || nav.userAgent || '');
+}
+
+/** "mod+k", "shift+j", "escape" … from a KeyboardEvent (mod = ⌘ on Apple keyboards, else Ctrl). */
 export function comboOf(e) {
   let key = String(e.key || '').toLowerCase();
   if (key === 'esc') key = 'escape';
   if (key === ' ') key = 'space';
   const mods = [];
-  if (e.metaKey || e.ctrlKey) mods.push('mod');
+  // On a Mac Ctrl is a key of its own ("ctrl+k"): the text fields' Emacs keys (Ctrl+K deletes to
+  // the end of the line) must reach them, and Ctrl+K is not a plain K either.
+  if (isApple()) {
+    if (e.metaKey) mods.push('mod');
+    if (e.ctrlKey) mods.push('ctrl');
+  } else if (e.metaKey || e.ctrlKey) {
+    mods.push('mod');
+  }
   if (e.altKey) mods.push('alt');
   if (e.shiftKey) mods.push('shift');
   return [...mods, key].join('+');

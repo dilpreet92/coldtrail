@@ -462,11 +462,13 @@ textarea.input { min-height: 80px; line-height: 1.5; }
   display: flex;
   gap: 20px;
   /* Room inside the scroll box for the first and last tab's focus ring; the labels stay in line
-     with the content. */
+     with the content, and so does the rule under them: the border is drawn as an image that
+     leaves those 4px out (a view's border-bottom: 0 still removes it). */
   margin-inline: -4px;
   padding-inline: 4px;
   overflow-x: auto;
   border-bottom: 1px solid var(--border);
+  border-image: linear-gradient(to right, transparent 4px, var(--border) 4px, var(--border) calc(100% - 4px), transparent calc(100% - 4px)) 0 0 1 0;
   scrollbar-width: none;
 }
 
@@ -861,3 +863,27 @@ html.has-overlay { overflow: hidden; }
 .toast-err::before { background: var(--danger); }
 .toast-text { flex: 1; min-width: 0; padding-top: 1px; white-space: pre-line; overflow-wrap: anywhere; }
 .toast-close { width: 28px; height: 28px; flex: none; }
+
+/* ---- Forced colours (Windows High Contrast) ----
+   Forced colours drop backgrounds and box-shadows (and recolour borders), so a state drawn only
+   with those gets a mark in a system colour here. */
+
+@media (forced-colors: active) {
+  /* Switch: the thumb shows, and on fills the track. */
+  .switch-thumb { forced-color-adjust: none; background: CanvasText; }
+  .switch[aria-checked="true"] { background: Highlight; border-color: Highlight; }
+  .switch[aria-checked="true"] .switch-thumb { background: HighlightText; }
+
+  /* The selected tab is underlined with a border (its usual underline is a box-shadow); the rule
+     under the tabs is a plain border. */
+  .tabs { border-image: none; }
+  .tab[aria-selected="true"] { border-bottom: 2px solid Highlight; }
+
+  /* The result Enter opens, and the current screen in the sidebar. */
+  .search-opt.is-active,
+  .ss-option.is-active { outline: 2px solid Highlight; outline-offset: -2px; }
+  .nav-item[aria-current="page"] {
+    padding: calc(var(--space-1) - 1px) calc(var(--space-2) - 1px);
+    border: 1px solid Highlight;
+  }
+}

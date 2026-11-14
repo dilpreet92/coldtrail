@@ -3,7 +3,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { matchDrafts, draftOption, draftHref } from '../../ui/js/shell.js';
+import { matchDrafts, draftOption, draftHref, companyHref } from '../../ui/js/shell.js';
 
 const DRAFTS = [
   { domain: 'northwind-health.example', channel: 'linkedin', to: 'https://www.linkedin.com/in/sami-roe-1', contact_name: 'Sami Roe', company_name: 'Northwind Health', subject: null },
@@ -52,4 +52,16 @@ test('matchDrafts folds drafts on the same domain and channel, as the Drafts lis
   ];
   assert.deepEqual(matchDrafts(rows, 'xenia').map((d) => d.contact_name), ['Maya Moreau', 'Lina Note'], 'the newest of each');
   assert.deepEqual(matchDrafts(rows, 'old draft').map((d) => d.contact_name), ['Old Draft'], 'an older one still matches on its own');
+});
+
+test('a company result searched from Pipeline opens over the same list, filters and page kept', () => {
+  assert.equal(companyHref('granite-freight.example', '#/home'), '#/pipeline/granite-freight.example');
+  assert.equal(companyHref('granite-freight.example', ''), '#/pipeline/granite-freight.example');
+  assert.equal(companyHref('granite-freight.example', '#/drafts/acme.example?channel=email'), '#/pipeline/granite-freight.example', "another screen's query stays there");
+  assert.equal(companyHref('granite-freight.example', '#/pipeline?stage=sent&page=3'), '#/pipeline/granite-freight.example?stage=sent&page=3');
+  assert.equal(
+    companyHref('granite-freight.example', '#/pipeline/lumen-labs.example?q=data%20co&query=fintech&stage=sent&sort=x'),
+    '#/pipeline/granite-freight.example?q=data%20co&stage=sent&query=fintech',
+    'from an open drawer too; only the list part comes along',
+  );
 });

@@ -6,8 +6,8 @@
 
 import { api, errorText } from './core/api.js';
 import { debounce, fmtDate, fmtNum, fmtRelative, h, pluralize } from './core/dom.js';
-import { bindKeys, clearOverlay, holdPageKeys } from './core/keys.js';
-import { href } from './core/router.js';
+import { bindKeys, clearOverlay, holdPageKeys, isApple } from './core/keys.js';
+import { href, parseHash } from './core/router.js';
 
 const SECTIONS = [
   {
@@ -149,6 +149,17 @@ export function draftHref(d, all = []) {
   const channel = channelOf(d);
   const shared = all.some((x) => x.domain === d.domain && channelOf(x) !== channel);
   return href(['drafts', d.domain], { channel: shared ? channel : null });
+}
+
+/**
+ * Where a company or person search result goes: the company's drawer in Pipeline. Searched from
+ * Pipeline (`hash`, the address on show), over the same list: its search, stage, source and page
+ * stay behind the drawer and are what closing it goes back to.
+ */
+export function companyHref(domain, hash = '') {
+  const { path, query } = parseHash(hash);
+  const list = path[0] === 'pipeline' ? { q: query.q, stage: query.stage, query: query.query, page: query.page } : {};
+  return href(['pipeline', domain], list);
 }
 
 /**
@@ -336,7 +347,7 @@ export function mountShell({ store, navigate }) {
 
   // ---- Top bar: search ----
 
-  const mac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent || '');
+  const mac = isApple();
   const listId = 'search-results';
   const input = h('input', {
     type: 'text',
@@ -346,7 +357,7 @@ export function mountShell({ store, navigate }) {
     'aria-expanded': 'false',
     'aria-controls': listId,
     'aria-autocomplete': 'list',
-    'aria-keyshortcuts': 'Meta+K Control+K',
+    'aria-keyshortcuts': mac ? 'Meta+K' : 'Control+K',
     autocomplete: 'off',
     spellcheck: 'false',
     enterkeyhint: 'search',
@@ -368,6 +379,7 @@ export function mountShell({ store, navigate }) {
   let searchSeq = 0;
   let searchCtl = null;
   let draftsCache = null; // { at, promise }
+  let returnTo = null; // what had focus before the search took it (⌘K, Tab or a click)
 
   function setActive(i) {
     active = i;
@@ -434,9 +446,9 @@ export function mountShell({ store, navigate }) {
     results = [];
     shownQuery = q;
     const { companies, people } = groupCompanyHits(rows, q);
-    const companyOpts = companies.map((r) => option(r.name || r.domain, r.domain, href(['pipeline', r.domain])));
+    const companyOpts = companies.map((r) => option(r.name || r.domain, r.domain, companyHref(r.domain, location.hash)));
     const peopleOpts = people.map((r) =>
-      option(r.founder || r.email, [r.name || r.domain, r.domain].filter((v, i, a) => a.indexOf(v) === i).join(' · '), href(['pipeline', r.domain])),
+      option(r.founder || r.email, [r.name || r.domain, r.domain].filter((v, i, a) => a.indexOf(v) === i).join(' · '), companyHref(r.domain, location.hash)),
     );
     const draftOpts = drafts.map((d) => {
       const { name, meta } = draftOption(d);
@@ -501,12 +513,26 @@ export function mountShell({ store, navigate }) {
   function choose(to) {
     closePop();
     input.value = '';
+    returnTo = null;
     input.blur();
     navigate(to);
   }
 
+  // Esc out of an empty search goes back where the user was (the Pipeline row, the draft), as an
+  // overlay gives focus back to its opener; to <body> only when that is gone or now hidden (inert,
+  // or in the phone menu ⌘K closed).
+  function leaveSearch() {
+    const back = returnTo;
+    returnTo = null;
+    const hidden = !back || !back.isConnected || back.closest('[inert]') || (aside.contains(back) && phone.matches && !isOpen());
+    if (!hidden) back.focus({ preventScroll: true });
+    if (document.activeElement === input) input.blur();
+  }
+
   input.addEventListener('input', onQuery);
-  input.addEventListener('focus', () => {
+  input.addEventListener('focus', (e) => {
+    const from = e.relatedTarget;
+    returnTo = from && from !== document.body && !searchBox.contains(from) ? from : null;
     if (input.value.trim() && pop.hidden) onQuery();
   });
   input.addEventListener('keydown', (e) => {
@@ -534,7 +560,7 @@ export function mountShell({ store, navigate }) {
       e.stopPropagation();
       if (!pop.hidden) closePop();
       else if (input.value) input.value = '';
-      else input.blur();
+      else leaveSearch();
     }
   });
   searchBox.addEventListener('focusout', (e) => {
@@ -559,7 +585,8 @@ export function mountShell({ store, navigate }) {
   const chip = h('a', { class: 'chip', href: '#/schedules', hidden: true }, chipDot, chipText);
 
   // On a phone the chip has room for when, not what: "Next in 21h" / "Running", the full text
-  // staying its name (which starts with the words on show, WCAG 2.5.3).
+  // staying its name (which starts with the words on show, WCAG 2.5.3). "In under a minute" is
+  // too long for it: "Next in <1m" there, its name saying it in full.
   let chipSummary = null;
   function renderChip(summary) {
     chipSummary = summary;
@@ -581,7 +608,7 @@ export function mountShell({ store, navigate }) {
       const next = summary.next_schedule;
       const when = fmtRelative(next.next_at);
       text = `${next.name} · next ${when}`;
-      short = [`Next ${when}`, `Next ${when} · ${next.name}`];
+      short = [`Next ${when === 'in under a minute' ? 'in <1m' : when}`, `Next ${when} · ${next.name}`];
       chip.setAttribute('href', '#/schedules');
       chip.title = `Next run ${fmtDate(next.next_at, { time: true })}`;
       chipDot.classList.add('is-next');

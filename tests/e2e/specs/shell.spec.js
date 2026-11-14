@@ -288,6 +288,85 @@ test('⌘K focuses search and results navigate to a company', async ({ app, page
   expect(await page.evaluate(() => window.__xss)).toBeUndefined();
 });
 
+test('Esc out of ⌘K search gives focus back where it was', async ({ app, page }) => {
+  await app.goto('#/pipeline');
+  await shellReady(page);
+  const rows = page.locator('#view tbody tr.is-clickable');
+  await expect(rows.nth(3)).toBeVisible();
+  const search = page.getByRole('combobox', { name: 'Search' });
+  await rows.nth(2).focus();
+  await page.keyboard.press('ControlOrMeta+k');
+  await expect(search).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(rows.nth(2)).toBeFocused();
+  await page.keyboard.press('j');
+  await expect(rows.nth(3), 'J goes on from that row').toBeFocused();
+
+  // With a query: Esc closes the results, then clears the text, then goes back.
+  await page.keyboard.press('ControlOrMeta+k');
+  await search.fill('lumen');
+  await expect(search).toHaveAttribute('aria-expanded', 'true');
+  await page.keyboard.press('Escape');
+  await expect(search).toHaveAttribute('aria-expanded', 'false');
+  await expect(search).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(search).toHaveValue('');
+  await expect(search).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(rows.nth(3)).toBeFocused();
+
+  // On a screen's heading too (where a new screen puts focus).
+  await app.goto('#/drafts');
+  const h1 = page.locator('#view h1');
+  await expect(h1).toHaveText('Drafts');
+  await expect(h1).toBeFocused();
+  await page.keyboard.press('ControlOrMeta+k');
+  await page.keyboard.press('Escape');
+  await expect(h1).toBeFocused();
+});
+
+test('a company picked in ⌘K search opens over the Pipeline list on show', async ({ app, page }) => {
+  const company = COMPANIES.find((c) => !c.name.includes('<') && !COMPANIES.some((o) => o !== c && o.domain.includes(c.domain)));
+  await app.goto('#/pipeline?stage=sent');
+  await shellReady(page);
+  const selected = page.locator('#view .tab[aria-selected="true"]');
+  await expect(selected).toHaveText(/^Sent/);
+  const search = page.getByRole('combobox', { name: 'Search' });
+  await page.keyboard.press('ControlOrMeta+k');
+  await search.fill(company.domain);
+  await expect(page.getByRole('group', { name: 'Companies' }).getByRole('option').first()).toContainText(company.domain);
+  await page.keyboard.press('Enter');
+  await expect(page).toHaveURL(hashIs(`#/pipeline/${company.domain}?stage=sent`));
+  await expect(page.getByRole('dialog')).toBeVisible();
+  await expect(selected, 'the list behind the drawer keeps its filter').toHaveText(/^Sent/);
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await expect(page).toHaveURL(hashIs('#/pipeline?stage=sent'));
+  await expect(selected).toHaveText(/^Sent/);
+});
+
+test('on a Mac ⌘K opens search and Ctrl+K is left to the text field', async ({ app, page }) => {
+  await page.addInitScript(() => Object.defineProperty(Navigator.prototype, 'platform', { get: () => 'MacIntel' }));
+  await app.goto('#/home');
+  await shellReady(page);
+  const search = page.getByRole('combobox', { name: 'Search' });
+  await expect(search).toHaveAttribute('aria-keyshortcuts', 'Meta+K');
+  await expect(page.locator('.search-kbd')).toHaveText('⌘K');
+  await sandbox(page, (box) => {
+    const note = document.createElement('textarea');
+    note.setAttribute('aria-label', 'Note');
+    box.append(note);
+  });
+  const note = page.getByRole('textbox', { name: 'Note' });
+  await note.fill('Find seed-stage fintech founders');
+  await note.evaluate((el) => el.setSelectionRange(0, 0));
+  // Ctrl+K deletes to the end of the line there; it must not take the caret to the search.
+  await page.keyboard.press('Control+k');
+  await expect(note).toBeFocused();
+  await page.keyboard.press('Meta+k');
+  await expect(search).toBeFocused();
+});
+
 test('search finds a draft by the contact and company the Drafts list names it by', async ({ app, page, server, request }) => {
   const drafts = await (await request.get(server.apiUrl('/api/drafts'))).json();
   const named = (d) => d.contact_name && d.company_name && !/[<>]/.test(d.contact_name + d.company_name);
@@ -395,9 +474,9 @@ test('on a phone the schedule chip says when, and the search hint fits', async (
   await app.goto('#/home');
   const chip = page.locator('#topbar .chip');
   const search = page.getByRole('combobox', { name: 'Search' });
-  await expect(chip).toHaveText(/^Next in (\d+[mh]|under a minute)$/);
+  await expect(chip).toHaveText(/^Next in (\d+[mh]|<1m)$/);
   const shown = await chip.textContent();
-  await expect(chip).toHaveAttribute('aria-label', `${shown} · ${name}`);
+  await expect(chip).toHaveAttribute('aria-label', `${shown.replace('<1m', 'under a minute')} · ${name}`);
   // Nothing cut off: the time is what the chip is for.
   const cut = (loc) => loc.evaluate((el) => el.scrollWidth > el.clientWidth + 1);
   expect(await cut(chip.locator('.chip-text'))).toBe(false);
@@ -416,6 +495,29 @@ test('on a phone the schedule chip says when, and the search hint fits', async (
   await expect(chip).toHaveText(new RegExp(`^${reEscape(name)} · next `));
   expect(await chip.getAttribute('aria-label')).toBeNull();
   await expect(search).toHaveAttribute('placeholder', 'Search companies, people, drafts');
+});
+
+test('on a phone a run due within a minute reads "Next in <1m", and in full to a screen reader', async ({ app, page }) => {
+  let name = null;
+  await page.route('**/api/summary', async (route) => {
+    const res = await route.fetch();
+    const json = await res.json();
+    json.running = null;
+    json.next_schedule.next_at = new Date(Date.now() + 40_000).toISOString();
+    name = json.next_schedule.name;
+    await route.fulfill({ response: res, json });
+  });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await app.goto('#/home');
+  const chip = page.locator('#topbar .chip');
+  for (const width of [390, 360, 320]) {
+    await page.setViewportSize({ width, height: 800 });
+    await expect(chip).toHaveText('Next in <1m');
+    await expect(chip).toHaveAttribute('aria-label', `Next in under a minute · ${name}`);
+    expect(await chip.locator('.chip-text').evaluate((el) => el.scrollWidth > el.clientWidth + 1), `cut at ${width}`).toBe(false);
+  }
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await expect(chip).toHaveText(`${name} · next in under a minute`);
 });
 
 test('a pinned theme is on the page before the app code runs', async ({ app, page }) => {
@@ -1249,6 +1351,138 @@ test.describe('components', () => {
     }
   });
 
+  test('the rule under the tabs lines up with the content, not with the focus-ring room beside it', async ({ app, page }) => {
+    for (const width of [1440, 390]) {
+      await page.setViewportSize({ width, height: 800 });
+      await app.goto('#/home');
+      await sandbox(page, async (box) => {
+        const { tabs } = await import('/assets/js/components/tabs.js');
+        box.append(tabs({ label: 'Stage', items: [{ id: 'a', label: 'All', count: 4 }, { id: 'b', label: 'Sent', count: 1 }], active: 'a', onChange() {} }));
+      });
+      await page.getByRole('tablist', { name: 'Stage' }).scrollIntoViewIfNeeded();
+      const sb = await page.locator('#sandbox').boundingBox();
+      const lb = await page.getByRole('tablist', { name: 'Stage' }).boundingBox();
+      // The rule's row of pixels, from 4px left of the content to 4px right of it, and the empty
+      // ground 3px under it.
+      const png = await page.screenshot({ clip: { x: sb.x - 4, y: lb.y + lb.height - 1, width: sb.width + 8, height: 4 } });
+      const [px, under] = await page.evaluate(async (b64) => {
+        const img = new Image();
+        img.src = `data:image/png;base64,${b64}`;
+        await img.decode();
+        const c = document.createElement('canvas');
+        c.width = img.width;
+        c.height = img.height;
+        c.getContext('2d').drawImage(img, 0, 0);
+        const row = (y) => {
+          const d = c.getContext('2d').getImageData(0, y, img.width, 1).data;
+          return Array.from({ length: img.width }, (_, i) => d[i * 4] + d[i * 4 + 1] + d[i * 4 + 2]);
+        };
+        return [row(0), row(img.height - 1)];
+      }, png.toString('base64'));
+      const line = px[Math.floor(px.length / 2)];
+      const ground = under[Math.floor(under.length / 2)];
+      expect(line, 'the rule shows').toBeLessThan(ground - 20);
+      for (const i of [0, 1, 2, px.length - 3, px.length - 2, px.length - 1]) {
+        expect(Math.abs(px[i] - ground), `${width}px: no rule ${i < 4 ? 'left' : 'right'} of the content (pixel ${i})`).toBeLessThanOrEqual(6);
+      }
+      expect(Math.abs(px[5] - line), 'the rule starts at the content edge').toBeLessThanOrEqual(6);
+      expect(Math.abs(px[px.length - 6] - line), 'and ends at the other').toBeLessThanOrEqual(6);
+    }
+  });
+
+  test('in forced colours (High Contrast) switch states, the selected tab and the active option still show', async ({ app, page }) => {
+    await app.goto('#/home');
+    await shellReady(page);
+    await sandbox(page, async (box) => {
+      const c = (n) => import('/assets/js/components/' + n + '.js');
+      const [{ tabs }, { switchEl }, { searchSelect }] = await Promise.all(['tabs', 'switch', 'searchSelect'].map(c));
+      box.append(
+        tabs({ label: 'Stage', items: [{ id: 'a', label: 'All', count: 4 }, { id: 'b', label: 'Sent', count: 1 }], active: 'a', onChange() {} }),
+        switchEl({ checked: true, label: 'Email auto-send', onChange() {} }),
+        switchEl({ checked: false, label: 'LinkedIn auto-send', onChange() {} }),
+        searchSelect({ label: 'Sourced by', options: [{ value: 'Q1', label: 'fintech' }, { value: 'Q2', label: 'health' }], value: '', onChange() {} }),
+      );
+    });
+    await page.emulateMedia({ forcedColors: 'active' });
+    expect(await page.evaluate(() => matchMedia('(forced-colors: active)').matches)).toBe(true);
+    const style = (loc, ...props) => loc.evaluate((el, ps) => Object.fromEntries(ps.map((p) => [p, getComputedStyle(el)[p]])), props);
+    const bg = async (loc) => (await style(loc, 'backgroundColor')).backgroundColor;
+
+    // Switches: on and off look different, and each thumb shows against its track.
+    const on = page.getByRole('switch', { name: 'Email auto-send' });
+    const off = page.getByRole('switch', { name: 'LinkedIn auto-send' });
+    expect(await bg(on), 'on fills the track').not.toBe(await bg(off));
+    expect(await bg(on.locator('.switch-thumb'))).not.toBe(await bg(on));
+    expect(await bg(off.locator('.switch-thumb'))).not.toBe(await bg(off));
+
+    // The selected tab is underlined with a border (its box-shadow is dropped).
+    const list = page.getByRole('tablist', { name: 'Stage' });
+    expect(await style(list.getByRole('tab', { selected: true }), 'borderBottomStyle', 'borderBottomWidth')).toEqual({ borderBottomStyle: 'solid', borderBottomWidth: '2px' });
+    expect(await style(list.getByRole('tab', { selected: false }), 'borderBottomWidth')).toEqual({ borderBottomWidth: '0px' });
+
+    // The option Enter picks: in a search select, and in the global search.
+    const ring = { outlineStyle: 'solid', outlineWidth: '2px' };
+    await page.getByRole('combobox', { name: 'Sourced by' }).click();
+    await page.keyboard.press('ArrowDown');
+    const ssActive = page.getByRole('listbox', { name: 'Sourced by' }).locator('.ss-option.is-active');
+    await expect(ssActive).toHaveCount(1);
+    expect(await style(ssActive, 'outlineStyle', 'outlineWidth')).toEqual(ring);
+    await page.keyboard.press('Escape');
+    await page.keyboard.press('ControlOrMeta+k');
+    await page.getByRole('combobox', { name: 'Search' }).fill('lumen');
+    const active = page.locator('.search-opt.is-active');
+    await expect(active).toHaveCount(1);
+    expect(await style(active, 'outlineStyle', 'outlineWidth')).toEqual(ring);
+
+    // The current screen in the sidebar.
+    expect(await style(page.locator('.nav-item[aria-current="page"]'), 'borderTopStyle')).toEqual({ borderTopStyle: 'solid' });
+    await page.emulateMedia({ forcedColors: 'none' });
+  });
+
+  test('Shift+Tab from a drawer that opened on its panel goes to its last control, not out of the page', async ({ app, page }) => {
+    await app.goto('#/home');
+    await shellReady(page);
+    await page.evaluate(async () => {
+      const ui = await import('/assets/js/core/ui.js');
+      const site = Object.assign(document.createElement('a'), { href: '#/home', textContent: 'Website' });
+      const skip = Object.assign(document.createElement('button'), { type: 'button', textContent: 'Skip' });
+      ui.openDrawer({ title: 'Lumen Labs', content: [site, skip] });
+    });
+    const drawer = page.getByRole('dialog', { name: 'Lumen Labs' });
+    await expect(drawer).toBeFocused();
+    await page.keyboard.press('Shift+Tab');
+    await expect(drawer.getByRole('button', { name: 'Skip' })).toBeFocused();
+    await page.keyboard.press('Tab');
+    await expect(drawer.getByRole('button', { name: 'Close' })).toBeFocused();
+    await page.keyboard.press('Escape');
+    await expect(drawer).toHaveCount(0);
+  });
+
+  test('Esc that cancels an IME composition leaves the dialog and its form alone', async ({ app, page }) => {
+    await app.goto('#/home');
+    await shellReady(page);
+    await page.evaluate(async () => {
+      const ui = await import('/assets/js/core/ui.js');
+      const name = Object.assign(document.createElement('input'), { className: 'input' });
+      name.setAttribute('aria-label', 'Name');
+      ui.openDialog({ title: 'New schedule', content: name, actions: [{ label: 'Cancel' }] });
+    });
+    const dialog = page.getByRole('dialog', { name: 'New schedule' });
+    const name = dialog.getByRole('textbox', { name: 'Name' });
+    await expect(name).toBeFocused();
+    await name.pressSequentially('Find seed-stage fintech ');
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send('Input.imeSetComposition', { text: 'にほ', selectionStart: 2, selectionEnd: 2 });
+    await page.keyboard.press('Escape');
+    await expect(dialog).toBeVisible();
+    await expect(name).toHaveValue(/^Find seed-stage fintech /);
+    await cdp.send('Input.insertText', { text: 'にほん' }); // the IME commits
+    await expect(name).toHaveValue('Find seed-stage fintech にほん');
+    await page.keyboard.press('Escape');
+    await expect(dialog).toHaveCount(0);
+    await cdp.detach();
+  });
+
   test('list/detail, badge and empty state', async ({ app, page }) => {
     await app.goto('#/home');
     await sandbox(page, async (box) => {
@@ -1809,6 +2043,73 @@ test.describe('components', () => {
     await expectAccessible(page);
     await page.emulateMedia({ colorScheme: 'dark' });
     await expectAccessible(page);
+  });
+});
+
+test.describe('overlays opened by a double press', () => {
+  test.use({ hasTouch: true });
+
+  test('the double-click or double-tap that opens a confirm does not also answer it', async ({ app, page }) => {
+    await app.goto('#/home');
+    await shellReady(page);
+    // An opener right where the confirm's own button comes up, as a phone's Follow-ups card can
+    // put its Mark bounced.
+    await page.evaluate(async () => {
+      const { confirmDialog } = await import('/assets/js/core/ui.js');
+      const ask = () => confirmDialog({ title: 'Mark acme.example as bounced?', body: 'Its follow-up is deleted.', confirmText: 'Mark bounced', danger: true });
+      ask();
+      const r = document.querySelector('.dialog .btn-danger').getBoundingClientRect();
+      document.querySelector('.dialog .overlay-close').dispatchEvent(new MouseEvent('click', { detail: 0 }));
+      const b = Object.assign(document.createElement('button'), { type: 'button', id: 'opener', textContent: 'Mark bounced' });
+      Object.assign(b.style, { position: 'fixed', left: `${r.left}px`, top: `${r.top}px`, width: `${r.width}px`, height: `${r.height}px`, zIndex: '40' });
+      window.__answers = [];
+      b.addEventListener('click', () => ask().then((a) => window.__answers.push(a)));
+      document.getElementById('view').append(b);
+    });
+    const dialog = page.getByRole('alertdialog', { name: 'Mark acme.example as bounced?' });
+    await expect(dialog).toHaveCount(0);
+    const answers = () => page.evaluate(() => window.__answers);
+    const opener = page.locator('#opener');
+    const at = async () => {
+      const box = await opener.boundingBox();
+      return [box.x + box.width / 2, box.y + box.height / 2];
+    };
+
+    // Double-click: the second click lands on the confirm's own button.
+    let [x, y] = await at();
+    await page.mouse.dblclick(x, y);
+    await expect(dialog).toBeVisible();
+    await expect(dialog.getByRole('button', { name: 'Cancel' }), 'focus stays on Cancel').toBeFocused();
+    await page.waitForTimeout(600); // past any double-click
+    expect(await answers()).toEqual([]);
+    // A press of its own answers it.
+    await dialog.getByRole('button', { name: 'Mark bounced' }).click();
+    await expect(dialog).toHaveCount(0);
+    expect(await answers()).toEqual([true]);
+
+    // Double-tap, the taps 120ms apart.
+    await page.waitForTimeout(600);
+    await page.touchscreen.tap(x, y);
+    await page.waitForTimeout(120);
+    await page.touchscreen.tap(x, y);
+    await expect(dialog).toBeVisible();
+    await expect(dialog.getByRole('button', { name: 'Cancel' })).toBeFocused();
+    await page.waitForTimeout(600);
+    expect(await answers()).toEqual([true]);
+    await page.keyboard.press('Escape');
+    await expect(dialog).toHaveCount(0);
+    expect(await answers()).toEqual([true, false]);
+
+    // Beside the panel the second click lands on the backdrop: the confirm stays open.
+    await opener.evaluate((b) => Object.assign(b.style, { left: '280px', top: '120px' }));
+    [x, y] = await at();
+    await page.waitForTimeout(600);
+    await page.mouse.dblclick(x, y);
+    await expect(dialog).toBeVisible();
+    await page.waitForTimeout(600);
+    await expect(dialog).toBeVisible();
+    await page.keyboard.press('Escape');
+    expect(await answers()).toEqual([true, false, false]);
   });
 });
 

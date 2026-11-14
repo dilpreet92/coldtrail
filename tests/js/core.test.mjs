@@ -8,7 +8,7 @@ import { h, debounce, esc as domEsc } from '../../ui/js/core/dom.js';
 import { esc } from '../../ui/js/core/format.js';
 import { api, SESSION_EXPIRED, SESSION_REOPEN, OFFLINE, OFFLINE_SHORT, errorText, isStaleSession, isOffline, initToken, token, openStream } from '../../ui/js/core/api.js';
 import { store } from '../../ui/js/core/store.js';
-import { bindKeys, comboOf } from '../../ui/js/core/keys.js';
+import { bindKeys, comboOf, isApple } from '../../ui/js/core/keys.js';
 import { getThemePref, setThemePref, applyTheme } from '../../ui/js/core/theme.js';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
@@ -595,15 +595,62 @@ test('store.subscriberCount counts subscribers and stays out of the listed API',
 
 // ---- keys ----
 
-test('comboOf normalizes modifiers and key names', () => {
+const WINDOWS = { platform: 'Win32', userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' };
+const MAC = { platform: 'MacIntel', userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)' };
+
+test('comboOf normalizes modifiers and key names', async () => {
   const ev = (key, mods = {}) => ({ key, metaKey: false, ctrlKey: false, shiftKey: false, altKey: false, ...mods });
-  assert.equal(comboOf(ev('k', { metaKey: true })), 'mod+k');
-  assert.equal(comboOf(ev('K', { ctrlKey: true })), 'mod+k');
-  assert.equal(comboOf(ev('Enter', { metaKey: true })), 'mod+enter');
-  assert.equal(comboOf(ev('Escape')), 'escape');
-  assert.equal(comboOf(ev('Esc')), 'escape');
-  assert.equal(comboOf(ev('j')), 'j');
-  assert.equal(comboOf(ev('J', { shiftKey: true })), 'shift+j');
+  await withGlobals({ navigator: WINDOWS }, () => {
+    assert.equal(isApple(), false);
+    assert.equal(comboOf(ev('k', { metaKey: true })), 'mod+k');
+    assert.equal(comboOf(ev('K', { ctrlKey: true })), 'mod+k');
+    assert.equal(comboOf(ev('Enter', { metaKey: true })), 'mod+enter');
+    assert.equal(comboOf(ev('Escape')), 'escape');
+    assert.equal(comboOf(ev('Esc')), 'escape');
+    assert.equal(comboOf(ev('j')), 'j');
+    assert.equal(comboOf(ev('J', { shiftKey: true })), 'shift+j');
+  });
+});
+
+test('on a Mac only ⌘ is mod: Ctrl+K stays the text fields\' "delete to the end of the line"', async () => {
+  const ev = (key, mods = {}) => ({ key, metaKey: false, ctrlKey: false, shiftKey: false, altKey: false, ...mods });
+  for (const nav of [MAC, { platform: 'iPad', userAgent: '' }, { platform: '', userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)' }]) {
+    await withGlobals({ navigator: nav }, () => {
+      assert.equal(isApple(), true, JSON.stringify(nav));
+      assert.equal(comboOf(ev('k', { metaKey: true })), 'mod+k');
+      assert.equal(comboOf(ev('k', { ctrlKey: true })), 'ctrl+k', 'not mod+k, and not a plain K either');
+      assert.equal(comboOf(ev('Enter', { ctrlKey: true })), 'ctrl+enter');
+      assert.equal(comboOf(ev('k', { metaKey: true, ctrlKey: true })), 'mod+ctrl+k');
+    });
+  }
+
+  let listener = null;
+  const doc = {
+    addEventListener: (_t, f) => { listener = f; },
+    removeEventListener: () => { listener = null; },
+    querySelector: () => null,
+  };
+  const textarea = { tagName: 'TEXTAREA', isContentEditable: false, getAttribute: () => null };
+  const body = { tagName: 'BODY', isContentEditable: false, getAttribute: () => null };
+  const press = (key, target, mods) => {
+    const e = { key, target, metaKey: false, ctrlKey: false, shiftKey: false, altKey: false, defaultPrevented: false, ...mods, preventDefault() { this.defaultPrevented = true; } };
+    listener(e);
+    return e;
+  };
+  await withGlobals({ document: doc, navigator: MAC }, () => {
+    const hits = [];
+    const unbind = bindKeys({ 'mod+k': () => hits.push('mod+k'), k: () => hits.push('k') });
+    try {
+      const ctrlK = press('k', textarea, { ctrlKey: true });
+      assert.equal(ctrlK.defaultPrevented, false, 'Ctrl+K in the Agent composer deletes to the end of the line');
+      press('k', body, { ctrlKey: true });
+      assert.deepEqual(hits, [], 'and is not K (move up) on the page either');
+      assert.ok(press('k', textarea, { metaKey: true }).defaultPrevented);
+      assert.deepEqual(hits, ['mod+k'], '⌘K opens search');
+    } finally {
+      unbind();
+    }
+  });
 });
 
 test('bindKeys: ignored while typing except mod+k / escape / mod+enter', async () => {
@@ -622,7 +669,7 @@ test('bindKeys: ignored while typing except mod+k / escape / mod+enter', async (
     listener(e);
     return e;
   };
-  await withGlobals({ document: doc }, () => {
+  await withGlobals({ document: doc, navigator: WINDOWS }, () => {
     const hits = [];
     const unbind = bindKeys({
       j: () => hits.push('j'),
