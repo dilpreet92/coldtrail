@@ -72,13 +72,33 @@ const CONFIDENCE_HINT = {
   generic: 'A shared inbox, not a person',
 };
 
-/** How the company reads in prompts and toasts: "Acme (acme.com)", or the domain. */
-const companyLabel = (c) => (c && c.name ? `${c.name} (${c.domain})` : c ? c.domain : '');
 const displayName = (c, domain) => (c && c.name) || (c && c.domain) || domain;
+
+const SITE_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i;
+const siteUrl = (domain) => (SITE_RE.test(String(domain || '')) ? `https://${domain}` : '');
+
+// Invisible characters (format and control codes, Unicode tag characters, variation selectors,
+// private-use and unassigned code points) and runs of whitespace, for promptName.
+const PROMPT_HIDDEN = /[\p{Cf}\p{Co}\p{Cn}\p{Cs}\u{FE00}-\u{FE0F}\u{E0100}-\u{E01EF}]/gu;
+const PROMPT_SPACE = /[\p{Cc}\p{Z}\s]+/gu;
+const PROMPT_MAX = 60;
+
+/** The company as the Agent prompt names it. A name or domain is stored as a third party gave it
+ *  (Canonical results, JSON the agent imports), and the prompt reaches the agent as the user's
+ *  own words, from a composer that shows only its first lines. So: the domain, when it is a plain
+ *  host name (spec §5.3: the prompt names the domain); else the domain cut to one short quoted
+ *  line with nothing hidden in it. Never the name. */
+function promptName(company) {
+  const domain = String((company && company.domain) || '');
+  if (SITE_RE.test(domain)) return domain;
+  const flat = [...domain.replace(PROMPT_HIDDEN, '').replace(PROMPT_SPACE, ' ').trim()];
+  const cut = flat.length > PROMPT_MAX ? `${flat.slice(0, PROMPT_MAX - 1).join('').trimEnd()}…` : flat.join('');
+  return `“${cut}”`;
+}
 
 /** The Agent prompt for a company's next step (never sent for the user). */
 export function askPrompt(mode, company) {
-  const who = companyLabel(company);
+  const who = promptName(company);
   return mode === 'draft'
     ? `Draft personalized outreach for ${who}.`
     : `Find a founder contact for ${who}, then draft personalized outreach.`;
@@ -150,9 +170,6 @@ function errorBox(title, err, retry) {
   );
 }
 
-const SITE_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i;
-const siteUrl = (domain) => (SITE_RE.test(String(domain || '')) ? `https://${domain}` : '');
-
 // ---- URL state ----
 
 function readQuery(query = {}) {
@@ -189,6 +206,7 @@ function createView(root, ctx) {
   let listSeq = 0;
   let listLoading = null; // the list load in flight (loadList)
   let shownPage = null; // the page on screen as JSON (null: none yet, or an error)
+  let shownAt = 0; // the number of the last page shown (0: none yet)
   const rowsByDomain = new Map(); // the rows on screen, by lowercased domain
 
   // ---- Header ----
@@ -359,9 +377,12 @@ function createView(root, ctx) {
   // The pager's range is what a screen reader hears after a search ("1–24 of 24"); with nothing
   // to show it is hidden with the footer, so this says so instead.
   const announce = h('p', { class: 'sr-only pl-announce', role: 'status' });
+  // Each row's description (aria-describedby reads hidden text): a focused row is a plain table
+  // row to a screen reader, and the hint above isn't read.
+  const rowHint = h('p', { id: `pl-row-hint-${panelUid}`, hidden: true }, 'Press Enter to open its contacts and outreach.');
 
   const controls = h('div', { class: 'pl-controls' }, tabsSlot, toolbar);
-  const container = h('div', { class: 'pipeline' }, head, controls, results, footer, announce);
+  const container = h('div', { class: 'pipeline' }, head, controls, results, footer, announce, rowHint);
   root.append(container);
   buildTabs();
   clearBtn.hidden = !filtersOn();
@@ -497,6 +518,8 @@ function createView(root, ctx) {
    *  the focus on its action) as it is when the list is still that one: only the counts move. */
   function renderList(page, { keepScroll = false } = {}) {
     shownPage = JSON.stringify(page);
+    const turned = shownAt > 0 && page.page !== shownAt;
+    shownAt = page.page;
     rowsByDomain.clear();
     for (const r of page.rows) rowsByDomain.set(String(r.domain).toLowerCase(), r);
     const stagesTotal = (page.stages || []).reduce((n, [, c]) => n + c, 0);
@@ -540,6 +563,7 @@ function createView(root, ctx) {
         cellClass: colClass,
         onRowClick: (row, e) => openCompany(row.domain, e.currentTarget),
       });
+      for (const tr of wrap.querySelectorAll('tbody tr.is-clickable')) tr.setAttribute('aria-describedby', rowHint.id);
       results.replaceChildren(wrap);
       if (scrolled) {
         wrap.scrollTop = scrolled.top;
@@ -550,10 +574,20 @@ function createView(root, ctx) {
         const at = rowEls().indexOf(rowFor(drawer.domain));
         if (at >= 0) drawer.rowIndex = at;
       }
+      // Another page, where the window scrolls rather than the table (phones, short windows):
+      // the pager pressed sat under the last row, so bring the new page's first row up, as the
+      // table's own scroll box does on a desktop. Focus stays on the pager.
+      if (turned && !keepScroll) {
+        const bar = document.getElementById('topbar');
+        const under = bar ? bar.getBoundingClientRect().bottom : 0;
+        if (results.getBoundingClientRect().top < under) results.scrollIntoView({ block: 'start' });
+      }
     }
     // A focused row that left the list (skipped, filtered out) hands focus to the row now in its
-    // place, not to <body>.
-    if (focusedKey && !focusRow(focusedKey)) focusListAt(focusedAt);
+    // place, not to <body>. On a quiet reload the user may have wheeled the table away from that
+    // row: focus moves without scrolling to it, so the table stays where it was read.
+    const still = { preventScroll: keepScroll };
+    if (focusedKey && !focusRow(focusedKey, still)) focusListAt(focusedAt, still);
     else if (emptyFocused && !keepEmpty) {
       // A replaced empty state's action hands focus to the same action where it is now, so Enter
       // still does what it would have: its twin above the list, else what the list now holds.
@@ -620,22 +654,23 @@ function createView(root, ctx) {
   const rowEls = () => [...results.querySelectorAll('tbody tr.is-clickable')];
   const rowFor = (domain) => rowEls().find((tr) => String(tr.dataset.key).toLowerCase() === String(domain).toLowerCase());
 
-  function focusRow(domain) {
+  /** Focus `domain`'s row, scrolled into view unless `preventScroll`. → whether it is listed. */
+  function focusRow(domain, { preventScroll = false } = {}) {
     const tr = rowFor(domain);
-    if (tr) tr.focus({ preventScroll: false });
+    if (tr) tr.focus({ preventScroll });
     return !!tr;
   }
 
   /** Focus the row at `index` (the last one if the list got shorter), else the empty state's
    *  action. → whether anything took focus. */
-  function focusListAt(index) {
+  function focusListAt(index, { preventScroll = false } = {}) {
     const list = rowEls();
     if (list.length) {
-      list[Math.max(0, Math.min(index, list.length - 1))].focus();
+      list[Math.max(0, Math.min(index, list.length - 1))].focus({ preventScroll });
       return true;
     }
     const action = results.querySelector('.empty-state .btn');
-    if (action) action.focus();
+    if (action) action.focus({ preventScroll });
     return !!action;
   }
 
@@ -1117,19 +1152,16 @@ function createView(root, ctx) {
 
   // ---- Changes made elsewhere ----
 
-  // A scheduled run or an agent turn sources, enriches, drafts or sends while the list is open.
-  // Each moves the shared summary (its counts and funnel, the last run, the chat running), so
-  // when a store refresh brings a different one the list is asked again, quietly: the rows stay
-  // up under the busy bar, focus and scroll stay put, and nothing is redrawn if the page came
-  // back the same. Skip / Restore here don't move the summary; they reload the list themselves.
-  const summaryKey = (sum) => (sum ? JSON.stringify([sum.counts, sum.funnel, sum.last_run, sum.running]) : null);
-  let summarySeen = summaryKey(ctx.store.get().summary);
-  const unsubscribe = ctx.store.subscribe(({ summary }) => {
-    const key = summaryKey(summary);
-    // Not while a load is on its way, nor over a failed one (Try again is the user's): the
-    // change is still unseen on the next refresh.
-    if (dead || key == null || key === summarySeen || listLoading || shownPage == null) return;
-    summarySeen = key;
+  // A scheduled run or an agent turn sources, enriches, drafts or sends while the list is open,
+  // and another tab can Skip or Restore. Not every such change moves the shared summary
+  // (`coldtrail mark` moves a company to In Gmail and leaves every count as it was), so each
+  // store refresh (every 30s while the tab is visible, and after an action) asks for the list
+  // again, quietly: one GET, the rows stay up under the busy bar, focus and scroll stay put, and
+  // nothing is redrawn if the page came back the same.
+  const unsubscribe = ctx.store.subscribe(() => {
+    // Not while a load is on its way, nor over a failed one (Try again is the user's): the next
+    // refresh asks again.
+    if (dead || listLoading || shownPage == null) return;
     loadList({ quiet: true });
     // The open drawer too (a draft may have been written for its company): once it has loaded,
     // and not while it is re-reading after a Skip / Restore.

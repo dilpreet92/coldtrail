@@ -17,14 +17,15 @@
 }
 
 /* On a desktop-sized window the page fits the viewport: the table scrolls under its sticky
-   header and the pager stays in view. Smaller screens let the page scroll instead. */
+   header and the pager stays in view. Smaller screens let the page scroll instead. A row that
+   J, K or Shift+Tab scrolls up to stops below that header (a 36px row), not under it. */
 @media (min-width: 900px) and (min-height: 600px) {
   .pipeline { height: calc(100vh - var(--topbar-h) - var(--space-6) - var(--space-8)); }
   @supports (height: 100dvh) {
     .pipeline { height: calc(100dvh - var(--topbar-h) - var(--space-6) - var(--space-8)); }
   }
   .pl-results { flex: 1 1 auto; min-height: 0; }
-  .pl-results > .table-wrap { flex: 1 1 auto; min-height: 0; }
+  .pl-results > .table-wrap { flex: 1 1 auto; min-height: 0; scroll-padding-top: 36px; }
 }
 
 /* ---- Stage tabs ---- */
@@ -92,6 +93,8 @@
   flex-direction: column;
   margin-top: var(--space-3);
   min-width: 0;
+  /* A new page on a window that scrolls is brought up to here, clear of the sticky top bar. */
+  scroll-margin-top: calc(var(--topbar-h) + var(--space-3));
 }
 /* Focused from script only (Try again holds focus here while the list reloads). */
 .pl-results:focus { outline: none; }
