@@ -151,22 +151,37 @@ test.describe('helpers', () => {
     expect(searchesCaption({ shown: 1, searches: 1, total: 4, found: 5 })).toBe('');
   });
 
-  test('needsYouItems: replies since they were last opened; a sign-in failure goes to agent settings', () => {
-    const replies = (seen) =>
-      needsYouItems({ counts: {}, funnel: [['sent', 15], ['replied', 3]], attention: [] }, seen).find((it) => it.key === 'replies');
-    // Never opened in this browser: every reply is new.
-    expect(replies(null)).toMatchObject({
-      num: 3,
-      label: 'new replies',
-      meta: 'Founders who wrote back',
+  test('needsYouItems: the replies not opened yet, by company; a sign-in failure goes to agent settings', () => {
+    const replies = (unopened) =>
+      needsYouItems({ counts: {}, funnel: [['sent', 15], ['replied', 3]], attention: [] }, unopened).find((it) => it.key === 'replies');
+    // One company: named, and the link opens the Replied tab filtered to it.
+    expect(replies(['a.example'])).toMatchObject({
+      num: 1,
+      label: 'reply',
+      meta: 'a.example wrote back',
+      cta: 'See reply',
+      href: '#/followups?tab=replied&q=a.example',
+      opens: ['a.example'],
+    });
+    // More: the tab lists them all, and the card names who.
+    expect(replies(['a.example', 'b.example'])).toMatchObject({
+      num: 2,
+      label: 'replies',
+      meta: 'a.example and b.example wrote back',
       cta: 'See replies',
       href: '#/followups?tab=replied',
+      opens: ['a.example', 'b.example'],
     });
-    expect(replies(undefined)).toMatchObject({ num: 3 });
-    expect(replies(2)).toMatchObject({ num: 1, label: 'new reply', meta: 'Founders who wrote back since you last looked' });
-    // All of them opened (or fewer now than then): nothing waits.
-    expect(replies(3)).toBeUndefined();
-    expect(replies(5)).toBeUndefined();
+    expect(replies(['a.example', 'b.example', 'c.example'])).toMatchObject({ num: 3, meta: 'a.example and 2 others wrote back' });
+    // The card says only what Home knows: who wrote back, not that it's news to the user (they
+    // may have marked it themselves on Follow-ups).
+    for (const it of [replies(['a.example']), replies(['a.example', 'b.example', 'c.example'])]) {
+      expect(JSON.stringify(it)).not.toMatch(/\bnew\b|since you last looked/i);
+    }
+    // All opened, or not known yet (the list still loading): no card.
+    expect(replies([])).toBeUndefined();
+    expect(replies(undefined)).toBeUndefined();
+    expect(replies(null)).toBeUndefined();
 
     // The server sends every failed last run to the run history; one that couldn't sign in is
     // fixed in agent settings, as Schedules says on its row.
@@ -204,8 +219,11 @@ test('numbers match the seed', async ({ app, page, server, request }) => {
   ]);
 
   // Needs you: the failed last run first (with why it failed, from its note), then drafts,
-  // follow-ups due and replies (all new: none were opened in this browser).
+  // follow-ups due and replies (all of them: none were opened in this browser), named by the
+  // companies on the Replied tab, most recent send first.
   const runs = await (await request.get(server.apiUrl('/api/runs'))).json();
+  const replied = (await (await request.get(server.apiUrl('/api/followups'))).json()).filter((f) => f.state === 'replied').map((f) => f.domain);
+  expect(replied.length).toBe(seedStage('replied'));
   const cards = needsYou(page).getByRole('link');
   await expect(cards).toHaveCount(4);
   const lastRun = SEED.runs.at(-1);
@@ -219,7 +237,10 @@ test('numbers match the seed', async ({ app, page, server, request }) => {
   await expect(cards.nth(2).locator('.home-ny-num')).toHaveText(fmtNum(SEED.counts.followups_due));
   await expect(cards.nth(2)).toContainText('follow-ups due');
   await expect(cards.nth(3).locator('.home-ny-num')).toHaveText(fmtNum(seedStage('replied')));
-  await expect(cards.nth(3)).toContainText('new replies');
+  await expect(cards.nth(3).locator('.home-ny-label')).toHaveText('replies');
+  await expect(cards.nth(3).locator('.home-ny-meta')).toHaveText(`${replied[0]} and ${replied.length - 1} others wrote back`);
+  // Domains are data: the mono face.
+  await expect(cards.nth(3).locator('.home-ny-meta .mono')).toHaveText(replied[0]);
   expect(await cards.evaluateAll((els) => els.map((a) => a.getAttribute('href')))).toEqual([
     '#/schedules',
     '#/drafts',
@@ -542,7 +563,13 @@ test('quiet and edge states: nothing needs you, no runs, no sends', async ({ app
   await expect(page.locator('.home-stats .home-stat-value').nth(4)).toHaveText('—');
   const runs = page.getByRole('region', { name: 'Recent runs' });
   await expect(runs).toContainText('No runs yet');
-  await expect(runs.getByRole('link', { name: 'Create a schedule' })).toHaveAttribute('href', '#/schedules');
+  // No schedule to wait for: the button does what it says, opening Schedules' New schedule
+  // dialog rather than the list.
+  const create = runs.getByRole('link', { name: 'Create a schedule' });
+  await expect(create).toHaveAttribute('href', '#/schedules?new=1');
+  await create.click();
+  await expect(page.locator('#view h1')).toHaveText('Schedules');
+  await expect(page.getByRole('dialog', { name: 'New schedule' })).toBeVisible();
 });
 
 test('a run with no schedule name says why', async ({ app, page }) => {
@@ -600,8 +627,18 @@ test('hostile text from the server renders as text', async ({ app, page }) => {
     body.queries = [[evil, 7], [null, 3], ...body.queries];
     await route.fulfill({ response: res, json: body });
   });
+  await page.route('**/api/followups', async (route) => {
+    const res = await route.fetch();
+    const rows = await res.json();
+    await route.fulfill({ response: res, json: [{ domain: evil, to: null, days: 1, touches: 1, state: 'replied' }, ...rows] });
+  });
   await app.goto('#/home');
   await homeReady(page);
+
+  // A company's domain names the replies card as text, and its link stays this app's route.
+  const replies = card(page, /replies/);
+  await expect(replies.locator('.home-ny-meta')).toContainText(`${evil} and `);
+  await expect(replies).toHaveAttribute('href', '#/followups?tab=replied');
 
   const warn = card(page, /LinkedIn signed out/);
   await expect(warn).toContainText(`${evil} signed out`);
@@ -768,6 +805,41 @@ test('home is accessible in light and dark, and fits a phone', async ({ app, pag
   await page.setViewportSize({ width: 1440, height: 900 });
   await expect(recent.getByRole('table', { name: 'Recent runs' }).locator('tbody tr')).toHaveCount(expected.length);
   await expect(recent.getByRole('list', { name: 'Recent runs' })).toHaveCount(0);
+});
+
+test('a stat hint that wraps splits evenly, never leaving one word on a line', async ({ app, page }) => {
+  await app.goto('#/home');
+  await homeReady(page);
+  /** Each hint's lines (the words on them and how wide they are), from where its words sit. */
+  const hintLines = () =>
+    page.locator('.home-stat-hint').evaluateAll((els) =>
+      els.map((el) => {
+        const text = el.firstChild;
+        const lines = new Map();
+        for (const m of text.data.matchAll(/\S+/g)) {
+          const range = document.createRange();
+          range.setStart(text, m.index);
+          range.setEnd(text, m.index + m[0].length);
+          const r = range.getBoundingClientRect();
+          const line = lines.get(Math.round(r.top)) || { words: [], left: r.left, right: r.right };
+          line.words.push(m[0]);
+          line.left = Math.min(line.left, r.left);
+          line.right = Math.max(line.right, r.right);
+          lines.set(Math.round(r.top), line);
+        }
+        return [...lines.values()].map((l) => ({ words: l.words.join(' '), width: l.right - l.left }));
+      }),
+    );
+  // Laptop widths where the five cells are too narrow for the longer hints, the narrowest window
+  // with the sidebar, and a phone.
+  for (const width of [1024, 1100, 900, 899, 390]) {
+    await page.setViewportSize({ width, height: 900 });
+    for (const lines of await hintLines()) {
+      if (lines.length < 2) continue;
+      const widths = lines.map((l) => l.width);
+      expect(Math.min(...widths) / Math.max(...widths), `${width}px: ${lines.map((l) => l.words).join(' / ')}`).toBeGreaterThan(0.5);
+    }
+  }
 });
 
 test('failed runs say why, in the table and on a phone', async ({ app, page }) => {
@@ -955,6 +1027,28 @@ test('a background refetch that fails is tried again on the next summary', async
   expect(calls).toEqual(settled);
 });
 
+test('replies that fail to load leave the other cards, and the next summary asks again', async ({ app, page }) => {
+  // The browser logs each failed request as a console error.
+  app.allowConsole(/status of 500/);
+  let fail = true;
+  await page.route('**/api/followups', async (route) => {
+    if (fail) await route.fulfill({ status: 500, contentType: 'text/plain', body: 'database is locked' });
+    else await route.continue();
+  });
+  const repliesCard = needsYou(page).locator('a[href^="#/followups?tab=replied"]');
+  await app.goto('#/home');
+  await homeReady(page);
+  // Needs you isn't left loading: the other cards show, without the replies (the stat line still
+  // counts them), and nothing claims an error the user can't act on.
+  await expect(card(page, /drafts waiting/)).toBeVisible();
+  await expect(needsYou(page)).not.toHaveAttribute('aria-busy', 'true');
+  await expect(repliesCard).toHaveCount(0);
+  await expect(page.locator('#view .home-error')).toHaveCount(0);
+  fail = false;
+  await refreshStore(page);
+  await expect(repliesCard.locator('.home-ny-num')).toHaveText(fmtNum(seedStage('replied')));
+});
+
 test('with no runs yet, says when the next schedule runs', async ({ app, page }) => {
   // 5½ hours away: "in 5h" (relative within 48h, as the top bar's chip says it).
   const at = localIso(new Date(Date.now() + 5.5 * HOUR));
@@ -1013,28 +1107,37 @@ test('top searches say what the list leaves out, and few cards share the row', a
   expect(Math.abs(cardBox.width - listBox.width)).toBeLessThanOrEqual(1);
 });
 
-test('replies need you until you open them; after that only new ones do', async ({ app, page }) => {
+test('a reply needs you until you open it from its card, which names the company', async ({ app, page }) => {
   await stubViews(page);
-  // Nothing else waits on the human, so the replies are all of Needs you. `more` replies arrive
-  // (or, below 0, companies that replied are deleted).
-  let more = 0;
+  // Nothing else waits on the human, so the replies are all of Needs you. The `arrived`
+  // companies write back on top of the seed's (and are gone again once deleted).
+  let arrived = [];
   await page.route('**/api/summary*', async (route) => {
     const res = await route.fetch();
     const s = await res.json();
     s.counts = { ...s.counts, drafts: 0, drafts_email: 0, drafts_linkedin: 0, followups_due: 0 };
-    s.funnel = s.funnel.map(([stage, n]) => [stage, stage === 'replied' ? n + more : n]);
+    s.funnel = s.funnel.map(([stage, n]) => [stage, stage === 'replied' ? n + arrived.length : n]);
     s.attention = [];
     await route.fulfill({ response: res, json: s });
   });
+  await page.route('**/api/followups', async (route) => {
+    const res = await route.fetch();
+    const rows = await res.json();
+    const extra = arrived.map((domain) => ({ domain, to: `founder@${domain}`, days: 0, touches: 1, state: 'replied' }));
+    await route.fulfill({ response: res, json: [...extra, ...rows] });
+  });
   const replied = seedStage('replied');
   const statReplies = () => page.getByRole('region', { name: 'At a glance' }).locator('.home-stat-value').nth(3);
+  const seen = () => page.evaluate(() => localStorage.getItem('ct-replies-seen'));
+  const anyReplies = needsYou(page).locator('a[href^="#/followups?tab=replied"]');
+  const one = card(page, /^1 reply\b/);
   await app.goto('#/home');
   await homeReady(page);
 
-  // Never opened in this browser: every reply is new.
+  // None opened in this browser: all of them.
   await expect(needsYou(page).getByRole('link')).toHaveCount(1);
-  await expect(card(page, /new replies/).locator('.home-ny-num')).toHaveText(fmtNum(replied));
-  await card(page, /new replies/).click();
+  await expect(anyReplies.locator('.home-ny-num')).toHaveText(fmtNum(replied));
+  await anyReplies.click();
   await expect.poll(() => stubbed(page)).toMatchObject({ name: 'followups', query: { tab: 'replied' } });
 
   // Opened: they no longer need you, so nothing does. The stat line still counts them all.
@@ -1044,23 +1147,29 @@ test('replies need you until you open them; after that only new ones do', async 
   await expect(needsYou(page).getByRole('link')).toHaveCount(0);
   await expect(statReplies()).toHaveText(fmtNum(replied));
 
-  // A founder writes back: that one is new, and stays new after a reload until it is opened.
-  more = 1;
+  // A founder writes back: the card names the company and opens the Replied tab filtered to it,
+  // and stays (a reload too) until it is opened.
+  arrived = ['newco.example'];
   await refreshStore(page);
-  await expect(card(page, /new reply\b/).locator('.home-ny-num')).toHaveText('1');
-  await expect(card(page, /new reply\b/)).toContainText('Founders who wrote back since you last looked');
+  await expect(one).toHaveAttribute('aria-label', '1 reply. newco.example wrote back. See reply');
+  await expect(one).toHaveAttribute('href', '#/followups?tab=replied&q=newco.example');
   await page.reload();
   await homeReady(page);
-  await expect(card(page, /new reply\b/).locator('.home-ny-num')).toHaveText('1');
-
-  // Fewer replies than when they were opened (a company that replied was deleted): none are new,
-  // and the next one to come in is.
-  more = -1;
-  await refreshStore(page);
+  await one.click();
+  await expect.poll(() => stubbed(page)).toMatchObject({ name: 'followups', query: { tab: 'replied', q: 'newco.example' } });
+  await page.goBack();
+  await homeReady(page);
   await expect(needsYou(page)).toContainText('Nothing needs you right now');
-  more = 0;
+
+  // The company is deleted (this browser forgets it was opened), then found again and writes
+  // back again: that reply needs you too.
+  arrived = [];
   await refreshStore(page);
-  await expect(card(page, /new reply\b/).locator('.home-ny-num')).toHaveText('1');
+  await expect.poll(seen).not.toContain('newco.example');
+  await expect(needsYou(page)).toContainText('Nothing needs you right now');
+  arrived = ['newco.example'];
+  await refreshStore(page);
+  await expect(one).toHaveAttribute('href', '#/followups?tab=replied&q=newco.example');
 });
 
 // Changes the workspace, so it runs after the other tests on the full seed.
@@ -1090,6 +1199,46 @@ test('replies count companies, as the funnel and the Replied tab do', async ({ a
   const funnelReplied = page.getByRole('table', { name: 'Funnel' }).locator('tbody tr').last();
   await expect(funnelReplied.locator('.home-funnel-count')).toHaveText(fmtNum(replied));
   await expect(funnelReplied.locator('.home-funnel-rate')).toHaveText(pct(replied, sent));
+});
+
+// Changes the workspace, so it runs after the other tests on the full seed.
+test('a reply recorded after the replies were opened is named, not called new', async ({ app, page, server, request }) => {
+  await stubViews(page);
+  // The replies card, whatever it says: the one card that opens the Replied tab.
+  const repliesCard = needsYou(page).locator('a[href^="#/followups?tab=replied"]');
+  await app.goto('#/home');
+  await homeReady(page);
+  // Open every reply from Home.
+  await repliesCard.click();
+  await expect.poll(() => stubbed(page)).toMatchObject({ name: 'followups', query: { tab: 'replied' } });
+  await page.goBack();
+  await homeReady(page);
+  await expect(needsYou(page).getByRole('link', { name: 'drafts waiting', exact: false })).toHaveCount(1);
+  await expect(repliesCard).toHaveCount(0);
+
+  // On Follow-ups the user marks a company replied themselves (Mark replied; Check for replies
+  // marks them the same way). Home can't know they have seen it, so it doesn't say the reply is
+  // new or came "since you last looked": it says who wrote back, and its link opens that one row.
+  const followups = await (await request.get(server.apiUrl('/api/followups'))).json();
+  const target = followups.find((f) => f.state === 'awaiting');
+  expect(target, 'a company awaiting a reply').toBeTruthy();
+  const res = await request.post(server.apiUrl(`/api/followups/${encodeURIComponent(target.domain)}/mark`), { data: { value: 'replied' } });
+  expect(res.ok()).toBe(true);
+  await refreshStore(page);
+  await expect(repliesCard.locator('.home-ny-num')).toHaveText('1');
+  await expect(repliesCard.locator('.home-ny-meta')).toHaveText(`${target.domain} wrote back`);
+  await expect(repliesCard).not.toContainText(/\bnew\b|since you last looked/i);
+  await expect(repliesCard).toHaveAttribute('href', `#/followups?tab=replied&q=${encodeURIComponent(target.domain)}`);
+  // Still there after a reload, until it is opened.
+  await page.reload();
+  await homeReady(page);
+  await expect(repliesCard).toHaveAttribute('aria-label', `1 reply. ${target.domain} wrote back. See reply`);
+  await repliesCard.click();
+  await expect.poll(() => stubbed(page)).toMatchObject({ name: 'followups', query: { tab: 'replied', q: target.domain } });
+  await page.goBack();
+  await homeReady(page);
+  await expect(needsYou(page).getByRole('link', { name: 'drafts waiting', exact: false })).toHaveCount(1);
+  await expect(repliesCard).toHaveCount(0);
 });
 
 // Last: a different seed restarts the server.
@@ -1132,9 +1281,11 @@ test.describe('new workspace', () => {
     expect(await actions.evaluateAll((els) => els.map((a) => a.getAttribute('href')))).toEqual([
       expect.stringMatching(/^#\/agent\?prompt=.+/),
       '#/drafts',
-      '#/schedules',
+      '#/schedules?new=1',
       '#/settings?tab=connections',
     ]);
+    // No schedule yet: its step opens the New schedule dialog, named as Schedules names it.
+    await expect(actions.nth(2)).toHaveText('New schedule');
     // The actions line up as one column: the same width, the same left edge.
     const boxes = await actions.evaluateAll((els) => els.map((a) => a.getBoundingClientRect()).map((r) => [Math.round(r.left), Math.round(r.width)]));
     expect(new Set(boxes.map(String)).size, JSON.stringify(boxes)).toBe(1);
@@ -1172,6 +1323,8 @@ test.describe('new workspace', () => {
     await expect(start).not.toContainText('Connect where outreach goes');
     const schedule = start.getByRole('listitem').nth(2);
     await expect(schedule).toContainText('Done');
+    // One exists: its step opens the list.
+    await expect(schedule.getByRole('link', { name: 'View schedules' })).toHaveAttribute('href', '#/schedules');
     // Within 48h the time is relative (spec §5.10), with the date and time as its tooltip.
     await expect(schedule.locator('p')).toHaveText('Morning <b>Source</b> runs next in 5h.');
     await expect(schedule.locator('time')).toHaveAttribute('title', fmtDate(nextAt, { time: true }));

@@ -109,11 +109,13 @@ a.home-ny-card:hover .home-ny-cta { text-decoration: underline; }
 .home-ny-label { font-weight: 500; color: var(--text); }
 .home-ny-title { font-weight: 600; line-height: 1.45; }
 
+/* A detail that wraps doesn't end on one short word ("…wrote" over "back"). */
 .home-ny-meta {
   color: var(--text-2);
   font-size: 13px;
   line-height: 1.45;
   overflow-wrap: anywhere;
+  text-wrap: pretty;
 }
 
 .home-ny-cta {
@@ -210,7 +212,9 @@ a.home-ny-alert:hover .home-ny-cta { text-decoration: underline; }
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.home-stat-hint { margin: 0; font-size: 12px; color: var(--text-3); }
+/* A hint too long for its cell (1024px leaves each ~145px) wraps into even lines, not
+   "companies written" over a lone "to". */
+.home-stat-hint { margin: 0; font-size: 12px; color: var(--text-3); text-wrap: balance; }
 .home-stats-loading .home-stat { gap: var(--space-2); }
 
 /* ---- Funnel and top searches, side by side on wide screens ---- */

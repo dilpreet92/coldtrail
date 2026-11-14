@@ -3,15 +3,16 @@
 // problem only the human can fix (a failed run, a missing agent).
 //
 // Data: the summary comes from the shared store (/api/summary, polled every 30s and refreshed
-// after mutations elsewhere), so Home and the sidebar counts always agree. /api/runs and
-// /api/companies?per=1 (for `queries`) are fetched here, and fetched again when the summary says
-// they changed (a newer last run, a different company count). Each source has its own loading,
-// empty and error state. Every server string reaches the page as text through h(); hrefs are
-// built with href() or checked against the app's own routes. Where their section is too narrow
-// for a table, Recent runs render as cards (a ResizeObserver swaps them). Unmount drops the store
-// subscription and that observer, and aborts any request in flight. Run statuses use the shared
-// wording (runStatus, core/format.js), so Home and Schedules name a run the same way. Replies are
-// "new" until the user opens them from their card: the count opened is kept in this browser.
+// after mutations elsewhere), so Home and the sidebar counts always agree. /api/runs,
+// /api/companies?per=1 (for `queries`) and /api/followups (which companies replied) are fetched
+// here, and fetched again when the summary says they changed (a newer last run, a different
+// company or reply count). Each source has its own loading, empty and error state. Every server
+// string reaches the page as text through h(); hrefs are built with href() or checked against the
+// app's own routes. Where their section is too narrow for a table, Recent runs render as cards (a
+// ResizeObserver swaps them). Unmount drops the store subscription and that observer, and aborts
+// any request in flight. Run statuses use the shared wording (runStatus, core/format.js), so Home
+// and Schedules name a run the same way. A reply needs you until you open it from its card: the
+// companies opened are kept in this browser.
 
 import { api, errorText } from '../core/api.js';
 import { fmtDate, fmtNum, fmtRelative, h, pluralize, runStatus, toDate } from '../core/dom.js';
@@ -71,43 +72,48 @@ const ATTENTION_OTHER = { title: 'Needs attention', action: 'Open Settings', tar
 // (the server's target for every failed run is the run history).
 const SIGN_IN_FAILED = { title: 'Agent sign-in failed', action: 'Sign the agent in again', target: '#/settings?tab=agent' };
 
-// Replies the user has opened: how many companies had replied when they last followed the
-// Replies card, kept in this browser (Needs you counts only replies since). Storage can throw
-// (privacy modes): the count then holds for this page only.
+// Replies the user has opened from their card: the companies (domains) that had replied then,
+// kept in this browser as a JSON list. Needs you shows the replied companies not on it, by name.
+// Home can't see what was looked at, or marked, on Follow-ups, so the card says only who wrote
+// back, never that a reply is new. The list is cut to the companies that have replied now, so
+// one deleted and found again needs you again when it writes back. Storage can throw (privacy
+// modes): the list then holds for this page only.
 const SEEN_KEY = 'ct-replies-seen';
-let seenHere = null;
+let seenHere = [];
 
 function readSeen() {
   try {
-    const v = localStorage.getItem(SEEN_KEY);
-    if (v != null && /^\d+$/.test(v)) return Number(v);
+    const v = JSON.parse(localStorage.getItem(SEEN_KEY));
+    // Anything but a list (an older build kept a count here) is nothing opened.
+    return new Set(Array.isArray(v) ? v.map(String) : []);
   } catch (_) {
-    /* storage unavailable */
+    return new Set(seenHere); // storage unavailable
   }
-  return seenHere;
 }
 
-function writeSeen(n) {
-  seenHere = n;
+function writeSeen(domains) {
+  seenHere = [...domains];
   try {
-    localStorage.setItem(SEEN_KEY, String(n));
+    localStorage.setItem(SEEN_KEY, JSON.stringify(seenHere));
   } catch (_) {
     /* storage unavailable: keep it for this page */
   }
 }
 
-/** The replied count when the user last opened the replies (null: never, in this browser). Fewer
- *  replies now than then (a company that replied was deleted) moves the mark down, so the next
- *  reply to come in counts as new. */
-function repliesSeen(summary) {
+/** Opening the card: its companies join the ones opened before. */
+const markOpened = (domains) => writeSeen(new Set([...readSeen(), ...domains]));
+
+/** A new replied list: forget opened companies that are no longer on it. */
+function keepOpened(replied) {
   const seen = readSeen();
-  const replied = stageCount(summary, 'replied');
-  if (seen != null && replied < seen) {
-    writeSeen(replied);
-    return replied;
-  }
-  return seen;
+  const now = new Set(replied);
+  const kept = [...seen].filter((d) => now.has(d));
+  if (kept.length !== seen.size) writeSeen(kept);
 }
+
+// The last replied list fetched, kept across visits: a return to Home shows the replies at once
+// (and asks for them again), rather than waiting on them.
+let repliedCache = null;
 
 // Only hash routes of this app become hrefs; anything else from the server is ignored.
 const APP_ROUTE = /^#\/[a-z-]+(\/[^\s"'<>]*)?(\?[^\s"'<>]*)?$/;
@@ -206,6 +212,16 @@ function errorBox(heading, err, onRetry) {
   );
 }
 
+/** Three placeholder cards in the shape of Needs you. */
+const needsSkeleton = () =>
+  h(
+    'ul',
+    { class: 'home-ny-list', 'aria-hidden': 'true' },
+    [0, 1, 2].map(() =>
+      h('li', { class: 'home-ny-card home-ny-card-skeleton' }, h('span', { class: 'skeleton home-skel-num' }), h('span', { class: 'skeleton home-skel-line' }), h('span', { class: 'skeleton home-skel-short' })),
+    ),
+  );
+
 function loadingRows(label, rows = 4) {
   return h(
     'div',
@@ -217,11 +233,24 @@ function loadingRows(label, rows = 4) {
 
 // ---- Needs you ----
 
+/** Who wrote back, as the replies card says it: "a.example wrote back", "a.example and b.example
+ *  wrote back", "a.example and 2 others wrote back". A domain is a { mono } part (data, set in the
+ *  mono face); the rest is text. */
+function repliedParts(domains) {
+  const [a, b] = domains.map((d) => ({ mono: d }));
+  if (domains.length === 1) return [a, ' wrote back'];
+  if (domains.length === 2) return [a, ' and ', b, ' wrote back'];
+  return [a, ` and ${fmtNum(domains.length - 1)} others wrote back`];
+}
+
+const partsText = (parts) => parts.map((p) => (typeof p === 'string' ? p : p.mono)).join('');
+
 /** The cards Home shows, most urgent first: connection problems and a failed run, then the
- *  drafts, due follow-ups and new replies waiting. Replies are companies (the funnel's Replied
- *  stage, as the Follow-ups Replied tab the card opens lists them); `seen` is how many had
- *  replied when the user last opened them (null: never, so every reply is new). */
-export function needsYouItems(summary, seen = null) {
+ *  drafts, due follow-ups and replies waiting. `unopened` lists the companies that replied and
+ *  haven't been opened from the replies card (as the Follow-ups Replied tab lists them; null
+ *  while that list loads): the card names them and opens that tab, filtered to the company when
+ *  there is one. */
+export function needsYouItems(summary, unopened = []) {
   const c = (summary && summary.counts) || {};
   const items = [];
   const lastRun = summary && summary.last_run;
@@ -255,18 +284,20 @@ export function needsYouItems(summary, seen = null) {
       href: href(['followups'], { tab: 'due' }),
     });
   }
-  const replied = stageCount(summary, 'replied');
-  const fresh = seen == null ? replied : replied - Number(seen);
-  if (fresh > 0) {
+  const fresh = Array.isArray(unopened) ? unopened.map(String) : [];
+  if (fresh.length) {
+    const one = fresh.length === 1;
+    const parts = repliedParts(fresh);
     items.push({
       key: 'replies',
-      num: fresh,
-      label: fresh === 1 ? 'new reply' : 'new replies',
-      meta: seen == null ? 'Founders who wrote back' : 'Founders who wrote back since you last looked',
-      cta: 'See replies',
-      href: href(['followups'], { tab: 'replied' }),
-      // Following the card opens them all: this many have been seen.
-      opens: replied,
+      num: fresh.length,
+      label: one ? 'reply' : 'replies',
+      meta: partsText(parts),
+      parts,
+      cta: one ? 'See reply' : 'See replies',
+      href: href(['followups'], one ? { tab: 'replied', q: fresh[0] } : { tab: 'replied' }),
+      // Following the card opens these (the tab lists every one of them).
+      opens: fresh,
     });
   }
   return items;
@@ -288,10 +319,12 @@ function needsYouCard(it) {
         href: it.href,
         'data-focus': it.key,
         'aria-label': nameOf(`${fmtNum(it.num)} ${it.label}`, it.meta, it.cta),
-        onClick: it.opens != null ? () => writeSeen(it.opens) : null,
+        onClick: it.opens ? () => markOpened(it.opens) : null,
       },
       h('span', { class: 'home-ny-top' }, h('span', { class: 'home-ny-num' }, fmtNum(it.num)), h('span', { class: 'home-ny-label' }, it.label)),
-      it.meta ? h('span', { class: 'home-ny-meta' }, it.meta) : null,
+      it.meta
+        ? h('span', { class: 'home-ny-meta' }, it.parts ? it.parts.map((p) => (typeof p === 'string' ? p : h('span', { class: 'mono' }, p.mono))) : it.meta)
+        : null,
       h('span', { class: 'home-ny-cta' }, it.cta, icon(ICONS.arrow, 14)),
     ),
   );
@@ -529,7 +562,11 @@ function renderRuns(rows, next, narrow) {
         body: when
           ? nextRunSentence(next, when, ' What it adds shows up here.')
           : 'A run shows up here after a schedule fires or you use Run now on Schedules.',
-        action: h('a', { class: 'btn btn-secondary', href: '#/schedules' }, when ? 'Open Schedules' : 'Create a schedule'),
+        // With none on (the summary names only the next enabled schedule), the button opens
+        // Schedules' New schedule dialog (?new=1); any paused ones are listed behind it.
+        action: when
+          ? h('a', { class: 'btn btn-secondary', href: '#/schedules' }, 'Open Schedules')
+          : h('a', { class: 'btn btn-secondary', href: href(['schedules'], { new: 1 }) }, 'Create a schedule'),
       }),
     );
   }
@@ -621,7 +658,8 @@ function startSteps(summary, status) {
     // Plain data (the step list's signature is its JSON); renderStart words it.
     next: next ? { name: next.name, when: nextRunWhen(next.next_at) } : null,
     done: !!next,
-    action: { label: next ? 'View schedules' : 'Open Schedules', href: '#/schedules' },
+    // None yet: Schedules opens its New schedule dialog straight away (?new=1).
+    action: next ? { label: 'View schedules', href: '#/schedules' } : { label: 'New schedule', href: href(['schedules'], { new: 1 }) },
   });
   // Only when setup's destination step was skipped (and status says so).
   if (status && !status.destination_connected && !status.linkedin_connected) {
@@ -711,6 +749,11 @@ function mountHome(root, ctx) {
   let companiesKey; // the company count when searches were fetched (likewise)
   let runsCtl = null;
   let searchesCtl = null;
+  // Replied companies, from /api/followups: { status: 'idle'|'loading'|'ok', domains } (null
+  // until a list is on hand: this visit's, or the last visit's while this one loads).
+  let replies = { status: 'idle', domains: repliedCache };
+  let repliesKey; // the reply counts when they were fetched (unset after a failed fetch)
+  let repliesCtl = null;
   let summaryShown = null;
 
   // Recent runs become cards when their section is narrower than RUNS_TABLE_MIN. The section's
@@ -758,7 +801,7 @@ function mountHome(root, ctx) {
       body.setAttribute('aria-busy', 'true');
       body.replaceChildren(
         h('span', { class: 'sr-only' }, 'Loading your workspace…'),
-        h('ul', { class: 'home-ny-list', 'aria-hidden': 'true' }, [0, 1, 2].map(() => h('li', { class: 'home-ny-card home-ny-card-skeleton' }, h('span', { class: 'skeleton home-skel-num' }), h('span', { class: 'skeleton home-skel-line' }), h('span', { class: 'skeleton home-skel-short' })))),
+        needsSkeleton(),
         h('div', { class: 'home-stats home-stats-loading', 'aria-hidden': 'true' }, [0, 1, 2, 3, 4].map(() => h('div', { class: 'home-stat' }, h('span', { class: 'skeleton home-skel-short' }), h('span', { class: 'skeleton home-skel-num' })))),
       );
     } else if (next === 'dash') {
@@ -813,21 +856,51 @@ function mountHome(root, ctx) {
     summaryShown = summary;
     const empty = !(summary.counts && Number(summary.counts.companies) > 0);
     setMode(empty ? 'start' : 'dash');
-    const items = needsYouItems(summary, repliesSeen(summary));
     if (empty) {
-      const alerts = items.filter((it) => it.warn);
+      const alerts = needsYouItems(summary).filter((it) => it.warn);
       dash.needs.el.hidden = !alerts.length;
       part('needs', JSON.stringify(alerts), dash.needs.body, () => (alerts.length ? alertList(alerts) : null));
       const steps = startSteps(summary, status);
       part('start', JSON.stringify(steps), dash.start.body, () => renderStart(summary, status));
     } else {
-      renderDash(summary, items);
+      renderDash(summary);
     }
     if (had) keepFocus();
   }
 
-  function renderDash(summary, items) {
-    part('needs', JSON.stringify(items), dash.needs.body, () => renderNeedsYou(items));
+  /** The replied companies not opened from the card yet; null while the list loads. */
+  function unopenedReplies(summary) {
+    if (!stageCount(summary, 'replied')) return [];
+    if (!replies.domains) return null;
+    const seen = readSeen();
+    return replies.domains.filter((d) => !seen.has(d));
+  }
+
+  // Needs you waits for the replied list the first time (a placeholder, not "Nothing needs you"
+  // and then a card); after that a newer list loads behind what is shown.
+  function drawNeeds() {
+    if (mode !== 'dash' || !dash || !summaryShown) return;
+    const sec = dash.needs;
+    const unopened = unopenedReplies(summaryShown);
+    if (unopened === null) {
+      sec.el.setAttribute('aria-busy', 'true');
+      part('needs', 'loading', sec.body, () => [h('span', { class: 'sr-only' }, 'Loading what needs you…'), needsSkeleton()]);
+      return;
+    }
+    sec.el.removeAttribute('aria-busy');
+    const items = needsYouItems(summaryShown, unopened);
+    part('needs', JSON.stringify(items), sec.body, () => renderNeedsYou(items));
+  }
+
+  function renderDash(summary) {
+    // Replies: first time, or when the summary's reply counts changed (none: nothing to fetch).
+    const replied = stageCount(summary, 'replied');
+    const nextRepliesKey = `${replied}|${Number(summary.counts.replied) || 0}`;
+    if (replied > 0 && (replies.status === 'idle' || nextRepliesKey !== repliesKey)) {
+      repliesKey = nextRepliesKey;
+      loadReplies();
+    }
+    drawNeeds();
     part('glance', JSON.stringify([summary.counts, summary.funnel]), dash.glance.body, () => renderStats(summary));
     part('funnel', JSON.stringify(summary.funnel), dash.funnel.body, () => renderFunnel(summary));
 
@@ -957,6 +1030,32 @@ function mountHome(root, ctx) {
     }
     drawSearches();
     if (fromRetry && dash && dash.top) refocus(dash.top);
+  }
+
+  // The replied companies, as the Follow-ups Replied tab lists them (most recent send first).
+  async function loadReplies() {
+    if (repliesCtl) repliesCtl.abort();
+    const ctl = controller();
+    repliesCtl = ctl;
+    replies = { ...replies, status: 'loading' };
+    try {
+      const rows = await api.get('/api/followups', { signal: ctl.signal });
+      if (gone || ctl.signal.aborted) return;
+      const domains = (Array.isArray(rows) ? rows : []).filter((r) => r && r.state === 'replied' && r.domain != null).map((r) => String(r.domain));
+      replies = { status: 'ok', domains };
+      repliedCache = domains;
+      keepOpened(domains);
+    } catch (err) {
+      if (gone || ctl.signal.aborted || isAbort(err)) return;
+      // Needs you goes on with the list on hand, or without the replies (the stat line still
+      // counts them), and the next summary asks again.
+      replies = { status: 'ok', domains: replies.domains || [] };
+      repliesKey = undefined;
+    } finally {
+      release(ctl);
+      if (repliesCtl === ctl) repliesCtl = null;
+    }
+    drawNeeds();
   }
 
   // The summary: fresh from the store on every visit; on failure, ask once more to say why.
