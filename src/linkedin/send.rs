@@ -45,12 +45,14 @@ fn random_pacing_target() -> u64 {
 }
 
 /// Whole seconds since the most recent `channel='linkedin'` send, or `None` if there is none.
+/// A send since marked replied or bounced still went out, so it counts (as in the caps).
 /// Best-effort — a db error is treated as "no prior send" (no wait), never a hard failure.
 fn secs_since_last_linkedin_send() -> Option<i64> {
     crate::db::open().ok().and_then(|c| {
         c.query_row(
             "SELECT CAST((julianday('now') - julianday(MAX(sent_at))) * 86400 AS INTEGER) \
-             FROM outreach WHERE channel='linkedin' AND status='sent' AND sent_at IS NOT NULL",
+             FROM outreach WHERE channel='linkedin' AND status IN ('sent','replied','bounced') \
+               AND sent_at IS NOT NULL",
             [],
             |r| r.get::<_, Option<i64>>(0),
         )
@@ -262,6 +264,28 @@ mod tests {
         assert_eq!(remaining_pacing_delay(None, 100), Duration::ZERO);
         // Clock skew (negative) → no wait, never a panic/overflow.
         assert_eq!(remaining_pacing_delay(Some(-5), 100), Duration::ZERO);
+    }
+
+    /// Pacing counts from the last invite that went out, whatever came of it since: an invite
+    /// accepted (marked replied) or a company marked bounced still paces the next one.
+    #[test]
+    fn pacing_counts_an_invite_marked_replied_or_bounced() {
+        crate::testutil::with_home("ct-lisend-pacing-marked", |_| {
+            crate::db::init().unwrap();
+            crate::db::open()
+                .unwrap()
+                .execute_batch(
+                    "INSERT INTO companies (domain, status) VALUES ('a.com','sent'), ('b.com','sent'); \
+                     INSERT INTO outreach (domain, channel, status, sent_at) VALUES \
+                     ('a.com','linkedin','sent',datetime('now','-30 seconds')), \
+                     ('b.com','linkedin','sent',datetime('now','-1 day'));",
+                )
+                .unwrap();
+            crate::mark::run("a.com", "replied").unwrap();
+            crate::mark::run("b.com", "bounced").unwrap();
+            let since = secs_since_last_linkedin_send().unwrap();
+            assert!((25..120).contains(&since), "got {since}");
+        });
     }
 
     #[tokio::test]

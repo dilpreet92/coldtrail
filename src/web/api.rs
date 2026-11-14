@@ -32,7 +32,8 @@ pub struct StatusDto {
     /// Gmail is connected, through any of `gmail_via`.
     pub destination_connected: bool,
     /// How Gmail is connected, the way delivery uses it: "app_password", "google" (coldtrail's
-    /// own Google sign-in) or "gcloud" (a gcloud login); null when it isn't.
+    /// own Google sign-in) or "gcloud" (a gcloud login Gmail has taken a draft or send
+    /// through); null when it isn't.
     pub gmail_via: Option<String>,
     /// Opt-in auto-send is enabled (default false = draft-only).
     pub auto_send: bool,
@@ -46,7 +47,9 @@ pub struct StatusDto {
     /// coldtrail's own Google client is configured (COLDTRAIL_GOOGLE_CLIENT_ID/SECRET).
     pub gmail_client_configured: bool,
     /// A gcloud user login (Application Default Credentials with a refresh token) is present:
-    /// the keyless Gmail path. It counts in `destination_connected`.
+    /// the keyless Gmail path, which Create Gmail draft tries. It counts in
+    /// `destination_connected` only once Gmail has taken a call through it, since the ADC file
+    /// doesn't say whether the login has the Gmail scope (a plain one doesn't).
     pub gcloud_available: bool,
     /// A LinkedIn session is connected (`linkedin::LinkedinState`).
     pub linkedin_connected: bool,

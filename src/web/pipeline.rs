@@ -124,10 +124,10 @@ pub struct DiscardQuery {
 
 /// `DELETE /api/drafts/:domain?channel=email|linkedin` — throw away a domain's pending draft on
 /// one channel: its reviewable rows there go (never sent history, never the other channel's
-/// draft). A company never written to is set to `skip` (excluded from outreach); one with sent
-/// history keeps its stage, since dropping a follow-up doesn't undo what went out. `skipped`
-/// says which happened. DB-only: a Gmail draft already created for a `drafted` row stays in
-/// Gmail.
+/// draft). A company never written to with no other draft waiting is set to `skip` (excluded
+/// from outreach); one with sent history keeps its stage, since dropping a follow-up doesn't
+/// undo what went out, and so does one whose other channel's draft still waits. `skipped` says
+/// which happened. DB-only: a Gmail draft already created for a `drafted` row stays in Gmail.
 pub async fn discard_draft(
     Path(domain): Path<String>,
     Query(q): Query<DiscardQuery>,
@@ -156,7 +156,15 @@ pub async fn discard_draft(
         })
         .into_response());
     }
-    let skipped = !crate::mark::contacted(&tx, &domain)?;
+    // Skip only a company left with nothing: one written to keeps its stage, and one whose
+    // other channel's draft still waits stays in the queue, since that draft can still go out.
+    let other_waits: bool = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM outreach WHERE domain = ?1 \
+         AND status IN ('draft_pending','drafted'))",
+        [&domain],
+        |r| r.get(0),
+    )?;
+    let skipped = !other_waits && !crate::mark::contacted(&tx, &domain)?;
     if skipped {
         crate::db::set_status(&tx, &domain, "skip")?;
     }
@@ -1032,6 +1040,37 @@ mod tests {
             assert_eq!(status_of("acme.com"), "sent");
 
             // A company never written to leaves the queue as skipped, and the reply says so.
+            let (status, body) = call("DELETE", "/api/drafts/fresh.com?channel=email");
+            assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!((&v["ok"], &v["skipped"]), (&true.into(), &true.into()));
+            assert!(outreach_of("fresh.com").is_empty());
+            assert_eq!(status_of("fresh.com"), "skip");
+        });
+    }
+
+    /// A company nothing has gone out to, with an email and a LinkedIn note waiting: discarding
+    /// one leaves the other to review and send, so the company isn't skipped (that would show
+    /// it as Skip with a draft still queued). Discarding the last one skips it.
+    #[test]
+    fn discarding_one_channel_keeps_the_company_while_its_other_draft_waits() {
+        crate::testutil::with_home("ct-web-pipeline-discard-other", |_| {
+            seed(
+                "INSERT INTO companies (domain, status) VALUES ('fresh.com','drafted'); \
+                 INSERT INTO outreach (domain, channel, body, status) VALUES \
+                 ('fresh.com','email','first','draft_pending'), \
+                 ('fresh.com','linkedin','note','drafted');",
+            );
+            let (status, body) = call("DELETE", "/api/drafts/fresh.com?channel=linkedin");
+            assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!((&v["ok"], &v["skipped"]), (&true.into(), &false.into()));
+            assert_eq!(
+                outreach_of("fresh.com"),
+                rows(&[("email", "draft_pending")])
+            );
+            assert_eq!(status_of("fresh.com"), "drafted");
+
             let (status, body) = call("DELETE", "/api/drafts/fresh.com?channel=email");
             assert_eq!(status, axum::http::StatusCode::OK, "{body}");
             let v: serde_json::Value = serde_json::from_str(&body).unwrap();

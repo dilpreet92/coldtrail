@@ -84,8 +84,10 @@ pub async fn draft(domain: &str, d: &Draft) -> Result<()> {
         let mime = crate::gmail::mime_message(&d.to, &d.subject, &d.body);
         crate::imap_draft::append_draft(&email, &pw, &mime).await?;
     } else {
-        let (token, quota) = crate::gmail::token().await?;
-        crate::gmail::create_draft(&token, quota.as_deref(), &d.to, &d.subject, &d.body).await?;
+        let t = crate::gmail::token().await?;
+        let quota = t.quota_project.as_deref();
+        crate::gmail::create_draft(&t.access, quota, &d.to, &d.subject, &d.body).await?;
+        t.worked();
     }
     crate::mark::run(domain, "gmail")?; // records a gmail draft + status='drafted'
     Ok(())
@@ -93,25 +95,31 @@ pub async fn draft(domain: &str, d: &Draft) -> Result<()> {
 
 /// Email sends today (email channel or legacy NULL), for the email warmup cap.
 pub fn sent_today() -> u32 {
-    count_sent("status='sent' AND date(sent_at)=date('now') AND COALESCE(channel,'email')='email'")
+    count_sent("date(sent_at)=date('now') AND COALESCE(channel,'email')='email'")
 }
 
 /// LinkedIn connection-invites sent today.
 pub fn linkedin_sent_today() -> u32 {
-    count_sent("status='sent' AND channel='linkedin' AND date(sent_at)=date('now')")
+    count_sent("channel='linkedin' AND date(sent_at)=date('now')")
 }
 
 /// LinkedIn connection-invites sent in the trailing 7 days (rolling weekly cap).
 pub fn linkedin_sent_last_7d() -> u32 {
-    count_sent("status='sent' AND channel='linkedin' AND sent_at >= datetime('now','-7 days')")
+    count_sent("channel='linkedin' AND sent_at >= datetime('now','-7 days')")
 }
 
+/// Sends matching `where_clause`, counting everything that went out: a send later marked
+/// replied or bounced keeps its `sent_at` and still counts, so an outcome never hands its slot
+/// back to a cap.
 fn count_sent(where_clause: &str) -> u32 {
     crate::db::open()
         .ok()
         .and_then(|c| {
             c.query_row(
-                &format!("SELECT COUNT(*) FROM outreach WHERE {where_clause}"),
+                &format!(
+                    "SELECT COUNT(*) FROM outreach \
+                     WHERE status IN ('sent','replied','bounced') AND {where_clause}"
+                ),
                 [],
                 |r| r.get(0),
             )
@@ -180,8 +188,10 @@ pub async fn send(domain: &str, d: &Draft) -> Result<String> {
         let mime = crate::gmail::mime_message(&d.to, &d.subject, &d.body);
         crate::smtp::send(&email, &pw, &d.to, &mime).await?;
     } else {
-        let (token, quota) = crate::gmail::token().await?;
-        crate::gmail::send_message(&token, quota.as_deref(), &d.to, &d.subject, &d.body).await?;
+        let t = crate::gmail::token().await?;
+        let quota = t.quota_project.as_deref();
+        crate::gmail::send_message(&t.access, quota, &d.to, &d.subject, &d.body).await?;
+        t.worked();
     }
     crate::mark::sent(domain, Some("email"))?; // status='sent', sent_at=now
     Ok(format!("sent to {} ({}/{cap} today)", d.to, n + 1))
@@ -536,6 +546,35 @@ mod tests {
             )
             .unwrap();
             assert_eq!(linkedin_sent_last_7d(), 2);
+        });
+    }
+
+    /// A reply or a bounce is what came of a send, not an undo of it: marking one (Follow-ups,
+    /// the reply check, `coldtrail mark`) keeps the send in every cap it counts against, on
+    /// both channels, so it never frees a slot for another send.
+    #[test]
+    fn marking_replied_or_bounced_keeps_sends_in_the_caps() {
+        crate::testutil::with_home("ct-deliver-caps-after-mark", |_| {
+            crate::db::init().unwrap();
+            crate::db::open()
+                .unwrap()
+                .execute_batch(
+                    "INSERT INTO companies (domain, status) VALUES \
+                     ('a.com','sent'), ('b.com','sent'), ('c.com','sent'); \
+                     INSERT INTO outreach (domain, channel, status, sent_at) VALUES \
+                     ('a.com','email','sent',datetime('now')), \
+                     ('a.com','linkedin','sent',datetime('now')), \
+                     ('b.com',NULL,'sent',datetime('now')), \
+                     ('c.com','linkedin','sent',datetime('now','-2 days'));",
+                )
+                .unwrap();
+            let caps = || (sent_today(), linkedin_sent_today(), linkedin_sent_last_7d());
+            let before = caps();
+            crate::mark::run("a.com", "bounced").unwrap();
+            crate::mark::run("b.com", "replied").unwrap();
+            crate::mark::run("c.com", "replied").unwrap();
+            assert_eq!(before, (2, 1, 2));
+            assert_eq!(caps(), before);
         });
     }
 

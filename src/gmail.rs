@@ -24,15 +24,42 @@ fn raw_message(to: &str, subject: &str, body: &str) -> String {
     URL_SAFE_NO_PAD.encode(mime_message(to, subject, body).as_bytes())
 }
 
+/// A Gmail access token, and where it came from.
+pub struct Token {
+    pub access: String,
+    /// The ADC quota project, for a gcloud token.
+    pub quota_project: Option<String>,
+    /// Minted from the gcloud login: a call Gmail takes with it proves that login works
+    /// (`gcloud::gmail_worked`).
+    pub gcloud: bool,
+}
+
+impl Token {
+    /// Note a call Gmail took with this token (see `gcloud::gmail_verified`).
+    pub fn worked(&self) {
+        if self.gcloud {
+            crate::gcloud::gmail_worked();
+        }
+    }
+}
+
 /// The best available Gmail token: coldtrail's own OAuth if connected, else gcloud ADC
-/// (keyless — reuses Google's gcloud client). Returns (access_token, quota_project).
-pub async fn token() -> Result<(String, Option<String>)> {
+/// (keyless — reuses Google's gcloud client).
+pub async fn token() -> Result<Token> {
     if let Some(t) = crate::oauth::valid_access("gmail").await {
-        return Ok((t, None));
+        return Ok(Token {
+            access: t,
+            quota_project: None,
+            gcloud: false,
+        });
     }
     if crate::gcloud::available() {
         let t = crate::gcloud::access_token().await?;
-        return Ok((t, crate::gcloud::quota_project()));
+        return Ok(Token {
+            access: t,
+            quota_project: crate::gcloud::quota_project(),
+            gcloud: true,
+        });
     }
     Err(anyhow!(
         "Gmail isn't connected. Keyless option: run `{}` and set a quota project with the \

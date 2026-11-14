@@ -340,6 +340,73 @@ async fn enrich_one(domain: String, name: Option<String>, seeded: Option<String>
     }
 }
 
+/// Write the workers' results: each found address as a contact, and each company's stage.
+/// A founder named but with no address yet is kept as a name-only contact, so the company
+/// shows who it found (the stage says "named"); a later pass that finds their address fills
+/// that row in rather than listing them twice. Returns the contacts that gained an address.
+fn record(conn: &rusqlite::Connection, results: &[DomainResult]) -> Result<u32> {
+    let mut new_contacts = 0u32;
+    for r in results {
+        match &r.found {
+            None => {
+                if let Some(founder) = &r.founder {
+                    conn.execute(
+                        "INSERT INTO contacts (domain, founder_name) SELECT ?1, ?2 \
+                         WHERE NOT EXISTS (SELECT 1 FROM contacts WHERE domain=?1 AND founder_name=?2)",
+                        params![r.domain, founder],
+                    )?;
+                }
+                crate::db::set_status(
+                    conn,
+                    &r.domain,
+                    if r.founder.is_some() {
+                        "named"
+                    } else {
+                        "sourced"
+                    },
+                )?;
+            }
+            Some(res) => {
+                let mx = if r.mx_ok { 1 } else { 0 };
+                let filled = conn.execute(
+                    "UPDATE OR IGNORE contacts \
+                     SET email=?3, email_source=?4, email_confidence=?5, mx_ok=?6 \
+                     WHERE id = (SELECT id FROM contacts WHERE domain=?1 AND founder_name=?2 \
+                                 AND email IS NULL ORDER BY id LIMIT 1)",
+                    params![
+                        r.domain,
+                        r.founder,
+                        res.email,
+                        res.source,
+                        res.confidence,
+                        mx
+                    ],
+                )?;
+                let changed = if filled > 0 {
+                    filled
+                } else {
+                    conn.execute(
+                        "INSERT OR IGNORE INTO contacts \
+                         (domain, founder_name, email, email_source, email_confidence, mx_ok) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            r.domain,
+                            r.founder,
+                            res.email,
+                            res.source,
+                            res.confidence,
+                            mx
+                        ],
+                    )?
+                };
+                new_contacts += changed as u32;
+                crate::db::set_status(conn, &r.domain, if r.mx_ok { "emailed" } else { "named" })?;
+            }
+        }
+    }
+    Ok(new_contacts)
+}
+
 pub async fn run(max: usize) -> Result<()> {
     crate::db::init()?;
 
@@ -390,46 +457,7 @@ pub async fn run(max: usize) -> Result<()> {
         .await;
 
     // Single synchronous write pass — avoids WORKERS concurrent writers racing on SQLITE_BUSY.
-    let mut new_contacts = 0u32;
-    {
-        let conn = crate::db::open()?;
-        for r in &results {
-            match &r.found {
-                None => {
-                    crate::db::set_status(
-                        &conn,
-                        &r.domain,
-                        if r.founder.is_some() {
-                            "named"
-                        } else {
-                            "sourced"
-                        },
-                    )?;
-                }
-                Some(res) => {
-                    let changed = conn.execute(
-                        "INSERT OR IGNORE INTO contacts \
-                         (domain, founder_name, email, email_source, email_confidence, mx_ok) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                        params![
-                            r.domain,
-                            r.founder,
-                            res.email,
-                            res.source,
-                            res.confidence,
-                            if r.mx_ok { 1 } else { 0 }
-                        ],
-                    )?;
-                    new_contacts += changed as u32;
-                    crate::db::set_status(
-                        &conn,
-                        &r.domain,
-                        if r.mx_ok { "emailed" } else { "named" },
-                    )?;
-                }
-            }
-        }
-    }
+    let new_contacts = record(&crate::db::open()?, &results)?;
 
     // Re-count the un-enriched set for an honest "how much is left" — worked-but-not-found
     // companies are still un-enriched, so this is ground truth, not batch arithmetic.
@@ -490,6 +518,79 @@ mod tests {
         assert!(!looks_throttled(
             "<html><body><div class=\"no-results\">No results found</div></body></html>"
         ));
+    }
+
+    /// (founder_name, email, mx_ok) of `domain`'s contacts, oldest first.
+    fn contacts_of(domain: &str) -> Vec<(Option<String>, Option<String>, Option<i64>)> {
+        crate::db::open()
+            .unwrap()
+            .prepare("SELECT founder_name, email, mx_ok FROM contacts WHERE domain=?1 ORDER BY id")
+            .unwrap()
+            .query_map([domain], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    fn result(domain: &str, founder: Option<&str>, email: Option<&str>) -> DomainResult {
+        DomainResult {
+            domain: domain.into(),
+            founder: founder.map(Into::into),
+            found: email.map(|e| Found {
+                email: e.into(),
+                confidence: "direct",
+                source: "site-page",
+            }),
+            mx_ok: email.is_some(),
+        }
+    }
+
+    /// A founder named with no address yet is kept as a name-only contact, so the company the
+    /// pipeline calls "named" shows who; a repeat pass doesn't add them twice, and the pass
+    /// that finds their address fills that row in. No founder, no contact.
+    #[test]
+    fn a_named_founder_without_an_email_is_kept_and_filled_in_later() {
+        crate::testutil::with_home("ct-find-record-named", |_| {
+            crate::db::init().unwrap();
+            let conn = crate::db::open().unwrap();
+            conn.execute_batch(
+                "INSERT INTO companies (domain, status) VALUES ('acme.com','sourced'), ('nobody.com','sourced');",
+            )
+            .unwrap();
+            let status = |d: &str| -> String {
+                conn.query_row("SELECT status FROM companies WHERE domain=?1", [d], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+            };
+            let pass = [
+                result("acme.com", Some("Jane Doe"), None),
+                result("nobody.com", None, None),
+            ];
+            assert_eq!(record(&conn, &pass).unwrap(), 0);
+            assert_eq!(record(&conn, &pass).unwrap(), 0);
+            assert_eq!(
+                contacts_of("acme.com"),
+                [(Some("Jane Doe".into()), None, None)]
+            );
+            assert_eq!(
+                (status("acme.com"), status("nobody.com")),
+                ("named".into(), "sourced".into())
+            );
+            assert!(contacts_of("nobody.com").is_empty());
+
+            let found = [result("acme.com", Some("Jane Doe"), Some("jane@acme.com"))];
+            assert_eq!(record(&conn, &found).unwrap(), 1);
+            assert_eq!(
+                contacts_of("acme.com"),
+                [(
+                    Some("Jane Doe".into()),
+                    Some("jane@acme.com".into()),
+                    Some(1)
+                )]
+            );
+            assert_eq!(status("acme.com"), "emailed");
+        });
     }
 
     #[test]

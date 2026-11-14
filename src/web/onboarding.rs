@@ -54,12 +54,14 @@ pub async fn status() -> Result<Json<StatusDto>, ApiErr> {
     let discovery_connected = crate::secrets::has_token("canonical");
     // Connected = a Gmail app password (keyless IMAP), a Gmail OAuth token (own client) or a
     // gcloud login, in the order delivery uses them (`deliver::draft`, then `gmail::token`).
-    // One rule for every screen: Drafts' Create Gmail draft works through any of them.
+    // One rule for every screen. A gcloud login counts only once Gmail has taken a draft or
+    // send through it: a plain one lacks the Gmail scope, and the ADC file can't tell. Until
+    // then it is only `gcloud_available`, which Drafts' Create Gmail draft still tries.
     let gmail_via = if crate::secrets::gmail_app_password().is_some() {
         Some("app_password")
     } else if crate::secrets::has_token("gmail") {
         Some("google")
-    } else if crate::gcloud::available() {
+    } else if crate::gcloud::gmail_verified() {
         Some("gcloud")
     } else {
         None
@@ -497,11 +499,13 @@ mod tests {
         });
     }
 
-    /// A gcloud user login is a Gmail connection like the others, so every screen agrees on
-    /// it; an app password wins (delivery uses it first). An ADC file with no user login isn't
-    /// one, and isn't offered as the keyless path either.
+    /// A gcloud user login is offered as the keyless path (`gcloud_available`), but it is a
+    /// Gmail connection only once Gmail has taken a draft or send through it: ADC doesn't
+    /// record scopes, and a plain `gcloud auth application-default login` lacks the Gmail one.
+    /// A new login (or quota project) has to show it again. An app password wins (delivery
+    /// uses it first). An ADC file with no user login isn't offered at all.
     #[test]
-    fn status_counts_a_gcloud_login_as_gmail() {
+    fn status_counts_a_gcloud_login_as_gmail_once_it_reached_gmail() {
         crate::testutil::with_home("ct-web-onboarding-gcloud", |dir| {
             let _ = std::fs::remove_dir_all(format!("{}.secrets", dir.display()));
             crate::home::workspace().unwrap();
@@ -512,15 +516,26 @@ mod tests {
                 let s = rt.block_on(status()).unwrap().0;
                 (s.destination_connected, s.gmail_via, s.gcloud_available)
             };
+            let login = |refresh: &str| {
+                std::fs::write(
+                    &adc,
+                    format!(
+                        r#"{{"type":"authorized_user","client_id":"c","client_secret":"s","refresh_token":"{refresh}"}}"#
+                    ),
+                )
+                .unwrap()
+            };
             let none = gmail();
             std::fs::write(&adc, r#"{"type":"service_account","client_id":"1"}"#).unwrap();
             let service_account = gmail();
-            std::fs::write(
-                &adc,
-                r#"{"type":"authorized_user","client_id":"c","client_secret":"s","refresh_token":"r"}"#,
-            )
-            .unwrap();
-            let login = gmail();
+            crate::gcloud::gmail_worked();
+            let service_account_worked = gmail();
+            login("r1");
+            let unproven = gmail();
+            crate::gcloud::gmail_worked();
+            let proven = gmail();
+            login("r2");
+            let new_login = gmail();
             crate::secrets::set_gmail_app_password("me@gmail.com", "abcd efgh ijkl mnop").unwrap();
             let both = gmail();
             std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
@@ -528,7 +543,10 @@ mod tests {
 
             assert_eq!(none, (false, None, false));
             assert_eq!(service_account, (false, None, false));
-            assert_eq!(login, (true, Some("gcloud".into()), true));
+            assert_eq!(service_account_worked, (false, None, false));
+            assert_eq!(unproven, (false, None, true));
+            assert_eq!(proven, (true, Some("gcloud".into()), true));
+            assert_eq!(new_login, (false, None, true));
             assert_eq!(both, (true, Some("app_password".into()), true));
         });
     }

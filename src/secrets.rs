@@ -32,6 +32,10 @@ struct Secrets {
     /// Persistent loopback session token so restarting coldtrail doesn't invalidate open tabs.
     #[serde(default)]
     session_token: Option<String>,
+    /// The gcloud login Gmail has taken a draft or send through (`gcloud::gmail_verified`), as
+    /// a fingerprint of it, never its token.
+    #[serde(default)]
+    gcloud_gmail: Option<String>,
     #[serde(default)]
     tokens: BTreeMap<String, TokenRec>,
 }
@@ -78,6 +82,18 @@ pub fn gmail_app_password() -> Option<(String, String)> {
     let email = s.gmail_address.filter(|v| !v.trim().is_empty())?;
     let pw = s.gmail_app_password.filter(|v| !v.trim().is_empty())?;
     Some((email, pw))
+}
+
+/// Record the gcloud login (its fingerprint) that Gmail has taken a call through.
+pub fn set_gcloud_gmail(login: &str) -> Result<()> {
+    let mut s = load();
+    s.gcloud_gmail = Some(login.to_string());
+    save(&s)
+}
+
+/// The gcloud login (its fingerprint) Gmail has taken a call through, if any.
+pub fn gcloud_gmail() -> Option<String> {
+    load().gcloud_gmail
 }
 
 fn load() -> Secrets {
