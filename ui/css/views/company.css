@@ -218,7 +218,8 @@
 }
 
 /* Text restored from an editor that closed before it was saved (or from an unsaved Already
-   contacted list), with a way back. Under the file bar on both tabs. */
+   contacted list), or put on top of a file changed elsewhere, with a way back. Under the file bar
+   on both tabs. */
 .pe-restored,
 .ac-restored {
   display: flex;
@@ -379,6 +380,7 @@
 
 .ac-help code,
 .ac-msg code,
+.pe-restored code,
 .ac-restored code {
   padding: 1px 5px;
   border-radius: 4px;

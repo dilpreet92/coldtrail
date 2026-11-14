@@ -4,9 +4,10 @@
 // sections the agent drafts from. The checklist reads headings the way the backend does — the
 // call-to-action check mirrors `product::cta_link()` line for line, so a ticked CTA is one the
 // LinkedIn note path will really pick up. Already contacted: contacted.toml, validated by the
-// server on save; plain domains, links and email addresses are turned into entries first. The
-// file is read again before each save and when the tab is shown again: it is edited by hand too,
-// and a save never writes over a change made there.
+// server on save; plain domains, links and email addresses are turned into entries first. Both
+// files are read again before each save and when the tab is shown again: they are edited
+// elsewhere too (by hand, another tab, the agent), and a save never writes over a change made
+// there.
 //
 // `mountProfileEditor` is exported for the Setup wizard's company step, with PROFILE_TEMPLATE:
 // it needs only the app's tokens and base styles around it (it loads its own stylesheet), and
@@ -380,11 +381,62 @@ function replaceRange(ta, start, end, text, select = null) {
   if (select) ta.setSelectionRange(start + select[0], start + select[1]);
 }
 
+/** What lays out a textarea's text, copied onto textPlace's stand-in for it. */
+const TEXT_LOOK = ['fontFamily', 'fontSize', 'fontStyle', 'fontWeight', 'fontVariantLigatures', 'letterSpacing', 'wordSpacing', 'lineHeight', 'tabSize', 'textIndent', 'textTransform', 'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft', 'whiteSpace', 'overflowWrap', 'wordBreak'];
+
+/** Where offset `at` of a textarea's text sits: its line's top and height in the box's own
+ *  scrolling. Measured on an unseen copy of the box, so wrapped lines count. */
+function textPlace(ta, at) {
+  const look = getComputedStyle(ta);
+  const copy = document.createElement('div');
+  for (const p of TEXT_LOOK) copy.style[p] = look[p];
+  Object.assign(copy.style, { position: 'absolute', top: '0', left: '0', visibility: 'hidden', boxSizing: 'border-box', width: `${ta.clientWidth}px`, border: '0' });
+  copy.textContent = ta.value.slice(0, at);
+  const mark = document.createElement('span');
+  mark.textContent = '\u200b';
+  copy.append(mark);
+  document.body.append(copy);
+  const place = { top: mark.offsetTop, height: mark.offsetHeight };
+  copy.remove();
+  return place;
+}
+
+/** Select [start, end) in a textarea and bring it into view: focus scrolls the box back to the
+ *  old caret, and a selection set from script is never scrolled to. */
+function selectInView(ta, start, end = start) {
+  ta.focus();
+  ta.setSelectionRange(start, end);
+  const { top, height } = textPlace(ta, start);
+  if (top >= ta.scrollTop && top + height <= ta.scrollTop + ta.clientHeight) return;
+  ta.scrollTop = Math.max(0, top - (ta.clientHeight - height) / 2);
+}
+
+/** Offset `at` of `old` in `text`: the same place when everything before it is unchanged, or
+ *  everything after it; else as near as the new text's length allows. */
+function placeIn(old, text, at) {
+  if (text.startsWith(old.slice(0, at))) return at;
+  if (text.endsWith(old.slice(at))) return text.length - (old.length - at);
+  return Math.min(at, text.length);
+}
+
+/** Put `text` in a textarea in place of what it shows (a newer version of the file), keeping the
+ *  scroll, and the caret and selection on the same text where only lines above or below them
+ *  changed. */
+function replaceKeepingPlace(ta, text) {
+  const old = ta.value;
+  const { selectionStart, selectionEnd, scrollTop } = ta;
+  const focused = document.activeElement === ta;
+  ta.value = text;
+  if (focused) ta.setSelectionRange(placeIn(old, text, selectionStart), placeIn(old, text, selectionEnd));
+  ta.scrollTop = scrollTop;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Profile editor
 
-/** Profile text an editor was closed with before the server had it ({ doc, failed }: `failed`
- *  once its exit save has failed); the next editor offers it back unless the file has it by then. */
+/** Profile text an editor was closed with before the server had it ({ doc, base, failed }: `base`,
+ *  the file it was typed over; `failed` once its exit save has failed); the next editor offers it
+ *  back, on top of the file as it is by then, unless the file has it. */
 let profileDraft = null;
 /** The save a closing editor started (settles, never rejects): the next editor loads after it,
  *  so it neither reads the file from before that save nor offers back text that just landed. */
@@ -418,6 +470,11 @@ const STATUS_ICON = { saved: 'check', error: 'error', empty: 'warn', 'load-error
  * that stay until the next edit.
  * Closing or reloading the tab sends unsaved text with a keepalive request; when the text is too
  * big for one (over 60 KiB) or the last save failed, the browser asks before leaving instead.
+ *
+ * product.md is edited elsewhere too (another tab, the agent): showing the page again loads a
+ * newer version when nothing here is unsaved, and each save reads the file first. If it changed
+ * since it was read here, this editor's changes are saved on top of the new version (line by
+ * line) instead of over it, with a notice whose Discard puts that version back.
  *
  * A stale session (401): the load card and the save state give the short "Reopen coldtrail from
  * your terminal." (the shell's banner says the rest) and offer no Try again or Retry.
@@ -511,6 +568,14 @@ export function mountProfileEditor(root, { onChange, store = sharedStore, headin
   let refocus = false; // Try again had focus: hand it on to what the load shows
   const discardBtn = h('button', { type: 'button', class: 'cp-text-btn', onClick: () => discardRestored() }, 'Discard');
   const restored = h('p', { class: 'pe-restored' }, h('span', {}, 'Your unsaved changes from earlier are back.'), discardBtn);
+  // A save that found the file changed elsewhere since it was read here: it saved this editor's
+  // changes on top of that version instead. Discard puts that version back (restoredFrom).
+  const changed = h(
+    'p',
+    { class: 'pe-restored' },
+    h('span', {}, h('code', {}, 'product.md'), ' changed since you opened it, so your changes were added to its new version instead of replacing it.'),
+    h('button', { type: 'button', class: 'cp-text-btn', onClick: () => discardRestored() }, 'Discard your changes'),
+  );
   const restoredNotice = liveNotice('pe-restored');
   const skeleton = skeletonLines([38, 0, 22, 64, 0, 26, 71, 58, 0, 30, 49]);
   const loadError = h('div', { class: 'pe-load-error cp-load-error', role: 'alert' });
@@ -636,8 +701,8 @@ export function mountProfileEditor(root, { onChange, store = sharedStore, headin
       const start = lineStart(v, fix.line);
       const line = v.slice(start, lineEnd(v, fix.line));
       const at = line.lastIndexOf(fix.text);
-      ta.focus();
-      if (at >= 0) ta.setSelectionRange(start + at, start + at + fix.text.length);
+      if (at >= 0) selectInView(ta, start + at, start + at + fix.text.length);
+      else ta.focus();
     }
   }
 
@@ -719,8 +784,9 @@ export function mountProfileEditor(root, { onChange, store = sharedStore, headin
   // ---- saving ---------------------------------------------------------------------------
 
   /** Save until the server has what the editor shows (or a save fails). Never sends a blank,
-   *  unloaded or untouched-template profile. */
-  function saveNow() {
+   *  unloaded or untouched-template profile, and never writes over a change made to the file
+   *  elsewhere since it was read here; `check: false` (a closing tab's write) skips that read. */
+  function saveNow({ check = true } = {}) {
     if (inflight) {
       again = true;
       return inflight;
@@ -734,6 +800,19 @@ export function mountProfileEditor(root, { onChange, store = sharedStore, headin
         lastError = null;
         renderStatus();
         try {
+          // product.md is edited elsewhere too (another tab, the agent, a text editor): read it
+          // first. (No abort signal: a closing editor's last save runs on after dispose().) A
+          // blank file is no version to keep, and would send the workspace back to setup.
+          if (check) {
+            const res = await api.get('/api/company');
+            const disk = lf(res && res.doc);
+            if (disk.trim() && !same(disk, persisted)) {
+              changedElsewhere(disk);
+              again = true;
+              continue;
+            }
+          }
+          check = true; // `false` is for the write a closing tab starts (onBeforeUnload)
           await api.post('/api/company', { doc });
           const wasEmpty = persisted.trim() === '';
           persisted = doc.trimStart();
@@ -752,6 +831,26 @@ export function mountProfileEditor(root, { onChange, store = sharedStore, headin
     });
     renderStatus();
     return inflight;
+  }
+
+  /** The file changed elsewhere after it was read here: this editor's changes go on top of its new
+   *  version, line by line as on Already contacted (a line both changed comes out in both
+   *  versions), for the save to write. The notice offers that version back. */
+  function changedElsewhere(disk) {
+    const mine = ta.value;
+    const merged = mergeContacted(persisted, mine, disk);
+    persisted = disk;
+    if (merged !== mine) replaceKeepingPlace(ta, merged);
+    if (same(merged, disk)) {
+      forgetRestored(); // nothing of this editor's own is left to discard
+    } else {
+      restoredFrom = disk;
+      restoredNotice.show(changed);
+    }
+    if (disposed) return;
+    analyze();
+    renderStatus();
+    emit();
   }
 
   const queueSave = debounce(() => {
@@ -789,16 +888,18 @@ export function mountProfileEditor(root, { onChange, store = sharedStore, headin
     template = !doc.trim();
     ta.value = template ? PROFILE_TEMPLATE : doc;
     // Text an earlier editor couldn't save as it closed comes back (and saves), unless the file
-    // has it by now (load() waited for that editor's last save).
+    // has it by now (load() waited for that editor's last save). Changed elsewhere since that
+    // text was typed over it, the file keeps those changes: the text goes on top.
     const draft = profileDraft;
     profileDraft = null;
     guardLeftDrafts();
-    if (draft && !same(draft.doc, doc)) {
+    const text = draft && (!doc.trim() || same(draft.base, doc) ? draft.doc : mergeContacted(draft.base, draft.doc, doc));
+    if (draft && !same(text, doc)) {
       // A blank file can't be saved back, so there's nothing to discard to.
       restoredFrom = doc.trim() ? doc : null;
       discardBtn.hidden = restoredFrom === null;
       template = false;
-      ta.value = draft.doc;
+      ta.value = text;
       restoredNotice.show(restored);
       pending = true;
       queueSave();
@@ -871,10 +972,12 @@ export function mountProfileEditor(root, { onChange, store = sharedStore, headin
   }
 
   // Coming back to the tab: pick up edits made elsewhere (another tab, the agent) unless there
-  // is unsaved work here or the user is typing.
+  // is unsaved work here. The caret is usually still in the text (the browser puts focus back
+  // there), so it stays where it was; a key typed before the answer comes wins over it, and a
+  // save never writes over the file's newer version anyway (saveNow).
   function onVisibility() {
     if (document.hidden || disposed || !loaded) return;
-    if (pending || inflight || lastError || document.activeElement === ta) return;
+    if (pending || inflight || lastError) return;
     if (!template && !same(ta.value, persisted)) return;
     const shown = ta.value;
     const known = persisted;
@@ -882,12 +985,12 @@ export function mountProfileEditor(root, { onChange, store = sharedStore, headin
       (res) => {
         const doc = lf(res && res.doc);
         // Anything that happened here meanwhile (an edit, a save) wins over this older answer.
-        if (disposed || pending || inflight || document.activeElement === ta) return;
+        if (disposed || pending || inflight) return;
         if (ta.value !== shown || persisted !== known) return;
         if (!doc.trim() || same(doc, persisted)) return;
         persisted = doc;
         template = false;
-        ta.value = doc;
+        replaceKeepingPlace(ta, doc);
         forgetRestored(); // its Discard would put back a version older than this one
         analyze();
         renderStatus();
@@ -899,13 +1002,17 @@ export function mountProfileEditor(root, { onChange, store = sharedStore, headin
 
   // Closing or reloading the tab: a keepalive save on pagehide (below) carries the text past the
   // page, but only up to the browser's keepalive budget, and a save that just failed may fail
-  // again. In those cases start the save now and ask the user to stay while it runs.
+  // again. In those cases start the save now and ask the user to stay while it runs. It writes
+  // without reading the file first, as the keepalive save does: no answer is handled while the
+  // browser asks, so a read would hold the write back until the page is gone.
   function onBeforeUnload(e) {
     if (disposed || !loaded || template) return;
     const doc = ta.value;
     if (!doc.trim() || (same(doc, persisted) && !lastError)) return;
     if (!lastError && fitsKeepalive(doc)) return;
-    flush();
+    queueSave.cancel();
+    pending = false;
+    saveNow({ check: false });
     e.preventDefault();
     e.returnValue = '';
   }
@@ -947,7 +1054,7 @@ export function mountProfileEditor(root, { onChange, store = sharedStore, headin
     if (doc.trim() && (pending || inflight || lastError || !same(doc, persisted))) {
       queueSave.cancel();
       pending = false;
-      const draft = { doc, failed: false };
+      const draft = { doc, base: persisted, failed: false };
       profileDraft = draft;
       const saving = saveNow().then(() => {
         if (profileDraft === draft) {
@@ -1000,6 +1107,11 @@ const HEADER_LINE = /^\s*\[\[?[^\]\n]*\]\]?\s*(?:#.*)?$/;
  *  "mailto:jane@acme.com". Its domain is the company's. */
 const EMAIL_TOKEN = /^<?(?:mailto:)?[^\s@<>/]+@([^\s@<>/]+?)>?$/i;
 const isComment = (line) => line.trim().startsWith('#');
+/** A domain written as a bare key (`acme.com = { … }`) or table name (`[acme.com]`), which TOML
+ *  reads as nested keys ("acme" holding "com"): the domain, to be put in quotes. */
+const BARE_DOMAIN = '((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\\.)+[a-z]{2,63})';
+const BARE_KEY_LINE = new RegExp(`^(\\s*)${BARE_DOMAIN}(\\s*=)`, 'i');
+const BARE_TABLE_LINE = new RegExp(`^(\\s*)\\[\\s*${BARE_DOMAIN}\\s*\\](\\s*(?:#.*)?)$`, 'i');
 
 /** The domains on a line that holds only domains, links or email addresses, and the note after
  *  them in the file's own comment style ("acme.com  # old client"), else null. A link's "?query"
@@ -1027,7 +1139,9 @@ function lineDomains(line) {
  * Turn lines that are only domains, links or email addresses ("acme.com",
  * "https://www.acme.com/x?ref=1", "jane@acme.com", "a.com, b.io") into contacted.toml entries
  * with status "sent"; a note after them ("# old client") stays on the line's last entry. Every
- * other line is left for the server to judge. Domains already listed (or repeated) are dropped
+ * other line is left for the server to judge, except that a domain written as a bare top-level key
+ * or `[table]` name (`acme.com = { … }`) is put in quotes: TOML would read it as nested keys
+ * ("acme" holding "com") and refuse the entry. Domains already listed (or repeated) are dropped
  * and counted in `skipped`. Entries made from lines below a `[table]` header move up above it:
  * there they would be keys of that table, which the parser accepts and seeding then ignores.
  * @returns {{ text: string, added: number, skipped: number, from: number[] }} `from[k]`: the line
@@ -1053,7 +1167,9 @@ export function normalizeContacted(raw) {
     if (i === firstHeader) headerAt = out.length;
     const found = lineDomains(line);
     if (!found) {
-      out.push(line);
+      // A key below a header belongs to that table: only a top-level one names a domain.
+      const topLevel = firstHeader < 0 || i < firstHeader;
+      out.push(topLevel && BARE_KEY_LINE.test(line) ? line.replace(BARE_KEY_LINE, '$1"$2"$3') : line.replace(BARE_TABLE_LINE, '$1["$2"]$3'));
       from.push(i);
       return;
     }
@@ -1102,6 +1218,19 @@ function renumber(snippet, from, to) {
       return l.startsWith(gutter) ? ' '.repeat(to.length + 1) + l.slice(from.length + 1) : l;
     })
     .join('\n');
+}
+
+/** The reason a TOML parser's snippet ends with: its lines after the gutter ("  |", "4 | text",
+ *  "  |  ^"), on one line. A snippet without a gutter is all reason. */
+function snippetReason(snippet) {
+  const lines = String(snippet).split('\n');
+  let at = lines.length;
+  while (at > 0 && !/^\s*\d*\s\|/.test(lines[at - 1])) at--;
+  return lines
+    .slice(at)
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .join('; ');
 }
 
 /** The domains a contacted.toml lists, lowercased: its top-level `key = …` lines plus its
@@ -1404,7 +1533,12 @@ function mountContacted(root, { onState } = {}) {
     gotoBtn.textContent = errorAt ? `Go to line ${errorAt.line + 1}` : '';
     gotoBtn.hidden = !errorAt;
     errorMore.hidden = !snippet && !errorAt;
-    errorEl.textContent = `Not saved: ${first}`;
+    // The parser's reason ("duplicate key `acme.com`") ends the snippet, which is seen but not
+    // announced: screen readers get it with the message (and the box's description), so they
+    // hear why as well as where. (Unseen text is read as a separate piece: a dash joins it.)
+    const why = snippetReason(snippet);
+    const unseen = why ? h('span', { class: 'sr-only' }, ` — ${why}${/[.!?]$/.test(why) ? '' : '.'}`) : '';
+    errorEl.replaceChildren(`Not saved: ${first}`, unseen);
     errorEl.hidden = false;
     errorBox.hidden = false;
     ta.setAttribute('aria-invalid', 'true');
@@ -1431,9 +1565,7 @@ function mountContacted(root, { onState } = {}) {
   function gotoError() {
     if (!errorAt) return;
     const v = ta.value;
-    const at = Math.min(lineStart(v, errorAt.line) + errorAt.col, lineEnd(v, errorAt.line));
-    ta.focus();
-    ta.setSelectionRange(at, at);
+    selectInView(ta, Math.min(lineStart(v, errorAt.line) + errorAt.col, lineEnd(v, errorAt.line)));
   }
 
   const isDirty = () => saved !== null && ta.value !== saved;

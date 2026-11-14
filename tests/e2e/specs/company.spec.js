@@ -71,6 +71,25 @@ async function typeAfter(page, anchor, text) {
 /** The text selected in the profile editor. */
 const selectedText = (page) => editor(page).evaluate((el) => el.value.slice(el.selectionStart, el.selectionEnd));
 
+/** Whether the line the selection starts on is inside the text box's visible area. For text whose
+ *  lines up to there don't wrap: line n sits n line heights below the top padding. */
+const selectionInView = (box) =>
+  box.evaluate((el) => {
+    const look = getComputedStyle(el);
+    const lineHeight = parseFloat(look.lineHeight);
+    const line = el.value.slice(0, el.selectionStart).split('\n').length - 1;
+    const top = parseFloat(look.paddingTop) + line * lineHeight;
+    return top >= el.scrollTop && top + lineHeight <= el.scrollTop + el.clientHeight;
+  });
+
+/** Put the caret, and the text box's scroll, back at the top. */
+const caretToTop = (box) =>
+  box.evaluate((el) => {
+    el.focus();
+    el.setSelectionRange(0, 0);
+    el.scrollTop = 0;
+  });
+
 /** How the profile's file bar is laid out: the file name clear of the save state, whose text
  *  isn't cut off, and no sideways page scroll. */
 function fileBarLayout(page) {
@@ -462,6 +481,45 @@ test('checklist fixes apply to the text as it is now, after lines are added abov
   expect(await selectedText(page)).toBe(EXAMPLE_LINK);
 });
 
+test('“Replace link” and “Go to line” bring what they select into view in a long text', async ({ app, page }) => {
+  app.allowConsole(/status of 500/);
+  await openProfile(app, page);
+  const ed = editor(page);
+  // The example link far below the top of a long profile, the caret and the box at the top.
+  const notes = Array.from({ length: 45 }, (_, i) => `Note ${i + 1}.`).join('\n');
+  await ed.fill(`# Acme\n\n## What we do\n${notes}\n\n## Call to Action\n- Link: ${EXAMPLE_LINK}\n`);
+  const flag = page.getByRole('button', { name: /^Replace example link/ });
+  const replace = item(page, 'cta').getByRole('button', { name: 'Replace link' });
+  for (const [width, height] of [[1440, 900], [1024, 768], [390, 844]]) {
+    await page.setViewportSize({ width, height });
+    for (const [name, button] of [['file bar', flag], ['checklist', replace]]) {
+      await caretToTop(ed);
+      await button.click();
+      await expect(ed).toBeFocused();
+      expect(await selectedText(page)).toBe(EXAMPLE_LINK);
+      expect(await selectionInView(ed), `${name} at ${width}px`).toBe(true);
+    }
+  }
+
+  // A long Already contacted list with a bad line far down.
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.getByRole('tab', { name: 'Already contacted' }).click();
+  const box = contactedBox(page);
+  await expect(box).toHaveValue(CONTACTED_TEMPLATE);
+  const lines = Array.from({ length: 200 }, (_, i) => `co-${i}.example`);
+  lines[150] = '"broken-150.example" = { status = sent }';
+  for (const [width, height] of [[1440, 900], [390, 844]]) {
+    await page.setViewportSize({ width, height });
+    await box.fill(`${lines.join('\n')}\n`);
+    await caretToTop(box);
+    await page.getByRole('button', { name: 'Save', exact: true }).click();
+    await page.getByRole('button', { name: 'Go to line 151' }).click();
+    await expect(box).toBeFocused();
+    expect(await box.evaluate((el) => el.value.slice(0, el.selectionStart).split('\n').length)).toBe(151);
+    expect(await selectionInView(box), `line 151 at ${width}px`).toBe(true);
+  }
+});
+
 test('an edit whose save failed is saved on leaving, or kept for the next visit', async ({ app, page, server }) => {
   app.allowConsole(/status of 500/);
   await stubView(page, 'home', 'Home');
@@ -543,6 +601,40 @@ test('an edit whose save failed is saved on leaving, or kept for the next visit'
   await expect.poll(() => productOnDisk(server)).toBe(third + more);
   await expect(saveStatus(page)).toHaveText('Saved');
   await expect(editor(page)).toHaveValue(third + more);
+});
+
+test('a profile edit kept from a screen you left comes back on top of changes made elsewhere meanwhile', async ({ app, page, server }) => {
+  app.allowConsole(/status of 500/);
+  await stubView(page, 'home', 'Home');
+  let failures = 0;
+  await page.route('**/api/company', (route) => {
+    if (route.request().method() !== 'POST' || failures === 0) return route.fallback();
+    failures--;
+    return route.fulfill({ status: 500, contentType: 'text/plain', body: 'disk full' });
+  });
+  const restored = page.locator('.pe-restored');
+  await openProfile(app, page);
+  // Every save on the way out fails (the autosave, the router's beforeLeave flush and the
+  // unmount's own try): the text waits in memory.
+  failures = 3;
+  const offer = (doc) => doc.replace('## Offer\n', '## Offer\nPilots start Monday. ');
+  await editor(page).fill(offer(PRODUCT_MD));
+  await expect(saveStatus(page)).toContainText('Couldn’t save: disk full');
+  await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: /^Home\b/ }).click();
+  await expect(page.locator('#view h1')).toHaveText('Home');
+  await expect.poll(() => failures).toBe(0);
+  // Meanwhile the profile is changed elsewhere (the agent adds a section).
+  const elsewhere = PRODUCT_MD.replace('## Voice\n', '## Team\nTwo founders.\n\n## Voice\n');
+  writeFileSync(join(server.home, 'product.md'), elsewhere);
+  await page.goBack();
+  await expect(editor(page)).toHaveValue(offer(elsewhere));
+  await expect(restored).toHaveText(/^Your unsaved changes from earlier are back\./);
+  await expect.poll(() => productOnDisk(server)).toBe(offer(elsewhere));
+  // Discard goes back to the file as it was found.
+  await restored.getByRole('button', { name: 'Discard' }).click();
+  await expect(editor(page)).toHaveValue(elsewhere);
+  await expect.poll(() => productOnDisk(server)).toBe(elsewhere);
+  await expect(saveStatus(page)).toHaveText('Saved');
 });
 
 test('a profile edit kept from a screen you left still asks before a close, from any screen, while its save fails', async ({ app, page, server }) => {
@@ -802,14 +894,74 @@ test('picks up edits made elsewhere when the tab is shown again, never over unsa
   await expect(editor(page)).toHaveValue(elsewhere);
   await expect(saveStatus(page)).toHaveText('Saved');
 
-  // An edit still waiting to be saved here is kept, and then saved over the other version.
-  await post(request, server, '/api/company', { doc: `${PRODUCT_MD}\nThird version.` });
+  // An edit still waiting to be saved here is kept, and saved on top of the other version rather
+  // than over it.
+  const third = elsewhere.replace('## Voice\n', '## Voice & sign-off\n');
+  await post(request, server, '/api/company', { doc: third });
   const local = `${elsewhere}Local edit.`;
   await editor(page).fill(local);
   await page.locator('#view h1').focus();
   await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
-  await expect.poll(() => productOnDisk(server)).toBe(local);
-  await expect(editor(page)).toHaveValue(local);
+  await expect.poll(() => productOnDisk(server)).toBe(`${third}Local edit.`);
+  await expect(editor(page)).toHaveValue(`${third}Local edit.`);
+  await expect(saveStatus(page)).toHaveText('Saved');
+});
+
+test('the caret left in the editor doesn’t stop it picking up edits made elsewhere', async ({ app, page, server }) => {
+  await openProfile(app, page);
+  const ed = editor(page);
+  // Typing in the editor, then off to another tab or app: the caret stays in the text, and the
+  // browser puts focus back there on the way back.
+  const anchor = '## Who we help\n';
+  await typeAfter(page, anchor, '');
+  const caret = PRODUCT_MD.indexOf(anchor) + anchor.length;
+  const elsewhere = `${PRODUCT_MD}\n## Team\nWritten while this tab was in the background.\n`;
+  writeFileSync(join(server.home, 'product.md'), elsewhere);
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await expect(ed).toHaveValue(elsewhere);
+  await expect(ed).toBeFocused();
+  await expect(saveStatus(page)).toHaveText('Saved');
+  // The caret stays where it was in the text.
+  expect(await ed.evaluate((el) => [el.selectionStart, el.selectionEnd])).toEqual([caret, caret]);
+  // The next key lands in the new version.
+  await page.keyboard.type('Indie founders too. ');
+  const typed = elsewhere.replace(anchor, `${anchor}Indie founders too. `);
+  await expect.poll(() => productOnDisk(server)).toBe(typed);
+  await expect(saveStatus(page)).toHaveText('Saved');
+});
+
+test('a save never writes over a change made elsewhere since the profile was read', async ({ app, page, server }) => {
+  await openProfile(app, page);
+  const ed = editor(page);
+  const notice = page.locator('.pe-restored');
+  // Another window side by side (no tab switch to notice it by), or an edit that lands while this
+  // one is typed: the save puts this edit on top of the file's new version.
+  const elsewhere = PRODUCT_MD.replace('## Voice\n', '## Team\nTwo founders.\n\n## Voice\n');
+  writeFileSync(join(server.home, 'product.md'), elsewhere);
+  await typeAfter(page, '## Offer\n', 'Pilots start Monday. ');
+  const both = elsewhere.replace('## Offer\n', '## Offer\nPilots start Monday. ');
+  await expect.poll(() => productOnDisk(server)).toBe(both);
+  await expect(ed).toHaveValue(both);
+  await expect(saveStatus(page)).toHaveText('Saved');
+  await expect(notice).toHaveText(/^product\.md changed since you opened it, so your changes were added to its new version instead of replacing it\./);
+  await expect(page.getByRole('status').filter({ has: notice })).toBeVisible();
+  // Typing went on in the same place.
+  await page.keyboard.type('Or Friday. ');
+  const more = both.replace('Pilots start Monday. ', 'Pilots start Monday. Or Friday. ');
+  await expect(ed).toHaveValue(more);
+  await expect(notice).toBeHidden(); // the edit made the text the user's own
+  await expect.poll(() => productOnDisk(server)).toBe(more);
+
+  // "Discard your changes" goes back to the other version, and saves that.
+  writeFileSync(join(server.home, 'product.md'), elsewhere);
+  await typeAfter(page, '## Offer\n', 'X');
+  await expect(notice).toBeVisible();
+  await expectAccessible(page);
+  await notice.getByRole('button', { name: 'Discard your changes' }).click();
+  await expect(ed).toHaveValue(elsewhere);
+  await expect(ed).toBeFocused();
+  await expect(notice).toBeHidden();
+  await expect.poll(() => productOnDisk(server)).toBe(elsewhere);
   await expect(saveStatus(page)).toHaveText('Saved');
 });
 
@@ -907,8 +1059,10 @@ test('already contacted saves and rejects invalid input', async ({ app, page, se
   await box.fill('"broken = {\nnot a domain\n');
   await save.click();
   const error = page.locator('.ac-error');
-  await expect(error).toHaveText('Not saved: invalid contacted.toml: TOML parse error at line 1, column 12');
-  await expect(page.locator('.ac-main').getByRole('alert')).toHaveText('Not saved: invalid contacted.toml: TOML parse error at line 1, column 12');
+  await expect(error).toHaveText('Not saved: invalid contacted.toml: TOML parse error at line 1, column 12 — invalid basic string.');
+  await expect(page.locator('.ac-main').getByRole('alert')).toHaveText('Not saved: invalid contacted.toml: TOML parse error at line 1, column 12 — invalid basic string.');
+  // The reason is seen once, at the end of the snippet below; the message carries it unseen.
+  await expect(error.locator('.sr-only')).toHaveText('— invalid basic string.');
   const snippet = page.locator('.ac-error-snippet');
   await expect(snippet).toBeVisible();
   expect(await snippet.textContent()).toBe('  |\n1 | "broken = {\n  |            ^\ninvalid basic string');
@@ -929,7 +1083,7 @@ test('already contacted saves and rejects invalid input', async ({ app, page, se
   const typed = 'acme.example\nbeta.example, gamma.example\n"broken = {\n';
   await box.fill(typed);
   await save.click();
-  await expect(error).toHaveText('Not saved: invalid contacted.toml: TOML parse error at line 3, column 12');
+  await expect(error).toHaveText('Not saved: invalid contacted.toml: TOML parse error at line 3, column 12 — invalid basic string.');
   expect(await snippet.textContent()).toBe('  |\n3 | "broken = {\n  |            ^\ninvalid basic string');
   await page.getByRole('button', { name: 'Go to line 3' }).click();
   const at = typed.indexOf('"broken = {') + '"broken = {'.length;
@@ -939,9 +1093,17 @@ test('already contacted saves and rejects invalid input', async ({ app, page, se
   const nine = `a.example, b.example\n${'# note\n'.repeat(7)}"broken = {\n`;
   await box.fill(nine);
   await save.click();
-  await expect(error).toHaveText('Not saved: invalid contacted.toml: TOML parse error at line 9, column 12');
+  await expect(error).toHaveText('Not saved: invalid contacted.toml: TOML parse error at line 9, column 12 — invalid basic string.');
   expect(await snippet.textContent()).toBe('  |\n9 | "broken = {\n  |            ^\ninvalid basic string');
   await expect(page.getByRole('button', { name: 'Go to line 9' })).toBeVisible();
+  // The parser's reason is in the announced message and the box's description too, not only in
+  // the snippet: a screen reader hears why, not just where.
+  await box.fill(`${CONTACTED_TEMPLATE}"example-agency.com" = { status = "skip" }\n`);
+  await save.click();
+  const duplicate = 'Not saved: invalid contacted.toml: TOML parse error at line 10, column 1 — duplicate key `example-agency.com` in document root.';
+  await expect(page.locator('.ac-main').getByRole('alert')).toHaveText(duplicate);
+  await expect(box).toHaveAccessibleDescription(`${duplicate} One domain per line, or contacted.toml entries.`);
+  expect(await snippet.textContent()).toMatch(/\nduplicate key `example-agency\.com` in document root$/);
   await box.fill(typed);
   await save.click();
   await expect(error).toContainText('line 3, column 12');
@@ -1279,6 +1441,17 @@ test('pasted email addresses and notes become entries; other words get a plain r
   expect(contactedOnDisk(server)).toBe(saved);
   await expect(box).toHaveValue(saved);
 
+  // An entry or [table] written without the quotes the example has: TOML would read
+  // "gamma.example" as a table "gamma" holding "example" (and refuse it for its missing status),
+  // so the domain is quoted before saving. A plain line for the same domain is already listed.
+  await box.fill(`${saved}gamma-bare.example = { status = "skip" }\nGamma-Bare.example\n[ delta-bare.example ]  # by hand\nstatus = "sent"\n`);
+  await save.click();
+  await expect(msg).toHaveText(`Saved: 2 domains added, 1 already listed. The list has 8 domains.${SEED_HINT}`);
+  const quoted = `${saved}"gamma-bare.example" = { status = "skip" }\n["delta-bare.example"]  # by hand\nstatus = "sent"\n`;
+  expect(contactedOnDisk(server)).toBe(quoted);
+  await expect(box).toHaveValue(quoted);
+  await expect(page.locator('.ac-error')).toBeHidden();
+
   // A line that's neither: said in words, not as the parser's TOML expectations.
   await box.fill('acme.example\nJane Doe <jane@delta.example>\n');
   await save.click();
@@ -1286,7 +1459,7 @@ test('pasted email addresses and notes become entries; other words get a plain r
   await expect(page.locator('.ac-error-snippet')).toBeHidden();
   await page.getByRole('button', { name: 'Go to line 2' }).click();
   await expect(box).toBeFocused();
-  expect(contactedOnDisk(server)).toBe(saved);
+  expect(contactedOnDisk(server)).toBe(quoted);
 
   // Big pastes: every count with thousands separators.
   const fresh = Array.from({ length: 1500 }, (_, i) => `co-${i}.example`);
