@@ -4,9 +4,10 @@
 // the stream, which makes the server cancel the turn at its next event).
 //
 // Routes: #/agent is a new conversation, #/agent/<chat_id> an existing one, and
-// #/agent?prompt=<text> fills the composer without sending (the Pipeline and Home hand-offs),
-// only when the app was already running: one in the address the page loads with (a hand-off
-// opened in a new tab, a link from elsewhere) waits in a notice above the composer for a click.
+// #/agent?prompt=<text> fills the composer without sending (the Pipeline, Home and Setup
+// hand-offs), only when the page's own links or script set it: any other (the address the page
+// loads with, a hand-off opened in a new tab, another window) waits in a notice above the
+// composer for a click.
 // Scheduled-run conversations are a read-only log, polled every 2s while the run is writing to
 // them (a failed poll is tried again, less often, and the header says updates aren't arriving).
 // Leaving the screen closes the stream, stops the poll and aborts every pending request;
@@ -22,7 +23,7 @@
 // (holding the server's one-turn lock) until a 45s reaper, so a turn this view gives up on is
 // still claimed once and closed as soon as it connects, which cancels it.
 
-import { api, errorText, isStaleSession, openStream } from '../core/api.js';
+import { api, errorText, isOffline, isStaleSession, openStream } from '../core/api.js';
 import { fmtNum, fmtRelative, h, runStatus } from '../core/dom.js';
 import { renderMarkdown } from '../core/markdown.js';
 import { href } from '../core/router.js';
@@ -54,6 +55,13 @@ const STOPPED_DETACHED =
   "Stopped. The agent is still busy with another turn, so your message is saved as a conversation of its own once it's free.";
 // A failed first turn: the server keeps nothing of it (keepFailed()).
 const FAILED_BACK = "This conversation wasn't saved. Your message is back in the composer.";
+// A turn whose stream went away before it finished (onStreamEnd()). If coldtrail still answers,
+// only the connection dropped, and it saves what the agent wrote so far; if it doesn't, it
+// stopped, and as it saves the reply only once the turn ends, nothing of it is kept. CHECK_MS:
+// how long to wait for that answer (none by then counts as the connection only).
+const LOST_SAVED = 'Lost the connection to the agent before it finished. What it wrote so far is saved.';
+const LOST_STOPPED = "coldtrail stopped before the agent finished. What it wrote so far isn't saved.";
+const CHECK_MS = 2000;
 // A scheduled run whose log is empty.
 const EMPTY_RUN = 'It ended before the agent started.';
 const LIST_PAGE = 50;
@@ -159,16 +167,20 @@ function promptOf(query) {
   return p.trim() ? p : '';
 }
 
-// A ?prompt= is only taken from inside the running app. One Enter would send text the user may
-// not have read (and may not see: it can sit below the composer's fold), so two others are
-// dropped. One in the address the page loaded with came from a link on another site or a
-// bookmark: the navigation entry keeps that hash (changing only the hash later doesn't). One set
-// by another window holding this one (a site that opened coldtrail can later change just the
-// hash, which loads nothing) comes with no click or key press here. The in-app hand-offs
-// (Pipeline, Home, Setup) follow one in this window, as every link or button does. A dropped one
-// isn't lost without a word, though: those hand-offs are links, and one opened in a new tab
-// arrives in the address it loads with. A notice above the composer shows it, and its button is
-// the click that puts it there (offer()).
+// A ?prompt= is only taken from this page's own hand-offs (Pipeline, Home, Setup). One Enter
+// would send text the user may not have read (and may not see: it can sit below the composer's
+// fold), and a site that opened coldtrail can set that window's address whenever it likes: only
+// the hash, which loads nothing, and maybe a moment after a click here, so neither of those tells
+// a hand-off apart. What does: the last click was on a link here to exactly that address, or this
+// page's own script pushed it (the router's navigate(), as Pipeline's drawer does). This module
+// watches for both from when it loads, which is during the navigation that first opens Agent,
+// after that click or push but while the screen being left is still in the page. So for that
+// one, a link there to exactly that address counts, and so does a click or key press just now
+// when no other page holds this window (none opened it or frames it: nothing else can set its
+// address). Anything else, the address the page loaded with included (the navigation entry
+// keeps that hash; changing only the hash later doesn't), isn't lost without a word: a notice
+// above the composer quotes it, and its button is the click that puts it there (offer()). A
+// hand-off opened in a new tab arrives that way.
 const loadHash = (() => {
   try {
     const entry = performance.getEntriesByType('navigation')[0];
@@ -178,17 +190,48 @@ const loadHash = (() => {
   }
 })();
 let firstRoute = true;
+let clickedHash = null; // the in-page link the last plain click was on, if it was on one
+let pushedHash = null; // the address this page's script last pushed
+document.addEventListener(
+  'click',
+  (e) => {
+    const a = e.target instanceof Element ? e.target.closest('a[href^="#"]') : null;
+    const plain = e.button === 0 && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey;
+    clickedHash = a && plain ? a.hash : null;
+  },
+  true,
+);
+// Another window can navigate this one, but never push to its history: a push is this page's own.
+const pushState = history.pushState;
+history.pushState = function pushStateSeen(...args) {
+  pushState.apply(this, args);
+  pushedHash = location.hash;
+};
+// The address this module loaded at, and whether the page then linked to exactly it.
+const evalHash = location.hash;
+const evalLinked = [...document.querySelectorAll('a[href^="#"]')].some((a) => a.hash === evalHash);
+
+/** No other page holds this window, so none can set its address: none opened it, none frames it. */
+const alone = () => !window.opener && window.top === window;
 
 /**
  * The ?prompt= hand-off: { prompt } to put in the composer, or { dropped } when it came from
  * outside the app (each '' when there is none).
  */
 function handOff(query) {
-  const fromLoad = firstRoute && location.hash === loadHash;
+  const here = location.hash;
+  const first = firstRoute;
   firstRoute = false;
-  const ua = navigator.userActivation; // where a browser lacks it, the load check stands alone
+  const ua = navigator.userActivation; // where a browser lacks it, being alone stands for it
+  const own =
+    !(first && here === loadHash) &&
+    (here === clickedHash ||
+      here === pushedHash ||
+      (first && here === evalHash && (evalLinked || (alone() && (!ua || ua.isActive)))));
+  clickedHash = null;
+  pushedHash = null;
   const p = promptOf(query);
-  return fromLoad || (ua && !ua.isActive) ? { prompt: '', dropped: p } : { prompt: p, dropped: '' };
+  return own ? { prompt: p, dropped: '' } : { prompt: '', dropped: p };
 }
 
 /** What a dropped hand-off's notice quotes: its first line with text, cut short, and "…" when
@@ -225,7 +268,7 @@ function agentProblem(status) {
 // The mounted screen's route handler, so update() can keep the DOM when only the chat changes.
 let instance = null;
 // Text typed but not sent when the screen went away: the composer gets it back next time (the
-// old UI kept its composer across views). A ?prompt= hand-off replaces it.
+// old UI kept its composer across views). A ?prompt= hand-off replaces it, undoably.
 let unsent = '';
 
 export default {
@@ -943,7 +986,12 @@ export default {
               'aria-current': c.id === currentId ? 'page' : null,
               title: c.title || null,
               onClick: () => {
-                if (c.id === currentId) setListOpen(false);
+                if (c.id !== currentId) return;
+                // Already on screen: the list only closes. On a phone that hides the link with
+                // focus, so focus goes to the conversation, as for any pick from it (openChat()).
+                const picked = wrap.classList.contains('is-list-open');
+                setListOpen(false);
+                if (picked) log.focus({ preventScroll: true });
               },
             },
             h('span', { class: 'agent-item-title' }, listTitle(c.title)),
@@ -999,10 +1047,14 @@ export default {
     /** The loaded list, or why there is none; `focused`: the data-id of the item that had focus. */
     function drawList(focused) {
       if (listState === 'error') {
+        // An alert, as on the other screens. Drawn again only when it says something new: the
+        // search redraws the list as it is typed in.
+        const shown = navEl.querySelector('.agent-list-msg[role="alert"]');
+        if (shown && shown.dataset.error === listError) return;
         navEl.replaceChildren(
           h(
             'div',
-            { class: 'agent-list-msg' },
+            { class: 'agent-list-msg', role: 'alert', 'data-error': listError },
             h('p', { class: 'agent-list-msg-title' }, "Couldn't load conversations"),
             h('p', { class: 'agent-list-msg-body' }, listError),
             h(
@@ -1230,7 +1282,8 @@ export default {
         logState(
           emptyState({
             title: run ? 'This run recorded nothing' : 'No messages yet',
-            // showRunNote() drops the second sentence once it has the run's own reason.
+            // showRunNote() drops the second sentence once it has the run's own reason, or
+            // finds the run history doesn't list the run.
             body: run
               ? `${EMPTY_RUN} The run history in Schedules shows how it finished.`
               : 'Send a message to start this conversation.',
@@ -1455,18 +1508,23 @@ export default {
     /**
      * Why a finished run didn't succeed (the run history's note), at the end of its log. In a
      * run that recorded nothing it goes under the explanation, in place of the pointer to the
-     * run history, which would only say the same thing.
+     * run history, which would only say the same thing. A run the history doesn't list (it
+     * shows /api/runs: the newest 50) loses that pointer too.
      */
     function showRunNote() {
       for (const old of logInner.querySelectorAll('.agent-run-note')) old.remove();
-      if (!current || !current.run || current.running || !runInfo || !runInfo.note) return;
-      if (runInfo.status === 'ok') return;
+      if (!current || !current.run || current.running) return;
+      const empty = logInner.querySelector('.empty-state');
+      const body = empty && empty.querySelector('.empty-body');
+      if (!runInfo) {
+        if (body) body.textContent = EMPTY_RUN;
+        return;
+      }
+      if (!runInfo.note || runInfo.status === 'ok') return;
       const [label, tone] = runStatus(runInfo.status);
       const cls = ['agent-run-note', tone === 'warn' && 'is-warn'];
       const row = errorRow(`${label}: ${runInfo.note}`, { live: false, cls });
-      const empty = logInner.querySelector('.empty-state');
       if (empty) {
-        const body = empty.querySelector('.empty-body');
         if (body) body.textContent = EMPTY_RUN;
         empty.insertBefore(row, empty.querySelector('.empty-action'));
         return;
@@ -1800,19 +1858,39 @@ export default {
       });
     }
 
-    function onStreamEnd(t) {
+    async function onStreamEnd(t) {
       if (gone) return;
       if (t.done || t.stopped) {
         settle(t);
         return;
       }
       if (t !== turn) return;
-      // The stream went away before the turn finished.
+      // The stream went away before the turn finished: whether coldtrail stopped decides what
+      // was saved (LOST_SAVED). The turn shows as working until that's known.
       t.dropped = true;
-      follow(() => logInner.append(errorRow('Lost the connection to the agent before it finished. What it wrote so far is saved.')));
+      const up = await answers();
+      if (gone || t !== turn) return; // stopped, or left, meanwhile
+      follow(() => logInner.append(errorRow(up ? LOST_SAVED : LOST_STOPPED)));
       endTurn(t);
-      announce('The connection to the agent was lost.');
+      announce(up ? 'The connection to the agent was lost.' : 'coldtrail stopped before the agent finished.');
       settle(t);
+    }
+
+    /** Whether coldtrail answers now: false only when a request gets no answer (it stopped). */
+    async function answers() {
+      const check = new AbortController();
+      const quit = () => check.abort();
+      signal.addEventListener('abort', quit);
+      const timer = later(quit, CHECK_MS);
+      try {
+        await api.get('/api/summary', { signal: check.signal });
+        return true;
+      } catch (err) {
+        return !isOffline(err);
+      } finally {
+        cancel(timer);
+        signal.removeEventListener('abort', quit);
+      }
     }
 
     function endTurn(t) {
@@ -1936,8 +2014,8 @@ export default {
 
     /**
      * The conversation a route shows: a ?prompt= hand-off always gets a new one (it fills the
-     * composer and never sends). One that came with the page load is dropped (handOff()): the
-     * route shows what it would without it, and `dropped` is offered above the composer. Either
+     * composer and never sends). One from outside the app is dropped (handOff()): the route
+     * shows what it would without it, and `dropped` is offered above the composer. Either
      * way the prompt leaves the address bar, so a refresh won't refill it, and the address without
      * it takes the place of the one it came on, so Back skips that.
      */
@@ -1992,16 +2070,15 @@ export default {
       loadList();
     }
     if (start.dropped) offer(start.dropped);
-    if (start.prompt) {
-      fill(start.prompt, { atStart: true }); // the hand-off: focus goes to the composer
-    } else {
-      if (unsent) {
-        input.value = unsent;
-        grow();
-      }
-      focusHeading();
+    // Text typed but not sent last time comes back. A hand-off goes in its place as an edit
+    // (fill()), so Cmd/Ctrl+Z brings it back, as under a starter.
+    if (unsent) {
+      input.value = unsent;
+      grow();
     }
     unsent = '';
+    if (start.prompt) fill(start.prompt, { atStart: true }); // the hand-off: focus goes to the composer
+    else focusHeading();
 
     const self = {
       update(c) {
