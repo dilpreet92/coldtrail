@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# Scripted `opencode` for the README demo (tests/e2e/demo/record.mjs puts this directory first on
+# the server's PATH). It never touches the network or a model: it prints the same
+# `opencode run --format json` JSONL that src/provider/cli.rs parses (step_start, text, tool_use,
+# step_finish), with short pauses so the run streams at a watchable pace.
+#
+#   opencode models                 the demo model ids, one per line
+#   opencode run ... -- <message>
+#     "Reply with exactly: ok"      the provider probe: text "ok"
+#     anything else                 one scripted sourcing run (~8s): source three angles, enrich,
+#                                   draft, then a short summary. Between steps it applies the
+#                                   batches seed.mjs left in $COLDTRAIL_HOME/.demo-run (new
+#                                   companies, founders, drafts), so the app really changes.
+#
+# DEMO_OPENCODE_PACE scales every pause (1 = recording speed, 0 = instant).
+set -u
+
+case "$(uname)" in
+  Darwin) export LC_ALL=en_US.UTF-8 ;;
+  *) export LC_ALL=C.UTF-8 ;;
+esac
+
+if [ "${1:-}" = "models" ]; then
+  printf '%s\n' anthropic/claude-sonnet-5-5 openai/gpt-5.1 opencode/deepseek-v4.1-flash-free
+  exit 0
+fi
+
+if [ "${1:-}" != "run" ]; then
+  echo "opencode (demo): unsupported command: $*" >&2
+  exit 2
+fi
+shift
+
+# argv from opencode_args(): run --format json --auto [-m <model>] [-s <session>] -- <message>
+session="ses_demo_$$"
+message=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --)
+      shift
+      message="${1:-}"
+      break
+      ;;
+    -s)
+      shift
+      session="${1:-$session}"
+      ;;
+    -m | --format)
+      shift
+      ;;
+  esac
+  shift
+done
+
+json_escape() {
+  local s
+  s=$(printf '%s' "$1" | LC_ALL=C tr -d '\000-\010\013\014\016-\037')
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}
+  printf '%s' "$s"
+}
+
+pause() {
+  sleep "$(awk -v s="$1" -v k="${DEMO_OPENCODE_PACE:-1}" 'BEGIN { printf "%.3f", s * k }')"
+}
+
+step_start() {
+  printf '{"type":"step_start","sessionID":"%s","part":{"type":"step-start"}}\n' "$session"
+}
+
+step_finish() {
+  printf '{"type":"step_finish","sessionID":"%s","part":{"type":"step-finish","reason":"%s"}}\n' "$session" "$1"
+}
+
+text() {
+  printf '{"type":"text","sessionID":"%s","part":{"type":"text","text":"%s"}}\n' "$session" "$(json_escape "$1")"
+}
+
+bash_tool() {
+  printf '{"type":"tool_use","sessionID":"%s","part":{"type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"%s"},"metadata":{"exit":0}}}}\n' \
+    "$session" "$(json_escape "$1")"
+}
+
+# A non-bash tool (opencode's read / websearch): the app labels it by its name.
+other_tool() {
+  printf '{"type":"tool_use","sessionID":"%s","part":{"type":"tool","tool":"%s","state":{"status":"completed","input":{"%s":"%s"}}}}\n' \
+    "$session" "$1" "$2" "$(json_escape "$3")"
+}
+
+home="${COLDTRAIL_HOME:-$PWD}"
+batches="$home/.demo-run"
+
+# Apply one of seed.mjs's batches to the workspace DB, once.
+apply() {
+  local sql="$batches/$1"
+  [ -f "$sql" ] && [ ! -f "$sql.done" ] || return 0
+  if command -v sqlite3 >/dev/null 2>&1; then
+    sqlite3 -cmd '.timeout 5000' "$home/outreach.db" <"$sql" >/dev/null 2>&1 || return 0
+  elif command -v node >/dev/null 2>&1; then
+    node --no-warnings -e '
+      const { DatabaseSync } = require("node:sqlite");
+      const db = new DatabaseSync(process.argv[1]);
+      db.exec("PRAGMA busy_timeout = 5000");
+      db.exec(require("node:fs").readFileSync(process.argv[2], "utf8"));
+      db.close();' "$home/outreach.db" "$sql" >/dev/null 2>&1 || return 0
+  else
+    return 0
+  fi
+  : >"$sql.done"
+}
+
+if [ "$message" = "Reply with exactly: ok" ]; then
+  step_start
+  text "ok"
+  step_finish stop
+  exit 0
+fi
+
+# Numbers for the summary (written by seed.mjs; defaults match its RUN).
+RUN_SOURCED=24 RUN_FOUNDERS=15 RUN_DRAFTS=15 RUN_EMAILS=11 RUN_NOTES=4
+# shellcheck disable=SC1091
+[ -f "$batches/stats.env" ] && . "$batches/stats.env"
+
+step_start
+text "On it. I'll search three angles from your company profile, "
+pause 0.2
+text "find the founders, then write each intro in your voice."
+step_finish tool-calls
+pause 0.3
+
+step_start
+bash_tool 'coldtrail source "seed-stage fintech, Europe" "embedded finance APIs, EU" "B2B payments, DACH + Nordics"'
+pause 1.1
+apply 1-source.sql
+other_tool read filePath "$home/enrichment.md"
+pause 0.25
+for who in 'Railyard Finance founder' 'Kontora Munich co-founder' 'Alpwise Zurich founder email'; do
+  other_tool websearch query "$who"
+  pause 0.22
+done
+bash_tool "coldtrail find-emails $RUN_SOURCED"
+pause 0.8
+
+# LinkedIn-only founders are stored with add-contact; then one draft or note per founder.
+if [ -f "$batches/drafts.tsv" ]; then
+  while IFS=$'\t' read -r channel domain _subject name; do
+    [ "$channel" = linkedin ] || continue
+    bash_tool "coldtrail add-contact $domain \"$name\" --linkedin https://www.linkedin.com/in/…"
+    pause 0.15
+  done <"$batches/drafts.tsv"
+fi
+apply 2-enrich.sql
+
+if [ -f "$batches/drafts.tsv" ]; then
+  while IFS=$'\t' read -r channel domain subject _name; do
+    if [ "$channel" = email ]; then
+      bash_tool "coldtrail draft $domain --subject \"$subject\" --body \"…\""
+    else
+      bash_tool "coldtrail linkedin-note $domain --note \"…\""
+    fi
+    pause 0.12
+  done <"$batches/drafts.tsv"
+fi
+apply 3-draft.sql
+step_finish tool-calls
+pause 0.3
+
+step_start
+summary="Sourced **$RUN_SOURCED** new fintech companies across 3 angles, found founders for **$RUN_FOUNDERS** and drafted **$RUN_DRAFTS** intros ($RUN_EMAILS emails, $RUN_NOTES LinkedIn notes). They're waiting in Drafts for your review.
+
+- **Strongest fits:** Railyard Finance, Kontora and Alpwise, which all settle money through several PSPs and banks.
+- **$((RUN_SOURCED - RUN_FOUNDERS))** had no reachable founder yet, so I left them as Sourced.
+- Nothing was sent."
+# Stream it in short chunks, the way a model's text arrives.
+rest="$summary"
+while [ -n "$rest" ]; do
+  text "${rest:0:28}"
+  rest="${rest:28}"
+  pause 0.05
+done
+step_finish stop
+exit 0

@@ -21,8 +21,8 @@ drafts, plus **Home**, the **Pipeline**, **Drafts**, **Follow-ups**, **Schedules
 ![coldtrail — company profile, a run, the pipeline, and a personalized draft](docs/demo.gif)
 
 _Your **company profile** → a **run** with the agent (source → enrich → draft) → the
-**pipeline** of verified companies → a **personalized draft** ready to send.
-([higher-quality MP4](docs/demo.mp4))_
+**pipeline** of verified companies → a **personalized draft** ready to send → the numbers on
+**Home**. ([higher-quality MP4](docs/demo.mp4))_
 
 ## Install
 
