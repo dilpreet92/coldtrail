@@ -368,6 +368,24 @@ a.setup-step-link:hover { color: var(--text); background: var(--surface-2); }
 .ap-model-foot { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-1) var(--space-3); }
 .ap-model-foot .field-hint { min-width: 0; }
 .ap-model-foot .ap-msg:not(:empty) { margin-top: 0; }
+/* A saved model opencode no longer lists: what's wrong and the fix, then what it costs. */
+.ap-model-warn {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  max-width: 560px;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+  border-radius: var(--radius-input);
+  background: color-mix(in srgb, var(--warn) 6%, var(--surface));
+  font-size: 13px;
+  color: var(--text);
+}
+.ap-model-warn > svg { flex: none; margin-top: 2px; color: var(--warn); }
+.ap-model-warn .mono { font-size: 12px; overflow-wrap: anywhere; }
+.ap-model-warn-text { display: flex; flex-direction: column; min-width: 0; text-wrap: pretty; }
+.ap-model-warn-lead { font-weight: 500; }
+.ap-model-warn-lead + span { color: var(--text-2); }
 
 .ap-byok { display: flex; flex-direction: column; gap: var(--space-4); }
 .ap-byok-note { font-size: 13px; color: var(--text-2); }

@@ -19,8 +19,10 @@
 // it, and it would hold the callback port every other sign-in needs); saves and the other
 // connect requests already sent still land. One sign-in waits at a time (they share that port).
 // A pending profile edit is saved first: the router waits for it (beforeLeave), and moving
-// between steps hands it to the editor's exit save. Opened again once onboarded (Settings → Run
-// guided setup), the header links back to Settings.
+// between steps hands it to the editor's exit save. "Your own model" filled in but not saved
+// holds Continue; any other way off step 1 drops it, saying so in a toast. Opened again in a
+// workspace that was set up (Settings → Run guided setup), the header links back to Settings and
+// the finish screen offers only what the workspace hasn't done yet.
 //
 // agentPanel(root, ctx) is exported for Settings → Agent; see its JSDoc below.
 
@@ -190,8 +192,11 @@ let apUid = 0;
  *     opens the form; the provider switches on Save. Until then the panel is pending().
  *   - Test connection: POST /api/provider/probe on the saved provider, result shown inline; a
  *     CLI that fails it also gets its sign-in command (its "signed in" state is only a file check).
- *     A result, or a test still running, is about the agent and model it ran on: saving another
- *     one clears it and frees the button.
+ *     It first waits for the saves already made (a model typed just before the press is saved as
+ *     the field loses focus), so it tests what was just chosen. A result, or a test still
+ *     running, is about the agent and model it ran on: saving another one clears it and frees
+ *     the button. Your own model's form edited but not saved clears it too, and holds the button
+ *     until a save (the test can only run what's saved).
  *   Saves go out one at a time, in the order they were made, so the last choice is the one kept.
  *   Status reads are numbered: one that answers after a later one was applied is dropped.
  *
@@ -205,6 +210,9 @@ let apUid = 0;
  *              { what: 'provider' | 'model' | 'byok', provider }.
  *   onPending(pending) runs when pending() changes.
  *   signal     an AbortSignal; aborting it is destroy().
+ *   warnRetiredModel  true: a saved opencode model that opencode no longer lists (every run fails
+ *              on it) is called out under the picker, from the list the picker loaded. Setup
+ *              passes it; Settings → Agent shows its own notice.
  *
  * Returns { el, update(status), settled(), pending(), destroy() }. update(status) re-renders
  * from a status the host already has (typing in the form and the last test result are kept).
@@ -249,6 +257,8 @@ export function agentPanel(root, ctx = {}) {
     p.then(() => inflight.delete(p));
     return p;
   };
+  /** → Promise<boolean>: the saves made so far have landed (true), or one of them didn't. */
+  const settled = () => Promise.all([...inflight]).then((all) => all.every(Boolean));
 
   const emit = (what, provider) => {
     if (typeof ctx.onChange !== 'function') return;
@@ -312,10 +322,19 @@ export function agentPanel(root, ctx = {}) {
     freeText: true,
     onChange: saveModel,
   });
-  modelSelect.input.setAttribute('aria-describedby', modelHintId);
+  const modelWarnId = `${uid}-model-warn`;
+  // Read with the field (before the hint): emptied while hidden, so it adds nothing then.
+  modelSelect.input.setAttribute('aria-describedby', ctx.warnRetiredModel ? `${modelWarnId} ${modelHintId}` : modelHintId);
+  const modelWarn = h('p', { class: 'ap-model-warn', id: modelWarnId, hidden: true });
   const modelHint = h('p', { class: 'field-hint', id: modelHintId });
   const modelStatus = h('p', { class: 'ap-msg', role: 'status' });
-  const modelBox = h('div', { class: 'ap-model', hidden: true }, modelSelect, h('div', { class: 'ap-model-foot' }, modelHint, modelStatus));
+  const modelBox = h(
+    'div',
+    { class: 'ap-model', hidden: true },
+    modelSelect,
+    modelWarn,
+    h('div', { class: 'ap-model-foot' }, modelHint, modelStatus),
+  );
 
   // Your own model
   const field = (label, input, extra = null) =>
@@ -329,9 +348,8 @@ export function agentPanel(root, ctx = {}) {
     autocomplete: 'off',
     spellcheck: 'false',
     onInput: () => {
-      byokDirty = true;
       setBaseError('');
-      notePending();
+      byokEdited();
     },
   });
   const baseError = h('p', { class: 'field-error', id: `${uid}-base-error`, hidden: true });
@@ -342,10 +360,7 @@ export function agentPanel(root, ctx = {}) {
     placeholder: OLLAMA.model,
     autocomplete: 'off',
     spellcheck: 'false',
-    onInput: () => {
-      byokDirty = true;
-      notePending();
-    },
+    onInput: () => byokEdited(),
   });
   const keyInput = h('input', {
     class: 'input',
@@ -353,10 +368,7 @@ export function agentPanel(root, ctx = {}) {
     type: 'password',
     autocomplete: 'new-password',
     spellcheck: 'false',
-    onInput: () => {
-      byokDirty = true;
-      notePending();
-    },
+    onInput: () => byokEdited(),
   });
   const byokNote = h('p', { class: 'ap-byok-note' });
   const byokSave = h('button', { type: 'submit', class: 'btn btn-primary' }, 'Save');
@@ -382,8 +394,9 @@ export function agentPanel(root, ctx = {}) {
   );
 
   // Test connection
-  const testBtn = h('button', { type: 'button', class: 'btn btn-secondary', onClick: runProbe }, 'Test connection');
-  const testNote = h('p', { class: 'ap-test-note' });
+  const testNoteId = `${uid}-test-note`;
+  const testBtn = h('button', { type: 'button', class: 'btn btn-secondary', 'aria-describedby': testNoteId, onClick: runProbe }, 'Test connection');
+  const testNote = h('p', { class: 'ap-test-note', id: testNoteId });
   const testResult = h('p', { class: 'ap-msg ap-test-result', role: 'status' });
   // A CLI that failed the test: its sign-in command, whatever its auth file says.
   const testCmd = h('div', { class: 'ap-cmd ap-test-cmd', hidden: true });
@@ -539,6 +552,7 @@ export function agentPanel(root, ctx = {}) {
     if (showModel) {
       if (document.activeElement !== modelSelect.input) modelSelect.setValue(status.opencode_model || '');
       if (!models) loadModels();
+      renderModelWarn();
     }
     if (showByok) {
       if (!byokDirty) {
@@ -551,13 +565,32 @@ export function agentPanel(root, ctx = {}) {
         ? `coldtrail keeps using ${current.name} until you save.`
         : 'Saved here. Change any field and save again to update it.';
     }
-    if (showTest) {
-      const label = saved === OWN ? 'your model' : (cards.get(saved) || {}).name || saved;
-      testNote.textContent = `Sends one tiny request to check that ${label} answers.`;
-    }
     // A result, or a test still running, says nothing about another agent or model once that's
     // the one saved.
     if (probeFor !== null && probeFor !== probeKey(status)) resetProbe();
+    if (showTest) renderTest();
+  }
+
+  // Your own model's form changed since it was saved: the test runs on what's saved, so it waits
+  // for a save rather than answer for settings the form no longer shows.
+  const testHeld = () => view === OWN && byokDirty;
+
+  function renderTest() {
+    const saved = status.provider;
+    const label = saved === OWN ? 'your model' : (cards.get(saved) || {}).name || saved;
+    testNote.textContent = testHeld() ? 'Save first to test these settings.' : `Sends one tiny request to check that ${label} answers.`;
+    // A busy button is left alone (setBusy owns it meanwhile).
+    if (isBusy(testBtn)) return;
+    if (testHeld()) testBtn.setAttribute('aria-disabled', 'true');
+    else testBtn.removeAttribute('aria-disabled');
+  }
+
+  function byokEdited() {
+    byokDirty = true;
+    // A result shown (or a test running) under these fields is about the saved settings.
+    if (status && status.provider === OWN && probeFor !== null) resetProbe();
+    if (status && !testBox.hidden) renderTest();
+    notePending();
   }
 
   function render() {
@@ -614,7 +647,7 @@ export function agentPanel(root, ctx = {}) {
   }
 
   function choose(kind) {
-    if (!status || saving) return;
+    if (!status || saving === kind) return;
     say(pickError, '');
     if (kind === OWN) {
       view = OWN;
@@ -623,12 +656,15 @@ export function agentPanel(root, ctx = {}) {
     }
     const a = agentOf(kind);
     if (!a || !a.present) return;
-    if (status.provider === kind) {
+    // Already the saved agent, with no other save on its way to replace it.
+    if (status.provider === kind && !saving) {
       view = kind;
       render();
       return;
     }
-    // Shown as chosen (and saving) at once; sent once the saves before it have landed.
+    // Shown as chosen (and saving) at once; sent once the saves before it have landed. A card
+    // picked while another is still saving is the user's latest choice: it queues behind that
+    // save rather than being dropped.
     const before = view;
     view = kind;
     saving = kind;
@@ -638,20 +674,27 @@ export function agentPanel(root, ctx = {}) {
 
   async function sendProvider(kind, before) {
     let saved = false;
+    // A later pick made while this one saved owns `saving` and `view` now: this save only
+    // reports itself.
+    const latest = () => saving === kind;
     try {
       await api.post('/api/onboarding/provider', { provider: kind });
       saved = true;
       const fresh = await read();
       if (destroyed) return true;
       if (fresh) status = fresh;
-      saving = null;
-      view = status.provider;
+      if (latest()) {
+        saving = null;
+        view = status.provider;
+      }
       render();
       emit('provider', kind);
     } catch (err) {
       if (destroyed || aborted(err)) return saved;
-      saving = null;
-      if (!saved) view = before;
+      if (latest()) {
+        saving = null;
+        if (!saved) view = before;
+      }
       render();
       const name = (cards.get(kind) || {}).name || kind;
       say(pickError, saved ? `Switched to ${name}, but couldn't re-check your agents: ${errorText(err)}` : `Couldn't switch to ${name}: ${errorText(err)}`, 'err');
@@ -673,6 +716,30 @@ export function agentPanel(root, ctx = {}) {
     }
     modelSelect.setOptions(models.list.map((m) => ({ value: m, label: m })));
     renderModelHint();
+    renderModelWarn();
+  }
+
+  // A saved model opencode no longer lists (retired, or mistyped) makes every opencode run fail,
+  // chats and schedules alike. Only a list that loaded with models in it can tell.
+  function renderModelWarn() {
+    if (!ctx.warnRetiredModel) return;
+    const model = status && status.provider === 'opencode' ? String(status.opencode_model || '').trim() : '';
+    const retired = !!model && !!models && models.state === 'ready' && !models.list.includes(model);
+    modelWarn.hidden = !retired;
+    if (!retired) {
+      modelWarn.replaceChildren();
+      return;
+    }
+    modelWarn.replaceChildren(
+      icon('alert', 14),
+      h(
+        'span',
+        { class: 'ap-model-warn-text' },
+        h('span', { class: 'ap-model-warn-lead' }, h('span', { class: 'mono' }, model), " isn't offered by opencode anymore — pick another model."),
+        ' ',
+        h('span', {}, 'Chats and scheduled runs fail until you do.'),
+      ),
+    );
   }
 
   function renderModelHint() {
@@ -731,9 +798,8 @@ export function agentPanel(root, ctx = {}) {
   function fillOllama() {
     baseInput.value = OLLAMA.base;
     if (!modelInput.value.trim()) modelInput.value = OLLAMA.model;
-    byokDirty = true;
     setBaseError('');
-    notePending();
+    byokEdited();
   }
 
   function saveByok(e) {
@@ -794,13 +860,23 @@ export function agentPanel(root, ctx = {}) {
   }
 
   async function runProbe() {
-    if (isBusy(testBtn) || !status) return;
-    const provider = status.provider;
+    if (isBusy(testBtn) || !status || testHeld()) return;
     const run = ++probeRun;
-    probeFor = probeKey(status);
+    probeFor = null;
     hideTestCmd();
     setBusy(testBtn, true, { label: 'Testing…' });
     say(testResult, 'Running a quick check. This can take up to a minute.');
+    // A model typed just before this press was saved as the field lost focus: test what that save
+    // leaves in use, not what was saved before it (whose result its re-read would then clear).
+    const landed = await settled();
+    if (destroyed || run !== probeRun) return;
+    if (!landed) {
+      setBusy(testBtn, false);
+      say(testResult, "Not tested: your last change didn't save.", 'err');
+      return;
+    }
+    const provider = status.provider;
+    probeFor = probeKey(status);
     try {
       const r = await api.post('/api/provider/probe', {}, { signal });
       if (destroyed || run !== probeRun) return;
@@ -847,9 +923,7 @@ export function agentPanel(root, ctx = {}) {
       }
       render();
     },
-    settled() {
-      return Promise.all([...inflight]).then((all) => all.every(Boolean));
-    },
+    settled,
     pending,
     destroy,
   };
@@ -867,6 +941,7 @@ function mountSetup(root, ctx) {
   let step = null;
   let scope = null; // the shown step's { ctl, cleanups, api }
   let requested = ctx.path[1] || '';
+  let unmounting = false; // the screen is going (not just the step)
   // Connections confirmed this session by an ok response, in case status lags behind.
   const local = { canonical: false, gmail: false, linkedin: false };
 
@@ -887,13 +962,21 @@ function mountSetup(root, ctx) {
     h('div', { class: 'setup-body' }, progress, main),
   );
   root.replaceChildren(page);
-  // Opened again once onboarded (Settings → Run guided setup), the screen has no sidebar: link
-  // back. Decided by the first status it has, so a first run doesn't grow one on the way through.
+  // Opened again in a workspace that was set up (Settings → Run guided setup), the screen has no
+  // sidebar: link back. "Set up" is main.js's rule, not `onboarded`, which also turns false when
+  // a working setup lapses (a Canonical token, an agent signed out): the user most likely to come
+  // back here. Decided by the first status it has, so a first run doesn't grow one on the way.
   let exitDecided = false;
   function renderExit() {
     if (exitDecided || !status) return;
     exitDecided = true;
-    exit.hidden = !status.onboarded;
+    exit.hidden = !(status.onboarded || status.product_set || summaryCount('companies') > 0);
+  }
+
+  /** A count from the store's summary (0 when there's none). */
+  function summaryCount(key) {
+    const summary = store && store.get().summary;
+    return summary && summary.counts ? Number(summary.counts[key]) || 0 : 0;
   }
 
   // ---- Status ----
@@ -1152,6 +1235,12 @@ function mountSetup(root, ctx) {
 
   // ---- Progress ----
 
+  // One item per step, rebuilt only when it changes: every status update renders the row, and
+  // focus on another step's link (Shift+Tab there while a browser approval runs) must stay put.
+  const progressList = h('ol', { class: 'setup-steps' });
+  progress.append(progressList);
+  const progressShown = new Map(); // step id → { li, key }
+
   function renderProgress() {
     if (!status) {
       progress.hidden = true;
@@ -1159,20 +1248,28 @@ function mountSetup(root, ctx) {
     }
     progress.hidden = false;
     const at = step === 'done' ? STEPS.length : STEPS.findIndex((s) => s.id === step);
-    const items = STEPS.map((s, i) => {
+    STEPS.forEach((s, i) => {
       const isDone = doneOf(s.id);
       const isCurrent = s.id === step;
       // Done steps and the ones already passed link back; later steps wait for Continue.
       const linked = !isCurrent && (isDone || i < at) && reachable(i);
+      const key = [isDone, isCurrent, linked].join();
+      const had = progressShown.get(s.id);
+      if (had && had.key === key) return;
       const dot = h('span', { class: 'setup-dot', 'aria-hidden': 'true' }, isDone && !isCurrent ? icon('check', 14) : String(i + 1));
       const parts = [dot, h('span', { class: 'setup-step-label' }, s.label), isDone ? h('span', { class: 'sr-only' }, ', done') : null];
       const node =
         linked
           ? h('a', { class: 'setup-step-link', href: href(['setup', s.id]) }, parts)
           : h('span', { class: 'setup-step-link', 'aria-current': isCurrent ? 'step' : null }, parts);
-      return h('li', { class: ['setup-step', isDone && 'is-done', isCurrent && 'is-current'] }, node);
+      const li = h('li', { class: ['setup-step', isDone && 'is-done', isCurrent && 'is-current'] }, node);
+      const focused = !!had && had.li.contains(document.activeElement);
+      if (had) had.li.replaceWith(li);
+      else progressList.append(li);
+      progressShown.set(s.id, { li, key });
+      // The link that had focus changed (a step just done): its new self takes it over.
+      if (focused && linked) node.focus({ preventScroll: true });
     });
-    progress.replaceChildren(h('ol', { class: 'setup-steps' }, items));
   }
 
   // ---- Showing a step ----
@@ -1321,8 +1418,11 @@ function mountSetup(root, ctx) {
       if (!sc.api) return { ok: false, reason: '' };
       const g = sc.api.gate();
       const skipping = !!(sc.api.canSkip && sc.api.canSkip());
+      const skipFocused = !!skip && document.activeElement === skip;
       if (skip) skip.hidden = !skipping;
       next.hidden = skipping;
+      // A connection that lands takes Skip for now away: focus on it goes to Continue, in its place.
+      if (skipFocused && skip.hidden) next.focus({ preventScroll: true });
       if (g.ok) {
         next.removeAttribute('aria-disabled');
         // An ok gate can still carry a note (e.g. a saved blank template): shown, not blocking.
@@ -1369,6 +1469,14 @@ function mountSetup(root, ctx) {
 
   // ---- Step 1: agent ----
 
+  /** The toast when step 1 goes with "Your own model" chosen or edited but not saved. */
+  function ownModelUnsaved() {
+    const where = unmounting ? 'under Settings → Agent' : 'on the Agent step';
+    if (status.provider === OWN) return `Your changes to your own model weren't saved. To keep them, make them again ${where} and press Save.`;
+    const using = (status.agents || []).find((a) => a.kind === status.provider);
+    return `Your own model wasn't saved, so coldtrail still uses ${using ? using.label : 'the same agent'}. To switch, fill it in ${where} and press Save.`;
+  }
+
   function agentStep(content, sc, step_) {
     const box = h('div', { class: 'setup-agent' });
     content.append(box);
@@ -1383,6 +1491,12 @@ function mountSetup(root, ctx) {
       onChange: () => step_.gate(),
       // "Your own model" chosen but not saved: Continue would leave it behind, typed key and all.
       onPending: () => step_.gate(),
+      warnRetiredModel: true,
+    });
+    // Every other way off the step (a progress link, back/forward) or the screen (Back to
+    // Settings, the wordmark) drops it too, and can't be held: say so, as Settings does.
+    sc.cleanups.push(() => {
+      if (panel.pending()) toast(ownModelUnsaved());
     });
     const reason = 'Choose an installed agent, or save your own model, to continue.';
     const unsaved = 'Save your own model, or choose another agent, to continue.';
@@ -1876,7 +1990,9 @@ function mountSetup(root, ctx) {
     function ended(o) {
       if (o.err) say(msg, errorText(o.err), 'err');
       else if (o.connected) say(msg, 'LinkedIn is connected.', 'ok');
-      else say(msg, "LinkedIn sign-in didn't finish: the window was closed or it timed out. Try again.", 'err');
+      // The task ended without a session: the window was closed, it timed out, or Chrome never
+      // started (none installed where the server looks). The status can't tell which, so say both.
+      else say(msg, "LinkedIn sign-in ended before you signed in. Try again. If no Chrome window opened, coldtrail couldn't start Chrome: install Google Chrome first.", 'err');
       render();
       onChange();
     }
@@ -1977,18 +2093,31 @@ function mountSetup(root, ctx) {
       if (scope !== sc) return;
       nav.navigate('#/home');
     }
-    const next = h(
-      'ul',
-      { class: 'setup-next' },
-      nextItem(
-        href(['agent'], { prompt: STARTER_PROMPT }),
-        'chat',
-        'Find your first companies',
-        'Open the agent with a starter request filled in. Nothing runs until you send it.',
-      ),
+    // Run again from Settings, the workspace may already have companies and a schedule: only the
+    // suggestions it hasn't done yet are offered, and a workspace in use isn't told it's starting.
+    const summary = store && store.get().summary;
+    const hasCompanies = summaryCount('companies') > 0;
+    const hasSchedule = !!(summary && summary.next_schedule);
+    const items = [
+      hasCompanies
+        ? null
+        : nextItem(
+            href(['agent'], { prompt: STARTER_PROMPT }),
+            'chat',
+            'Find your first companies',
+            'Open the agent with a starter request filled in. Nothing runs until you send it.',
+          ),
       // ?new=1: Schedules opens its New schedule dialog straight away.
-      nextItem(href(['schedules'], { new: '1' }), 'clock', 'Create a schedule', 'Run the agent every day or week so new companies and drafts are waiting for you.'),
-    );
+      hasSchedule
+        ? null
+        : nextItem(href(['schedules'], { new: '1' }), 'clock', 'Create a schedule', 'Run the agent every day or week so new companies and drafts are waiting for you.'),
+    ].filter(Boolean);
+    let intro;
+    if (!hasCompanies && !hasSchedule) intro = 'coldtrail is ready to find companies and write drafts. Two good first steps:';
+    else if (items.length) intro = 'Your setup is saved. A good next step:';
+    else intro = 'Your setup is saved. Your companies, drafts and schedules are where you left them.';
+    const desc = h('p', { class: 'setup-desc' }, intro);
+    const next = items.length ? h('ul', { class: 'setup-next' }, items) : null;
     const note = h(
       'p',
       { class: 'setup-note' },
@@ -2004,16 +2133,20 @@ function mountSetup(root, ctx) {
         { class: 'setup-card-main' },
         h('span', { class: 'setup-done-mark', 'aria-hidden': 'true' }, icon('check', 22)),
         h('h2', { class: 'setup-title', id: 'setup-title', tabindex: '-1' }, "You're set"),
-        h('p', { class: 'setup-desc' }, 'coldtrail is ready to find companies and write drafts. Two good first steps:'),
+        desc,
         next,
       ),
       h('div', { class: 'setup-foot' }, h('div', { class: 'setup-foot-start' }, back), h('div', { class: 'setup-foot-end' }, homeBtn)),
     );
     // A connect sent before skipping here can still land (startJob, the LinkedIn poll): the note
-    // follows it.
+    // follows it. It goes after the suggestions (or the line above them, when there are none).
+    const noteAfter = next || desc;
     function renderNote() {
-      if (gmailOn() || linkedinOn()) note.remove();
-      else if (!note.parentNode) next.after(note);
+      if (gmailOn() || linkedinOn()) {
+        // Focus on its link would drop to the page: the screen's title takes it.
+        if (note.contains(document.activeElement)) card.querySelector('.setup-title').focus({ preventScroll: true });
+        note.remove();
+      } else if (!note.parentNode) noteAfter.after(note);
     }
     renderNote();
     sc.api = { onStatus: renderNote };
@@ -2055,6 +2188,7 @@ function mountSetup(root, ctx) {
   }
 
   return () => {
+    unmounting = true;
     teardownStep();
     liStop();
     viewCtl.abort();

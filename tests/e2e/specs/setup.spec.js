@@ -1,14 +1,17 @@
 // First-run setup (spec §5.1) on an empty workspace: the four steps (agent with the opencode model
-// picker and Test connection, Canonical, the company profile in Company profile's editor, where
-// outreach goes) and the "You're set" screen; Continue gating (an own model chosen but not saved
-// holds it); the address (a bare #/setup stays bare, a step that isn't open yet names the one
-// shown); copy buttons; keyboard-only completion; loading, error and stale-session states; saves
-// that outlive the step (and keep their order) and connect requests that do too (a step shown
-// again waits on them); a late status read or test result not overruling a later choice;
-// cancelling an OAuth wait; the outreach copy following auto-send; the LinkedIn poll stopping on
-// unmount and on a stale session, and picking up a sign-in already open; the way back to Settings
-// when setup is run again; hostile text staying text; and the exported agentPanel working outside
-// the wizard (Settings reuses it).
+// picker, a retired model called out, and Test connection, Canonical, the company profile in
+// Company profile's editor, where outreach goes) and the "You're set" screen; Continue gating (an
+// own model chosen but not saved holds it, and every other way off step 1 says it was dropped);
+// the address (a bare #/setup stays bare, a step that isn't open yet names the one shown); copy
+// buttons; keyboard-only completion; loading, error and stale-session states; saves that outlive
+// the step (and keep their order) and connect requests that do too (a step shown again waits on
+// them); a late status read or test result not overruling a later choice, and a test waiting for
+// the save just made (or held while your own model's edits aren't saved); cancelling an OAuth
+// wait; focus surviving status updates and controls a connection takes away; the outreach copy
+// following auto-send; the LinkedIn poll stopping on unmount and on a stale session, and picking
+// up a sign-in already open; the way back to Settings when setup is run again (a lapsed
+// connection included) and a finish screen that fits a workspace in use; hostile text staying
+// text; and the exported agentPanel working outside the wizard (Settings reuses it).
 //
 // Tests share one server and run in order: the early ones leave the workspace as they found it,
 // "walks all four steps to Home" onboards it, and the later ones build on that.
@@ -304,6 +307,36 @@ test('model list loading, empty and error states fall back to free text', async 
   expect((await getJSON(request, server, '/api/status')).opencode_model).toBe('fake/model-a');
 });
 
+test('a saved model opencode no longer offers is called out', async ({ app, page, request, server }) => {
+  await page.route('**/api/provider/opencode/models', (route) =>
+    route.fulfill({ json: { models: ['fake/model-b', 'opencode/free-c'], message: null } }),
+  );
+  await app.goto('#/setup/agent');
+  const model = view(page).getByRole('combobox', { name: 'Model' });
+  const warn = view(page).locator('.ap-model-warn');
+  await expect(model).toHaveValue('fake/model-a');
+  // Every opencode run fails on it, so step 1 says so by the picker (and the picker reads it out).
+  const text = "fake/model-a isn't offered by opencode anymore — pick another model. Chats and scheduled runs fail until you do.";
+  await expect(warn).toHaveText(text);
+  await expect(model).toHaveAccessibleDescription(new RegExp(`^${reEscape(text)}`));
+  for (const scheme of ['light', 'dark']) {
+    await page.emulateMedia({ colorScheme: scheme });
+    await expectAccessible(page);
+  }
+
+  // One it offers: the warning goes.
+  await model.fill('fake/model-b');
+  await model.press('Enter');
+  await expect(view(page).locator('.ap-model .ap-msg[role="status"]')).toHaveText('Model saved');
+  await expect(warn).toBeHidden();
+  await expect(model).toHaveAccessibleDescription(/^2 models from opencode/);
+
+  const res = await request.post(server.apiUrl('/api/onboarding/provider'), {
+    data: { provider: 'opencode', opencode_model: 'fake/model-a' },
+  });
+  expect(res.status()).toBe(200);
+});
+
 test('a model typed just before Continue still saves', async ({ app, page, request, server }) => {
   // Hold the save, as a slow server would, so leaving the step can't outrun it.
   let release;
@@ -375,6 +408,37 @@ test('agent changes save one at a time, in the order made', async ({ app, page, 
     data: { provider: 'opencode', opencode_model: 'fake/model-a' },
   });
   expect(res.status()).toBe(200);
+});
+
+test('a card picked while another is still saving is kept, and saves after it', async ({ app, page, request, server }) => {
+  // Codex is picked and its save is slow; opencode is picked before it lands. The second click
+  // is the user's latest choice: it isn't dropped, it shows at once, and it saves after codex's.
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  const saves = [];
+  await page.route('**/api/onboarding/provider', async (route) => {
+    const body = route.request().postDataJSON();
+    saves.push(body);
+    if (body.provider === 'codex') await held;
+    await route.fallback();
+  });
+  await app.goto('#/setup/agent');
+  await expect(pick(page, 'opencode')).toHaveAttribute('aria-pressed', 'true');
+  await pick(page, 'codex').click();
+  await expect(card(page, 'codex')).toHaveClass(/is-saving/);
+  await expect.poll(() => saves.length).toBe(1);
+  await pick(page, 'opencode').click();
+  await expect(pick(page, 'opencode')).toHaveAttribute('aria-pressed', 'true');
+  await expect(card(page, 'opencode')).toHaveClass(/is-saving/);
+
+  release();
+  await expect(card(page, 'opencode')).not.toHaveClass(/is-saving/);
+  await expect(pick(page, 'opencode')).toHaveAttribute('aria-pressed', 'true');
+  await expect(view(page).getByRole('combobox', { name: 'Model' })).toBeVisible();
+  expect(saves).toEqual([{ provider: 'codex' }, { provider: 'opencode' }]);
+  expect((await getJSON(request, server, '/api/status')).provider).toBe('opencode');
 });
 
 test('a Check again that answers late does not undo a card chosen after it', async ({ app, page, request, server }) => {
@@ -501,6 +565,36 @@ test('a connection test result is about the agent and model it ran on', async ({
   expect(res.status()).toBe(200);
 });
 
+test('a connection test pressed right after typing a model tests that model', async ({ app, page, request, server }) => {
+  const sent = [];
+  page.on('request', (req) => {
+    const path = new URL(req.url()).pathname;
+    if (req.method() !== 'POST') return;
+    if (path === '/api/onboarding/provider') sent.push(`save ${req.postDataJSON().opencode_model}`);
+    if (path === '/api/provider/probe') sent.push('probe');
+  });
+  await page.route('**/api/provider/probe', (route) => route.fulfill({ json: { ok: true, message: 'opencode is signed in and responding.' } }));
+  await app.goto('#/setup/agent');
+  const model = view(page).getByRole('combobox', { name: 'Model' });
+  await expect(model).toHaveValue('fake/model-a');
+  const testBox = view(page).locator('.ap-test');
+
+  // Typed, not committed: the press commits it (the field loses focus), and the test waits for
+  // that save, so its result is about the model just typed and stays.
+  await model.fill('fake/model-b');
+  await testBox.getByRole('button', { name: 'Test connection' }).click();
+  await expect(view(page).locator('.ap-model .ap-msg[role="status"]')).toHaveText('Model saved');
+  await expect(testBox.locator('.ap-test-result')).toHaveText('opencode is signed in and responding.');
+  await expect(testBox.getByRole('button', { name: 'Test connection' })).not.toHaveAttribute('aria-busy', 'true');
+  expect(sent).toEqual(['save fake/model-b', 'probe']);
+  expect((await getJSON(request, server, '/api/status')).opencode_model).toBe('fake/model-b');
+
+  const res = await request.post(server.apiUrl('/api/onboarding/provider'), {
+    data: { provider: 'opencode', opencode_model: 'fake/model-a' },
+  });
+  expect(res.status()).toBe(200);
+});
+
 test('your own model: the form checks the URL, saves, tests and switches back', async ({ app, page, request, server }) => {
   const probes = [];
   // The probe would call the endpoint for real (it may be a live local Ollama): answer it here.
@@ -558,6 +652,56 @@ test('your own model: the form checks the URL, saves, tests and switches back', 
   await expect(card(page, 'openai').locator('.badge')).toHaveText('Saved');
   await pick(page, 'openai').click();
   await expect(form.getByLabel('Base URL')).toHaveValue('http://localhost:11434/v1');
+});
+
+test('Test connection waits for edits to your own model to be saved', async ({ app, page, request, server }) => {
+  const probes = [];
+  await page.route('**/api/provider/probe', async (route) => {
+    probes.push(route.request().method());
+    await route.fulfill({ json: { ok: true, message: 'Your model is signed in and responding.' } });
+  });
+  await app.goto('#/setup/agent');
+  await pick(page, 'openai').click();
+  const form = view(page).getByRole('form', { name: 'Your own model' });
+  await form.getByRole('button', { name: 'Use local Ollama' }).click();
+  await form.getByRole('button', { name: 'Save' }).click();
+  await expect(form.getByRole('status')).toHaveText('Saved. coldtrail now uses your own model.');
+  const testBox = view(page).locator('.ap-test');
+  const testBtn = testBox.getByRole('button', { name: 'Test connection' });
+  const result = testBox.locator('.ap-test-result');
+  const note = testBox.locator('.ap-test-note');
+  await expect(note).toHaveText('Sends one tiny request to check that your model answers.');
+  await testBtn.click();
+  await expect(result).toHaveText('Your model is signed in and responding.');
+  expect(probes).toEqual(['POST']);
+
+  // An edit: the test runs on what's saved, so the result (about the saved settings) goes, and
+  // the button waits for a save instead of reporting on settings the form no longer shows.
+  await form.getByLabel('Base URL').fill('http://127.0.0.1:9/v1');
+  await expect(result).toHaveText('');
+  await expect(testBtn).toHaveAttribute('aria-disabled', 'true');
+  await expect(note).toHaveText('Save first to test these settings.');
+  await expect(testBtn).toHaveAccessibleDescription('Save first to test these settings.');
+  await testBtn.click({ force: true });
+  await page.evaluate(() => new Promise((resolve) => setTimeout(resolve, 150)));
+  await expect(result).toHaveText('');
+  expect(probes).toEqual(['POST']);
+
+  // Saved: it tests the new settings.
+  await form.getByRole('button', { name: 'Save' }).click();
+  await expect(form.getByRole('status')).toHaveText('Saved. coldtrail now uses your own model.');
+  await expect(testBtn).not.toHaveAttribute('aria-disabled', 'true');
+  await expect(note).toHaveText('Sends one tiny request to check that your model answers.');
+  await testBtn.click();
+  await expect(result).toHaveText('Your model is signed in and responding.');
+  expect(probes).toEqual(['POST', 'POST']);
+
+  const res = await request.post(server.apiUrl('/api/onboarding/provider'), {
+    data: { provider: 'openai', base_url: 'http://localhost:11434/v1', model: 'llama3.1', api_key: null },
+  });
+  expect(res.status()).toBe(200);
+  const back = await request.post(server.apiUrl('/api/onboarding/provider'), { data: { provider: 'opencode' } });
+  expect(back.status()).toBe(200);
 });
 
 test('Continue holds an own model that is chosen but not saved', async ({ app, page, request, server }) => {
@@ -1355,9 +1499,13 @@ test('outreach step connects Gmail with an app password and LinkedIn', async ({ 
   await expect(gmail.getByLabel('Client ID', { exact: true })).toBeFocused();
 
   // LinkedIn: the sign-in window never opens here, so the server reports it isn't waiting:
-  // the card says the sign-in didn't finish instead of waiting forever.
+  // the card says the sign-in ended instead of waiting forever. It can't tell a closed window
+  // from a Chrome that never started (what happened here), so it names both.
   await linkedin.getByRole('button', { name: 'Connect LinkedIn' }).click();
-  await expect(linkedin.locator('.setup-msg')).toHaveText("LinkedIn sign-in didn't finish: the window was closed or it timed out. Try again.", { timeout: 15_000 });
+  await expect(linkedin.locator('.setup-msg')).toHaveText(
+    "LinkedIn sign-in ended before you signed in. Try again. If no Chrome window opened, coldtrail couldn't start Chrome: install Google Chrome first.",
+    { timeout: 15_000 },
+  );
   await expect(linkedin.getByRole('button', { name: 'Connect LinkedIn' })).toBeEnabled();
 
   // Busy browser.
@@ -1596,6 +1744,174 @@ test('setup opened again from Settings has a way back', async ({ app, page, requ
   await exit.click();
   await expect(page).toHaveURL(hashIs('#/settings'));
   await expect(page.locator('.setup')).toHaveCount(0);
+});
+
+test('setup opened again to fix a lapsed connection has a way back too', async ({ app, page, request, server }) => {
+  await onboard(request, server);
+  // A Canonical token that lapsed: no longer onboarded, but set up (the app doesn't send this
+  // workspace to setup), so the user came here from Settings and needs the way back.
+  removeCanonicalToken(server);
+  try {
+    expect((await getJSON(request, server, '/api/status')).onboarded).toBe(false);
+    await app.goto('#/settings');
+    await view(page).getByRole('link', { name: 'Run guided setup' }).click();
+    await expect(stepTitle(page, 'canonical')).toBeVisible();
+    const exit = view(page).getByRole('link', { name: 'Back to Settings' });
+    await expect(exit).toBeVisible();
+    await exit.click();
+    await expect(page).toHaveURL(hashIs('#/settings'));
+  } finally {
+    storeCanonicalToken(server);
+  }
+});
+
+test('leaving step 1 with your own model not saved says so', async ({ app, page, request, server }) => {
+  await onboard(request, server);
+  const saves = recordProviderSaves(page);
+  const toastWith = (text) => page.locator('#toasts .toast').filter({ hasText: text });
+  const ownToasts = page.locator('#toasts .toast').filter({ hasText: 'own model' });
+  await app.goto('#/settings');
+  await view(page).getByRole('link', { name: 'Run guided setup' }).click();
+  await expect(stepTitle(page, 'agent')).toBeVisible();
+  const progress = view(page).getByRole('navigation', { name: 'Setup progress' });
+  const form = view(page).getByRole('form', { name: 'Your own model' });
+  const fillOwn = async () => {
+    await pick(page, 'openai').click();
+    await form.getByLabel('Base URL').fill('https://api.example.com/v1');
+    await form.getByLabel('Model').fill('my-model');
+    await form.getByLabel('API key').fill('sk-typed-secret');
+    await expect(continueBtn(page)).toHaveAttribute('aria-disabled', 'true');
+  };
+
+  // Nothing pending: moving on says nothing.
+  await progress.getByRole('link', { name: /^Canonical\b/ }).click();
+  await expect(stepTitle(page, 'canonical')).toBeVisible();
+  await progress.getByRole('link', { name: /^Agent\b/ }).click();
+  await expect(stepTitle(page, 'agent')).toBeVisible();
+  await expect(ownToasts).toHaveCount(0);
+
+  // A progress link while it's filled in but not saved: the step goes, and the form (typed key
+  // and all) with it. Continue holds it; this way off says so.
+  await fillOwn();
+  await progress.getByRole('link', { name: /^Company\b/ }).click();
+  await expect(stepTitle(page, 'company')).toBeVisible();
+  await expect(
+    toastWith("Your own model wasn't saved, so coldtrail still uses opencode. To switch, fill it in on the Agent step and press Save."),
+  ).toBeVisible();
+  await progress.getByRole('link', { name: /^Agent\b/ }).click();
+  await expect(pick(page, 'openai')).toHaveAttribute('aria-pressed', 'false');
+  await expect(form).toBeHidden();
+
+  // Leaving setup: said where the user is going.
+  await fillOwn();
+  await view(page).getByRole('link', { name: 'Back to Settings' }).click();
+  await expect(page).toHaveURL(hashIs('#/settings'));
+  await expect(
+    toastWith("Your own model wasn't saved, so coldtrail still uses opencode. To switch, fill it in under Settings → Agent and press Save."),
+  ).toBeVisible();
+  await expect(ownToasts).toHaveCount(2);
+  expect(saves).toEqual([]);
+  expect((await getJSON(request, server, '/api/status')).provider).toBe('opencode');
+});
+
+test('a status update leaves focus on the progress link it was on', async ({ app, page, request, server }) => {
+  await onboard(request, server);
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  await page.route('**/api/discovery/canonical/connect', async (route) => {
+    await held;
+    await route.fulfill({ json: { ok: true, message: null } });
+  });
+  await app.goto('#/setup/canonical');
+  await view(page).getByRole('button', { name: 'Reconnect' }).click();
+  await expect(view(page).getByRole('button', { name: 'Waiting for approval…' })).toBeVisible();
+  // Off to another step's link while approving in the browser; the approval lands meanwhile.
+  const link = view(page).getByRole('navigation', { name: 'Setup progress' }).getByRole('link', { name: /^Agent\b/ });
+  await link.focus();
+  const reread = page.waitForResponse((res) => statusPath(new URL(res.url())));
+  release();
+  await expect(view(page).locator('.setup-conn .setup-msg')).toHaveText('Canonical is connected.');
+  await reread;
+  await expect(link).toBeFocused();
+  // Its re-read landing too.
+  await page.evaluate(() => new Promise((resolve) => setTimeout(resolve, 100)));
+  await expect(link).toBeFocused();
+});
+
+test('a connection that lands moves focus off the control it takes away', async ({ app, page, request, server }) => {
+  await onboard(request, server);
+  let li = { connected: false, reconnect_needed: false, waiting: false };
+  await page.route('**/api/destination/linkedin/status', (route) => route.fulfill({ json: li }));
+  await page.route('**/api/destination/linkedin/connect', (route) => {
+    li = { ...li, waiting: true };
+    return route.fulfill({ json: { status: 'waiting' } });
+  });
+  await app.goto('#/setup/destination');
+  const linkedin = view(page).getByRole('region', { name: 'LinkedIn' });
+  const badge = linkedin.locator('.badge').first();
+  const skip = foot(page).getByRole('button', { name: 'Skip for now' });
+
+  // Skip for now goes once something is connected: focus on it moves to Continue, in its place.
+  await linkedin.getByRole('button', { name: 'Connect LinkedIn' }).click();
+  await expect(badge).toHaveText('Waiting for sign-in');
+  await skip.focus();
+  li = { connected: true, reconnect_needed: false, waiting: false };
+  await expect(badge).toHaveText('Connected', { timeout: 15_000 });
+  await expect(skip).toBeHidden();
+  await expect(continueBtn(page)).toBeFocused();
+
+  // The finish screen's "not connected yet" note goes when a sign-in left running lands: focus
+  // on its link moves to the screen's title.
+  li = { connected: false, reconnect_needed: false, waiting: false };
+  await page.reload();
+  await expect(badge).toHaveText('Not connected');
+  await linkedin.getByRole('button', { name: 'Connect LinkedIn' }).click();
+  await expect(badge).toHaveText('Waiting for sign-in');
+  await skip.click();
+  await expect(stepTitle(page, 'done')).toBeVisible();
+  const noteLink = view(page).getByRole('link', { name: 'Settings → Connections' });
+  await noteLink.focus();
+  li = { connected: true, reconnect_needed: false, waiting: false };
+  await expect(noteLink).toHaveCount(0, { timeout: 15_000 });
+  await expect(stepTitle(page, 'done')).toBeFocused();
+});
+
+test('setup run again in a busy workspace ends without first-run suggestions', async ({ app, page, request, server }) => {
+  await onboard(request, server);
+  const busy = { companies: 1200, next_schedule: { name: 'Lunch Source', next_at: new Date(Date.now() + 18 * 3600_000).toISOString() } };
+  await page.route('**/api/summary', async (route) => {
+    try {
+      const res = await route.fetch();
+      const summary = await res.json();
+      await route.fulfill({
+        response: res,
+        json: { ...summary, counts: { ...summary.counts, companies: busy.companies }, next_schedule: busy.next_schedule },
+      });
+    } catch (err) {
+      if (!/disposed|closed|ended/i.test(String(err))) throw err;
+    }
+  });
+  const desc = view(page).locator('.setup-done .setup-desc');
+  const first = view(page).getByRole('link', { name: /Find your first companies/ });
+  const schedule = view(page).getByRole('link', { name: /Create a schedule/ });
+
+  // Companies and a schedule already: nothing here is a first step.
+  await app.goto('#/setup/done');
+  await expect(stepTitle(page, 'done')).toBeVisible();
+  await expect(desc).toHaveText('Your setup is saved. Your companies, drafts and schedules are where you left them.');
+  await expect(first).toHaveCount(0);
+  await expect(schedule).toHaveCount(0);
+  await expect(foot(page).getByRole('button', { name: 'Go to Home' })).toBeVisible();
+
+  // Companies but no schedule: a schedule is still the step to take.
+  busy.next_schedule = null;
+  await page.reload();
+  await expect(stepTitle(page, 'done')).toBeVisible();
+  await expect(desc).toHaveText('Your setup is saved. A good next step:');
+  await expect(first).toHaveCount(0);
+  await expect(schedule).toBeVisible();
 });
 
 test("the finish screen's Create a schedule opens the New schedule dialog", async ({ app, page, request, server }) => {
