@@ -9,9 +9,11 @@
 // screen is left and reopened) Send all shows its progress and nothing else can send the same
 // drafts. The LinkedIn pollers (one row, or the bulk sender) stop when the screen unmounts and
 // pick up again when it comes back. coldtrail's own LinkedIn sends (Send invite, Send all) mirror
-// the sender's stops: none are offered while LinkedIn is signed out or outside 08:00–20:00 local.
-// Open in LinkedIn, the manual path, has no hours and never waits, but it drives the same Chrome
-// profile, so it too is off until LinkedIn is connected.
+// the sender's stops: none are offered while LinkedIn is signed out, outside 08:00–20:00 local or
+// at a used-up cap, and a row's send stops being watched as soon as the sender shows it gave up.
+// Open in LinkedIn, the manual path, has no hours or caps and never waits, but it drives the same
+// Chrome profile, so it too is off until LinkedIn is connected. While a draft is on its way out
+// (into Gmail, sent, opened in LinkedIn) its text is read-only: the server already has it.
 //
 // Data: GET /api/drafts (the queue, with each draft's contact and company names),
 // /api/companies/:domain (the selected draft's source query and its contact's role), the shared
@@ -48,17 +50,21 @@ const WIDE = '(min-width: 900px)';
 // A refusal that applies to every email, not just one: stop the bulk loop instead of repeating it.
 const EMAIL_GATE = /dry run|cap reached|auto-send is off|isn't connected|not connected/i;
 const CONTACTED = ['sent', 'replied', 'bounced']; // outreach statuses that mean something went out
+const WAITING = ['draft_pending', 'drafted']; // outreach statuses of a draft still in the queue
 
 // Page-lifetime state (kept across remounts, gone on reload — except what sessionStorage holds).
 const staged = new Set(); // LinkedIn drafts opened with assist, waiting for "Did it send?"
-const rowSends = new Map(); // key -> { at, timedOut }: per-row LinkedIn sends being watched
-const pushing = new Set(); // email drafts being sent / put in Gmail one at a time (Send now)
+const opening = new Set(); // LinkedIn drafts being opened with assist (Open in LinkedIn on its way)
+const starting = new Set(); // LinkedIn drafts whose Send invite is on its way to the server
+const rowSends = new Map(); // key -> { at, timedOut, who }: per-row LinkedIn sends being watched
+const pushing = new Map(); // key -> auto: email drafts being sent / put in Gmail one at a time (Send now)
 const details = new Map(); // domain -> { source_query, contacts } from /api/companies/:domain
 const sendConfirmed = new Set(); // channels whose first send this session was confirmed
 let active = null; // the mounted view: { update, beforeLeave, destroy, runChanged, stateChanged, reload, saveFirst }
-// The Send all run while it goes: { auto, i, n, li } (email send mode, the email being sent, how
-// many, whether it starts the LinkedIn sender after them). It outlives the view that started it,
-// so a remount still sees it: Send all and Send now stay disabled until it ends.
+// The Send all run while it goes: { auto, i, n, li, key } (email send mode, the email being sent,
+// how many, whether it starts the LinkedIn sender after them, the key of the one being sent). It
+// outlives the view that started it, so a remount still sees it: Send all and Send now stay
+// disabled until it ends.
 let run = null;
 
 const runChanged = () => {
@@ -172,6 +178,21 @@ function gatePlain(gate) {
   if (gate === 'reconnect') return 'LinkedIn is signed out: reconnect it in Settings → Connections.';
   if (gate === 'connect') return 'LinkedIn isn’t connected: connect it in Settings → Connections.';
   return `LinkedIn invites go out ${LI_WINDOW_TEXT}.`;
+}
+
+/** Which LinkedIn cap `c` (caps()) says is used up, as a sentence: "The daily LinkedIn cap is
+ *  reached (15 of 15 sent today)". */
+function capReached(c) {
+  return c.liCap === 'week'
+    ? `The weekly LinkedIn cap is reached (${fmtNum(c.week)} of ${fmtNum(c.weekly)} sent in the last 7 days)`
+    : `The daily LinkedIn cap is reached (${fmtNum(c.today)} of ${fmtNum(c.daily)} sent today)`;
+}
+
+/** Send invite at a used-up cap: until when it waits, and what still works (strings and nodes). */
+function capText(c) {
+  // (The weekly cap is a rolling one: it frees up as the week's invites get older.)
+  const until = c.liCap === 'week' ? 'until some of them are more than a week old' : 'until tomorrow';
+  return [`${capReached(c)}, so Send invite waits ${until}. Open in LinkedIn works any time; raise the cap in `, sendingLink(), '.'];
 }
 /** Email sends wait while a Send all works through the emails (and until the queue reloads). */
 const emailBlocked = () => !!(run && run.n);
@@ -459,6 +480,10 @@ function createView(root, ctx) {
     const cap = st.daily_send_cap || 20;
     // Emails sent today (deliver::sent_today), or null from a server that doesn't report it.
     const emailToday = Number.isFinite(st.email_sent_today) ? st.email_sent_today : null;
+    const daily = st.linkedin_daily_cap || 15;
+    const weekly = st.linkedin_weekly_cap || 80;
+    const today = st.linkedin_sent_today || 0;
+    const week = st.linkedin_sent_7d || 0;
     return {
       auto,
       cap,
@@ -467,10 +492,13 @@ function createView(root, ctx) {
       // Gmail can't be reached, 'cap' when auto-send has used up today's cap.
       emailGate: !gmailReady(s.status) ? 'gmail' : auto && emailToday != null && emailToday >= cap ? 'cap' : null,
       liAuto: !!st.linkedin_auto_send,
-      daily: st.linkedin_daily_cap || 15,
-      weekly: st.linkedin_weekly_cap || 80,
-      today: st.linkedin_sent_today || 0,
-      week: st.linkedin_sent_7d || 0, // in the last 7 days (the weekly cap is a rolling one)
+      daily,
+      weekly,
+      today,
+      week, // in the last 7 days (the weekly cap is a rolling one)
+      // Which LinkedIn cap is used up ('week' first: it waits longer), or null. The sender refuses
+      // at either before it sends anything.
+      liCap: !s.status ? null : week >= weekly ? 'week' : today >= daily ? 'day' : null,
       gate: liGate(s.status), // why coldtrail can't send LinkedIn invites now, or null
       session: liSession(s.status), // why nothing can be done in LinkedIn from here, or null
     };
@@ -577,17 +605,17 @@ function createView(root, ctx) {
     // A stale session: the shell's banner says what happened, this says what to do, and Try
     // again isn't offered (it can't work until coldtrail is reopened).
     const expired = isStaleSession(s.error);
-    return h(
-      'div',
-      { class: 'drafts-panel' },
-      emptyState({
-        title: 'Couldn’t load drafts',
-        body: errorText(s.error) || 'Something went wrong.',
-        action: expired
-          ? null
-          : h('button', { type: 'button', class: 'btn btn-secondary', onClick: retry }, 'Try again'),
-      }),
-    );
+    const panel = emptyState({
+      title: 'Couldn’t load drafts',
+      body: errorText(s.error) || 'Something went wrong.',
+      action: expired
+        ? null
+        : h('button', { type: 'button', class: 'btn btn-secondary', onClick: retry }, 'Try again'),
+    });
+    panel.prepend(icon(ICONS.alert, 20));
+    // Announced, as every screen's load error is; on a stale session the shell's banner already
+    // is the alert, once.
+    return h('div', { class: ['drafts-panel', 'drafts-error'], role: expired ? null : 'alert' }, panel);
   }
 
   const sentSoFar = () => (s.summary && s.summary.counts && s.summary.counts.sent) || 0;
@@ -1187,9 +1215,10 @@ function createView(root, ctx) {
   function actionsSig(it) {
     const c = caps();
     return [
-      detailSig(it), staged.has(it.key), rowSendState(it.key), pushing.has(it.key),
+      detailSig(it), staged.has(it.key), rowSendState(it.key), pushing.has(it.key), opening.has(it.key), starting.has(it.key),
       emailBlocked(), liBlocked(), !!bulkStart(), c.auto, c.liAuto, c.gate, c.session,
       c.emailGate, c.emailGate === 'cap' ? `${c.emailToday}/${c.cap}` : '', // (the cap hint names them)
+      c.liCap, c.liCap ? `${c.today}/${c.daily}/${c.week}/${c.weekly}` : '',
     ].join('|');
   }
 
@@ -1216,7 +1245,9 @@ function createView(root, ctx) {
       watchToasts();
       return;
     }
-    const el = h('article', { class: 'draft', 'aria-labelledby': 'draft-title' });
+    // An email under review fills the pane on a desktop, its body taking the room left (drafts.css).
+    const fill = it.channel === 'email' && it.status === 'draft_pending';
+    const el = h('article', { class: ['draft', fill && 'draft-fill'], 'aria-labelledby': 'draft-title' });
     d = { key: it.key, el, sig: detailSig(it), actionsSig: '', labels: new Map() };
     d.name = h('h2', { class: 'draft-name', id: 'draft-title', tabindex: '-1' });
     d.meta = h('p', { class: 'draft-meta' });
@@ -1281,12 +1312,13 @@ function createView(root, ctx) {
         rows: '8',
         spellcheck: 'true',
         'data-editor': '',
-        'aria-describedby': 'draft-count', // + the error while it shows (updateNote)
+        'aria-describedby': 'draft-count', // + the error and the lock while they show (syncLock)
         value: it.body,
         onInput: (e) => edit(it.key, 'body', e.target.value),
       });
       d.note = note;
       d.text = { body: note };
+      d.lock = lockLine();
       d.noteErr = h('p', { class: 'field-error', id: 'draft-note-err', hidden: true }, `Shorten the note to ${NOTE_MAX} characters or fewer to send it.`);
       d.link = h('p', { class: 'draft-link' });
       // The count sits under the note, at its end, as LinkedIn's own note box shows it.
@@ -1294,6 +1326,7 @@ function createView(root, ctx) {
       return h(
         'div',
         { class: 'draft-fields' },
+        d.lock,
         h(
           'div',
           { class: 'field' },
@@ -1337,7 +1370,47 @@ function createView(root, ctx) {
       onInput: (e) => edit(it.key, 'body', e.target.value),
     });
     d.text = { subject, body: text };
-    return h('div', { class: 'draft-fields' }, to, field('Subject', subject, 'draft-subject'), field('Body', text, 'draft-body'));
+    d.lock = lockLine();
+    return h('div', { class: 'draft-fields' }, d.lock, to, field('Subject', subject, 'draft-subject'), field('Body', text, 'draft-body'));
+  }
+
+  // Why the text can't be edited now (syncLock): named in the editor's description while it shows.
+  const lockLine = () => h('p', { class: 'draft-lock', id: 'draft-lock', hidden: true });
+
+  /**
+   * Why the draft's text can't be edited now, or null: the server has taken it (or is about to)
+   * for something under way, so an edit would never reach Gmail or LinkedIn, and one saved
+   * meanwhile would be recorded as what went out.
+   */
+  function lockReason(it) {
+    const { key } = it;
+    if (it.channel === 'email') {
+      const auto = pushing.has(key) ? pushing.get(key) : run && run.key === key ? run.auto : null;
+      if (auto == null) return null;
+      return auto ? 'Being sent: edits are off while it goes out.' : 'Being put in your Gmail Drafts: edits are off until it’s there.';
+    }
+    if (opening.has(key)) return 'Being opened in LinkedIn: edits are off until it’s open.';
+    if (staged.has(key)) {
+      return 'This note is open in LinkedIn: change it there if you need to. Editing here is off until you answer Did it send?';
+    }
+    if (starting.has(key) || rowSendState(key) === 'sending') return 'Being sent on LinkedIn: edits are off while it goes out.';
+    return null;
+  }
+
+  /** The open draft's editor read-only, saying why, while it's on its way out (lockReason). */
+  function syncLock(it) {
+    if (!d || !it || d.key !== it.key || !d.lock) return;
+    const why = lockReason(it);
+    if (d.lock.textContent !== (why || '')) d.lock.textContent = why || '';
+    d.lock.hidden = !why;
+    for (const el of Object.values(d.text)) {
+      el.readOnly = !!why;
+      // A hidden element named in aria-describedby is still read out, so each part is named only
+      // while it shows: the note's count, its over-the-limit error, why it can't be edited.
+      const ids = [el === d.note && 'draft-count', el === d.note && overLimit(it) && 'draft-note-err', why && 'draft-lock'].filter(Boolean);
+      if (ids.length) el.setAttribute('aria-describedby', ids.join(' '));
+      else el.removeAttribute('aria-describedby');
+    }
   }
 
   /**
@@ -1407,9 +1480,7 @@ function createView(root, ctx) {
     d.count.textContent = `${it.body.length} / ${NOTE_MAX}`;
     d.count.classList.toggle('is-over', over);
     d.noteErr.hidden = !over;
-    // A hidden element named in aria-describedby is still read out, so the error is named only
-    // while it shows.
-    d.note.setAttribute('aria-describedby', over ? 'draft-count draft-note-err' : 'draft-count');
+    syncLock(it); // (names the error in the note's description while it shows)
     if (over) d.note.setAttribute('aria-invalid', 'true');
     else d.note.removeAttribute('aria-invalid');
     const link = noteLink(it.body);
@@ -1476,7 +1547,7 @@ function createView(root, ctx) {
       if (pushing.has(key)) {
         // A Send now still on its way (this button was rebuilt meanwhile): it stays busy.
         const b = actionBtn('', 'primary', 'push', null);
-        setBusy(b, true, { label: c.auto ? 'Sending…' : 'Creating…' });
+        setBusy(b, true, { label: pushing.get(key) ? 'Sending…' : 'Creating…' });
         return [discardBtn, b];
       }
       const label = c.auto
@@ -1517,7 +1588,13 @@ function createView(root, ctx) {
         ),
       ];
     }
-    if (rowSendState(key) === 'sending') {
+    if (opening.has(key)) {
+      // Open in LinkedIn still on its way (this button was rebuilt meanwhile): it stays busy.
+      const b = actionBtn('', 'primary', 'assist', null);
+      setBusy(b, true, { label: 'Opening…' });
+      return [discardBtn, b];
+    }
+    if (starting.has(key) || rowSendState(key) === 'sending') {
       const b = actionBtn('', 'primary', 'sending', null);
       setBusy(b, true, { label: 'Sending…' });
       return [h('span', { class: 'draft-hint' }, 'coldtrail is sending this invite in the LinkedIn window.'), b];
@@ -1531,17 +1608,21 @@ function createView(root, ctx) {
     }
     const canSend = c.liAuto && !it.parked;
     // Neither button works while LinkedIn is signed out or was never connected: both are off, and
-    // the hint says where to connect it. Send invite also stays off outside the sender's hours,
-    // and waits while a bulk send runs (it may send this one). Open in LinkedIn is the manual
-    // path: it has no hours and never waits (the server answers "busy" if the window is in use).
+    // the hint says where to connect it. Send invite also stays off outside the sender's hours and
+    // at a used-up cap (the sender would refuse it, and the screen would never hear why), and
+    // waits while a bulk send runs (it may send this one). Open in LinkedIn is the manual path: it
+    // has no hours or caps and never waits (the server answers "busy" if the window is in use).
     const { session } = c;
     const gate = canSend ? c.gate : null;
-    const waits = canSend && !gate && liBlocked();
+    const cap = canSend && !gate ? c.liCap : null;
+    const waits = canSend && !gate && !cap && liBlocked();
     let hint = null;
     if (session) {
       hint = h('span', { class: 'draft-hint' }, gateText(session, canSend ? 'Open in LinkedIn and Send invite are off.' : 'Open in LinkedIn is off.'));
     } else if (gate) {
       hint = h('span', { class: 'draft-hint' }, gateText(gate, 'Send invite waits until then. Open in LinkedIn works any time.'));
+    } else if (cap) {
+      hint = h('span', { class: 'draft-hint' }, capText(c));
     } else if (waits) {
       hint = h(
         'span',
@@ -1552,7 +1633,7 @@ function createView(root, ctx) {
           : null,
       );
     }
-    const ready = canSend && !gate;
+    const ready = canSend && !gate && !cap;
     const out = [
       hint,
       discardBtn,
@@ -1565,7 +1646,7 @@ function createView(root, ctx) {
       out.push(
         actionBtn('', ready ? 'primary' : 'secondary', 'invite', (e) => sendInvite(key, e.currentTarget), {
           needsNote: true,
-          blocked: !!gate || waits,
+          blocked: !!gate || !!cap || waits,
           label: () => {
             const cur = find(key);
             const who = cur && personFirst(cur);
@@ -1581,6 +1662,8 @@ function createView(root, ctx) {
     if (!d) return;
     const it = find(d.key);
     if (!it) return;
+    // What the actions follow (a send starting or ending) also locks the text, or frees it.
+    syncLock(it);
     const sig = actionsSig(it);
     if (!force && sig === d.actionsSig) {
       relabel();
@@ -1665,7 +1748,8 @@ function createView(root, ctx) {
       });
       if (!ok || pushing.has(key) || emailBlocked() || caps().emailGate) return;
     }
-    pushing.add(key);
+    pushing.set(key, auto);
+    syncLock(it); // (the server sends what it has now: no edit until it's done)
     const restore = busy(btn, auto ? 'Sending…' : 'Creating…');
     const what = auto ? 'Email not sent' : 'Gmail draft not created';
     try {
@@ -1721,17 +1805,23 @@ function createView(root, ctx) {
   }
 
   /**
-   * Whether anything has gone out to `domain` yet (sent, replied or bounced, on either channel):
-   * what decides whether Discard skips the company (`mark::contacted`) → true / false, or null
-   * when that can't be told. Asked fresh, since a send since the details loaded changes it.
+   * What decides whether discarding `domain`'s draft on `channel` skips the company: whether
+   * anything has gone out to it yet (sent, replied or bounced, on either channel:
+   * `mark::contacted`), and whether its draft on the other channel still waits. Each is true /
+   * false, or null when that can't be told. Asked fresh, since a send or a new draft since the
+   * details loaded changes them.
    */
-  async function contactedNow(domain) {
+  async function discardFacts(domain, channel) {
     try {
       const res = await api.get(`/api/companies/${enc(domain)}`, { signal: ctl.signal });
       const rows = res && Array.isArray(res.outreach) ? res.outreach : null;
-      return rows ? rows.some((o) => CONTACTED.includes(o.status)) : null;
+      if (!rows) return { contacted: null, otherWaits: null };
+      return {
+        contacted: rows.some((o) => CONTACTED.includes(o.status)),
+        otherWaits: rows.some((o) => (o.channel || 'email') !== channel && WAITING.includes(o.status)),
+      };
     } catch (_) {
-      return null;
+      return { contacted: null, otherWaits: null };
     }
   }
 
@@ -1744,21 +1834,25 @@ function createView(root, ctx) {
     const what = it.channel === 'linkedin' ? 'LinkedIn note' : 'email';
     const n = it.extra + 1;
     // Discard deletes every pending draft on this domain + channel, folded rows included. A
-    // company nothing has gone out to yet is then marked Skip; one already written to (this is a
-    // follow-up) keeps its stage and stays in Follow-ups.
-    let contacted;
+    // company nothing has gone out to yet, with no draft waiting on its other channel, is then
+    // marked Skip; one already written to (this is a follow-up) keeps its stage and stays in
+    // Follow-ups, and one whose other draft still waits stays in Drafts.
+    let facts;
     discardAsking = true;
     try {
-      contacted = await contactedNow(it.domain);
+      facts = await discardFacts(it.domain, it.channel);
     } finally {
       discardAsking = false;
     }
     if (!alive || !find(key)) return;
+    const { contacted, otherWaits } = facts;
+    const other = it.channel === 'linkedin' ? 'email' : 'LinkedIn note';
     const lead = it.extra ? `${n === 2 ? 'Both' : `All ${fmtNum(n)}`} ${what}s` : `The ${what}`;
     const gone = `${lead} to ${l.person || l.recipient} ${it.extra ? 'are' : 'is'} deleted`;
     let body;
-    if (contacted === false) body = `${gone} and ${l.org} is marked Skip, so it isn’t drafted again.`;
-    else if (contacted) body = `${gone}. You’ve already been in touch with ${l.org}, so it stays in Follow-ups.`;
+    if (contacted) body = `${gone}. You’ve already been in touch with ${l.org}, so it stays in Follow-ups.`;
+    else if (otherWaits) body = `${gone}. ${l.org}’s ${other} still waits, so it stays in Drafts.`;
+    else if (contacted === false) body = `${gone} and ${l.org} is marked Skip, so it isn’t drafted again.`;
     else body = `${gone}. If nothing has gone out to ${l.org} yet, it’s marked Skip, so it isn’t drafted again.`;
     if (it.channel === 'email' && it.status === 'drafted') body += ' The copy in your Gmail Drafts stays there.';
     const ok = await confirmDialog({
@@ -1790,8 +1884,12 @@ function createView(root, ctx) {
       } else {
         staged.delete(key);
         rowSends.delete(key);
-        // The server says which it did (`skipped`; one that doesn't say always skipped).
-        const after = r && r.skipped === false ? `${l.org} stays in Follow-ups.` : `${l.org} is now skipped.`;
+        // The server says which it did (`skipped`; one that doesn't say always skipped). Not
+        // skipped means written to before, or the other channel's draft still waits.
+        let after = `${l.org} is now skipped.`;
+        if (r && r.skipped === false) {
+          after = !contacted && otherWaits ? `${l.org}’s ${other} still waits in Drafts.` : `${l.org} stays in Follow-ups.`;
+        }
         toast(`${it.extra ? `${fmtNum(n)} drafts` : 'Draft'} discarded. ${after}`, 'ok');
       }
       store.refresh();
@@ -1806,16 +1904,21 @@ function createView(root, ctx) {
 
   async function assist(key, btn) {
     const it = find(key);
-    if (!it || overLimit(it) || caps().session) return;
+    if (!it || overLimit(it) || caps().session || opening.has(key)) return;
     const restore = busy(btn, 'Opening…');
+    // LinkedIn opens with the note as saved now: no edit until it has (then "Did it send?").
+    opening.add(key);
+    syncLock(it);
     const reason = await saveBeforeAction(key);
     if (reason) {
+      opening.delete(key);
       restore();
+      settled();
       unsaved('LinkedIn not opened', reason);
       return;
     }
     try {
-      const r = await api.post(`/api/drafts/${enc(it.domain)}/linkedin/assist`, {});
+      const r = await api.post(`/api/drafts/${enc(it.domain)}/linkedin/assist`, {}).finally(() => opening.delete(key));
       if (r && r.staged) {
         staged.add(key);
         toast('Opened in LinkedIn — review the note and click Send there.', 'ok');
@@ -1833,14 +1936,36 @@ function createView(root, ctx) {
         store.refresh();
         await reloadQueue({ focusOnVanish: true });
         restore();
+        settled();
       } else {
         restore();
+        settled();
         toast('Couldn’t open LinkedIn.', 'err');
       }
     } catch (err) {
       restore();
-      toast(`LinkedIn not opened — ${errorText(err)}`, 'err');
+      toast(await whyNotLinkedin('LinkedIn not opened', err), 'err');
+      settled();
     }
+  }
+
+  /** After a LinkedIn action that didn't go ahead: the screen showing now shows it ended (the
+   *  text editable again, the button back), this one or one opened since. */
+  function settled() {
+    if (alive) refreshActions();
+    else stateChanged();
+  }
+
+  /**
+   * A LinkedIn action the server refused, as a toast: "LinkedIn not opened — <why>". It may have
+   * just found LinkedIn signed out (it records that, then says so), so the status is fetched again
+   * first: the screen catches up at once rather than at the next refresh (30s), nothing offers the
+   * action again, and the toast says how to reconnect in this screen's words.
+   */
+  async function whyNotLinkedin(what, err) {
+    await store.refresh();
+    const session = alive ? caps().session : null;
+    return session ? `${what}. ${gatePlain(session)}` : `${what} — ${errorText(err)}`;
   }
 
   async function answer(key, sent, btn) {
@@ -1874,7 +1999,8 @@ function createView(root, ctx) {
 
   async function sendInvite(key, btn) {
     const it = find(key);
-    if (!it || overLimit(it) || it.parked || liBlocked() || caps().gate || rowSends.has(key)) return;
+    const blocked = () => liBlocked() || caps().gate || caps().liCap || rowSends.has(key) || starting.has(key);
+    if (!it || overLimit(it) || it.parked || blocked()) return;
     const c = caps();
     const who = labelsOf(it).person || linkedinHandle(it.to || it.domain);
     const ok = await confirmFirstSend('linkedin', {
@@ -1883,23 +2009,31 @@ function createView(root, ctx) {
       confirmText: 'Send invite',
       opener: btn,
     });
-    if (!ok || !alive) return;
+    // (A status refresh while the confirm was open may have closed the window or used up a cap.)
+    if (!ok || !alive || blocked()) return;
     const restore = busy(btn, 'Sending…');
+    // The sender sends the note as saved now: no edit while it goes out.
+    starting.add(key);
+    syncLock(it);
     const reason = await saveBeforeAction(key);
     if (reason) {
+      starting.delete(key);
       restore();
+      settled();
       unsaved('Invite not sent', reason);
       return;
     }
     try {
-      const r = await api.post(`/api/drafts/${enc(it.domain)}/linkedin/send`, {});
+      const r = await api.post(`/api/drafts/${enc(it.domain)}/linkedin/send`, {}).finally(() => starting.delete(key));
       if (!r || !r.sending) {
         restore();
+        settled();
         toast('Couldn’t start the LinkedIn send.', 'err');
         return;
       }
-      rowSends.set(key, { at: Date.now(), timedOut: false });
-      toast('Sending on LinkedIn — coldtrail is driving the browser…', 'ok');
+      // (Named in its toasts: several can be going out, and they land after the user moved on.)
+      rowSends.set(key, { at: Date.now(), timedOut: false, who });
+      toast(`Sending on LinkedIn to ${who} — coldtrail is driving the browser…`, 'ok');
       if (!alive) {
         stateChanged(); // the screen showing now watches it
         return;
@@ -1909,7 +2043,8 @@ function createView(root, ctx) {
       scheduleRowPoll();
     } catch (err) {
       restore();
-      toast(`Invite not sent — ${errorText(err)}`, 'err');
+      toast(await whyNotLinkedin('Invite not sent', err), 'err');
+      settled();
     }
   }
 
@@ -2086,7 +2221,7 @@ function createView(root, ctx) {
     // The dialog may have sat open past 20:00: check the LinkedIn sender's hours again.
     const gate = p.liGo ? liGate(s.status) : null;
     const liGo = p.liGo && !gate;
-    run = { auto, i: 0, n: emails.length, li: liGo };
+    run = { auto, i: 0, n: emails.length, li: liGo, key: null };
     const step = (text) => {
       progress.textContent = text;
       runChanged();
@@ -2102,6 +2237,7 @@ function createView(root, ctx) {
         const it = emails[i];
         const name = labelsOf(it).org;
         run.i = i;
+        run.key = it.key; // (its text is read-only while it goes: lockReason)
         step(`${auto ? 'Sending' : 'Creating'} ${fmtNum(i + 1)} of ${fmtNum(emails.length)}…`);
         // The server sends what it has stored: an edit it doesn't have yet (its save failed, or
         // is still on the way) is saved first, and an email whose edit can't be saved stays here.
@@ -2133,13 +2269,15 @@ function createView(root, ctx) {
         }
       }
       run.i = run.n;
+      run.key = null;
       if (emails.length) {
         const done = auto ? `Sent ${pluralize(ok, 'email')}.` : `Created ${pluralize(ok, 'Gmail draft')}.`;
         if (stopped) toast(`${done} Stopped: ${stopped}`, 'err');
         else if (failed.length) toast(`${done} ${fmtNum(failed.length)} failed:\n${failed.join('\n')}`, 'err');
         else toast(done, 'ok');
       }
-      if (gate) toast(`No LinkedIn invites went out. ${gatePlain(gate)}`);
+      // (An error, as the emails' "Stopped:" is: it stays until dismissed.)
+      if (gate) toast(`No LinkedIn invites went out. ${gatePlain(gate)}`, 'err');
       if (liGo && !staleStop) await startLinkedinSender(p, step);
       // Send now stays off until the queue shows what went out, so nothing goes twice.
       store.refresh();
@@ -2203,28 +2341,56 @@ function createView(root, ctx) {
   async function rowTick() {
     rowTimer = null;
     if (!alive) return;
+    // The status (the LinkedIn session, the caps), then the queue: a send that went out has left a
+    // queue asked for after the status that counts it, so a cap it used up itself is never taken
+    // for the reason it stopped.
+    await store.refresh();
+    if (!alive) return;
     const fresh = await load();
     if (!alive) return;
-    let late = false;
+    const watched = [...rowSends.values()].filter((v) => !v.timedOut).length;
+    let changed = false;
     for (const [key, v] of rowSends) {
       if (v.timedOut) continue;
-      if (fresh && !find(key)) {
+      const it = fresh ? find(key) : null;
+      const why = it ? rowStopped(it, watched) : null;
+      if (fresh && !it) {
         rowSends.delete(key);
-        toast('Invite sent on LinkedIn.', 'ok');
+        toast(`Invite to ${v.who} sent on LinkedIn.`, 'ok');
         store.refresh();
+      } else if (why) {
+        // The sender gave up on it: the watch ends, and the draft offers what still works.
+        rowSends.delete(key);
+        changed = true;
+        toast(`The invite to ${v.who} wasn’t sent. ${why}`, 'err');
       } else if (Date.now() - v.at > ROW_TIMEOUT_MS) {
         // Out of time, whether or not the queue could be read meanwhile (a server that stopped
         // answering): the button stays off (it may still go out), and now says it didn't confirm.
         v.timedOut = true;
-        late = true;
-        toast('The LinkedIn invite didn’t confirm. Check it in LinkedIn, or reload this page to try again.');
+        changed = true;
+        toast(`The invite to ${v.who} didn’t confirm. Check it in LinkedIn, or reload this page to try again.`);
       }
     }
-    if (late) {
+    if (changed) {
       renderList();
       refreshActions();
     }
     scheduleRowPoll();
+  }
+
+  /**
+   * Why the sender gave up on a row's invite that's still queued, as a sentence, or null. Nothing
+   * reports a failed send back, but some show: it parked the draft (LinkedIn wants the member's
+   * email; it failed too often), LinkedIn signed out, or a cap was used up. A cap counts only
+   * while this is the one send being watched: with others going out, one of them may have used it
+   * up while this one, already past its check, still goes.
+   */
+  function rowStopped(it, watched) {
+    if (it.parked) return capitalize(it.parked);
+    const c = caps();
+    if (c.session) return gatePlain(c.session);
+    if (c.liCap && watched === 1 && !liBlocked()) return `${capReached(c)}.`;
+    return null;
   }
 
   function scheduleBulkPoll() {
@@ -2281,7 +2447,8 @@ function createView(root, ctx) {
         const sent = `${pluralize(gone, 'invite')} sent`;
         if (gone >= b.want) toast(`LinkedIn bulk send finished: ${sent}.`, 'ok');
         else if (capped) toast(`LinkedIn bulk send stopped at your LinkedIn cap: ${sent}.`, 'ok');
-        else toast(`LinkedIn bulk send stopped: ${sent}. ${gatePlain(gate)}`);
+        // (An error: it stays until dismissed, since the user is often away while it runs.)
+        else toast(`LinkedIn bulk send stopped: ${sent}. ${gatePlain(gate)}`, 'err');
         store.refresh();
         return;
       }
@@ -2399,14 +2566,45 @@ function createView(root, ctx) {
     else if (before !== s.key) loadDetails(find(s.key).domain);
     if (urlChanged && s.key) syncUrl({ replace: true });
     else if (urlChanged) deselect();
-    if (urlChanged && focusOnVanish && s.key) focusOption(s.key);
+    if (urlChanged && focusOnVanish && s.key) {
+      if (wide.matches || !d) {
+        focusOption(s.key);
+      } else {
+        // Phone: the list is hidden behind the draft that took its place, so the keyboard (and a
+        // screen reader, which reads its name out) goes there, scrolled to its top.
+        d.name.focus({ preventScroll: true });
+        d.el.scrollIntoView({ block: 'start' });
+      }
+    }
   }
 
   function retry() {
+    // Try again from the keyboard: the button goes with the panel, so the keyboard is placed again
+    // once the reload lands (it would otherwise drop to the top of the page).
+    const refocus = body.contains(document.activeElement);
     s.error = null;
     renderHeader();
     renderBody();
-    start();
+    start({ refocus });
+  }
+
+  /** After Try again: the keyboard on what's there now, unless it has moved on meanwhile. Failed
+   *  again: Try again. The list: the open draft's row (a phone's open draft: its name), or the
+   *  first row. Nothing waiting: the empty state's link. */
+  function focusAfterRetry() {
+    const el = document.activeElement;
+    if (el && el !== document.body && document.contains(el)) return;
+    if (!s.items) {
+      const again = body.querySelector('.drafts-panel button');
+      if (again) again.focus();
+    } else if (!s.items.length) {
+      const link = body.querySelector('.drafts-panel a');
+      if (link) link.focus();
+    } else if (d && !wide.matches) {
+      d.name.focus({ preventScroll: true });
+    } else {
+      focusOption(s.key);
+    }
   }
 
   // The selected draft's company details: the query that sourced it ("Sourced by") and its
@@ -2655,8 +2853,10 @@ function createView(root, ctx) {
   // ---- Start ----
 
   // The first load (or Try again after it failed), then the pollers a send left running.
-  function start() {
+  // `refocus`: Try again was pressed from the keyboard.
+  function start({ refocus = false } = {}) {
     load().then((fresh) => {
+      if (alive && refocus) focusAfterRetry();
       if (!alive || !fresh) return;
       scheduleRowPoll();
       if (bulkStart() && !bulkTimer) {

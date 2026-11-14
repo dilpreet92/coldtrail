@@ -73,6 +73,9 @@
   border: 1px solid var(--border);
   border-radius: var(--radius-input);
 }
+/* The queue couldn't load: an alert, as the other screens' load errors look. */
+.drafts-error { border-color: color-mix(in srgb, var(--danger) 40%, var(--border)); }
+.drafts-error .empty-state > svg { color: var(--danger); }
 
 .drafts-ld {
   flex: 1;
@@ -376,6 +379,9 @@
 .draft-note-meta .draft-count { flex: none; margin-left: auto; color: var(--text-3); }
 
 .draft-info { color: var(--text-2); }
+/* Why the text can't be edited now (it's on its way out); the editor below is read-only. */
+.draft-lock { color: var(--text-2); font-size: 13px; }
+.draft-fields .input[readonly] { background: var(--surface-2); color: var(--text-2); }
 
 .draft-ro {
   padding: var(--space-2) var(--space-3);
@@ -387,11 +393,15 @@
 }
 .draft-ro-body { white-space: pre-wrap; line-height: 1.55; padding: var(--space-3); }
 
+/* The bar: the save state, then the actions. Their parts (a hint, the buttons, "Did it send?")
+   are laid out in the bar itself: a hint takes a line of its own above the buttons, which keep
+   to one row with the save state when there's room. */
 .draft-foot {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: var(--space-2) var(--space-3);
+  justify-content: flex-end;
+  gap: var(--space-2);
 }
 /* Desktop: the detail pane scrolls on its own, so its actions stay pinned to the pane's bottom
    edge while a long draft scrolls under them (a short one leaves them where they are). */
@@ -404,6 +414,14 @@
     border-top: 1px solid var(--border);
     background: var(--surface);
   }
+  /* An email under review fills the pane, and its body takes the room left between the fields
+     above it and the bar: it ends at the bar rather than running under it, and grows with the
+     window. Below 120px (a short window) the pane scrolls instead, the bar pinned. */
+  .drafts-detail { display: flex; flex-direction: column; }
+  .draft-fill { flex: 1 0 auto; padding-bottom: 0; } /* (the bar sits on the pane's bottom edge) */
+  .draft-fill > .draft-fields,
+  .draft-fill .draft-fields > .field:last-child { flex: 1 0 auto; }
+  .draft-fill #draft-body { flex: 1 0 auto; height: 120px; min-height: 120px; }
 }
 .draft-state {
   display: flex;
@@ -422,13 +440,8 @@
 .draft-note-meta .draft-count.is-over { color: var(--danger); font-weight: 600; }
 .draft-save.is-error { color: var(--danger); }
 
-.draft-actions {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: flex-end;
-  gap: var(--space-2);
-}
+.draft-actions { display: contents; }
+.draft-actions > .draft-hint { flex: 1 1 100%; order: -1; }
 .draft-hint { color: var(--text-2); font-size: 13px; }
 .draft-hint a { color: var(--accent-ink); }
 /* "Stop waiting": a text button inside the hint sentence. */
@@ -499,17 +512,17 @@
   .drafts-ld:not(.has-selection) .ld-detail,
   .drafts-ld.has-selection .ld-list { display: none; }
   .drafts-keys { display: none; }
-  .draft { padding: var(--space-4); gap: var(--space-3); }
+  /* (Scrolled to when it takes over from a draft that left: its top clear of the top bar.) */
+  .draft { padding: var(--space-4); gap: var(--space-3); scroll-margin-top: var(--topbar-h); }
   .draft-back { display: inline-flex; }
   .draft-text { min-height: 200px; }
 }
 
-/* Narrow: the actions take the full width and their buttons share each row, so one that wraps
-   (usually the primary, last) is a full-width button rather than a stray one at the edge. */
+/* Narrow: the save state takes a line of its own, and the buttons share each row, so one that
+   wraps (usually the primary, last) is a full-width button rather than a stray one at the edge. */
 @media (max-width: 599px) {
-  .draft-actions { flex: 1 1 100%; }
+  .draft-state { flex: 1 1 100%; }
   .draft-actions > .btn { flex: 1 1 auto; }
-  .draft-actions > .draft-hint { flex-basis: 100%; }
   .draft-ask { flex: 1 1 100%; }
   .draft-ask > .btn { flex: 1 1 auto; }
   .draft-ask-q { flex-basis: 100%; }
