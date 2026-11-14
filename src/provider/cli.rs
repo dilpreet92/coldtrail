@@ -272,17 +272,7 @@ fn parse_codex_line(line: &str) -> Vec<AgentEvent> {
 fn codex_item_name(it: &Value) -> String {
     match it["type"].as_str().unwrap_or("item") {
         "command_execution" => {
-            let cmd: String = it["command"]
-                .as_str()
-                .unwrap_or("")
-                .chars()
-                .take(48)
-                .collect();
-            if cmd.trim().is_empty() {
-                "shell".into()
-            } else {
-                format!("$ {cmd}")
-            }
+            command_label(it["command"].as_str().unwrap_or("")).unwrap_or_else(|| "shell".into())
         }
         "mcp_tool_call" => it["tool"]
             .as_str()
@@ -395,17 +385,30 @@ fn parse_opencode_line(line: &str) -> Vec<AgentEvent> {
 fn opencode_tool_name(part: &Value) -> String {
     let tool = part["tool"].as_str().unwrap_or("tool");
     if tool == "bash" {
-        let cmd: String = part["state"]["input"]["command"]
-            .as_str()
-            .unwrap_or("")
-            .chars()
-            .take(48)
-            .collect();
-        if !cmd.trim().is_empty() {
-            return format!("$ {cmd}");
+        if let Some(label) = command_label(part["state"]["input"]["command"].as_str().unwrap_or(""))
+        {
+            return label;
         }
     }
     tool.to_string()
+}
+
+/// How many characters of a shell command its step label shows.
+const COMMAND_LABEL_CHARS: usize = 48;
+
+/// A shell step's label: `$ ` and the command's first [`COMMAND_LABEL_CHARS`] characters, with
+/// "…" when there was more. None for a blank command.
+fn command_label(cmd: &str) -> Option<String> {
+    if cmd.trim().is_empty() {
+        return None;
+    }
+    let mut chars = cmd.chars();
+    let head: String = chars.by_ref().take(COMMAND_LABEL_CHARS).collect();
+    Some(if chars.next().is_some() {
+        format!("$ {}…", head.trim_end())
+    } else {
+        format!("$ {head}")
+    })
 }
 
 async fn run_opencode(
@@ -714,6 +717,32 @@ mod tests {
     use super::*;
 
     const NONE: Tools = Tools::Disallow(&[]);
+
+    /// A shell step's label keeps the first 48 characters of its command and says, with "…",
+    /// when it cut the rest, for codex and opencode alike. A short command stays whole.
+    #[test]
+    fn long_command_labels_end_in_an_ellipsis() {
+        let long = "coldtrail source \"seed-stage fintech, Europe\" \"embedded finance\"";
+        let cut = format!("$ {}…", &long[..48]);
+        let codex = |c: &str| {
+            codex_item_name(&serde_json::json!({"type": "command_execution", "command": c}))
+        };
+        let opencode = |c: &str| {
+            opencode_tool_name(
+                &serde_json::json!({"tool": "bash", "state": {"input": {"command": c}}}),
+            )
+        };
+        assert_eq!(codex(long), cut);
+        assert_eq!(opencode(long), cut);
+        let exact = "x".repeat(48);
+        assert_eq!(codex(&exact), format!("$ {exact}"));
+        assert_eq!(opencode("ls -la"), "$ ls -la");
+        assert_eq!(codex("   "), "shell");
+        assert_eq!(opencode(""), "bash");
+        // Cut on characters, not bytes; trailing spaces at the cut don't sit before the "…".
+        let wide = format!("{} {}", "é".repeat(47), "tail");
+        assert_eq!(opencode(&wide), format!("$ {}…", "é".repeat(47)));
+    }
 
     #[test]
     fn auth_hint_detects_expired_login() {
