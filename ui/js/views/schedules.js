@@ -7,7 +7,9 @@
 // No polling of its own: the shared store's 30s summary tells it when a run finished (last_run
 // changes) or is running, and a 30s ticker keeps the relative times fresh. Unmount aborts the
 // screen's loads and, through the same signal, closes any dialog, confirm or row menu this
-// screen opened; it also stops the ticker and unsubscribes.
+// screen opened; it also stops the ticker and unsubscribes. A create/edit form with unsaved
+// changes that closes without a choice to drop them (⌘K, or leaving the screen) is kept by the
+// module, and New schedule (or Edit of that schedule) brings it back; a toast says so.
 // The server writes a schedule's row before it installs or removes the OS timer, so a 500 from
 // a save or a toggle may come after the change was stored: the screen then reloads the list and
 // says what was saved and what wasn't. A list reload that read the list before a change was
@@ -19,6 +21,7 @@
 
 import { api, errorText, isStaleSession } from '../core/api.js';
 import { fmtDate, fmtNum, fmtRelative, h, pluralize, runStatus, toDate } from '../core/dom.js';
+import { comboOf } from '../core/keys.js';
 import { href } from '../core/router.js';
 import { confirmDialog, openDialog, openMenu, setBusy, toast } from '../core/ui.js';
 import { badge } from '../components/badge.js';
@@ -203,6 +206,10 @@ const ICON = {
 
 let current = null; // the mounted screen, for update()
 
+// Create/edit forms closed with unsaved changes by ⌘K or by leaving the screen: 'new' or the
+// schedule's id → what the form held (openEditor's fields()). Kept until the page reloads.
+const drafts = new Map();
+
 function mountSchedules(root, ctx) {
   const { store, nav } = ctx;
   let alive = true;
@@ -221,6 +228,7 @@ function mountSchedules(root, ctx) {
   const toggling = new Map(); // id → the state its switch is saving
   let lastRunKey = runKey(store.get().summary);
   let running = runningOf(store.get().summary);
+  let parked = null; // the part (list or run history) Try again left focus on while it reloads
 
   // ---- Layout ----
 
@@ -240,7 +248,9 @@ function mountSchedules(root, ctx) {
     h('div', { class: 'page-actions' }, newBtn),
   );
 
-  const listBox = h('div', { class: 'sch-list', 'aria-busy': 'true' });
+  // The list and the run history are focusable from script only: Try again parks focus there
+  // while what it replaced reloads.
+  const listBox = h('div', { class: 'sch-list', 'aria-busy': 'true', tabindex: '-1' });
   const listSection = h('section', { class: 'sch-section' }, listBox);
 
   const historyTitleId = `sch-history-${++uid}`;
@@ -248,7 +258,7 @@ function mountSchedules(root, ctx) {
   const historyDesc = h('p', { class: 'sch-section-desc' }, 'The latest 50 runs, newest first.');
   const historySection = h(
     'section',
-    { class: 'sch-section sch-history', 'aria-labelledby': historyTitleId, 'aria-busy': 'true' },
+    { class: 'sch-section sch-history', 'aria-labelledby': historyTitleId, 'aria-busy': 'true', tabindex: '-1' },
     h(
       'div',
       { class: 'sch-section-head' },
@@ -312,7 +322,7 @@ function mountSchedules(root, ctx) {
       },
       (err) => {
         errRuns = err;
-        if (!runs) renderHistory();
+        if (!runs) keepFocus(renderHistory);
       },
     );
   }
@@ -364,22 +374,46 @@ function mountSchedules(root, ctx) {
     return (newBtn.hidden && listBox.querySelector('.empty-state .btn')) || newBtn;
   }
 
-  // Re-rendering replaces rows; put focus back on the same control (by data-focus-key), or on
+  // Re-rendering replaces rows; put focus back on the same control (by data-focus-key), else on
+  // its row's ⋯ button when that row is still there (a run link gone once its run ended), else on
   // startBtn() when that control is gone (a deleted row, the empty state's button) or hidden
-  // (New schedule, once the list turns out empty).
+  // (New schedule, once the list turns out empty). Focus that Try again parked on a part goes on,
+  // once that part has loaded, to its new Try again or its first control.
   function keepFocus(fn) {
     const at = document.activeElement;
     const key = at && root.contains(at) && at.dataset ? at.dataset.focusKey : null;
     const inList = at && listBox.contains(at);
+    const inRow = inList && at.closest('.sch-row');
+    const rowId = inRow ? inRow.dataset.id : null;
+    if (parked && at !== parked) parked = null; // moved on meanwhile
     fn();
     if (!alive) return;
+    if (parked) {
+      if (parked.getAttribute('aria-busy') === 'true' || document.activeElement !== parked) return;
+      const next = parked.querySelector('a[href], button:not([disabled])');
+      parked = null;
+      if (next) next.focus({ preventScroll: true });
+      return;
+    }
     const again = byKey(key);
     if (again) {
       again.focus({ preventScroll: true });
       return;
     }
     const lost = inList ? !listBox.contains(document.activeElement) : at === newBtn && newBtn.hidden;
-    if (lost) startBtn().focus({ preventScroll: true });
+    if (lost) (byKey(rowId == null ? null : `menu:${rowId}`) || startBtn()).focus({ preventScroll: true });
+  }
+
+  // Try again: the part shows loading again. The button goes with the error, so when it had
+  // focus, focus waits on the part until it has loaded (keepFocus hands it on).
+  function retryIn(part, render, load) {
+    const had = part.contains(document.activeElement);
+    render();
+    if (had) {
+      parked = part;
+      part.focus({ preventScroll: true });
+    }
+    load();
   }
 
   // An overlay gives focus back to the control that opened it. When the list was rebuilt while
@@ -393,7 +427,7 @@ function mountSchedules(root, ctx) {
     (byKey(opener.dataset && opener.dataset.focusKey) || startBtn()).focus({ preventScroll: true });
   }
 
-  function errorBlock(what, err, retry) {
+  function errorBlock(what, err, retry, focusKey) {
     // A stale session reads "Reopen coldtrail from your terminal." (the banner has the rest).
     const why = errorText(err);
     return h(
@@ -406,7 +440,7 @@ function mountSchedules(root, ctx) {
         `${what} didn't load.`,
         why ? h('span', { class: 'sch-error-why' }, ` ${why}`) : null,
       ),
-      h('button', { type: 'button', class: 'btn btn-secondary btn-sm', onClick: retry }, 'Try again'),
+      h('button', { type: 'button', class: 'btn btn-secondary btn-sm', 'data-focus-key': focusKey, onClick: retry }, 'Try again'),
     );
   }
 
@@ -449,9 +483,8 @@ function mountSchedules(root, ctx) {
         ...(errSchedules
           ? [errorBlock('Schedules', errSchedules, () => {
             errSchedules = null;
-            renderList();
-            loadSchedules();
-          })]
+            retryIn(listBox, renderList, loadSchedules);
+          }, 'retry:schedules')]
           : [h('span', { class: 'sr-only' }, 'Loading schedules…'), listHead(), ...skeletonSchedules(2)]),
       );
       return;
@@ -524,10 +557,13 @@ function mountSchedules(root, ctx) {
   }
 
   function lastContent(s) {
+    // Watch the run and View run share a focus key: one takes the other's place when a run
+    // starts or ends, and focus stays on it.
+    const linkKey = `last-run:${s.id}`;
     if (isRunning(s)) {
       return [
         h('span', { class: 'sch-last-top' }, badge('Running', 'accent'), h('span', { class: 'sch-sub' }, 'now')),
-        h('a', { class: 'sch-link', href: href(['agent', running.chat_id]), 'data-focus-key': `watch:${s.id}` }, 'Watch the run', h('span', { class: 'sr-only' }, ` (${nameOf(s)})`)),
+        h('a', { class: 'sch-link', href: href(['agent', running.chat_id]), 'data-focus-key': linkKey }, 'Watch the run', h('span', { class: 'sr-only' }, ` (${nameOf(s)})`)),
       ];
     }
     const lr = s.last_run;
@@ -562,7 +598,7 @@ function mountSchedules(root, ctx) {
       links.push(
         h(
           'a',
-          { class: 'sch-link', href: href(['agent', lr.chat_id]), 'data-focus-key': `view:${s.id}` },
+          { class: 'sch-link', href: href(['agent', lr.chat_id]), 'data-focus-key': linkKey },
           'View run',
           h('span', { class: 'sr-only' }, ` (${nameOf(s)}, ${fmtDate(when, { time: true })})`),
         ),
@@ -823,6 +859,7 @@ function mountSchedules(root, ctx) {
       return;
     }
     toast(`${quoted(s)} deleted.`, 'ok');
+    drafts.delete(s.id); // nothing left to edit
     if (alive) {
       if (schedules) schedules = schedules.filter((x) => x.id !== s.id);
       rereadAfterChange();
@@ -843,6 +880,8 @@ function mountSchedules(root, ctx) {
     // False once the dialog has closed. Esc and Close still work while a save is on its way (a
     // timer install can be slow); its outcome is then told by a toast instead.
     let open = true;
+    let saving = false; // a save is on its way
+    let discarded = false; // dropped by choice on the way out ("Discard and open Settings")
     // What is stored for editId as far as this dialog knows (the row it opened, or the one a
     // failed create left): a failed edit that sent just this can't show it was written.
     let base = s;
@@ -950,10 +989,20 @@ function mountSchedules(root, ctx) {
       ),
     );
 
+    // A form kept from earlier (⌘K, or leaving the screen) is back: say so, with a way to drop it.
+    const restored = h(
+      'p',
+      { class: 'sch-restored', id: id('restored'), hidden: true },
+      h('span', {}, s ? 'Your unsaved changes from earlier are back.' : 'Your unsaved schedule from earlier is back.'),
+      ' ',
+      h('button', { type: 'button', class: 'sch-text-btn', onClick: () => discardRestored() }, 'Discard'),
+    );
+
     const formError = h('p', { class: 'sch-form-error', role: 'alert', hidden: true });
     const form = h(
       'form',
       { class: 'sch-form', novalidate: true },
+      restored,
       nameF.wrap,
       h('div', { class: 'sch-when-row' }, freqField, dayF.wrap, timeF.wrap),
       taskField,
@@ -1044,6 +1093,7 @@ function mountSchedules(root, ctx) {
           shown: true,
           closed: `${quoted(body)} was saved, but its timer wasn't ${what}: ${errorText(err)}`,
         });
+      saving = true;
       try {
         if (editId) {
           try {
@@ -1059,8 +1109,13 @@ function mountSchedules(root, ctx) {
               store.refresh();
               const stored = fresh && fresh.find((x) => x.id === editId);
               const changed = !matchesSave(base, body);
+              // A stored rename renames its runs in the run history too.
+              if (alive && stored && base && stored.name !== base.name) loadRuns();
               if (stored) base = stored;
-              if (changed && matchesSave(stored, body)) throw timerFailed('updated', err);
+              if (changed && matchesSave(stored, body)) {
+                start = snapshot(); // what the form holds is stored now
+                throw timerFailed('updated', err);
+              }
             }
             throw err;
           }
@@ -1082,6 +1137,7 @@ function mountSchedules(root, ctx) {
               if (added) {
                 editId = added.id;
                 base = added;
+                start = snapshot(); // what the form holds is stored now
                 adopt(fresh);
                 store.refresh();
                 dlg.el.querySelector('.dialog-title').textContent = 'Edit schedule';
@@ -1093,18 +1149,24 @@ function mountSchedules(root, ctx) {
           }
         }
       } catch (err) {
+        saving = false;
         // Closed while it saved (Esc, Close, or the screen was left, which closes it too): a
-        // toast says how it went, on whichever screen is open now.
+        // toast says how it went, on whichever screen is open now. What wasn't stored is kept.
         if (!open) {
-          toast(err && err.shown ? err.closed : `Couldn't save ${quoted(body)}: ${errorText(err)}`, 'err');
+          const text = err && err.shown ? err.closed : `Couldn't save ${quoted(body)}: ${errorText(err)}`;
+          toast(settleDraft(true) ? `${text}\n${comesBack()}` : text, 'err');
           return false;
         }
         formError.textContent = err && err.shown ? err.message : `Couldn't save: ${errorText(err)}`;
         formError.hidden = false;
         return false;
       }
+      saving = false;
       // Closed while it saved: onClose has been and gone, so show the result now.
-      if (!open) settleSave(saved);
+      if (!open) {
+        settleSave(saved);
+        settleDraft(false);
+      }
       return true;
     }
 
@@ -1120,15 +1182,64 @@ function mountSchedules(root, ctx) {
     });
 
     sync();
-    // What the form holds, to tell whether anything was typed or changed since it opened.
-    const snapshot = () => JSON.stringify([nameIn.value, freq(), daySel.value, timeIn.value, task(), promptIn.value]);
-    const pristine = snapshot();
+    // What the form holds; `start` is the form as stored (or empty, for a new schedule), so a
+    // form whose snapshot() differs holds unsaved changes.
+    const fields = () => ({ name: nameIn.value, freq: freq(), day: daySel.value, time: timeIn.value, task: task(), prompt: promptIn.value });
+    const snapshot = () => JSON.stringify(fields());
+    let start = snapshot();
 
-    // "Change in Settings" leaves this screen, which closes the dialog: once the form has changed,
-    // ask before dropping it. (A click that opens another tab loses nothing.)
+    function apply(f) {
+      nameIn.value = f.name;
+      for (const r of form.querySelectorAll(`input[name="${freqName}"]`)) r.checked = r.value === f.freq;
+      daySel.value = f.day;
+      timeIn.value = f.time;
+      for (const r of form.querySelectorAll(`input[name="${taskName}"]`)) r.checked = r.value === f.task;
+      promptIn.value = f.prompt;
+      allFields.forEach(clearError);
+      sync();
+    }
+
+    // The form this one was closed with earlier, unsaved (⌘K, or the screen was left): it's back.
+    const kept = drafts.get(s ? s.id : 'new');
+    if (kept && JSON.stringify(kept) !== start) {
+      apply(kept);
+      restored.hidden = false;
+    }
+
+    // Discard, under a form kept from earlier: back to the form as stored (or empty), for good.
+    function discardRestored() {
+      apply(JSON.parse(start));
+      drafts.delete(s ? s.id : 'new');
+      nameIn.focus();
+      restored.hidden = true;
+      dlg.el.removeAttribute('aria-describedby');
+    }
+
+    /** Once the dialog has closed: keep the form when it holds unsaved changes and `keep` (it
+     *  closed without a choice to drop them), else forget it. → whether it was kept. */
+    function settleDraft(keep) {
+      drafts.delete(s ? s.id : 'new');
+      drafts.delete(editId || 'new');
+      if (!keep || discarded || snapshot() === start) return false;
+      drafts.set(editId || 'new', fields());
+      return true;
+    }
+    /** How a kept form comes back. */
+    const comesBack = () => (editId ? 'Your changes come back when you edit it again.' : 'What you typed comes back when you open New schedule.');
+
+    // ⌘K (search) closes the dialog as Esc does (reason 'escape'), but isn't a choice to drop
+    // the form: note which of the two each key press is.
+    let searchKey = false;
+    const onKey = (e) => {
+      searchKey = comboOf(e) === 'mod+k';
+    };
+    document.addEventListener('keydown', onKey, true);
+
+    // "Change in Settings" leaves this screen, which closes the dialog: when the form holds
+    // unsaved changes, ask before dropping them. (A click that opens another tab loses nothing.)
     async function toSettings(e) {
       if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
-      if (snapshot() === pristine) return;
+      if (snapshot() === start) return;
       e.preventDefault();
       const ok = await ask({
         title: editId ? 'Discard your changes and open Settings?' : 'Discard this schedule and open Settings?',
@@ -1140,7 +1251,10 @@ function mountSchedules(root, ctx) {
         danger: true,
         opener: settingsLink,
       });
-      if (ok && open) nav.navigate(SENDING_SETTINGS);
+      if (ok && open) {
+        discarded = true;
+        nav.navigate(SENDING_SETTINGS);
+      }
     }
     const dlg = openDialog({
       title: s ? 'Edit schedule' : 'New schedule',
@@ -1152,15 +1266,28 @@ function mountSchedules(root, ctx) {
         { label: s ? 'Save changes' : 'Create schedule', kind: 'primary', onClick: save },
       ],
       // A stray click beside the dialog doesn't throw away what was typed (a long instruction):
-      // once the form has changed, only Cancel, Close or Esc close it.
-      beforeClose: (reason) => reason !== 'backdrop' || snapshot() === pristine,
-      onClose: () => {
+      // while the form holds unsaved changes, only Cancel, Close or Esc close it.
+      beforeClose: (reason) => reason !== 'backdrop' || snapshot() === start,
+      // Cancel, Close and Esc drop unsaved changes; ⌘K and leaving the screen (the signal: 'api')
+      // keep them, and say so. A save still on its way settles them once it ends (save()).
+      onClose: (reason) => {
         open = false;
+        document.removeEventListener('keydown', onKey, true);
         refocus(opener);
         if (saved) settleSave(saved);
+        if (saving) return;
+        if (!settleDraft(!saved && (reason === 'api' || (reason === 'escape' && searchKey)))) return;
+        const name = nameIn.value.trim();
+        toast(
+          editId
+            ? `Your changes to ${quoted(base)} aren’t saved yet. They come back when you edit it again.`
+            : `${name ? `“${name}”` : 'Your new schedule'} isn’t created yet. ${comesBack()}`,
+          'info',
+        );
       },
     });
     dlg.el.classList.add('sch-dialog');
+    if (!restored.hidden) dlg.el.setAttribute('aria-describedby', restored.id);
     const saveBtn = dlg.el.querySelector('.dialog-actions .btn-primary');
   }
 
@@ -1186,6 +1313,8 @@ function mountSchedules(root, ctx) {
   function afterSave(result) {
     const s = result.schedule;
     const at = (schedules || []).findIndex((x) => x.id === s.id);
+    // Run history names each run by its schedule's name now: a rename renames its runs.
+    const renamed = !result.created && (at < 0 || schedules[at].name !== s.name);
     if (at >= 0) {
       s.last_run = schedules[at].last_run; // the response's last_run is always null
       schedules[at] = s;
@@ -1197,6 +1326,7 @@ function mountSchedules(root, ctx) {
     keepFocus(renderList);
     toast(savedText(result), 'ok');
     loadSchedules({ announce: true });
+    if (renamed) loadRuns();
     store.refresh();
   }
 
@@ -1210,9 +1340,8 @@ function mountSchedules(root, ctx) {
         errRuns
           ? errorBlock('Run history', errRuns, () => {
             errRuns = null;
-            renderHistory();
-            loadRuns();
-          })
+            retryIn(historySection, renderHistory, loadRuns);
+          }, 'retry:runs')
           : h('div', { class: 'sch-history-skel' }, h('span', { class: 'sr-only' }, 'Loading run history…'), ...skeletonRows(3)),
       );
       return;

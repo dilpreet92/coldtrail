@@ -12,6 +12,9 @@
   border: 1px solid var(--border);
   border-radius: var(--radius-input);
 }
+/* Focusable from script only: Try again parks focus on its part while that reloads. */
+.sch-list:focus,
+.sch-history:focus { outline: none; }
 
 .sch-list-head,
 .sch-row,
@@ -376,6 +379,34 @@
   gap: var(--space-4);
   color: var(--text);
 }
+
+/* A form kept from earlier (closed unsaved by ⌘K, or by leaving the screen) is back, with a way
+   to drop it. */
+.sch-restored {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--warn);
+  border-radius: var(--radius-input);
+  color: var(--warn);
+  font-size: 13px;
+}
+.sch-text-btn {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+.sch-text-btn:hover { color: var(--accent); }
 
 .sch-when-row {
   display: flex;

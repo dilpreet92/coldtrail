@@ -473,6 +473,47 @@ test('shows loading, then an error with a retry, for each source', async ({ app,
   expect(runs).toEqual([]);
 });
 
+test('Try again keeps keyboard focus in the part it reloads, however the retry goes', async ({ app, page }) => {
+  app.allowConsole(/status of 500/);
+  const parts = [
+    { path: '**/api/schedules', part: page.locator('.sch-list'), first: () => page.locator('.sch-row').first().getByRole('switch') },
+    { path: '**/api/runs', part: page.locator('.sch-history'), first: () => page.locator('.sch-history').getByRole('link', { name: /^View run/ }).first() },
+  ];
+  for (const { path, part, first } of parts) {
+    // 'fail' answers a 500 at once; 'hold-fail' and 'hold-ok' wait for release() first.
+    let mode = 'fail';
+    const held = [];
+    const release = () => held.splice(0).forEach((resolve) => resolve());
+    await page.route(path, async (route) => {
+      if (route.request().method() !== 'GET') return route.continue();
+      const now = mode;
+      if (now !== 'fail') await new Promise((resolve) => held.push(resolve));
+      if (now === 'hold-ok') return route.continue().catch(() => {});
+      return route.fulfill({ status: 500, contentType: 'text/plain', body: 'database is locked' }).catch(() => {});
+    });
+    await app.goto('#/schedules');
+    const retry = part.getByRole('button', { name: 'Try again' });
+    await retry.focus();
+
+    // While it reloads, focus waits on the part (never on the page); it fails again: the new Try again.
+    mode = 'hold-fail';
+    await page.keyboard.press('Enter');
+    await expect.poll(() => held.length).toBeGreaterThan(0);
+    await expect(part).toBeFocused();
+    release();
+    await expect(retry).toBeFocused();
+
+    // It loads: focus goes on to the first control there.
+    mode = 'hold-ok';
+    await page.keyboard.press('Enter');
+    await expect.poll(() => held.length).toBeGreaterThan(0);
+    await expect(part).toBeFocused();
+    release();
+    await expect(first()).toBeFocused();
+    await page.unroute(path);
+  }
+});
+
 test('the loading placeholder fits 390px, and is about as tall as the rows it stands for', async ({ app, page }) => {
   // The seeded workspace has two schedules, one with a last run and one without: the placeholder
   // shows two rows. Run history (loaded first) moves by less than a third of a row when they land.
@@ -854,6 +895,31 @@ test('edit changes time', async ({ app, page, server }) => {
   await expect(row(page, LUNCH.name).locator('.sch-cadence')).toHaveText('Daily at 07:45');
 });
 
+// Leaves Lunch Source named as seeded.
+test('renaming a schedule renames its runs in the run history', async ({ app, page }) => {
+  await app.goto('#/schedules');
+  await ready(page);
+  // /api/runs names each run by its schedule's name now.
+  const named = (name) => page.locator('.sch-history .sch-run-name').filter({ hasText: new RegExp(`^${reEscape(name)}$`) });
+  const lunchRuns = await named(LUNCH.name).count();
+  expect(lunchRuns).toBeGreaterThan(0);
+  const rename = async (from, to) => {
+    await openRowMenu(page, from);
+    await page.getByRole('menuitem', { name: 'Edit' }).click();
+    const dialog = page.getByRole('dialog', { name: 'Edit schedule' });
+    await dialog.getByLabel('Name', { exact: true }).fill(to);
+    await dialog.getByRole('button', { name: 'Save changes' }).click();
+    await expect(dialog).toBeHidden();
+    await expect(row(page, to)).toBeVisible();
+  };
+  await rename(LUNCH.name, 'Midday Source');
+  await expect(named('Midday Source')).toHaveCount(lunchRuns);
+  await expect(named(LUNCH.name)).toHaveCount(0);
+  await rename('Midday Source', LUNCH.name);
+  await expect(named(LUNCH.name)).toHaveCount(lunchRuns);
+  await expect(named('Midday Source')).toHaveCount(0);
+});
+
 // Leaves Lunch Source at 07:45.
 test('an edit whose timer step fails says it was saved and shows it', async ({ app, page, server, request }) => {
   app.allowConsole(/status of 500/);
@@ -1226,6 +1292,120 @@ test('"Change in Settings" asks before it drops a changed form', async ({ app, p
   expect((await dbRows(server, 'SELECT time FROM schedules WHERE id = ?', LUNCH.id))[0].time).not.toBe('11:15');
 });
 
+test('a changed form closed by ⌘K or by leaving the screen comes back; Cancel, Esc and Close drop it', async ({ app, page, server }) => {
+  // From Home by the sidebar, so Back has somewhere in the app to go.
+  await app.goto('#/home');
+  await expect(page.locator('#view h1')).toHaveText('Home');
+  await page.locator('#nav a.nav-item[data-route="schedules"]').click();
+  await ready(page);
+  const newBtn = page.getByRole('button', { name: 'New schedule' });
+  const dialog = page.getByRole('dialog', { name: 'New schedule' });
+  const nameIn = dialog.getByLabel('Name', { exact: true });
+  const custom = dialog.getByRole('radio', { name: 'Custom instruction' });
+  const instruction = dialog.getByLabel('Instruction', { exact: true });
+  const back = dialog.locator('.sch-restored');
+  const beside = () => page.locator('.overlay-dialog').click({ position: { x: 8, y: 8 } });
+  const TEXT = 'Source 20 companies like Acme and draft intros to their founders';
+  const keptNew = toastWith(page, '“Like Acme” isn’t created yet. What you typed comes back when you open New schedule.');
+  const typeSomething = async () => {
+    await nameIn.fill('Like Acme');
+    await custom.check();
+    await instruction.fill(TEXT);
+  };
+
+  // ⌘K (search) closes the dialog as Esc does, but it isn't a choice to drop the form: it's kept.
+  await newBtn.click();
+  await typeSomething();
+  await page.keyboard.press('ControlOrMeta+k');
+  await expect(dialog).toBeHidden();
+  await expect(page.locator('.search-input')).toBeFocused();
+  await expect(keptNew).toBeVisible();
+  await keptNew.getByRole('button', { name: 'Dismiss' }).click();
+  // New schedule brings it back and says so. It is still unsaved: a click beside it keeps it open.
+  await newBtn.click();
+  await expect(nameIn).toHaveValue('Like Acme');
+  await expect(custom).toBeChecked();
+  await expect(instruction).toHaveValue(TEXT);
+  await expect(back).toHaveText('Your unsaved schedule from earlier is back. Discard');
+  await expect(dialog).toHaveAttribute('aria-describedby', await back.getAttribute('id'));
+  await beside();
+  await expect(dialog).toBeVisible();
+
+  // Back leaves the screen, which closes the dialog: it's kept, and the screen it lands on says so.
+  await page.goBack();
+  await expect(page.locator('#view h1')).toHaveText('Home');
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await expect(keptNew).toBeVisible();
+  await keptNew.getByRole('button', { name: 'Dismiss' }).click();
+  await page.goForward();
+  await ready(page);
+  await newBtn.click();
+  await expect(nameIn).toHaveValue('Like Acme');
+  await expect(instruction).toHaveValue(TEXT);
+
+  // Discard empties the form for good: untouched now, a click beside it closes it, and nothing
+  // comes back.
+  await back.getByRole('button', { name: 'Discard' }).click();
+  await expect(back).toBeHidden();
+  await expect(dialog).not.toHaveAttribute('aria-describedby', /./);
+  await expect(nameIn).toBeFocused();
+  await expect(nameIn).toHaveValue('');
+  await expect(dialog.getByRole('radio', { name: 'Agent decides' })).toBeChecked();
+  await expect(instruction).toBeHidden();
+  await beside();
+  await expect(dialog).toBeHidden();
+  await newBtn.click();
+  await expect(nameIn).toHaveValue('');
+  await expect(back).toBeHidden();
+
+  // Cancel, Esc and Close are a choice to drop it: nothing is kept, and nothing says it was.
+  const closes = [
+    () => dialog.getByRole('button', { name: 'Cancel' }).click(),
+    () => page.keyboard.press('Escape'),
+    () => dialog.getByRole('button', { name: 'Close' }).click(),
+  ];
+  for (const close of closes) {
+    await typeSomething();
+    await close();
+    await expect(dialog).toBeHidden();
+    await newBtn.click();
+    await expect(nameIn).toHaveValue('');
+    await expect(back).toBeHidden();
+  }
+  await expect(toastWith(page, 'isn’t created yet')).toHaveCount(0);
+  await dialog.getByRole('button', { name: 'Cancel' }).click();
+
+  // An edit is kept the same way, for Edit of that schedule only.
+  const stored = (await dbRows(server, 'SELECT time FROM schedules WHERE id = ?', LUNCH.id))[0].time;
+  const edit = page.getByRole('dialog', { name: 'Edit schedule' });
+  const time = edit.getByLabel('Time', { exact: true });
+  const openEdit = async () => {
+    await openRowMenu(page, LUNCH.name);
+    await page.getByRole('menuitem', { name: 'Edit' }).click();
+    await expect(edit).toBeVisible();
+  };
+  await openEdit();
+  await time.fill('11:15');
+  await page.keyboard.press('ControlOrMeta+k');
+  await expect(edit).toBeHidden();
+  await expect(toastWith(page, `Your changes to “${LUNCH.name}” aren’t saved yet. They come back when you edit it again.`)).toBeVisible();
+  await newBtn.click();
+  await expect(nameIn).toHaveValue('');
+  await dialog.getByRole('button', { name: 'Cancel' }).click();
+  await openEdit();
+  await expect(time).toHaveValue('11:15');
+  await expect(edit.locator('.sch-restored')).toHaveText('Your unsaved changes from earlier are back. Discard');
+  await edit.getByRole('button', { name: 'Cancel' }).click();
+  await openEdit();
+  await expect(time).toHaveValue(stored);
+  await expect(edit.locator('.sch-restored')).toBeHidden();
+  await edit.getByRole('button', { name: 'Cancel' }).click();
+
+  // Nothing was saved.
+  expect(await dbRows(server, "SELECT id FROM schedules WHERE name = 'Like Acme'")).toEqual([]);
+  expect((await dbRows(server, 'SELECT time FROM schedules WHERE id = ?', LUNCH.id))[0].time).toBe(stored);
+});
+
 test('closing the dialog while it saves still says how the save went', async ({ app, page, server, request }) => {
   app.allowConsole(/status of 500/);
   // Hold each create until released (a timer install can be slow); the second one fails.
@@ -1261,10 +1441,18 @@ test('closing the dialog while it saves still says how the save went', async ({ 
     await expect(row(page, 'Closed early')).toBeVisible();
     expect(await dbRows(server, "SELECT id FROM schedules WHERE name = 'Closed early'")).toHaveLength(1);
 
-    // Close while it saves, and the save fails: a toast says so (the dialog's message is gone).
+    // Close while it saves, and the save fails: a toast says so (the dialog's message is gone),
+    // and New schedule brings back what wasn't stored.
     await createAndLeave('Never stored', () => dialog.getByRole('button', { name: 'Close' }).click());
-    await expect(page.locator('.toast-err .toast-text')).toHaveText("Couldn't save “Never stored”: database is locked");
+    await expect(page.locator('.toast-err .toast-text')).toHaveText(
+      "Couldn't save “Never stored”: database is locked\nWhat you typed comes back when you open New schedule.",
+    );
     await expect(row(page, 'Never stored')).toHaveCount(0);
+    await newBtn.click();
+    await expect(dialog.getByLabel('Name', { exact: true })).toHaveValue('Never stored');
+    await expect(dialog.locator('.sch-restored')).toBeVisible();
+    await dialog.getByRole('button', { name: 'Cancel' }).click();
+    await expect(dialog).toBeHidden();
   } finally {
     for (const resolve of gates) resolve();
     await page.unroute('**/api/schedules');
@@ -1825,6 +2013,47 @@ test('a live run shows on its row, and a finished one refreshes the screen', asy
   await expect(page.getByRole('menuitem', { name: 'Run now' })).toBeEnabled();
   await expect(page.getByRole('menuitem', { name: 'Dry run' })).toBeEnabled();
   await page.keyboard.press('Escape');
+});
+
+test("focus on a row's run link stays on its row when the run starts or ends", async ({ app, page }) => {
+  // Lunch Source's last run gets a conversation (`chat`), so its row has a View run link.
+  let chat = SEED.chats.berlin.id;
+  let patch = {};
+  await patchSchedules(page, (list) => {
+    const lunch = list.find((s) => s.id === LUNCH.id);
+    if (lunch && lunch.last_run) lunch.last_run.chat_id = chat;
+  });
+  await patchSummary(page, () => patch);
+  await app.goto('#/schedules');
+  await ready(page);
+  const lunch = row(page, LUNCH.name);
+  const view = lunch.getByRole('link', { name: /^View run/ });
+  const watch = lunch.getByRole('link', { name: /^Watch the run/ });
+  const running = { chat_id: SEED.chats.scheduled.id, title: `Scheduled run — ${LUNCH.name}` };
+  await view.focus();
+
+  // A run starts: View run becomes Watch the run, and focus goes with it; it ends: back again.
+  patch = { running };
+  await refreshStore(page);
+  await expect(watch).toBeFocused();
+  patch = { running: null };
+  await refreshStore(page);
+  await expect(view).toBeFocused();
+
+  // A run ends that left nothing to view: focus stays on the row, on its ⋯ button.
+  patch = { running };
+  await refreshStore(page);
+  await expect(watch).toBeFocused();
+  chat = null;
+  const reloaded = page.waitForResponse((r) => new URL(r.url()).pathname === '/api/schedules');
+  patch = {
+    running: null,
+    last_run: { started_at: '2099-01-04 00:00:00', status: 'ok', schedule_name: LUNCH.name, chat_id: null, sourced: 1, drafted: 1, sent: 0 },
+  };
+  await refreshStore(page);
+  await reloaded;
+  await expect(view).toHaveCount(0);
+  await expect(lunch.getByRole('button', { name: `Actions for ${LUNCH.name}` })).toBeFocused();
 });
 
 // Leaves Lunch Source enabled, as seeded.
