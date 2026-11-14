@@ -4,13 +4,16 @@
 // the saved model, read from the picker's own list); Connections (Canonical, Gmail with the app
 // password first and more options folded, your own OAuth client saved and Google sign-in through
 // it, LinkedIn connect / reconnect / disconnect and its sign-in poll; connect requests outlive the
-// screen, and a sign-in wait can be cancelled, is picked up again on return, holds the other
-// sign-ins meanwhile and never stops the screen following status; a LinkedIn sign-in already open
-// is picked up again); Sending (email and LinkedIn auto-send switches that confirm before turning
-// on, never on an Enter pressed twice or held, caps that save on commit, refuse bad values, ask
-// before going up while auto-send is on and never turn it back on, today's usage, a consequence
-// line for each, caps saved on the way out but a raise not, with a toast saying so, a leave that
-// Back overtakes still asking, and the Connect link keeping keyboard focus through a save);
+// screen, and one that lands meanwhile has the store re-read; a sign-in wait can be cancelled, is
+// picked up again on return, holds the other sign-ins meanwhile and never stops the screen
+// following status; a LinkedIn sign-in already open is picked up again, and a session that
+// expires after connecting here shows; Gmail's note with auto-send on before it is connected);
+// Sending (email and LinkedIn auto-send switches that confirm before turning on, never on an
+// Enter pressed twice or held, caps that save on commit, refuse bad values, never change under
+// the wheel, ask before going up while auto-send is on and never turn it back on, today's usage,
+// a consequence line for each, caps saved on the way out but a raise or a bad value not, with a
+// toast saying so, a leave that Back overtakes still asking, and the Connect link keeping
+// keyboard focus through a save);
 // Enrichment (the OSINT installers, intercepted; an install still running is picked up again);
 // Appearance (System / Light / Dark, kept in this browser). Also: loading, error and stale-session
 // states, keyboard use, hostile text, the poll stopping on unmount and on a stale session, and
@@ -601,6 +604,46 @@ test('a cap typed and left keeps its value through a status refresh until it sav
   }
 });
 
+test('scrolling the page over a focused cap never changes it', async ({ app, page, request, server }) => {
+  await resetSending(request, server);
+  await postJSON(request, server, '/api/destination/linkedin/auto-send', { enabled: true, weekly_cap: 80, daily_cap: 15 });
+  try {
+    const posts = countRequests(page, '/api/destination/auto-send');
+    const liPosts = countRequests(page, '/api/destination/linkedin/auto-send');
+    await app.goto('#/settings?tab=sending');
+    const email = region(page, 'Email');
+    const li = region(page, 'LinkedIn');
+    const daily = email.getByLabel('Daily cap');
+    const weekly = li.getByLabel('Weekly cap');
+    await expect(daily).toHaveValue('20');
+    await expect(weekly).toHaveValue('80');
+    // Clicked into, then the wheel turned with the pointer still on it: the page scrolls, as over
+    // any other field, and the number stays.
+    const wheelOver = async (field, dy) => {
+      await field.click();
+      for (let i = 0; i < 10; i++) await page.mouse.wheel(0, dy);
+      await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+    };
+    await wheelOver(weekly, -120); // up, with LinkedIn auto-send on (a raise would ask)
+    await expect(weekly).toHaveValue('80');
+    await wheelOver(daily, 120); // down (nothing would ask)
+    await expect(daily).toHaveValue('20');
+
+    // Left: nothing was typed, so nothing saves and nothing asks.
+    await email.getByRole('heading', { name: 'Email' }).click();
+    await page.waitForTimeout(600); // past the save's debounce
+    await expect(confirmBox(page)).toHaveCount(0);
+    await expect(email.locator('.st-msg')).toHaveText('');
+    await expect(li.locator('.st-msg')).toHaveText('');
+    expect(posts).toEqual([]);
+    expect(liPosts).toEqual([]);
+    const status = await getJSON(request, server, '/api/status');
+    expect([status.daily_send_cap, status.linkedin_daily_cap, status.linkedin_weekly_cap]).toEqual([20, 15, 80]);
+  } finally {
+    await resetSending(request, server);
+  }
+});
+
 test('LinkedIn caps save', async ({ app, page, request, server }) => {
   await resetSending(request, server);
   const posts = countRequests(page, '/api/destination/linkedin/auto-send');
@@ -947,6 +990,41 @@ test('leaving the screen saves a cap that was typed and left', async ({ app, pag
   }
 });
 
+test('leaving the screen with a cap that cannot be saved says so', async ({ app, page, request, server }) => {
+  await resetSending(request, server);
+  await postJSON(request, server, '/api/destination/auto-send', { enabled: true, daily_cap: 20 });
+  try {
+    const posts = countRequests(page, '/api/destination/auto-send');
+    const liPosts = countRequests(page, '/api/destination/linkedin/auto-send');
+    // 0 typed (to pause sending, say), then straight to another screen: auto-send goes on at 20
+    // a day, and a toast (it outlives the screen) says so, and why.
+    await app.goto('#/settings?tab=sending');
+    const cap = region(page, 'Email').getByLabel('Daily cap');
+    await expect(cap).toHaveValue('20');
+    await cap.fill('0');
+    await goHome(page);
+    await expect(view(page).locator('.settings')).toHaveCount(0);
+    await expect(toasts(page)).toHaveText(['Email cap not changed: it stays at 20 a day. Caps are whole numbers from 1 to 500.']);
+
+    // A LinkedIn weekly cap under the daily one, the same way.
+    await app.goto('#/settings?tab=sending');
+    const weekly = region(page, 'LinkedIn').getByLabel('Weekly cap');
+    await expect(weekly).toHaveValue('80');
+    await weekly.fill('10');
+    await goHome(page);
+    await expect(view(page).locator('.settings')).toHaveCount(0);
+    await expect(toasts(page)).toHaveText([
+      "LinkedIn caps not changed: they stay at 15 a day and 80 a week. The daily cap can't be more than the weekly cap.",
+    ]);
+    expect(posts).toEqual([]);
+    expect(liPosts).toEqual([]);
+    const status = await getJSON(request, server, '/api/status');
+    expect([status.auto_send, status.daily_send_cap, status.linkedin_daily_cap, status.linkedin_weekly_cap]).toEqual([true, 20, 15, 80]);
+  } finally {
+    await resetSending(request, server);
+  }
+});
+
 test('a leave that Back overtakes keeps the screen asking before a raise', async ({ app, page, request, server }) => {
   await resetSending(request, server);
   await postJSON(request, server, '/api/destination/auto-send', { enabled: true, daily_cap: 20 });
@@ -1120,10 +1198,14 @@ test('connections connect through the intercepted routes', async ({ app, page, r
   await gmail.getByRole('button', { name: 'Save and connect' }).click();
   await expect(gmail.locator('.st-msg')).toHaveText('Paste your client ID first.');
 
-  // LinkedIn: the sign-in window never opens here, so the server reports it isn't waiting.
+  // LinkedIn: the sign-in window never opens here, so the server reports it isn't waiting (as it
+  // does when Chrome can't start: the message names that too).
   await expect(linkedin.locator('.badge').first()).toHaveText('Not connected');
   await linkedin.getByRole('button', { name: 'Connect LinkedIn' }).click();
-  await expect(linkedin.locator('.st-msg')).toHaveText("LinkedIn sign-in didn't finish: the window was closed or it timed out. Try again.", { timeout: 15_000 });
+  await expect(linkedin.locator('.st-msg')).toHaveText(
+    "LinkedIn sign-in ended before you signed in. Try again. If no Chrome window opened, coldtrail couldn't start Chrome: install Google Chrome first.",
+    { timeout: 15_000 },
+  );
   await expect(linkedin.getByRole('button', { name: 'Connect LinkedIn' })).toBeVisible();
 
   // Busy browser.
@@ -1251,6 +1333,58 @@ test('LinkedIn disconnect asks first; reconnect-needed says so', async ({ app, p
   } finally {
     setLinkedinState(server, null);
   }
+});
+
+test('a LinkedIn session that expires after connecting here shows on this screen', async ({ app, page, server }) => {
+  setLinkedinState(server, null);
+  // The sign-in, as linkedin.rs answers: connect starts it, and status says while it waits.
+  let li = { connected: false, reconnect_needed: false, waiting: false };
+  await page.route('**/api/destination/linkedin/status', (route) => route.fulfill({ json: li }));
+  await page.route('**/api/destination/linkedin/connect', (route) => {
+    li = { ...li, waiting: true };
+    return route.fallback(); // the harness's intercept answers {status:"waiting"}
+  });
+  try {
+    await app.goto('#/settings?tab=connections');
+    const linkedin = region(page, 'LinkedIn');
+    const badge = linkedin.locator('.badge').first();
+    await expect(badge).toHaveText('Not connected');
+    await linkedin.getByRole('button', { name: 'Connect LinkedIn' }).click();
+    await expect(badge).toHaveText('Waiting for sign-in');
+    setLinkedinState(server, { connected: true, reconnect_needed: false });
+    li = { connected: true, reconnect_needed: false, waiting: false };
+    await expect(badge).toHaveText('Connected', { timeout: 15_000 });
+    await expect(linkedin.locator('.st-msg')).toHaveText('LinkedIn is connected.');
+    const sidebarLinkedin = page.locator('.nav-conns li').filter({ hasText: 'LinkedIn' });
+    await expect(sidebarLinkedin).not.toContainText('Reconnect');
+
+    // Later LinkedIn logs the session out (a run finds it so): the next status says so, and the
+    // card follows it, as the sidebar does, without leaving the screen.
+    setLinkedinState(server, { connected: true, reconnect_needed: true });
+    await refreshStore(page);
+    await expect(sidebarLinkedin).toContainText('Reconnect');
+    await expect(badge).toHaveText('Reconnect needed');
+    await expect(linkedin.getByRole('button', { name: 'Reconnect LinkedIn' })).toBeVisible();
+    await tab(page, 'Sending').click();
+    await expect(region(page, 'LinkedIn').locator('.st-notice')).toContainText('Your LinkedIn session expired');
+  } finally {
+    setLinkedinState(server, null);
+  }
+});
+
+test('the Gmail card says what happens with auto-send on before Gmail is connected', async ({ app, page }) => {
+  await patchStatus(page, (s) => ({ ...s, destination_connected: false, auto_send: true, daily_send_cap: 1200 }));
+  await app.goto('#/settings?tab=connections');
+  const gmail = region(page, 'Gmail');
+  await expect(gmail.locator('.badge').first()).toHaveText('Not connected');
+  // As the LinkedIn card does: auto-send first, then the way in.
+  await expect(gmail.locator('.st-card-note')).toHaveText(
+    `Auto-send is on: once Gmail is connected, Send now on the Drafts screen and the agent email people right away, up to ${fmtNum(1200)} a day in total. Change it under Sending. An app password is the quickest way in: no Google Cloud project needed.`,
+  );
+  await gmail.getByRole('link', { name: 'Change it under Sending' }).focus();
+  await page.keyboard.press('Enter');
+  await expect(page).toHaveURL(hashIs('#/settings?tab=sending'));
+  await expect(region(page, 'Email').getByRole('heading', { name: 'Email' })).toBeFocused();
 });
 
 test('leaving settings stops the LinkedIn poll', async ({ app, page }) => {
@@ -1382,21 +1516,59 @@ test('connect requests outlive the screen', async ({ app, page }) => {
   page.on('requestfailed', (req) => {
     if (new URL(req.url()).pathname === '/api/discovery/canonical/connect') failed.push(req.failure());
   });
+  // The store's reads (/api/summary is only ever read by the store) from `armed` on.
+  let armed = false;
+  const storeReads = [];
+  page.on('request', (req) => {
+    if (armed && new URL(req.url()).pathname === '/api/summary') storeReads.push(req.url());
+  });
+  /** Home, settled, so a store read after that is this screen's (Home's own copy is fresh). */
+  const toHome = async () => {
+    await goHome(page);
+    await expect(view(page).locator('.settings')).toHaveCount(0);
+    await page.waitForTimeout(500);
+  };
   await app.goto('#/settings?tab=connections');
   const canonical = region(page, 'Canonical');
   await canonical.getByRole('button', { name: 'Reconnect' }).click();
   await expect(canonical.getByRole('button', { name: 'Waiting for approval…' })).toHaveAttribute('aria-busy', 'true');
   await expect(canonical.locator('.st-msg')).toContainText('Approve coldtrail in the browser tab that opened.');
 
-  await goHome(page);
-  await expect(view(page).locator('.settings')).toHaveCount(0);
+  await toHome();
+  armed = true;
   const finished = page.waitForEvent('requestfinished', (req) => new URL(req.url()).pathname === '/api/discovery/canonical/connect');
   release();
   await finished;
   expect(failed).toEqual([]);
   expect(app.calls.map((c) => c.path)).toEqual(['/api/discovery/canonical/connect']);
-  // Approved in the browser: nothing more to say.
-  await page.waitForTimeout(200);
+  // Approved in the browser: nothing more to say, but the app re-reads at once, so the sidebar
+  // and the screen now up show it (not on the store's next 30s tick).
+  await expect.poll(() => storeReads.length).toBeGreaterThan(0);
+  await expect(toasts(page)).toHaveCount(0);
+
+  // A Gmail app password still being checked as the screen goes: the same.
+  let releaseCheck;
+  const checking = new Promise((resolve) => {
+    releaseCheck = resolve;
+  });
+  await page.route('**/api/destination/gmail/app-password', async (route) => {
+    await checking;
+    await route.fallback(); // the harness's intercept answers {ok:true}
+  });
+  armed = false;
+  await page.goBack();
+  const gmail = region(page, 'Gmail');
+  await gmail.getByLabel('Gmail address', { exact: true }).fill('dee@example.com');
+  await gmail.getByLabel('App password', { exact: true }).fill('abcd efgh ijkl mnop');
+  await gmail.getByRole('button', { name: 'Connect Gmail' }).click();
+  await expect(gmail.getByRole('button', { name: 'Checking…' })).toHaveAttribute('aria-busy', 'true');
+  await toHome();
+  storeReads.length = 0;
+  armed = true;
+  const checked = page.waitForEvent('requestfinished', (req) => new URL(req.url()).pathname === '/api/destination/gmail/app-password');
+  releaseCheck();
+  await checked;
+  await expect.poll(() => storeReads.length).toBeGreaterThan(0);
   await expect(toasts(page)).toHaveCount(0);
 });
 

@@ -10,10 +10,11 @@
 //                already open). A sign-in wait has a Cancel, and holds the other sign-ins (they
 //                share one callback port) until it ends
 //   sending      email and LinkedIn auto-send: switches that ask before turning ON (never before
-//                OFF), caps that save on Enter or when the field is left (asking first when a cap
-//                goes up while auto-send is on; a raise nobody could confirm because the screen
-//                was going isn't saved, and a toast says so), today's usage, and a line saying
-//                what actually happens with the current setting
+//                OFF), caps (text fields: the wheel scrolls the page, never steps them) that save
+//                on Enter or when the field is left (asking first when a cap goes up while
+//                auto-send is on; a raise nobody could confirm because the screen was going isn't
+//                saved, nor is a value that can't be, and a toast says so), today's usage, and a
+//                line saying what actually happens with the current setting
 //   enrichment   the OSINT installers (theHarvester, SpiderFoot) with what each still needs
 //   appearance   System / Light / Dark through core/theme.js (kept in this browser)
 //
@@ -24,8 +25,10 @@
 // comes back; only their Cancel drops it); reads, the probe and the LinkedIn poll stop on
 // unmount. Sign-in waits and installs are kept by the module, not the screen: shown again, a
 // card picks its own up instead of offering a second, and one that ends while the screen is gone
-// says how it went in a toast. Leaving waits briefly (router beforeLeave) for switch, cap and
-// model saves, so the next screen sees them. A link to another tab takes focus to its card.
+// says how it went in a toast (a sign-in that worked says nothing; like an app password checked
+// or an install done meanwhile, it has the store re-read at once, so the sidebar and the screen
+// now up show it). Leaving waits briefly (router beforeLeave) for switch, cap and model saves, so
+// the next screen sees them. A link to another tab takes focus to its card.
 // Everything dynamic reaches the DOM through h() (text nodes); nothing here parses HTML.
 
 import { api, errorText, isStaleSession } from '../core/api.js';
@@ -175,14 +178,14 @@ function followJob(job) {
 }
 
 /**
- * The toast for a sign-in that ended, without connecting, after its screen had gone: `lead`,
- * with the reason when there is one. None for one that was stopped (Cancel, or moot), nor for a
- * stale session (the app's banner says that).
+ * A sign-in that ended after its screen had gone. Connected: catchUp() (nothing more to say).
+ * Else a toast: `lead`, with the reason when there is one. None for one that was stopped
+ * (Cancel, or moot), nor for a stale session (the app's banner says that).
  */
-function signInAway(o, lead) {
-  if (o.err && (aborted(o.err) || isStaleSession(o.err))) return;
+function signInAway(o, lead, catchUp) {
   const failed = failure(o, '');
-  if (failed) toast(failed[0] ? `${lead}: ${failed[0]}` : `${lead}.`, 'err');
+  if (!failed) catchUp();
+  else if (!(o.err && (aborted(o.err) || isStaleSession(o.err)))) toast(failed[0] ? `${lead}: ${failed[0]}` : `${lead}.`, 'err');
 }
 
 function waitsChanged() {
@@ -294,7 +297,8 @@ function mountSettings(root, ctx) {
   // was overtaken and the screen stays (update(), e.g. Back while the leave was still waiting).
   let leaving = false;
   // Connections a response confirmed this session, in case status lags behind (or, for an
-  // intercepted or failed re-read, never catches up). null = trust status.
+  // intercepted or failed re-read, never catches up), until status agrees (settleLocal).
+  // null = trust status.
   const local = { canonical: null, gmail: null, linkedin: null };
   // tab id → { el, built: null | { update(), destroy?(), flush?(), settled?() } }
   const panes = new Map();
@@ -357,10 +361,24 @@ function mountSettings(root, ctx) {
     local.linkedin != null ? local.linkedin : !!(status && status.linkedin_connected && !status.linkedin_reconnect_needed);
   const linkedinReconnect = () => local.linkedin == null && !!(status && status.linkedin_reconnect_needed);
 
+  /**
+   * Drop each override in `local` that `s` now agrees with: from then on status speaks again, so
+   * a later change (a session that expires, a disconnect elsewhere) shows on this screen too.
+   */
+  function settleLocal(s) {
+    const says = {
+      canonical: !!s.discovery_connected,
+      gmail: !!s.destination_connected,
+      linkedin: !!(s.linkedin_connected && !s.linkedin_reconnect_needed),
+    };
+    for (const k of Object.keys(local)) if (local[k] === says[k]) local[k] = null;
+  }
+
   /** Take a new status: every built tab re-renders (typed values are kept), the shown one builds. */
   function apply(next, { except = null } = {}) {
     if (!next || gone) return;
     status = next;
+    settleLocal(next);
     loadError = null;
     for (const [t, p] of panes) {
       if (p.built && p.built !== except && p.built.update) p.built.update();
@@ -413,6 +431,15 @@ function mountSettings(root, ctx) {
       if (!aborted(err) && !gone) console.warn('settings: status re-read failed', err);
       return null;
     }
+  }
+
+  /**
+   * Something this screen started worked after the screen had gone (a sign-in, an app password,
+   * an install): the store re-reads now, so the sidebar and the screen now up show it, not on the
+   * store's next 30s tick. (A screen shown again re-reads for itself: sync.)
+   */
+  function catchUp() {
+    if (store) store.refresh();
   }
 
   /** Run a quick save: the store's periodic copy is ignored while it is in flight. */
@@ -708,7 +735,7 @@ function mountSettings(root, ctx) {
       say(c.msg, "Approve coldtrail in the browser tab that opened. This page updates when you're done.", 'busy');
       job.done.then((o) => {
         if (gone) {
-          if (mine()) signInAway(o, `Canonical didn't ${canonicalOn() ? 'reconnect' : 'connect'}`);
+          if (mine()) signInAway(o, `Canonical didn't ${canonicalOn() ? 'reconnect' : 'connect'}`, catchUp);
           return;
         }
         cancel.end();
@@ -810,22 +837,27 @@ function mountSettings(root, ctx) {
     const more = h('details', { class: 'st-details' }, h('summary', {}, 'More options'), h('div', { class: 'st-more' }, googleBlock, byoForm));
     const forms = h('div', { class: 'st-gmail-forms' }, apForm, howTo, more);
     const reconnect = h('details', { class: 'st-details st-reconnect' }, h('summary', {}, 'Use different credentials'));
+    // The note while auto-send is on, built once and updated in place: rebuilt on every status
+    // refresh, its link would drop the keyboard focus parked on it.
+    const autoLead = h('span', {});
+    const autoTail = h('span', {});
+    const autoNote = [autoLead, h('a', { href: SENDING_TAB, 'data-goto': 'email' }, 'Change it under Sending'), autoTail];
+    const WAY_IN = 'An app password is the quickest way in: no Google Cloud project needed.';
 
     let shownOn = null;
     function render() {
       const on = gmailOn();
       c.badgeSlot.replaceChildren(on ? badge('Connected', 'ok') : badge('Not connected'));
       googleBlock.hidden = !status.gmail_client_configured;
-      if (on && status.auto_send) {
-        c.note.replaceChildren(
-          `Auto-send is on: Send now on the Drafts screen and the agent email people right away, up to ${fmtNum(status.daily_send_cap)} a day in total. `,
-          h('a', { href: SENDING_TAB, 'data-goto': 'email' }, 'Change it under Sending'),
-          '.',
-        );
+      if (status.auto_send) {
+        // What happens once an email goes through Gmail, as the LinkedIn card says it: first.
+        autoLead.textContent = `Auto-send is on: ${on ? '' : 'once Gmail is connected, '}Send now on the Drafts screen and the agent email people right away, up to ${fmtNum(status.daily_send_cap)} a day in total. `;
+        autoTail.textContent = on ? '.' : `. ${WAY_IN}`;
+        if (c.note.firstChild !== autoLead) c.note.replaceChildren(...autoNote);
       } else {
         c.note.textContent = on
           ? 'coldtrail saves each email as a draft in your Gmail. You review and send it there.'
-          : 'coldtrail puts each email in your Gmail drafts. An app password is the quickest way in: no Google Cloud project needed.';
+          : `coldtrail puts each email in your Gmail drafts. ${WAY_IN}`;
       }
       for (const [key, way] of Object.entries(ways)) holdFor(way.btn, key);
       unhold(c.msg);
@@ -877,7 +909,10 @@ function mountSettings(root, ctx) {
       await saveWith(async () => {
         try {
           const r = await api.post('/api/destination/gmail/app-password', { email: addr, app_password: pass });
-          if (gone) return;
+          if (gone) {
+            if (!(r && r.ok === false)) catchUp();
+            return;
+          }
           setBusy(apBtn, false);
           if (r && r.ok === false) say(c.msg, r.message || "Couldn't connect Gmail.", 'err');
           else ok = true;
@@ -901,7 +936,7 @@ function mountSettings(root, ctx) {
       say(c.msg, "Approve coldtrail in the Google tab that opened. This page updates when you're done.", 'busy');
       job.done.then((o) => {
         if (gone) {
-          if (mine()) signInAway(o, `Gmail didn't ${gmailOn() ? 'reconnect' : 'connect'}`);
+          if (mine()) signInAway(o, `Gmail didn't ${gmailOn() ? 'reconnect' : 'connect'}`, catchUp);
           return;
         }
         cancel.end();
@@ -1043,9 +1078,14 @@ function mountSettings(root, ctx) {
         sync();
       } else if (!s.waiting) {
         // The sign-in task ended without a session: the window was closed, it timed out, or
-        // Chrome couldn't start. Polling on would wait forever.
+        // Chrome couldn't start (none installed: the server only logs why). Polling on would wait
+        // forever.
         finish();
-        say(c.msg, "LinkedIn sign-in didn't finish: the window was closed or it timed out. Try again.", 'err');
+        say(
+          c.msg,
+          "LinkedIn sign-in ended before you signed in. Try again. If no Chrome window opened, coldtrail couldn't start Chrome: install Google Chrome first.",
+          'err',
+        );
         render();
       } else {
         schedule(seq);
@@ -1131,9 +1171,7 @@ function mountSettings(root, ctx) {
       const hadFocus = document.activeElement === disconnectBtn;
       render();
       if (hadFocus) connectBtn.focus();
-      await sync();
-      // Status now agrees: let it speak again (a later reconnect elsewhere shows up).
-      if (status && !status.linkedin_connected) local.linkedin = null;
+      await sync(); // once status agrees, it speaks again (settleLocal)
     }
 
     render();
@@ -1157,14 +1195,15 @@ function mountSettings(root, ctx) {
 
   function capInput(fid, label, unit, describedBy) {
     const unitId = `${fid}-unit`;
+    // Text, not a number field: a number field with focus steps on every wheel notch over it
+    // (scrolling the page would change a send cap, and leaving saves it). parseCap checks it.
     const input = h('input', {
       class: 'input st-cap-input',
       id: fid,
-      type: 'number',
+      type: 'text',
       inputmode: 'numeric',
-      min: String(CAP_MIN),
-      max: String(CAP_MAX),
-      step: '1',
+      pattern: '[0-9]*',
+      autocomplete: 'off',
       // The unit, the hint and any error are read with the field.
       'aria-describedby': [unitId, ...describedBy].join(' '),
     });
@@ -1182,7 +1221,8 @@ function mountSettings(root, ctx) {
    * caps(status), fields [{ key, label, unit }], hint, check(caps) → { text, fields } | null,
    * describe(on, caps), confirm(caps) and raise(caps) → dialog text (turning on; a cap going up
    * while on), unraised(saved) → the toast when a raise is dropped on the way out (nobody was
-   * there to confirm it), body(on, caps) → the request body, limit(caps) → "Up to …",
+   * there to confirm it), unchanged(saved) → the lead of the toast when a value that can't be
+   * saved is left on the way out, body(on, caps) → the request body, limit(caps) → "Up to …",
    * usage(caps) → today's sends as [part, …] ([] = none known), connected() and notConnected()
    * → { text, link }: the notice shown while the channel can't send, linking to Connections'
    * card `connect` (it takes the focus there).
@@ -1260,10 +1300,15 @@ function mountSettings(root, ctx) {
       for (const f of fields) invalid(f.input, !!text && culprits.includes(f.key));
     }
 
-    /** A value that can't be saved: the field says why, and the last "Saved." no longer holds. */
-    function refuse(text, culprits) {
+    /**
+     * A value that can't be saved: the field says why, and the last "Saved." no longer holds. On
+     * the way out nobody sees the field, so a toast (it outlives the screen) says the caps stayed
+     * where they were, and `why`.
+     */
+    function refuse(text, culprits, why = text) {
       say(c.msg, '');
       setError(text, culprits);
+      if (leaving || gone) toast(`${cfg.unchanged(cfg.caps(status))} ${why}`);
     }
 
     function renderText() {
@@ -1341,7 +1386,7 @@ function mountSettings(root, ctx) {
       const typed = shownCaps();
       const bad = fields.filter((f) => typed[f.key] == null).map((f) => f.key);
       if (bad.length) {
-        refuse(`Enter a whole number from ${CAP_MIN} to ${CAP_MAX}.`, bad);
+        refuse(`Enter a whole number from ${CAP_MIN} to ${CAP_MAX}.`, bad, `Caps are whole numbers from ${CAP_MIN} to ${CAP_MAX}.`);
         return;
       }
       const problem = cfg.check(typed);
@@ -1458,6 +1503,7 @@ function mountSettings(root, ctx) {
       }),
       unraised: (caps) =>
         `Email cap not raised: it stays at ${fmtNum(caps.daily)} a day. With auto-send on, a higher cap needs your confirmation under Settings → Sending.`,
+      unchanged: (caps) => `Email cap not changed: it stays at ${fmtNum(caps.daily)} a day.`,
       body: (on, caps) => ({ enabled: on, daily_cap: caps.daily }),
       limit: (caps) => `Up to ${fmtNum(caps.daily)} ${caps.daily === 1 ? 'email' : 'emails'} a day.`,
       usage: (caps) => (typeof status.email_sent_today === 'number' ? [`${fmtNum(status.email_sent_today)} of ${fmtNum(caps.daily)} sent today`] : []),
@@ -1497,6 +1543,7 @@ function mountSettings(root, ctx) {
       }),
       unraised: (caps) =>
         `LinkedIn caps not raised: they stay at ${fmtNum(caps.daily)} a day and ${fmtNum(caps.weekly)} a week. With auto-send on, higher caps need your confirmation under Settings → Sending.`,
+      unchanged: (caps) => `LinkedIn caps not changed: they stay at ${fmtNum(caps.daily)} a day and ${fmtNum(caps.weekly)} a week.`,
       body: (on, caps) => ({ enabled: on, weekly_cap: caps.weekly, daily_cap: caps.daily }),
       limit: (caps) => `Up to ${fmtNum(caps.daily)} ${caps.daily === 1 ? 'invite' : 'invites'} a day and ${fmtNum(caps.weekly)} a week.`,
       usage: (caps) => [
@@ -1614,13 +1661,15 @@ function mountSettings(root, ctx) {
 
     /**
      * An install that ended after the screen had gone (it can take minutes, so people move on):
-     * a toast says how it went. A stale session is left to the app's banner.
+     * a toast says how it went (and one that worked is caught up: catchUp). A stale session is
+     * left to the app's banner.
      */
     function installedAway(r, err) {
       if (err) {
         if (!isStaleSession(err)) toast(`${tool.title} didn't install: ${errorText(err)}`, 'err');
       } else if (r && r.ok) {
         toast(r.message || `${tool.title} is installed.`, 'ok');
+        catchUp();
       } else {
         toast(r && r.message ? `${tool.title} didn't install: ${r.message}` : `${tool.title} didn't install.`, 'err');
       }

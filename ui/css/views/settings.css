@@ -202,16 +202,12 @@
 }
 .st-cap-fields { display: flex; flex-wrap: wrap; gap: var(--space-3) var(--space-6); }
 .st-cap-row { display: flex; align-items: center; gap: var(--space-2); }
+/* A text field (settings.js capInput): no spinner arrows, and the wheel scrolls the page. */
 .st-cap-input {
   width: 96px;
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
-  -moz-appearance: textfield;
-  appearance: textfield;
 }
-/* No spinner arrows: the caps are typed, and the arrows crowd a short field. */
-.st-cap-input::-webkit-inner-spin-button,
-.st-cap-input::-webkit-outer-spin-button { margin: 0; -webkit-appearance: none; appearance: none; }
 .st-cap-unit { color: var(--text-2); white-space: nowrap; }
 .st-usage {
   font-family: var(--font-mono);
