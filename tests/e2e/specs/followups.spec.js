@@ -58,6 +58,27 @@ const toastWith = (page, text) => page.locator('#toasts .toast').filter({ hasTex
 const navCount = (page) =>
   page.getByRole('navigation', { name: 'Main' }).locator('a[data-route="followups"] .nav-count');
 const markDialog = (page, domain, value) => page.getByRole('alertdialog', { name: `Mark ${domain} as ${value}?` });
+/** The screen's status line (what it says to screen readers). */
+const live = (page) => page.locator('#view').getByRole('status');
+
+/** The company and contact names cut short on screen (one line of a clamp, or overflow), each with
+ *  `early`: cut narrower than it need be, short of both 40 characters (`ch`, the width of a "0"
+ *  in its font) and its cell's room. */
+const cutNames = (page) =>
+  page.locator('.fu-content').evaluate((el) => {
+    const ctx = document.createElement('canvas').getContext('2d');
+    return [...el.querySelectorAll('.fu-domain, .fu-email')]
+      .filter((s) => s.scrollWidth > s.clientWidth + 1 || s.scrollHeight > s.clientHeight + 1)
+      .map((s) => {
+        const td = s.closest('td');
+        const pad = getComputedStyle(td);
+        const room = td.clientWidth - parseFloat(pad.paddingLeft) - parseFloat(pad.paddingRight);
+        const f = getComputedStyle(s);
+        ctx.font = `${f.fontStyle} ${f.fontWeight} ${f.fontSize} ${f.fontFamily}`;
+        const cap = 40 * ctx.measureText('0').width;
+        return { text: s.textContent, early: s.getBoundingClientRect().width < Math.min(room, cap) - 1 };
+      });
+  });
 
 /** Press a row's Mark replied / Mark bounced and confirm (a mark always asks first). */
 async function markRow(page, domain, value) {
@@ -188,6 +209,19 @@ test('rows show the contact, touches and time since the last send', async ({ app
   await expect(tab(page, 'Due').locator('.tab-count')).toHaveText(fmtNum(SEED.followups.due));
 });
 
+test('a 1280px window shows every seeded name in full, whichever tab is open', async ({ app, page }) => {
+  // The sidebar leaves the list about 980px: room for each name beside the other columns, the
+  // Due tab's actions included. A name is cut only when the table has no room left for it.
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await app.goto('#/followups');
+  await ready(page);
+  for (const [state, label] of STATES) {
+    await tab(page, label).click();
+    await expect(rows(page)).toHaveCount(SEED.followups[state]);
+    expect(await cutNames(page), label).toEqual([]);
+  }
+});
+
 test('a filter from the address without a tab opens the tab that holds its match', async ({ app, page }) => {
   const now = await (await page.request.get(app.server.apiUrl('/api/followups'))).json();
   const awaiting = now.find((f) => f.state === 'awaiting' && f.to);
@@ -232,6 +266,43 @@ test('a filter from the address without a tab opens the tab that holds its match
   await expect(tab(page, 'Replied')).toHaveAttribute('aria-selected', 'true');
   await expect(row(page, replied.domain)).toBeVisible();
   await expect.poll(() => routeOf(page)).toEqual({ path: '/followups', tab: 'replied', q: replied.domain });
+});
+
+test('a filter naming a company opens its tab, not that of a domain containing its name', async ({ app, page }) => {
+  // data.io is awaiting a reply; bigdata.io, whose domain contains it, is due (an earlier tab).
+  await page.route(isList, (route) =>
+    route.fulfill({
+      json: [
+        { domain: 'bigdata.io', to: 'ann@bigdata.io', days: 6, touches: 1, state: 'due' },
+        { domain: 'data.io', to: 'bo@data.io', days: 2, touches: 1, state: 'awaiting' },
+      ],
+    }),
+  );
+  // As Pipeline links a sent company.
+  await app.goto('#/followups?q=data.io');
+  await ready(page);
+  await expect(tab(page, 'Awaiting')).toHaveAttribute('aria-selected', 'true');
+  await expect(rows(page)).toHaveCount(1);
+  await expect(row(page, 'data.io')).toBeVisible();
+  await expect.poll(() => routeOf(page)).toEqual({ path: '/followups', tab: 'awaiting', q: 'data.io' });
+
+  // In any case, and for a filter that arrives while the screen is open.
+  await page.evaluate(() => {
+    location.hash = '#/followups?tab=due';
+  });
+  await expect(tab(page, 'Due')).toHaveAttribute('aria-selected', 'true');
+  await page.evaluate(() => {
+    location.hash = '#/followups?q=DATA.IO';
+  });
+  await expect(tab(page, 'Awaiting')).toHaveAttribute('aria-selected', 'true');
+  await expect(row(page, 'data.io')).toBeVisible();
+  await expect.poll(() => routeOf(page)).toEqual({ path: '/followups', tab: 'awaiting', q: 'DATA.IO' });
+
+  // A filter naming no company exactly still opens the first tab it matches under.
+  await page.goto(app.server.url('#/followups?q=data'));
+  await ready(page);
+  await expect(tab(page, 'Due')).toHaveAttribute('aria-selected', 'true');
+  await expect(row(page, 'bigdata.io')).toBeVisible();
 });
 
 test('draft follow-up shows progress then a result', async ({ app, page }) => {
@@ -436,6 +507,8 @@ test('reply check results that need attention are shown as such', async ({ app, 
   await expect(notice(page)).toHaveClass(/fu-notice-warn/);
   await expect(notice(page)).toContainText("Couldn't check for replies");
   await expect(notice(page)).toContainText(byok);
+  // The notice isn't announced: the status line says what went wrong, and why.
+  await expect(live(page)).toHaveText(`Couldn't check for replies. ${byok}`);
 
   // A server error is an error, with its text.
   app.allowConsole(/Failed to load resource/);
@@ -445,6 +518,7 @@ test('reply check results that need attention are shown as such', async ({ app, 
   await expect(notice(page)).toHaveClass(/fu-notice-err/);
   await expect(notice(page)).toContainText('Reply check failed');
   await expect(notice(page)).toContainText('database is locked');
+  await expect(live(page)).toHaveText('Reply check failed. database is locked');
   await notice(page).getByRole('button', { name: 'Dismiss' }).click();
   await expect(notice(page)).toHaveCount(0);
 });
@@ -797,21 +871,20 @@ test('filter narrows the list and long lists show 100 rows at a time', async ({ 
 
   const filter = page.getByRole('searchbox', { name: 'Filter follow-ups' });
   // What the filter leaves is said to screen readers too, through the screen's status line.
-  const live = page.locator('#view').getByRole('status');
   await filter.fill('COMPANY-12');
   await expect(rows(page)).toHaveCount(10); // company-120 … company-129, any case
   await expect(tab(page, 'Due').locator('.tab-count')).toHaveText('10');
   await expect(page).toHaveURL(hashIs('#/followups?q=COMPANY-12'));
-  await expect(live).toHaveText('10 follow-ups under Due match “COMPANY-12”.');
+  await expect(live(page)).toHaveText('10 follow-ups under Due match “COMPANY-12”.');
   await filter.fill('nobody-here');
   await expect(page.locator('.fu-content')).toContainText('No follow-ups match “nobody-here”');
-  await expect(live).toHaveText('No follow-ups match “nobody-here”. No domain or emailed address under any tab contains that text.');
+  await expect(live(page)).toHaveText('No follow-ups match “nobody-here”. No domain or emailed address under any tab contains that text.');
   await page.getByRole('button', { name: 'Clear filter' }).click();
   await expect(rows(page)).toHaveCount(100);
   await expect(filter).toHaveValue('');
   await expect(filter).toBeFocused();
   await expect(page).toHaveURL(hashIs('#/followups'));
-  await expect(live).toHaveText('250 follow-ups under Due.');
+  await expect(live(page)).toHaveText('250 follow-ups under Due.');
 });
 
 test('loading, error and retry', async ({ app, page }) => {
@@ -865,6 +938,7 @@ test('a stale session says what to do, without repeating the banner', async ({ a
   await expect(notice(page)).toContainText('Reply check failed');
   await expect(notice(page)).toContainText('Reopen coldtrail from your terminal.');
   await expect(notice(page)).not.toContainText("This tab's session is stale");
+  await expect(live(page)).toHaveText('Reply check failed. Reopen coldtrail from your terminal.');
 });
 
 test('a drafts list that fails to load only hides the draft hint', async ({ app, page }) => {
@@ -1038,7 +1112,7 @@ test('the tabs sit as far under the page head as on Pipeline', async ({ app, pag
   expect(await gap(tablist(page))).toBe(pipeline);
 });
 
-test('laptop widths: the table fits without scrolling sideways, even with long names', async ({ app, page }) => {
+test('laptop widths: the table fits without scrolling sideways, cutting long names only as far as it must', async ({ app, page }) => {
   // Names as long as the table shows in full, on a Due row (all three actions, one of them busy),
   // beside a Due row reached only on LinkedIn (the widest next step), and on an Awaiting row with
   // the widest state and time.
@@ -1062,8 +1136,10 @@ test('laptop widths: the table fits without scrolling sideways, even with long n
   await expect(row(page, `b${long.slice(1)}`).locator('[data-action="bounced"]')).toHaveAttribute('aria-busy', 'true');
   await expect(row(page, `d${long.slice(1)}`).locator('.fu-hint')).toHaveText('Follow up on LinkedIn');
 
-  // Every width from just over the card layout to a wide window, with the sidebar beside it.
+  // Every width from just over the card layout to a wide window, with the sidebar beside it. A
+  // long name is cut only as far as it must be: to the room its column has, or to 40 characters.
   const sideways = [];
+  const early = [];
   for (const label of ['Due', 'Awaiting']) {
     if (label !== 'Due') await tab(page, label).click();
     for (let width = 1180; width <= 1480; width += 10) {
@@ -1073,9 +1149,11 @@ test('laptop widths: the table fits without scrolling sideways, even with long n
         return wrap.scrollWidth - wrap.clientWidth;
       });
       if (over > 0) sideways.push(`${label} at ${width}px: ${over}px`);
+      for (const name of await cutNames(page)) if (name.early) early.push(`${label} at ${width}px: ${name.text}`);
     }
   }
   expect(sideways).toEqual([]);
+  expect(early).toEqual([]);
   // A cut name is still there in full, on hover.
   await expect(row(page, `c${long.slice(1)}`).locator('.fu-email')).toHaveAttribute('title', email);
 });
@@ -1270,7 +1348,14 @@ test.describe('new workspace', () => {
     await ready(page);
     const empty = page.locator('.fu-content .empty-state');
     await expect(empty.getByRole('heading', { name: 'No one to follow up with yet' })).toBeVisible();
-    await expect(empty.getByRole('link', { name: 'Review drafts' })).toHaveAttribute('href', '#/drafts');
+    // No drafts are waiting either (Review drafts would open an empty Drafts): the way in is the
+    // agent, with Pipeline's Find companies prompt to review.
+    const find = empty.getByRole('link', { name: 'Find companies' });
+    await expect(find).toBeVisible();
+    const [path, qs] = (await find.getAttribute('href')).split('?');
+    expect(path).toBe('#/agent');
+    expect(new URLSearchParams(qs).get('prompt')).toBe('Find 20 companies that match my company profile and add them to the pipeline.');
+    await expect(empty.getByRole('link', { name: 'Review drafts' })).toHaveCount(0);
     for (const [, label] of STATES) await expect(tab(page, label).locator('.tab-count')).toHaveText('0');
 
     // The real check has nothing to do and says so. With no one to count, the progress line
@@ -1286,5 +1371,22 @@ test.describe('new workspace', () => {
     await expectAccessible(page);
     await page.setViewportSize({ width: 390, height: 844 });
     await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+
+    // Once a draft is waiting (written by a chat turn or a scheduled run), reviewing it is the
+    // next step: the store's next refresh (every 30s, or on coming back to the tab) brings it in,
+    // and the keyboard stays on the action.
+    await find.focus();
+    dbExec(
+      app.server,
+      `INSERT INTO companies (domain, name, status) VALUES ('first.example', 'First', 'drafted');
+       INSERT INTO contacts (id, domain, founder_name, email) VALUES (96001, 'first.example', 'Fay Lin', 'fay@first.example');
+       INSERT INTO outreach (domain, contact_id, channel, subject, body, status, created_at) VALUES
+         ('first.example', 96001, 'email', 'Hi Fay', 'Hi Fay', 'draft_pending', datetime('now'));`,
+    );
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    const review = empty.getByRole('link', { name: 'Review drafts' });
+    await expect(review).toHaveAttribute('href', '#/drafts');
+    await expect(review).toBeFocused();
+    await expect(find).toHaveCount(0);
   });
 });

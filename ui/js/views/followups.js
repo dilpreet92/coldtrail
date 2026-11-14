@@ -29,6 +29,8 @@ const FILTER_MS = 200;
 // fewer than 3 touches have gone out.
 const DUE_AFTER_DAYS = 4;
 const MAX_TOUCHES = 3;
+// Pipeline's "Find companies" words: the company profile says which market.
+const FIND_PROMPT = 'Find 20 companies that match my company profile and add them to the pipeline.';
 
 const STATES = [
   {
@@ -61,7 +63,7 @@ const STATES = [
 const STATE = Object.assign(Object.create(null), Object.fromEntries(STATES.map((st) => [st.id, st])));
 const tabFrom = (query) => (query && STATE[query.tab] ? query.tab : 'due');
 /** An address with a filter and no tab (Pipeline links a sent company that way: it can't tell
- *  Due from Awaiting). The tab is then the first one the filter matches under. */
+ *  Due from Awaiting). The tab is then the company's, or the first one the filter matches under. */
 const tabByMatch = (query) => !!(query && String(query.q ?? '').trim() && !STATE[query.tab]);
 /** The tab a row is listed under. A state this UI doesn't know (the server only sends the four
  *  above today) still shows, under Awaiting, with its raw label. */
@@ -675,6 +677,9 @@ function mount(root, ctx) {
       target = content.querySelector('[data-action="more"]') || (revealFrom != null ? lead(trs[revealFrom]) : null);
     } else if (f.action === 'clear' || f.action === 'retry') {
       target = filterBox.hidden ? null : filterInput;
+    } else if (f.action === 'start') {
+      // The empty state's action, which a draft written meanwhile can change.
+      target = content.querySelector('[data-action="start"]');
     } else {
       const same = f.domain != null ? trs.find((tr) => tr.dataset.key === f.domain) : null;
       if (same) target = inRow(same);
@@ -722,12 +727,15 @@ function mount(root, ctx) {
     updateCounts();
 
     if (!s.rows.length) {
+      // Nothing sent yet: the drafts waiting to go out, else the agent to find companies (an
+      // empty Drafts would only send the user on there).
+      const [label, to] = draftsWaiting() === false ? ['Find companies', href(['agent'], { prompt: FIND_PROMPT })] : ['Review drafts', '#/drafts'];
       content.replaceChildren(
         panel(
           emptyState({
             title: 'No one to follow up with yet',
             body: 'Companies show up here once you send them an email or a LinkedIn invite, so you can see who replied and when a follow-up is due.',
-            action: { label: 'Review drafts', href: '#/drafts' },
+            action: h('a', { class: 'btn btn-primary', href: to, 'data-action': 'start' }, label),
           }),
         ),
       );
@@ -846,9 +854,10 @@ function mount(root, ctx) {
       s.drafts = draftsByDomain(dr.value);
       draftsSeen = drafts;
     }
-    // What the list shows of the drafts: which rows have an email draft waiting.
+    // What the list shows of the drafts: which rows have an email draft waiting, and with no rows,
+    // whether any draft is (the empty state's action).
     const hints = s.drafts ? [...s.drafts].filter(([, w]) => w.email).map(([d]) => d).sort() : [];
-    const now = s.rows ? JSON.stringify([s.rows, hints]) : null;
+    const now = s.rows ? JSON.stringify([s.rows, hints, s.rows.length ? null : draftsWaiting()]) : null;
     if (quiet && now === loaded) {
       content.setAttribute('aria-busy', 'false');
       return;
@@ -861,6 +870,15 @@ function mount(root, ctx) {
   function emailDrafts(domain) {
     const w = s.drafts && s.drafts.get(lower(domain));
     return w ? w.email : 0;
+  }
+
+  /** Whether any draft (either channel) is waiting in Drafts: the summary's count, else the last
+   *  drafts list; null when neither has loaded. */
+  function draftsWaiting() {
+    const { summary } = store.get();
+    const n = summary && summary.counts ? summary.counts.drafts : null;
+    if (Number.isFinite(n)) return n > 0;
+    return s.drafts ? s.drafts.size > 0 : null;
   }
 
   /** The summary's count of email drafts waiting, or null if there is no summary yet. */
@@ -894,11 +912,15 @@ function mount(root, ctx) {
     load({ quiet: true });
   });
 
-  /** Open the first tab the filter matches under, once the rows are in (Due, the default, when
-   *  none does), and name it in the address. True when the tab changed. */
+  /** Once the rows are in, open the tab of the company the filter names (Pipeline's link), else
+   *  the first tab the filter matches under (Due, the default, when none does), and name it in the
+   *  address. True when the tab changed. */
   function chooseTab() {
     autoTab = false;
-    const hit = STATES.find((x) => filtered().some((r) => tabOf(r) === x.id));
+    // An exact domain first: the filter "data.io" also matches bigdata.io, maybe under an earlier tab.
+    const needle = lower(s.q.trim());
+    const named = s.rows.find((r) => lower(r.domain) === needle);
+    const hit = named ? STATE[tabOf(named)] : STATES.find((x) => filtered().some((r) => tabOf(r) === x.id));
     if (!hit || hit.id === s.tab) return false;
     s.tab = hit.id;
     s.limit = PAGE;
@@ -1060,7 +1082,14 @@ function mount(root, ctx) {
     afterCheck() {
       renderCheck();
       const r = jobs.result;
-      if (r) announce(r.changes ? `${r.title}. ${changesText(r.changes)}` : r.title);
+      if (r && r.tone !== 'ok') {
+        // The notice isn't a live region: a check that didn't work says why here too, as a failed
+        // draft's toast does.
+        const why = r.message ? (r.markdown ? mdPlain(r.message) : truncate(r.message, 400)) : '';
+        announce(why ? `${r.title}. ${why}` : r.title);
+      } else if (r) {
+        announce(r.changes ? `${r.title}. ${changesText(r.changes)}` : r.title);
+      }
       load();
       refreshStore();
     },
